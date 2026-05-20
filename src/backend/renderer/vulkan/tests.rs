@@ -1,11 +1,14 @@
 use std::{marker::PhantomData, os::unix::io::OwnedFd};
 
+use ash::vk;
+
 use crate::backend::allocator::Fourcc;
 use crate::backend::renderer::sync::Interrupted;
 use crate::backend::renderer::{Color32F, DebugFlags, Frame, Renderer, Texture, sync::Fence};
+use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
 use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 
-use super::device::VulkanDeviceState;
+use super::device::{VulkanDeviceState, select_queue_families};
 use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
     VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalMemoryHandleType, VulkanExternalMemoryState,
@@ -152,6 +155,71 @@ fn vulkan_renderer_builder_is_scaffold_only() {
         VulkanRenderer::builder().build(),
         Err(VulkanError::VulkanUnavailable)
     ));
+}
+
+#[test]
+fn initialized_device_capabilities_do_not_enable_renderer_operations() {
+    let caps = VulkanRendererCapabilities::for_initialized_device(&[]);
+
+    assert!(caps.device.available);
+    assert!(!caps.device.multi_gpu);
+    assert!(caps.device.extensions.is_empty());
+    assert!(!caps.import.memory);
+    assert!(!caps.import.dmabuf);
+    assert!(!caps.export.dmabuf);
+    assert!(!caps.rendering.offscreen);
+    assert!(!caps.rendering.blit);
+    assert!(!caps.sync.explicit);
+    assert!(caps.formats.records.is_empty());
+}
+
+#[test]
+fn queue_family_selection_requires_graphics() {
+    let families = [vk::QueueFamilyProperties {
+        queue_flags: vk::QueueFlags::TRANSFER,
+        queue_count: 1,
+        ..Default::default()
+    }];
+
+    assert!(matches!(
+        select_queue_families(&families),
+        Err(VulkanError::QueueFamilyUnsupported)
+    ));
+}
+
+#[test]
+fn queue_family_selection_prefers_dedicated_transfer() {
+    let families = [
+        vk::QueueFamilyProperties {
+            queue_flags: vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER,
+            queue_count: 1,
+            ..Default::default()
+        },
+        vk::QueueFamilyProperties {
+            queue_flags: vk::QueueFlags::TRANSFER,
+            queue_count: 1,
+            ..Default::default()
+        },
+    ];
+
+    let selected = select_queue_families(&families).unwrap();
+
+    assert_eq!(selected.graphics, Some(0));
+    assert_eq!(selected.transfer, Some(1));
+}
+
+#[test]
+fn queue_family_selection_uses_graphics_for_transfer_fallback() {
+    let families = [vk::QueueFamilyProperties {
+        queue_flags: vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER,
+        queue_count: 1,
+        ..Default::default()
+    }];
+
+    let selected = select_queue_families(&families).unwrap();
+
+    assert_eq!(selected.graphics, Some(0));
+    assert_eq!(selected.transfer, Some(0));
 }
 
 #[test]
@@ -470,7 +538,33 @@ fn wait_interruption_maps_to_sync_interrupted() {
 }
 
 #[test]
-#[ignore = "Vulkan device initialization is not implemented yet"]
+#[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_renderer_builder_initializes_with_first_physical_device() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let caps = renderer.capabilities();
+
+    assert!(renderer.is_usable());
+    assert!(caps.device.available);
+    assert!(caps.device.extensions.is_empty());
+    assert!(!caps.import.memory);
+    assert!(!caps.import.dmabuf);
+    assert!(!caps.export.dmabuf);
+    assert!(!caps.rendering.offscreen);
+    assert!(!caps.rendering.blit);
+    assert!(!caps.sync.explicit);
+}
+
+#[test]
+#[ignore = "Default Vulkan device selection is not implemented yet"]
 fn future_renderer_initialization_enables_device_capabilities() {
     let renderer = VulkanRenderer::new().unwrap();
     let caps = renderer.capabilities();

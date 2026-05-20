@@ -1,3 +1,5 @@
+use std::ffi::CStr;
+
 use crate::backend::{
     allocator::{Fourcc, Modifier, format::FormatSet},
     vulkan::PhysicalDevice,
@@ -94,6 +96,22 @@ impl VulkanFormatCapabilities {
     /// pairs that `ImportDma` cannot import.
     pub fn discover(_physical_device: &PhysicalDevice) -> Result<Self, VulkanError> {
         Err(VulkanError::UnsupportedOperation("format capability discovery"))
+    }
+}
+
+impl VulkanRendererCapabilities {
+    pub(super) fn for_initialized_device(enabled_extensions: &[&CStr]) -> Self {
+        Self {
+            device: VulkanDeviceCapabilities {
+                available: true,
+                multi_gpu: false,
+                extensions: enabled_extensions
+                    .iter()
+                    .map(|extension| extension.to_string_lossy().into_owned())
+                    .collect(),
+            },
+            ..Self::default()
+        }
     }
 }
 

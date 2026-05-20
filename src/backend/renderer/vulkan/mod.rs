@@ -1,8 +1,8 @@
 //! Native Vulkan renderer scaffold.
 //!
 //! This module establishes the renderer-side structure for a future native Vulkan backend. It is
-//! intentionally non-functional: it does not create a Vulkan instance or device, import buffers,
-//! render frames, present to KMS, implement HDR, or perform colour-management policy.
+//! intentionally non-functional: it does not create a Vulkan instance, import buffers, render frames,
+//! present to KMS, implement HDR, or perform colour-management policy.
 //!
 //! Downstream compositors must not treat the presence of this module or the `renderer_vulkan`
 //! feature as Vulkan rendering support. Real enablement must be added incrementally behind explicit
@@ -75,9 +75,9 @@ pub struct VulkanRenderer {
 
 /// Builder for future Vulkan renderer initialization.
 ///
-/// The builder records the ownership shape expected by the real implementation while still returning
-/// [`VulkanError::VulkanUnavailable`] in the scaffold. Device creation, queue selection, and capability
-/// discovery must be added here before any optional renderer traits are implemented.
+/// The builder records the ownership shape expected by the real implementation. It can initialize a
+/// logical Vulkan device from an explicitly provided [`PhysicalDevice`], but rendering/import/export
+/// operations remain unsupported until the corresponding capability bits can become true.
 #[derive(Debug, Default, Clone)]
 pub struct VulkanRendererBuilder {
     physical_device: Option<PhysicalDevice>,
@@ -100,19 +100,28 @@ impl VulkanRendererBuilder {
 
     /// Builds a Vulkan renderer.
     ///
-    /// This always returns [`VulkanError::VulkanUnavailable`] in the scaffold. Future implementation
-    /// steps should populate renderer device state and capabilities here before exposing functionality.
+    /// This returns [`VulkanError::VulkanUnavailable`] unless a [`PhysicalDevice`] was provided.
     pub fn build(self) -> Result<VulkanRenderer, VulkanError> {
-        let _ = self;
-        Err(VulkanError::VulkanUnavailable)
+        let physical_device = self.physical_device.ok_or(VulkanError::VulkanUnavailable)?;
+        let device = VulkanDeviceState::new(physical_device)?;
+        let capabilities = device.capabilities.clone();
+
+        Ok(VulkanRenderer {
+            context_id: ContextId::new(),
+            debug_flags: DebugFlags::empty(),
+            downscale_filter: TextureFilter::Linear,
+            upscale_filter: TextureFilter::Linear,
+            capabilities,
+            device: Some(device),
+        })
     }
 }
 
 impl VulkanRenderer {
     /// Attempts to create a Vulkan renderer.
     ///
-    /// This always returns [`VulkanError::VulkanUnavailable`] in the scaffold. A future implementation
-    /// must only return `Ok` after real device initialization and capability discovery are wired up.
+    /// This returns [`VulkanError::VulkanUnavailable`] until a default device-selection policy exists.
+    /// Use [`VulkanRenderer::builder`] with an explicit [`PhysicalDevice`] to initialize device state.
     pub fn new() -> Result<Self, VulkanError> {
         Self::builder().build()
     }
