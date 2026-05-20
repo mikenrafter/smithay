@@ -89,6 +89,8 @@ pub struct VulkanFormatUsage {
     pub dmabuf_import: bool,
     /// Usable as a render target.
     pub render_target: bool,
+    /// Usable as a framebuffer color attachment with blending.
+    pub color_attachment_blend: bool,
     /// Exportable as a dmabuf.
     pub dmabuf_export: bool,
     /// Usable as a blit source.
@@ -209,6 +211,7 @@ impl VulkanFormatUsage {
             || self.memory_import
             || self.dmabuf_import
             || self.render_target
+            || self.color_attachment_blend
             || self.dmabuf_export
             || self.blit_src
             || self.blit_dst
@@ -229,6 +232,7 @@ pub(super) fn format_usage_from_features(features: vk::FormatFeatureFlags) -> Vu
     VulkanFormatUsage {
         sampled: features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE),
         render_target: features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT),
+        color_attachment_blend: features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND),
         blit_src: features.contains(vk::FormatFeatureFlags::BLIT_SRC),
         blit_dst: features.contains(vk::FormatFeatureFlags::BLIT_DST),
         transfer_src: features.contains(vk::FormatFeatureFlags::TRANSFER_SRC),
@@ -241,6 +245,7 @@ pub(super) fn linear_tiling_supported(features: vk::FormatFeatureFlags) -> bool 
     features.intersects(
         vk::FormatFeatureFlags::SAMPLED_IMAGE
             | vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
             | vk::FormatFeatureFlags::TRANSFER_SRC
             | vk::FormatFeatureFlags::TRANSFER_DST
             | vk::FormatFeatureFlags::BLIT_SRC

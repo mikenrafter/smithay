@@ -184,12 +184,14 @@ fn format_usage_maps_vulkan_feature_flags() {
     let usage = format_usage_from_features(
         vk::FormatFeatureFlags::SAMPLED_IMAGE
             | vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
             | vk::FormatFeatureFlags::BLIT_SRC
             | vk::FormatFeatureFlags::TRANSFER_DST,
     );
 
     assert!(usage.sampled);
     assert!(usage.render_target);
+    assert!(usage.color_attachment_blend);
     assert!(usage.blit_src);
     assert!(!usage.blit_dst);
     assert!(!usage.transfer_src);
