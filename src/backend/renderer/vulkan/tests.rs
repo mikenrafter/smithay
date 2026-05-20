@@ -8,6 +8,7 @@ use crate::backend::renderer::{Color32F, DebugFlags, Frame, Renderer, Texture, s
 use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
 use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 
+use super::capabilities::{format_usage_from_features, linear_tiling_supported};
 use super::device::{VulkanDeviceState, select_queue_families};
 use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
@@ -97,6 +98,8 @@ fn vulkan_format_capability_matrix_defaults_empty() {
     assert!(caps.formats.dmabuf_export.iter().next().is_none());
     assert!(caps.formats.blit_src.iter().next().is_none());
     assert!(caps.formats.blit_dst.iter().next().is_none());
+    assert!(caps.formats.transfer_src.iter().next().is_none());
+    assert!(caps.formats.transfer_dst.iter().next().is_none());
     assert!(caps.formats.linear.iter().next().is_none());
 }
 
@@ -116,13 +119,14 @@ fn wayland_protocol_capabilities_are_not_advertised_by_default() {
 }
 
 #[test]
-fn vulkan_format_capability_record_is_per_modifier() {
+fn vulkan_format_capability_record_is_per_tiling_marker() {
     let record = VulkanFormatCapabilityRecord {
         format: Fourcc::Argb8888,
         modifier: crate::backend::allocator::Modifier::Linear,
         usages: VulkanFormatUsage {
             sampled: true,
             memory_import: true,
+            transfer_src: true,
             ..VulkanFormatUsage::default()
         },
     };
@@ -132,6 +136,7 @@ fn vulkan_format_capability_record_is_per_modifier() {
     assert!(record.usages.sampled);
     assert!(record.usages.memory_import);
     assert!(!record.usages.dmabuf_import);
+    assert!(record.usages.transfer_src);
 }
 
 #[test]
@@ -171,6 +176,34 @@ fn initialized_device_capabilities_do_not_enable_renderer_operations() {
     assert!(!caps.rendering.blit);
     assert!(!caps.sync.explicit);
     assert!(caps.formats.records.is_empty());
+}
+
+#[test]
+fn format_usage_maps_vulkan_feature_flags() {
+    let usage = format_usage_from_features(
+        vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | vk::FormatFeatureFlags::BLIT_SRC
+            | vk::FormatFeatureFlags::TRANSFER_DST,
+    );
+
+    assert!(usage.sampled);
+    assert!(usage.render_target);
+    assert!(usage.blit_src);
+    assert!(!usage.blit_dst);
+    assert!(!usage.transfer_src);
+    assert!(usage.transfer_dst);
+    assert!(!usage.memory_import);
+    assert!(!usage.dmabuf_import);
+    assert!(!usage.dmabuf_export);
+    assert!(!usage.linear);
+}
+
+#[test]
+fn linear_tiling_support_is_explicitly_limited_to_usable_features() {
+    assert!(linear_tiling_supported(vk::FormatFeatureFlags::TRANSFER_SRC));
+    assert!(linear_tiling_supported(vk::FormatFeatureFlags::SAMPLED_IMAGE));
+    assert!(!linear_tiling_supported(vk::FormatFeatureFlags::empty()));
 }
 
 #[test]
@@ -365,7 +398,7 @@ fn vulkan_renderer_reports_unusable_and_waits() {
     ));
 
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
-    assert!(!renderer.is_usable());
+    assert!(!renderer.is_device_initialized());
     assert!(renderer.wait(&SyncPoint::signaled()).is_ok());
 }
 
@@ -552,7 +585,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         .unwrap();
     let caps = renderer.capabilities();
 
-    assert!(renderer.is_usable());
+    assert!(renderer.is_device_initialized());
     assert!(caps.device.available);
     assert!(caps.device.extensions.is_empty());
     assert!(!caps.import.memory);
@@ -561,6 +594,37 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert!(!caps.rendering.offscreen);
     assert!(!caps.rendering.blit);
     assert!(!caps.sync.explicit);
+    assert!(
+        caps.formats.sampled.iter().next().is_some()
+            || caps.formats.render_target.iter().next().is_some()
+            || caps.formats.linear.iter().next().is_some(),
+        "expected builder-initialized renderer to expose probed non-import/export format support"
+    );
+    assert!(caps.formats.memory_import.iter().next().is_none());
+    assert!(caps.formats.dmabuf_import.iter().next().is_none());
+    assert!(caps.formats.dmabuf_export.iter().next().is_none());
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_format_discovery_finds_device_backed_formats_without_import_export() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let caps = VulkanFormatCapabilities::discover(&physical_device).unwrap();
+
+    assert!(
+        caps.sampled.iter().next().is_some()
+            || caps.render_target.iter().next().is_some()
+            || caps.linear.iter().next().is_some(),
+        "expected at least one sampled, render-target, or linear format"
+    );
+    assert!(caps.memory_import.iter().next().is_none());
+    assert!(caps.dmabuf_import.iter().next().is_none());
+    assert!(caps.dmabuf_export.iter().next().is_none());
 }
 
 #[test]
@@ -569,7 +633,7 @@ fn future_renderer_initialization_enables_device_capabilities() {
     let renderer = VulkanRenderer::new().unwrap();
     let caps = renderer.capabilities();
 
-    assert!(renderer.is_usable());
+    assert!(renderer.is_device_initialized());
     assert!(caps.device.available);
     assert!(!caps.device.extensions.is_empty());
 }

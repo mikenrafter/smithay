@@ -139,6 +139,16 @@ pub fn get_format_info(fourcc: Fourcc) -> Result<VulkanFormatInfo, VulkanError> 
     })
 }
 
+pub(crate) fn renderer_format_infos() -> impl Iterator<Item = VulkanFormatInfo> {
+    FORMAT_TABLE.iter().copied().map(|semantics| VulkanFormatInfo {
+        fourcc: semantics.fourcc,
+        vk_format: semantics.vk_format,
+        has_alpha: semantics.has_alpha,
+        opaque_alpha: semantics.opaque_alpha,
+        is_10bit: semantics.is_10bit,
+    })
+}
+
 /// Converts a DRM fourcc to the Vulkan renderer's static format mapping.
 ///
 /// This does not probe device support and is not a renderer render-target or colour-management

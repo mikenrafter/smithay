@@ -29,6 +29,8 @@ impl VulkanDeviceState {
                 .get_physical_device_queue_family_properties(physical_device.handle())
         };
         let queue_families = select_queue_families(&queue_properties)?;
+        let mut capabilities = VulkanRendererCapabilities::for_initialized_device(&[]);
+        capabilities.formats = super::VulkanFormatCapabilities::discover(&physical_device)?;
 
         let queue_priorities = [1.0];
         let queue_create_infos = queue_families
@@ -72,9 +74,6 @@ impl VulkanDeviceState {
         }
         .map_err(VulkanError::from)?;
 
-        let enabled_extensions = Vec::new();
-        let capabilities = VulkanRendererCapabilities::for_initialized_device(&[]);
-
         Ok(Self {
             command_pool: Some(command_pool),
             queues,
@@ -83,7 +82,7 @@ impl VulkanDeviceState {
             physical_device: Some(physical_device),
             instance: Some(instance),
             capabilities,
-            enabled_extensions,
+            enabled_extensions: Vec::new(),
         })
     }
 

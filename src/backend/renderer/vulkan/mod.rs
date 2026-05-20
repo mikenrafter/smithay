@@ -158,8 +158,10 @@ impl VulkanRenderer {
         &self.capabilities
     }
 
-    /// Returns whether this renderer is usable for rendering.
-    pub fn is_usable(&self) -> bool {
+    /// Returns whether Vulkan device state was initialized.
+    ///
+    /// This does not imply that rendering, import, export, or presentation operations are supported.
+    pub fn is_device_initialized(&self) -> bool {
         self.device.is_some() && self.capabilities.device.available
     }
 }
