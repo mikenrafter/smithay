@@ -248,6 +248,31 @@ impl VulkanDeviceState {
 
         Ok(unsafe { logical_device.handle().get_buffer_memory_requirements(buffer) })
     }
+
+    #[allow(dead_code)]
+    pub(super) fn allocate_memory(
+        &self,
+        size: vk::DeviceSize,
+        memory_type_index: u32,
+    ) -> Result<vk::DeviceMemory, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        allocate_memory(logical_device, size, memory_type_index)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn free_memory(&self, memory: vk::DeviceMemory) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        unsafe { logical_device.handle().free_memory(memory, None) };
+        Ok(())
+    }
 }
 
 impl Drop for VulkanDeviceState {
@@ -363,6 +388,18 @@ fn create_buffer(
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
     unsafe { logical_device.handle().create_buffer(&buffer_info, None) }.map_err(VulkanError::from)
+}
+
+fn allocate_memory(
+    logical_device: &VulkanLogicalDevice,
+    size: vk::DeviceSize,
+    memory_type_index: u32,
+) -> Result<vk::DeviceMemory, VulkanError> {
+    let allocate_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(size)
+        .memory_type_index(memory_type_index);
+
+    unsafe { logical_device.handle().allocate_memory(&allocate_info, None) }.map_err(VulkanError::from)
 }
 
 /// Logical device owner placeholder.
