@@ -320,6 +320,25 @@ impl VulkanDeviceState {
         unsafe { logical_device.handle().unmap_memory(memory) };
         Ok(())
     }
+
+    #[allow(dead_code)]
+    pub(super) fn flush_mapped_memory_range(
+        &self,
+        memory: vk::DeviceMemory,
+        offset: vk::DeviceSize,
+        size: vk::DeviceSize,
+    ) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        let ranges = [vk::MappedMemoryRange::default()
+            .memory(memory)
+            .offset(offset)
+            .size(size)];
+
+        unsafe { logical_device.handle().flush_mapped_memory_ranges(&ranges) }.map_err(VulkanError::from)
+    }
 }
 
 impl Drop for VulkanDeviceState {

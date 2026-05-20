@@ -268,6 +268,10 @@ fn buffer_creation_requires_initialized_device() {
         device.unmap_memory(vk::DeviceMemory::null()),
         Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
     ));
+    assert!(matches!(
+        device.flush_mapped_memory_range(vk::DeviceMemory::null(), 0, 4096),
+        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
+    ));
 }
 
 #[test]
@@ -795,6 +799,15 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     device.bind_buffer_memory(buffer, memory, 0).unwrap();
     let mapped = device.map_memory(memory, 0, 4096).unwrap();
     assert!(!mapped.is_null());
+    let pattern = [0x51, 0x52, 0x53, 0x54];
+    unsafe {
+        std::ptr::copy_nonoverlapping(pattern.as_ptr(), mapped.cast::<u8>(), pattern.len());
+        assert_eq!(
+            std::slice::from_raw_parts(mapped.cast::<u8>(), pattern.len()),
+            pattern
+        );
+    }
+    device.flush_mapped_memory_range(memory, 0, 4096).unwrap();
     device.unmap_memory(memory).unwrap();
     device.free_memory(memory).unwrap();
     device.destroy_buffer(buffer).unwrap();
