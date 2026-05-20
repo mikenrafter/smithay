@@ -108,6 +108,19 @@ impl VulkanDeviceState {
             enabled_extensions: Vec::new(),
         }
     }
+
+    #[allow(dead_code)]
+    pub(super) fn allocate_graphics_command_buffer(&self) -> Result<vk::CommandBuffer, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        let command_pool = self
+            .graphics_command_pool
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing graphics command pool".to_owned()))?;
+
+        allocate_command_buffer(logical_device, command_pool)
+    }
 }
 
 impl Drop for VulkanDeviceState {
@@ -137,6 +150,24 @@ fn create_command_pool(
             .create_command_pool(&command_pool_info, None)
     }
     .map_err(VulkanError::from)
+}
+
+fn allocate_command_buffer(
+    logical_device: &VulkanLogicalDevice,
+    command_pool: vk::CommandPool,
+) -> Result<vk::CommandBuffer, VulkanError> {
+    let allocate_info = vk::CommandBufferAllocateInfo::default()
+        .command_pool(command_pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+
+    let command_buffers = unsafe { logical_device.handle().allocate_command_buffers(&allocate_info) }
+        .map_err(VulkanError::from)?;
+
+    command_buffers
+        .into_iter()
+        .next()
+        .ok_or_else(|| VulkanError::DeviceInitializationFailed("no command buffer allocated".to_owned()))
 }
 
 /// Logical device owner placeholder.
