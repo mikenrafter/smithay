@@ -154,6 +154,23 @@ impl VulkanDeviceState {
 
         unsafe { logical_device.handle().end_command_buffer(command_buffer) }.map_err(VulkanError::from)
     }
+
+    #[allow(dead_code)]
+    pub(super) fn submit_graphics_command_buffer_and_wait(
+        &self,
+        command_buffer: vk::CommandBuffer,
+    ) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        let queue = self
+            .queues
+            .graphics
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing graphics queue".to_owned()))?;
+
+        submit_command_buffer_and_wait(logical_device, queue, command_buffer)
+    }
 }
 
 impl Drop for VulkanDeviceState {
@@ -216,6 +233,29 @@ fn begin_command_buffer(
             .begin_command_buffer(command_buffer, &begin_info)
     }
     .map_err(VulkanError::from)
+}
+
+fn submit_command_buffer_and_wait(
+    logical_device: &VulkanLogicalDevice,
+    queue: vk::Queue,
+    command_buffer: vk::CommandBuffer,
+) -> Result<(), VulkanError> {
+    let fence_info = vk::FenceCreateInfo::default();
+    let fence =
+        unsafe { logical_device.handle().create_fence(&fence_info, None) }.map_err(VulkanError::from)?;
+    let command_buffers = [command_buffer];
+    let submit_infos = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+
+    let result = unsafe { logical_device.handle().queue_submit(queue, &submit_infos, fence) }
+        .map_err(VulkanError::from)
+        .and_then(|_| {
+            unsafe { logical_device.handle().wait_for_fences(&[fence], true, u64::MAX) }
+                .map_err(VulkanError::from)
+        });
+
+    unsafe { logical_device.handle().destroy_fence(fence, None) };
+
+    result
 }
 
 /// Logical device owner placeholder.
