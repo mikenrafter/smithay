@@ -121,6 +121,19 @@ impl VulkanDeviceState {
 
         allocate_command_buffer(logical_device, command_pool)
     }
+
+    #[allow(dead_code)]
+    pub(super) fn allocate_transfer_command_buffer(&self) -> Result<vk::CommandBuffer, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        let command_pool = self
+            .transfer_command_pool
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing transfer command pool".to_owned()))?;
+
+        allocate_command_buffer(logical_device, command_pool)
+    }
 }
 
 impl Drop for VulkanDeviceState {
