@@ -64,8 +64,10 @@ vk_format_table! {
     Abgr8888 => R8G8B8A8_SRGB,
     Xbgr8888 => R8G8B8A8_SRGB,
 
-    // PACK32 formats are equivalent to u32 instead of [u8; 4] and thus depend their layout depends the host
-    // endian.
+    #[cfg(target_endian = "little")]
+    Rgb565 => R5G6B5_UNORM_PACK16,
+
+    // PACK32 formats are equivalent to u32 instead of [u8; 4], so their layout depends on the host endian.
     #[cfg(target_endian = "little")]
     Rgba8888 => A8B8G8R8_SRGB_PACK32,
     #[cfg(target_endian = "little")]
