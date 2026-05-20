@@ -201,7 +201,6 @@ fn format_usage_maps_vulkan_feature_flags() {
     assert!(!usage.memory_import);
     assert!(!usage.dmabuf_import);
     assert!(!usage.dmabuf_export);
-    assert!(!usage.linear);
 }
 
 #[test]

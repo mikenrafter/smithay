@@ -114,8 +114,6 @@ pub struct VulkanFormatUsage {
     pub transfer_src: bool,
     /// Usable as a transfer/copy destination.
     pub transfer_dst: bool,
-    /// Usable for linear/readback paths.
-    pub linear: bool,
 }
 
 impl VulkanFormatCapabilities {
@@ -171,9 +169,8 @@ impl VulkanFormatCapabilities {
                 });
             }
 
-            let mut linear_usage = format_usage_from_features(format_properties.linear_tiling_features);
+            let linear_usage = format_usage_from_features(format_properties.linear_tiling_features);
             if linear_tiling_supported(format_properties.linear_tiling_features) {
-                linear_usage.linear = true;
                 let format = format_with_modifier(info.fourcc, Modifier::Linear);
 
                 if linear_usage.sampled {
@@ -233,7 +230,6 @@ impl VulkanFormatUsage {
             || self.blit_dst
             || self.transfer_src
             || self.transfer_dst
-            || self.linear
     }
 }
 
