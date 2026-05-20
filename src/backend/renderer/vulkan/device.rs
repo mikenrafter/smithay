@@ -115,9 +115,9 @@ impl VulkanDeviceState {
             .logical_device
             .as_ref()
             .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
-        let command_pool = self
-            .graphics_command_pool
-            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing graphics command pool".to_owned()))?;
+        let command_pool = self.graphics_command_pool.ok_or_else(|| {
+            VulkanError::DeviceInitializationFailed("missing graphics command pool".to_owned())
+        })?;
 
         allocate_command_buffer(logical_device, command_pool)
     }
@@ -128,11 +128,31 @@ impl VulkanDeviceState {
             .logical_device
             .as_ref()
             .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
-        let command_pool = self
-            .transfer_command_pool
-            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing transfer command pool".to_owned()))?;
+        let command_pool = self.transfer_command_pool.ok_or_else(|| {
+            VulkanError::DeviceInitializationFailed("missing transfer command pool".to_owned())
+        })?;
 
         allocate_command_buffer(logical_device, command_pool)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn begin_command_buffer(&self, command_buffer: vk::CommandBuffer) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        begin_command_buffer(logical_device, command_buffer)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn end_command_buffer(&self, command_buffer: vk::CommandBuffer) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        unsafe { logical_device.handle().end_command_buffer(command_buffer) }.map_err(VulkanError::from)
     }
 }
 
@@ -181,6 +201,21 @@ fn allocate_command_buffer(
         .into_iter()
         .next()
         .ok_or_else(|| VulkanError::DeviceInitializationFailed("no command buffer allocated".to_owned()))
+}
+
+fn begin_command_buffer(
+    logical_device: &VulkanLogicalDevice,
+    command_buffer: vk::CommandBuffer,
+) -> Result<(), VulkanError> {
+    let begin_info =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+    unsafe {
+        logical_device
+            .handle()
+            .begin_command_buffer(command_buffer, &begin_info)
+    }
+    .map_err(VulkanError::from)
 }
 
 /// Logical device owner placeholder.
