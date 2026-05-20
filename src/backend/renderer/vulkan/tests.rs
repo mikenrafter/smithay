@@ -151,7 +151,8 @@ fn vulkan_device_state_placeholder_starts_empty() {
     assert_eq!(device.queue_families.transfer, None);
     assert_eq!(device.queues.graphics, None);
     assert_eq!(device.queues.transfer, None);
-    assert_eq!(device.command_pool, None);
+    assert_eq!(device.graphics_command_pool, None);
+    assert_eq!(device.transfer_command_pool, None);
 }
 
 #[test]
@@ -586,6 +587,9 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     let caps = renderer.capabilities();
 
     assert!(renderer.is_device_initialized());
+    let device = renderer.device.as_ref().unwrap();
+    assert!(device.graphics_command_pool.is_some());
+    assert!(device.transfer_command_pool.is_some());
     assert!(caps.device.available);
     assert!(caps.device.extensions.is_empty());
     assert!(!caps.import.memory);

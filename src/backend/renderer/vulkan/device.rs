@@ -10,7 +10,8 @@ use super::{VulkanError, VulkanRendererCapabilities};
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct VulkanDeviceState {
-    pub(super) command_pool: Option<ash::vk::CommandPool>,
+    pub(super) graphics_command_pool: Option<ash::vk::CommandPool>,
+    pub(super) transfer_command_pool: Option<ash::vk::CommandPool>,
     pub(super) queues: VulkanQueues,
     pub(super) queue_families: VulkanQueueFamilies,
     pub(super) logical_device: Option<VulkanLogicalDevice>,
@@ -60,22 +61,29 @@ impl VulkanDeviceState {
                 .map(|family| unsafe { logical_device.handle().get_device_queue(family, 0) }),
         };
 
-        let command_pool_info = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(
-                queue_families
-                    .graphics
-                    .ok_or(VulkanError::QueueFamilyUnsupported)?,
-            )
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        let command_pool = unsafe {
-            logical_device
-                .handle()
-                .create_command_pool(&command_pool_info, None)
-        }
-        .map_err(VulkanError::from)?;
+        let graphics_family = queue_families
+            .graphics
+            .ok_or(VulkanError::QueueFamilyUnsupported)?;
+        let graphics_command_pool = create_command_pool(&logical_device, graphics_family)?;
+        let transfer_command_pool = match queue_families
+            .transfer
+            .map(|family| create_command_pool(&logical_device, family))
+            .transpose()
+        {
+            Ok(pool) => pool,
+            Err(err) => {
+                unsafe {
+                    logical_device
+                        .handle()
+                        .destroy_command_pool(graphics_command_pool, None)
+                };
+                return Err(err);
+            }
+        };
 
         Ok(Self {
-            command_pool: Some(command_pool),
+            graphics_command_pool: Some(graphics_command_pool),
+            transfer_command_pool,
             queues,
             queue_families,
             logical_device: Some(logical_device),
@@ -89,7 +97,8 @@ impl VulkanDeviceState {
     #[cfg(test)]
     pub(super) fn empty_for_tests() -> Self {
         Self {
-            command_pool: None,
+            graphics_command_pool: None,
+            transfer_command_pool: None,
             queues: VulkanQueues::default(),
             queue_families: VulkanQueueFamilies::default(),
             logical_device: None,
@@ -103,12 +112,31 @@ impl VulkanDeviceState {
 
 impl Drop for VulkanDeviceState {
     fn drop(&mut self) {
-        if let (Some(command_pool), Some(logical_device)) =
-            (self.command_pool.take(), self.logical_device.as_ref())
-        {
-            unsafe { logical_device.handle().destroy_command_pool(command_pool, None) };
+        if let Some(logical_device) = self.logical_device.as_ref() {
+            if let Some(command_pool) = self.transfer_command_pool.take() {
+                unsafe { logical_device.handle().destroy_command_pool(command_pool, None) };
+            }
+            if let Some(command_pool) = self.graphics_command_pool.take() {
+                unsafe { logical_device.handle().destroy_command_pool(command_pool, None) };
+            }
         }
     }
+}
+
+fn create_command_pool(
+    logical_device: &VulkanLogicalDevice,
+    queue_family_index: u32,
+) -> Result<vk::CommandPool, VulkanError> {
+    let command_pool_info = vk::CommandPoolCreateInfo::default()
+        .queue_family_index(queue_family_index)
+        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+
+    unsafe {
+        logical_device
+            .handle()
+            .create_command_pool(&command_pool_info, None)
+    }
+    .map_err(VulkanError::from)
 }
 
 /// Logical device owner placeholder.
