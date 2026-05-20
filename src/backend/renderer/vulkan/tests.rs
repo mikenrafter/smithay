@@ -295,7 +295,6 @@ fn vulkan_errors_map_to_swap_buffers_error() {
     let context_lost_errors = [
         VulkanError::VulkanUnavailable,
         VulkanError::MissingRequiredExtension("VK_EXT_test".to_owned()),
-        VulkanError::UnsupportedOperation("test"),
         VulkanError::DeviceLost,
         VulkanError::DeviceInitializationFailed("test".to_owned()),
         VulkanError::QueueFamilyUnsupported,
@@ -317,6 +316,7 @@ fn vulkan_errors_map_to_swap_buffers_error() {
     }
 
     let temporary_errors = [
+        VulkanError::UnsupportedOperation("test"),
         VulkanError::UnsupportedFormat(Fourcc::Argb8888),
         VulkanError::UnsupportedModifier,
         VulkanError::SyncInterrupted,

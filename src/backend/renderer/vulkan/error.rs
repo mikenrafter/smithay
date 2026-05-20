@@ -50,7 +50,6 @@ impl From<VulkanError> for SwapBuffersError {
         match err {
             VulkanError::VulkanUnavailable
             | VulkanError::MissingRequiredExtension(_)
-            | VulkanError::UnsupportedOperation(_)
             | VulkanError::DeviceLost
             | VulkanError::DeviceInitializationFailed(_)
             | VulkanError::QueueFamilyUnsupported
@@ -58,7 +57,11 @@ impl From<VulkanError> for SwapBuffersError {
             VulkanError::VulkanApi(result) if vulkan_api_result_invalidates_context(result) => {
                 SwapBuffersError::ContextLost(Box::new(err))
             }
-            err => SwapBuffersError::TemporaryFailure(Box::new(err)),
+            VulkanError::UnsupportedOperation(_)
+            | VulkanError::UnsupportedFormat(_)
+            | VulkanError::UnsupportedModifier
+            | VulkanError::SyncInterrupted
+            | VulkanError::VulkanApi(_) => SwapBuffersError::TemporaryFailure(Box::new(err)),
         }
     }
 }
