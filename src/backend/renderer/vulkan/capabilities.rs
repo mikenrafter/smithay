@@ -38,7 +38,7 @@ pub struct VulkanRendererCapabilities {
 #[non_exhaustive]
 #[derive(Debug, Default, Clone)]
 pub struct VulkanFormatCapabilities {
-    /// Detailed records keyed by DRM format and renderer tiling marker.
+    /// Detailed records keyed by DRM format and Vulkan image tiling.
     pub records: Vec<VulkanFormatCapabilityRecord>,
     /// Formats usable as sampled textures.
     pub sampled: FormatSet,
@@ -73,6 +73,8 @@ pub struct VulkanFormatCapabilityRecord {
     pub format: Fourcc,
     /// Renderer tiling marker for this format.
     pub modifier: Modifier,
+    /// Vulkan image tiling queried for this format.
+    pub tiling: VulkanFormatTiling,
     /// Per-usage capability bits for this format and tiling marker.
     pub usages: VulkanFormatUsage,
 }
@@ -119,9 +121,9 @@ pub struct VulkanFormatUsage {
 impl VulkanFormatCapabilities {
     /// Discovers Vulkan renderer format capabilities for a physical device.
     ///
-    /// This probes sampled, render-target, blit, transfer, and linear tiling support for the renderer's
-    /// static format table. Import and export format sets remain empty until those traits are
-    /// implemented and can import or export the advertised pairs.
+    /// This probes sampled, color-attachment, blit, transfer, and linear tiling support for the
+    /// renderer's static format table. Import and export format sets remain empty until those
+    /// traits are implemented and can import or export the advertised pairs.
     pub fn discover(physical_device: &PhysicalDevice) -> Result<Self, VulkanError> {
         let mut records = Vec::new();
         let mut sampled = Vec::new();
@@ -164,6 +166,7 @@ impl VulkanFormatCapabilities {
                 records.push(VulkanFormatCapabilityRecord {
                     format: info.fourcc,
                     modifier: Modifier::Invalid,
+                    tiling: VulkanFormatTiling::Optimal,
                     usages: optimal_usage,
                 });
             }
@@ -192,9 +195,11 @@ impl VulkanFormatCapabilities {
                     transfer_dst.push(format);
                 }
                 linear.push(format);
+
                 records.push(VulkanFormatCapabilityRecord {
                     format: info.fourcc,
                     modifier: Modifier::Linear,
+                    tiling: VulkanFormatTiling::Linear,
                     usages: linear_usage,
                 });
             }

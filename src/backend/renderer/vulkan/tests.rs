@@ -123,6 +123,7 @@ fn vulkan_format_capability_record_is_per_tiling_marker() {
     let record = VulkanFormatCapabilityRecord {
         format: Fourcc::Argb8888,
         modifier: crate::backend::allocator::Modifier::Linear,
+        tiling: VulkanFormatTiling::Linear,
         usages: VulkanFormatUsage {
             sampled: true,
             memory_import: true,
@@ -133,6 +134,7 @@ fn vulkan_format_capability_record_is_per_tiling_marker() {
 
     assert_eq!(record.format, Fourcc::Argb8888);
     assert_eq!(record.modifier, crate::backend::allocator::Modifier::Linear);
+    assert_eq!(record.tiling, VulkanFormatTiling::Linear);
     assert!(record.usages.sampled);
     assert!(record.usages.memory_import);
     assert!(!record.usages.dmabuf_import);
