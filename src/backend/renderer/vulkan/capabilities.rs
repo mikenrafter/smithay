@@ -77,6 +77,17 @@ pub struct VulkanFormatCapabilityRecord {
     pub usages: VulkanFormatUsage,
 }
 
+/// Vulkan image tiling queried for a renderer-internal format record.
+#[non_exhaustive]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VulkanFormatTiling {
+    /// Vulkan optimal tiling.
+    Optimal,
+    /// Vulkan linear tiling.
+    Linear,
+}
+
 /// Per-usage capability bits for a Vulkan format record.
 #[non_exhaustive]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
