@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{ffi::c_void, sync::Arc};
 
 use ash::vk;
 
@@ -288,6 +288,37 @@ impl VulkanDeviceState {
 
         unsafe { logical_device.handle().bind_buffer_memory(buffer, memory, offset) }
             .map_err(VulkanError::from)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn map_memory(
+        &self,
+        memory: vk::DeviceMemory,
+        offset: vk::DeviceSize,
+        size: vk::DeviceSize,
+    ) -> Result<*mut c_void, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        unsafe {
+            logical_device
+                .handle()
+                .map_memory(memory, offset, size, vk::MemoryMapFlags::empty())
+        }
+        .map_err(VulkanError::from)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn unmap_memory(&self, memory: vk::DeviceMemory) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        unsafe { logical_device.handle().unmap_memory(memory) };
+        Ok(())
     }
 }
 
