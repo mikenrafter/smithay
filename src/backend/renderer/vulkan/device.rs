@@ -171,6 +171,23 @@ impl VulkanDeviceState {
 
         submit_command_buffer_and_wait(logical_device, queue, command_buffer)
     }
+
+    #[allow(dead_code)]
+    pub(super) fn submit_transfer_command_buffer_and_wait(
+        &self,
+        command_buffer: vk::CommandBuffer,
+    ) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        let queue = self
+            .queues
+            .transfer
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing transfer queue".to_owned()))?;
+
+        submit_command_buffer_and_wait(logical_device, queue, command_buffer)
+    }
 }
 
 impl Drop for VulkanDeviceState {
