@@ -210,6 +210,31 @@ impl VulkanDeviceState {
 
         find_memory_type_index(memory_properties, memory_type_bits, required_properties)
     }
+
+    #[allow(dead_code)]
+    pub(super) fn create_buffer(
+        &self,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+    ) -> Result<vk::Buffer, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        create_buffer(logical_device, size, usage)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn destroy_buffer(&self, buffer: vk::Buffer) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        unsafe { logical_device.handle().destroy_buffer(buffer, None) };
+        Ok(())
+    }
 }
 
 impl Drop for VulkanDeviceState {
@@ -312,6 +337,19 @@ pub(super) fn find_memory_type_index(
     }
 
     Err(VulkanError::MemoryTypeUnsupported)
+}
+
+fn create_buffer(
+    logical_device: &VulkanLogicalDevice,
+    size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+) -> Result<vk::Buffer, VulkanError> {
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    unsafe { logical_device.handle().create_buffer(&buffer_info, None) }.map_err(VulkanError::from)
 }
 
 /// Logical device owner placeholder.

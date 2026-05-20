@@ -233,6 +233,20 @@ fn memory_type_lookup_requires_initialized_memory_properties() {
 }
 
 #[test]
+fn buffer_creation_requires_initialized_device() {
+    let device = VulkanDeviceState::empty_for_tests();
+
+    assert!(matches!(
+        device.create_buffer(4096, vk::BufferUsageFlags::TRANSFER_SRC),
+        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
+    ));
+    assert!(matches!(
+        device.destroy_buffer(vk::Buffer::null()),
+        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
+    ));
+}
+
+#[test]
 fn graphics_command_buffer_allocation_requires_initialized_device() {
     let device = VulkanDeviceState::empty_for_tests();
 
@@ -729,6 +743,14 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     );
     assert!(device.graphics_command_pool.is_some());
     assert!(device.transfer_command_pool.is_some());
+    let buffer = device
+        .create_buffer(
+            4096,
+            vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+        )
+        .unwrap();
+    assert_ne!(buffer, vk::Buffer::null());
+    device.destroy_buffer(buffer).unwrap();
     let graphics_command_buffer = device.allocate_graphics_command_buffer().unwrap();
     let transfer_command_buffer = device.allocate_transfer_command_buffer().unwrap();
     assert_ne!(graphics_command_buffer, vk::CommandBuffer::null());
