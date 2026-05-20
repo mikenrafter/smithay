@@ -3,7 +3,7 @@ use std::ffi::CStr;
 use ash::vk;
 
 use crate::backend::{
-    allocator::{Format, Fourcc, Modifier, format::FormatSet},
+    allocator::{Fourcc, Modifier, format::FormatSet},
     vulkan::PhysicalDevice,
 };
 
@@ -31,35 +31,19 @@ pub struct VulkanRendererCapabilities {
 
 /// Raw per-format Vulkan image feature capabilities.
 ///
-/// [`FormatSet`] values use Smithay's DRM format representation, but non-empty sets in this
-/// structure do not imply that the matching Smithay renderer trait is implemented. In particular,
-/// `Modifier::Invalid` records internal Vulkan optimal-tiling support and must not be advertised as
-/// a linux-dmabuf modifier pair.
+/// Records describe renderer-internal Vulkan support. Smithay-facing [`FormatSet`] values remain
+/// limited to import/export traits and stay empty until those traits are implemented.
 #[non_exhaustive]
 #[derive(Debug, Default, Clone)]
 pub struct VulkanFormatCapabilities {
     /// Detailed records keyed by DRM format and Vulkan image tiling.
     pub records: Vec<VulkanFormatCapabilityRecord>,
-    /// Formats usable as sampled textures.
-    pub sampled: FormatSet,
     /// Formats usable for shared-memory uploads.
     pub memory_import: FormatSet,
     /// Formats usable for dmabuf imports.
     pub dmabuf_import: FormatSet,
-    /// Formats usable as render targets.
-    pub render_target: FormatSet,
     /// Formats exportable as dmabufs.
     pub dmabuf_export: FormatSet,
-    /// Formats usable as blit sources.
-    pub blit_src: FormatSet,
-    /// Formats usable as blit destinations.
-    pub blit_dst: FormatSet,
-    /// Formats usable as transfer/copy sources.
-    pub transfer_src: FormatSet,
-    /// Formats usable as transfer/copy destinations.
-    pub transfer_dst: FormatSet,
-    /// Formats usable for linear/readback paths.
-    pub linear: FormatSet,
 }
 
 /// Capability record for a DRM format and renderer tiling marker.
@@ -124,13 +108,6 @@ impl VulkanFormatCapabilities {
     /// traits are implemented and can import or export the advertised pairs.
     pub fn discover(physical_device: &PhysicalDevice) -> Result<Self, VulkanError> {
         let mut records = Vec::new();
-        let mut sampled = Vec::new();
-        let mut render_target = Vec::new();
-        let mut blit_src = Vec::new();
-        let mut blit_dst = Vec::new();
-        let mut transfer_src = Vec::new();
-        let mut transfer_dst = Vec::new();
-        let mut linear = Vec::new();
 
         for info in renderer_format_infos() {
             let mut properties = vk::FormatProperties2::default();
@@ -140,27 +117,6 @@ impl VulkanFormatCapabilities {
             let format_properties = properties.format_properties;
             let optimal_usage = format_usage_from_features(format_properties.optimal_tiling_features);
             if optimal_usage.any_supported() {
-                let format = format_with_modifier(info.fourcc, Modifier::Invalid);
-
-                if optimal_usage.sampled {
-                    sampled.push(format);
-                }
-                if optimal_usage.color_attachment {
-                    render_target.push(format);
-                }
-                if optimal_usage.blit_src {
-                    blit_src.push(format);
-                }
-                if optimal_usage.blit_dst {
-                    blit_dst.push(format);
-                }
-                if optimal_usage.transfer_src {
-                    transfer_src.push(format);
-                }
-                if optimal_usage.transfer_dst {
-                    transfer_dst.push(format);
-                }
-
                 records.push(VulkanFormatCapabilityRecord {
                     format: info.fourcc,
                     modifier: Modifier::Invalid,
@@ -171,28 +127,6 @@ impl VulkanFormatCapabilities {
 
             let linear_usage = format_usage_from_features(format_properties.linear_tiling_features);
             if linear_tiling_supported(format_properties.linear_tiling_features) {
-                let format = format_with_modifier(info.fourcc, Modifier::Linear);
-
-                if linear_usage.sampled {
-                    sampled.push(format);
-                }
-                if linear_usage.color_attachment {
-                    render_target.push(format);
-                }
-                if linear_usage.blit_src {
-                    blit_src.push(format);
-                }
-                if linear_usage.blit_dst {
-                    blit_dst.push(format);
-                }
-                if linear_usage.transfer_src {
-                    transfer_src.push(format);
-                }
-                if linear_usage.transfer_dst {
-                    transfer_dst.push(format);
-                }
-                linear.push(format);
-
                 records.push(VulkanFormatCapabilityRecord {
                     format: info.fourcc,
                     modifier: Modifier::Linear,
@@ -204,16 +138,9 @@ impl VulkanFormatCapabilities {
 
         Ok(Self {
             records,
-            sampled: sampled.into_iter().collect(),
             memory_import: FormatSet::default(),
             dmabuf_import: FormatSet::default(),
-            render_target: render_target.into_iter().collect(),
             dmabuf_export: FormatSet::default(),
-            blit_src: blit_src.into_iter().collect(),
-            blit_dst: blit_dst.into_iter().collect(),
-            transfer_src: transfer_src.into_iter().collect(),
-            transfer_dst: transfer_dst.into_iter().collect(),
-            linear: linear.into_iter().collect(),
         })
     }
 }
@@ -230,13 +157,6 @@ impl VulkanFormatUsage {
             || self.blit_dst
             || self.transfer_src
             || self.transfer_dst
-    }
-}
-
-fn format_with_modifier(format: Fourcc, modifier: Modifier) -> Format {
-    Format {
-        code: format,
-        modifier,
     }
 }
 

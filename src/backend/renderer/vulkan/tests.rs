@@ -58,6 +58,18 @@ fn texture_for_tests(size: Size<i32, BufferCoord>, format: Option<Fourcc>) -> Vu
     }
 }
 
+fn has_probed_format_support(caps: &VulkanFormatCapabilities) -> bool {
+    caps.records.iter().any(|record| {
+        record.usages.sampled
+            || record.usages.color_attachment
+            || record.usages.color_attachment_blend
+            || record.usages.blit_src
+            || record.usages.blit_dst
+            || record.usages.transfer_src
+            || record.usages.transfer_dst
+    })
+}
+
 #[test]
 fn renderer_context_id_is_stable_and_unique_per_instance() {
     let renderer = VulkanRenderer::new_scaffold_for_tests();
@@ -91,16 +103,9 @@ fn vulkan_renderer_default_capabilities_are_false() {
 fn vulkan_format_capability_matrix_defaults_empty() {
     let caps = VulkanRendererCapabilities::default();
     assert!(caps.formats.records.is_empty());
-    assert!(caps.formats.sampled.iter().next().is_none());
     assert!(caps.formats.memory_import.iter().next().is_none());
     assert!(caps.formats.dmabuf_import.iter().next().is_none());
-    assert!(caps.formats.render_target.iter().next().is_none());
     assert!(caps.formats.dmabuf_export.iter().next().is_none());
-    assert!(caps.formats.blit_src.iter().next().is_none());
-    assert!(caps.formats.blit_dst.iter().next().is_none());
-    assert!(caps.formats.transfer_src.iter().next().is_none());
-    assert!(caps.formats.transfer_dst.iter().next().is_none());
-    assert!(caps.formats.linear.iter().next().is_none());
 }
 
 #[test]
@@ -602,9 +607,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert!(!caps.rendering.blit);
     assert!(!caps.sync.explicit);
     assert!(
-        caps.formats.sampled.iter().next().is_some()
-            || caps.formats.render_target.iter().next().is_some()
-            || caps.formats.linear.iter().next().is_some(),
+        has_probed_format_support(&caps.formats),
         "expected builder-initialized renderer to expose probed non-import/export format support"
     );
     assert!(caps.formats.memory_import.iter().next().is_none());
@@ -624,10 +627,8 @@ fn runtime_format_discovery_finds_device_backed_formats_without_import_export() 
     let caps = VulkanFormatCapabilities::discover(&physical_device).unwrap();
 
     assert!(
-        caps.sampled.iter().next().is_some()
-            || caps.render_target.iter().next().is_some()
-            || caps.linear.iter().next().is_some(),
-        "expected at least one sampled, render-target, or linear format"
+        has_probed_format_support(&caps),
+        "expected at least one probed renderer-internal format record"
     );
     assert!(caps.memory_import.iter().next().is_none());
     assert!(caps.dmabuf_import.iter().next().is_none());
