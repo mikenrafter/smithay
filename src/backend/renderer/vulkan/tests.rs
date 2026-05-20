@@ -272,6 +272,10 @@ fn buffer_creation_requires_initialized_device() {
         device.flush_mapped_memory_range(vk::DeviceMemory::null(), 0, 4096),
         Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
     ));
+    assert!(matches!(
+        device.create_host_visible_buffer(4096, vk::BufferUsageFlags::TRANSFER_SRC),
+        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
+    ));
 }
 
 #[test]
@@ -811,6 +815,15 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     device.unmap_memory(memory).unwrap();
     device.free_memory(memory).unwrap();
     device.destroy_buffer(buffer).unwrap();
+    let host_visible_buffer = device
+        .create_host_visible_buffer(
+            4096,
+            vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+        )
+        .unwrap();
+    assert_ne!(host_visible_buffer.buffer(), vk::Buffer::null());
+    host_visible_buffer.write(&[0x61, 0x62, 0x63, 0x64]).unwrap();
+    drop(host_visible_buffer);
     let graphics_command_buffer = device.allocate_graphics_command_buffer().unwrap();
     let transfer_command_buffer = device.allocate_transfer_command_buffer().unwrap();
     assert_ne!(graphics_command_buffer, vk::CommandBuffer::null());

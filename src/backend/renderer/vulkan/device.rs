@@ -1,4 +1,4 @@
-use std::{ffi::c_void, sync::Arc};
+use std::{ffi::c_void, ptr, sync::Arc};
 
 use ash::vk;
 
@@ -339,6 +339,60 @@ impl VulkanDeviceState {
 
         unsafe { logical_device.handle().flush_mapped_memory_ranges(&ranges) }.map_err(VulkanError::from)
     }
+
+    #[allow(dead_code)]
+    pub(super) fn create_host_visible_buffer(
+        &self,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+    ) -> Result<VulkanHostVisibleBuffer, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+        let memory_properties = self
+            .memory_properties
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing memory properties".to_owned()))?;
+        let buffer = create_buffer(&logical_device, size, usage)?;
+        let requirements = unsafe { logical_device.handle().get_buffer_memory_requirements(buffer) };
+        let memory_type_index = match find_memory_type_index(
+            memory_properties,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE,
+        ) {
+            Ok(index) => index,
+            Err(err) => {
+                unsafe { logical_device.handle().destroy_buffer(buffer, None) };
+                return Err(err);
+            }
+        };
+        let memory = match allocate_memory(&logical_device, requirements.size, memory_type_index) {
+            Ok(memory) => memory,
+            Err(err) => {
+                unsafe { logical_device.handle().destroy_buffer(buffer, None) };
+                return Err(err);
+            }
+        };
+
+        if let Err(err) = unsafe { logical_device.handle().bind_buffer_memory(buffer, memory, 0) }
+            .map_err(VulkanError::from)
+        {
+            unsafe {
+                logical_device.handle().free_memory(memory, None);
+                logical_device.handle().destroy_buffer(buffer, None);
+            }
+            return Err(err);
+        }
+
+        Ok(VulkanHostVisibleBuffer {
+            logical_device,
+            buffer,
+            memory,
+            size,
+        })
+    }
 }
 
 impl Drop for VulkanDeviceState {
@@ -494,6 +548,59 @@ impl Drop for VulkanLogicalDevice {
 impl std::fmt::Debug for VulkanLogicalDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("VulkanLogicalDevice").field(&"_").finish()
+    }
+}
+
+/// Host-visible buffer owner for staging-style uploads.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanHostVisibleBuffer {
+    logical_device: VulkanLogicalDevice,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    size: vk::DeviceSize,
+}
+
+impl VulkanHostVisibleBuffer {
+    pub(super) fn buffer(&self) -> vk::Buffer {
+        self.buffer
+    }
+
+    pub(super) fn write(&self, data: &[u8]) -> Result<(), VulkanError> {
+        if data.len() as vk::DeviceSize > self.size {
+            return Err(VulkanError::UnsupportedOperation("mapped buffer write size"));
+        }
+
+        let mapped = unsafe {
+            self.logical_device
+                .handle()
+                .map_memory(self.memory, 0, self.size, vk::MemoryMapFlags::empty())
+        }
+        .map_err(VulkanError::from)?;
+
+        unsafe {
+            ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast::<u8>(), data.len());
+        }
+
+        let ranges = [vk::MappedMemoryRange::default()
+            .memory(self.memory)
+            .offset(0)
+            .size(self.size)];
+        let result = unsafe { self.logical_device.handle().flush_mapped_memory_ranges(&ranges) }
+            .map_err(VulkanError::from);
+
+        unsafe { self.logical_device.handle().unmap_memory(self.memory) };
+
+        result
+    }
+}
+
+impl Drop for VulkanHostVisibleBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            self.logical_device.handle().destroy_buffer(self.buffer, None);
+            self.logical_device.handle().free_memory(self.memory, None);
+        }
     }
 }
 
