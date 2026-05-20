@@ -87,8 +87,8 @@ pub struct VulkanFormatUsage {
     pub memory_import: bool,
     /// Usable for dmabuf imports.
     pub dmabuf_import: bool,
-    /// Usable as a render target.
-    pub render_target: bool,
+    /// Usable as a framebuffer color attachment.
+    pub color_attachment: bool,
     /// Usable as a framebuffer color attachment with blending.
     pub color_attachment_blend: bool,
     /// Exportable as a dmabuf.
@@ -134,7 +134,7 @@ impl VulkanFormatCapabilities {
                 if optimal_usage.sampled {
                     sampled.push(format);
                 }
-                if optimal_usage.render_target {
+                if optimal_usage.color_attachment {
                     render_target.push(format);
                 }
                 if optimal_usage.blit_src {
@@ -165,7 +165,7 @@ impl VulkanFormatCapabilities {
                 if linear_usage.sampled {
                     sampled.push(format);
                 }
-                if linear_usage.render_target {
+                if linear_usage.color_attachment {
                     render_target.push(format);
                 }
                 if linear_usage.blit_src {
@@ -210,7 +210,7 @@ impl VulkanFormatUsage {
         self.sampled
             || self.memory_import
             || self.dmabuf_import
-            || self.render_target
+            || self.color_attachment
             || self.color_attachment_blend
             || self.dmabuf_export
             || self.blit_src
@@ -231,7 +231,7 @@ fn format_with_modifier(format: Fourcc, modifier: Modifier) -> Format {
 pub(super) fn format_usage_from_features(features: vk::FormatFeatureFlags) -> VulkanFormatUsage {
     VulkanFormatUsage {
         sampled: features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE),
-        render_target: features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT),
+        color_attachment: features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT),
         color_attachment_blend: features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND),
         blit_src: features.contains(vk::FormatFeatureFlags::BLIT_SRC),
         blit_dst: features.contains(vk::FormatFeatureFlags::BLIT_DST),

@@ -190,7 +190,7 @@ fn format_usage_maps_vulkan_feature_flags() {
     );
 
     assert!(usage.sampled);
-    assert!(usage.render_target);
+    assert!(usage.color_attachment);
     assert!(usage.color_attachment_blend);
     assert!(usage.blit_src);
     assert!(!usage.blit_dst);
