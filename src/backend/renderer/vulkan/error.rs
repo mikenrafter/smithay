@@ -34,6 +34,9 @@ pub enum VulkanError {
     /// No usable queue family was available for the requested operation.
     #[error("Vulkan renderer queue family unsupported")]
     QueueFamilyUnsupported,
+    /// No usable memory type was available for the requested operation.
+    #[error("Vulkan renderer memory type unsupported")]
+    MemoryTypeUnsupported,
     /// External memory support required by the requested operation is unavailable.
     #[error("Vulkan renderer external memory unsupported")]
     ExternalMemoryUnsupported,
@@ -60,6 +63,7 @@ impl From<VulkanError> for SwapBuffersError {
             VulkanError::UnsupportedOperation(_)
             | VulkanError::UnsupportedFormat(_)
             | VulkanError::UnsupportedModifier
+            | VulkanError::MemoryTypeUnsupported
             | VulkanError::SyncInterrupted
             | VulkanError::VulkanApi(_) => SwapBuffersError::TemporaryFailure(Box::new(err)),
         }

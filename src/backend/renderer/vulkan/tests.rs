@@ -9,7 +9,7 @@ use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
 use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 
 use super::capabilities::{format_usage_from_features, linear_tiling_supported};
-use super::device::{VulkanDeviceState, select_queue_families};
+use super::device::{VulkanDeviceState, find_memory_type_index, select_queue_families};
 use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
     VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalMemoryHandleType, VulkanExternalMemoryState,
@@ -56,6 +56,24 @@ fn texture_for_tests(size: Size<i32, BufferCoord>, format: Option<Fourcc>) -> Vu
     VulkanTexture {
         image: VulkanImageState::new_for_tests(size, format),
     }
+}
+
+fn memory_properties_for_tests(
+    memory_types: &[vk::MemoryPropertyFlags],
+) -> vk::PhysicalDeviceMemoryProperties {
+    let mut properties = vk::PhysicalDeviceMemoryProperties {
+        memory_type_count: memory_types.len() as u32,
+        ..Default::default()
+    };
+
+    for (index, flags) in memory_types.iter().copied().enumerate() {
+        properties.memory_types[index] = vk::MemoryType {
+            property_flags: flags,
+            heap_index: 0,
+        };
+    }
+
+    properties
 }
 
 fn has_probed_format_support(caps: &VulkanFormatCapabilities) -> bool {
@@ -152,6 +170,7 @@ fn vulkan_device_state_placeholder_starts_empty() {
     assert!(device.instance.is_none());
     assert!(device.physical_device.is_none());
     assert!(device.logical_device.is_none());
+    assert!(device.memory_properties.is_none());
     assert!(!device.capabilities.device.available);
     assert!(device.enabled_extensions.is_empty());
     assert_eq!(device.queue_families.graphics, None);
@@ -160,6 +179,57 @@ fn vulkan_device_state_placeholder_starts_empty() {
     assert_eq!(device.queues.transfer, None);
     assert_eq!(device.graphics_command_pool, None);
     assert_eq!(device.transfer_command_pool, None);
+}
+
+#[test]
+fn memory_type_lookup_selects_supported_required_properties() {
+    let properties = memory_properties_for_tests(&[
+        vk::MemoryPropertyFlags::HOST_VISIBLE,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE,
+    ]);
+
+    assert_eq!(
+        find_memory_type_index(
+            &properties,
+            0b10,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE,
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn memory_type_lookup_rejects_missing_required_properties() {
+    let properties = memory_properties_for_tests(&[vk::MemoryPropertyFlags::HOST_VISIBLE]);
+
+    assert!(matches!(
+        find_memory_type_index(&properties, 0b1, vk::MemoryPropertyFlags::DEVICE_LOCAL),
+        Err(VulkanError::MemoryTypeUnsupported)
+    ));
+}
+
+#[test]
+fn memory_type_lookup_respects_type_bits() {
+    let properties = memory_properties_for_tests(&[
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        vk::MemoryPropertyFlags::HOST_VISIBLE,
+    ]);
+
+    assert!(matches!(
+        find_memory_type_index(&properties, 0b01, vk::MemoryPropertyFlags::HOST_VISIBLE),
+        Err(VulkanError::MemoryTypeUnsupported)
+    ));
+}
+
+#[test]
+fn memory_type_lookup_requires_initialized_memory_properties() {
+    let device = VulkanDeviceState::empty_for_tests();
+
+    assert!(matches!(
+        device.find_memory_type_index(u32::MAX, vk::MemoryPropertyFlags::empty()),
+        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing memory properties"
+    ));
 }
 
 #[test]
@@ -382,6 +452,7 @@ fn vulkan_errors_map_to_swap_buffers_error() {
         VulkanError::UnsupportedOperation("test"),
         VulkanError::UnsupportedFormat(Fourcc::Argb8888),
         VulkanError::UnsupportedModifier,
+        VulkanError::MemoryTypeUnsupported,
         VulkanError::SyncInterrupted,
         VulkanError::VulkanApi(ash::vk::Result::ERROR_FORMAT_NOT_SUPPORTED),
     ];
@@ -650,6 +721,12 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
 
     assert!(renderer.is_device_initialized());
     let device = renderer.device.as_ref().unwrap();
+    assert!(device.memory_properties.is_some());
+    assert!(
+        device
+            .find_memory_type_index(u32::MAX, vk::MemoryPropertyFlags::empty())
+            .is_ok()
+    );
     assert!(device.graphics_command_pool.is_some());
     assert!(device.transfer_command_pool.is_some());
     let graphics_command_buffer = device.allocate_graphics_command_buffer().unwrap();

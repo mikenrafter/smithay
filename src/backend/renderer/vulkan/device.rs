@@ -17,6 +17,7 @@ pub(crate) struct VulkanDeviceState {
     pub(super) logical_device: Option<VulkanLogicalDevice>,
     pub(super) physical_device: Option<PhysicalDevice>,
     pub(super) instance: Option<Instance>,
+    pub(super) memory_properties: Option<vk::PhysicalDeviceMemoryProperties>,
     pub(super) capabilities: VulkanRendererCapabilities,
     pub(super) enabled_extensions: Vec<String>,
 }
@@ -28,6 +29,11 @@ impl VulkanDeviceState {
             instance
                 .handle()
                 .get_physical_device_queue_family_properties(physical_device.handle())
+        };
+        let memory_properties = unsafe {
+            instance
+                .handle()
+                .get_physical_device_memory_properties(physical_device.handle())
         };
         let queue_families = select_queue_families(&queue_properties)?;
         let mut capabilities = VulkanRendererCapabilities::for_initialized_device(&[]);
@@ -89,6 +95,7 @@ impl VulkanDeviceState {
             logical_device: Some(logical_device),
             physical_device: Some(physical_device),
             instance: Some(instance),
+            memory_properties: Some(memory_properties),
             capabilities,
             enabled_extensions: Vec::new(),
         })
@@ -104,6 +111,7 @@ impl VulkanDeviceState {
             logical_device: None,
             physical_device: None,
             instance: None,
+            memory_properties: None,
             capabilities: VulkanRendererCapabilities::default(),
             enabled_extensions: Vec::new(),
         }
@@ -187,6 +195,20 @@ impl VulkanDeviceState {
             .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing transfer queue".to_owned()))?;
 
         submit_command_buffer_and_wait(logical_device, queue, command_buffer)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn find_memory_type_index(
+        &self,
+        memory_type_bits: u32,
+        required_properties: vk::MemoryPropertyFlags,
+    ) -> Result<u32, VulkanError> {
+        let memory_properties = self
+            .memory_properties
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing memory properties".to_owned()))?;
+
+        find_memory_type_index(memory_properties, memory_type_bits, required_properties)
     }
 }
 
@@ -273,6 +295,23 @@ fn submit_command_buffer_and_wait(
     unsafe { logical_device.handle().destroy_fence(fence, None) };
 
     result
+}
+
+pub(super) fn find_memory_type_index(
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    memory_type_bits: u32,
+    required_properties: vk::MemoryPropertyFlags,
+) -> Result<u32, VulkanError> {
+    for index in 0..memory_properties.memory_type_count {
+        let memory_type_supported = (memory_type_bits & (1u32 << index)) != 0;
+        let properties = memory_properties.memory_types[index as usize].property_flags;
+
+        if memory_type_supported && properties.contains(required_properties) {
+            return Ok(index);
+        }
+    }
+
+    Err(VulkanError::MemoryTypeUnsupported)
 }
 
 /// Logical device owner placeholder.
