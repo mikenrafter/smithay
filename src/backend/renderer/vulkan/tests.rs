@@ -256,6 +256,10 @@ fn buffer_creation_requires_initialized_device() {
         device.free_memory(vk::DeviceMemory::null()),
         Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
     ));
+    assert!(matches!(
+        device.bind_buffer_memory(vk::Buffer::null(), vk::DeviceMemory::null(), 0),
+        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
+    ));
 }
 
 #[test]
@@ -777,6 +781,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         .allocate_memory(requirements.size, memory_type_index)
         .unwrap();
     assert_ne!(memory, vk::DeviceMemory::null());
+    device.bind_buffer_memory(buffer, memory, 0).unwrap();
     device.free_memory(memory).unwrap();
     device.destroy_buffer(buffer).unwrap();
     let graphics_command_buffer = device.allocate_graphics_command_buffer().unwrap();

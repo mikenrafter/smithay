@@ -273,6 +273,22 @@ impl VulkanDeviceState {
         unsafe { logical_device.handle().free_memory(memory, None) };
         Ok(())
     }
+
+    #[allow(dead_code)]
+    pub(super) fn bind_buffer_memory(
+        &self,
+        buffer: vk::Buffer,
+        memory: vk::DeviceMemory,
+        offset: vk::DeviceSize,
+    ) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        unsafe { logical_device.handle().bind_buffer_memory(buffer, memory, offset) }
+            .map_err(VulkanError::from)
+    }
 }
 
 impl Drop for VulkanDeviceState {
