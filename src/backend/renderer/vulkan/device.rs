@@ -393,6 +393,32 @@ impl VulkanDeviceState {
             size,
         })
     }
+
+    #[allow(dead_code)]
+    pub(super) fn create_image(
+        &self,
+        extent: vk::Extent3D,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<vk::Image, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        create_image(logical_device, extent, format, usage)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn destroy_image(&self, image: vk::Image) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        unsafe { logical_device.handle().destroy_image(image, None) };
+        Ok(())
+    }
 }
 
 impl Drop for VulkanDeviceState {
@@ -520,6 +546,27 @@ fn allocate_memory(
         .memory_type_index(memory_type_index);
 
     unsafe { logical_device.handle().allocate_memory(&allocate_info, None) }.map_err(VulkanError::from)
+}
+
+fn create_image(
+    logical_device: &VulkanLogicalDevice,
+    extent: vk::Extent3D,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+) -> Result<vk::Image, VulkanError> {
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(extent)
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+
+    unsafe { logical_device.handle().create_image(&image_info, None) }.map_err(VulkanError::from)
 }
 
 /// Logical device owner placeholder.

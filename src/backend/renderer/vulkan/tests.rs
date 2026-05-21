@@ -276,6 +276,22 @@ fn buffer_creation_requires_initialized_device() {
         device.create_host_visible_buffer(4096, vk::BufferUsageFlags::TRANSFER_SRC),
         Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
     ));
+    assert!(matches!(
+        device.create_image(
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST,
+        ),
+        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
+    ));
+    assert!(matches!(
+        device.destroy_image(vk::Image::null()),
+        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
+    ));
 }
 
 #[test]
@@ -824,6 +840,19 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert_ne!(host_visible_buffer.buffer(), vk::Buffer::null());
     host_visible_buffer.write(&[0x61, 0x62, 0x63, 0x64]).unwrap();
     drop(host_visible_buffer);
+    let image = device
+        .create_image(
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+        )
+        .unwrap();
+    assert_ne!(image, vk::Image::null());
+    device.destroy_image(image).unwrap();
     let graphics_command_buffer = device.allocate_graphics_command_buffer().unwrap();
     let transfer_command_buffer = device.allocate_transfer_command_buffer().unwrap();
     assert_ne!(graphics_command_buffer, vk::CommandBuffer::null());
