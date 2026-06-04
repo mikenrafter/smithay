@@ -198,6 +198,24 @@ fn memory_type_lookup_selects_supported_required_properties() {
 }
 
 #[test]
+fn memory_type_lookup_can_require_coherent_host_visible_memory() {
+    let properties = memory_properties_for_tests(&[
+        vk::MemoryPropertyFlags::HOST_VISIBLE,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    ]);
+
+    assert_eq!(
+        find_memory_type_index(
+            &properties,
+            0b11,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn memory_type_lookup_rejects_missing_required_properties() {
     let properties = memory_properties_for_tests(&[vk::MemoryPropertyFlags::HOST_VISIBLE]);
 
@@ -807,7 +825,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     let memory_type_index = device
         .find_memory_type_index(
             requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )
         .unwrap();
     let memory = device
@@ -825,7 +843,6 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
             pattern
         );
     }
-    device.flush_mapped_memory_range(memory, 0, 4096).unwrap();
     device.unmap_memory(memory).unwrap();
     device.free_memory(memory).unwrap();
     device.destroy_buffer(buffer).unwrap();

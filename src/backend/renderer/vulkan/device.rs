@@ -360,7 +360,7 @@ impl VulkanDeviceState {
         let memory_type_index = match find_memory_type_index(
             memory_properties,
             requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         ) {
             Ok(index) => index,
             Err(err) => {
@@ -629,16 +629,9 @@ impl VulkanHostVisibleBuffer {
             ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast::<u8>(), data.len());
         }
 
-        let ranges = [vk::MappedMemoryRange::default()
-            .memory(self.memory)
-            .offset(0)
-            .size(self.size)];
-        let result = unsafe { self.logical_device.handle().flush_mapped_memory_ranges(&ranges) }
-            .map_err(VulkanError::from);
-
         unsafe { self.logical_device.handle().unmap_memory(self.memory) };
 
-        result
+        Ok(())
     }
 }
 
