@@ -3,7 +3,7 @@ use std::ffi::CStr;
 use ash::vk;
 
 use crate::backend::{
-    allocator::{Fourcc, Modifier, format::FormatSet},
+    allocator::{Fourcc, format::FormatSet},
     vulkan::PhysicalDevice,
 };
 
@@ -46,17 +46,12 @@ pub struct VulkanFormatCapabilities {
     pub dmabuf_export: FormatSet,
 }
 
-/// Capability record for a DRM format and renderer tiling marker.
-///
-/// `Modifier::Invalid` means Vulkan optimal tiling for renderer-internal images, not an explicit
-/// dmabuf modifier. `Modifier::Linear` means Vulkan linear tiling.
+/// Capability record for a DRM format and Vulkan image tiling.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VulkanFormatCapabilityRecord {
     /// DRM format code.
     pub format: Fourcc,
-    /// Renderer tiling marker for this format.
-    pub modifier: Modifier,
     /// Vulkan image tiling queried for this format.
     pub tiling: VulkanFormatTiling,
     /// Per-usage capability bits for this format and tiling marker.
@@ -119,7 +114,6 @@ impl VulkanFormatCapabilities {
             if optimal_usage.any_supported() {
                 records.push(VulkanFormatCapabilityRecord {
                     format: info.fourcc,
-                    modifier: Modifier::Invalid,
                     tiling: VulkanFormatTiling::Optimal,
                     usages: optimal_usage,
                 });
@@ -129,7 +123,6 @@ impl VulkanFormatCapabilities {
             if linear_tiling_supported(format_properties.linear_tiling_features) {
                 records.push(VulkanFormatCapabilityRecord {
                     format: info.fourcc,
-                    modifier: Modifier::Linear,
                     tiling: VulkanFormatTiling::Linear,
                     usages: linear_usage,
                 });
