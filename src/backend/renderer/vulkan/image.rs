@@ -215,6 +215,7 @@ impl VulkanRenderTarget<'_> {
                 usage: VulkanImageUsage {
                     color_attachment: true,
                     transfer_src: true,
+                    transfer_dst: true,
                     ..VulkanImageUsage::default()
                 },
                 layout: VulkanImageLayoutState::Undefined,

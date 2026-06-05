@@ -44,7 +44,8 @@ use crate::{
     backend::{
         allocator::{Format, Fourcc, Modifier},
         renderer::{
-            ContextId, DebugFlags, ImportMem, Renderer, RendererSuper, TextureFilter, sync::SyncPoint,
+            Color32F, ContextId, DebugFlags, ImportMem, Renderer, RendererSuper, TextureFilter,
+            sync::SyncPoint,
         },
     },
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
@@ -70,7 +71,7 @@ pub use self::{
 
 use self::{
     device::{VulkanDeviceState, image_copy_buffer_offset, tightly_packed_image_size},
-    format::get_render_vk_format,
+    format::{get_format_info, get_render_vk_format},
 };
 
 /// Native Vulkan renderer scaffold.
@@ -193,6 +194,33 @@ impl VulkanRenderer {
             format,
             color_image,
         ))
+    }
+
+    #[allow(dead_code)]
+    fn clear_offscreen_render_target(
+        &mut self,
+        target: &mut VulkanRenderTarget<'_>,
+        color: Color32F,
+    ) -> Result<(), VulkanError> {
+        if target.context_id != self.context_id {
+            return Err(VulkanError::UnsupportedOperation("foreign offscreen target"));
+        }
+        if target.image.source != image::VulkanImageSource::Offscreen {
+            return Err(VulkanError::UnsupportedOperation("offscreen target"));
+        }
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+        let color_image = target
+            .color_image
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("offscreen target image"))?;
+        let format = target
+            .image
+            .format
+            .ok_or(VulkanError::UnsupportedOperation("offscreen target format"))?;
+
+        device.clear_offscreen_color_image(color_image, clear_color_value_for_format(format, color)?)?;
+        target.image.layout = image::VulkanImageLayoutState::TransferDst;
+        Ok(())
     }
 }
 
@@ -414,6 +442,15 @@ fn update_region_to_vk(
             depth: 1,
         },
     ))
+}
+
+fn clear_color_value_for_format(format: Fourcc, color: Color32F) -> Result<vk::ClearColorValue, VulkanError> {
+    let mut components = color.components();
+    if get_format_info(format)?.opaque_alpha {
+        components[3] = 1.0;
+    }
+
+    Ok(vk::ClearColorValue { float32: components })
 }
 
 #[cfg(test)]

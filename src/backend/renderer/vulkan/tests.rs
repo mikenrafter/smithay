@@ -513,6 +513,30 @@ fn offscreen_render_target_creation_requires_initialized_device() {
 }
 
 #[test]
+fn offscreen_render_target_clear_rejects_foreign_targets() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut target = VulkanRenderTarget::new_for_tests((1, 1).into(), Some(Fourcc::Argb8888));
+
+    assert!(matches!(
+        renderer.clear_offscreen_render_target(&mut target, Color32F::BLACK),
+        Err(VulkanError::UnsupportedOperation("foreign offscreen target"))
+    ));
+}
+
+#[test]
+fn clear_color_value_preserves_format_alpha_semantics() {
+    let clear =
+        super::clear_color_value_for_format(Fourcc::Argb8888, Color32F::new(0.25, 0.5, 0.75, 0.5)).unwrap();
+
+    assert_eq!(unsafe { clear.float32 }, [0.25, 0.5, 0.75, 0.5]);
+
+    let opaque_clear =
+        super::clear_color_value_for_format(Fourcc::Xrgb8888, Color32F::new(0.25, 0.5, 0.75, 0.5)).unwrap();
+
+    assert_eq!(unsafe { opaque_clear.float32 }, [0.25, 0.5, 0.75, 1.0]);
+}
+
+#[test]
 fn initialized_device_capabilities_do_not_enable_renderer_operations() {
     let caps = VulkanRendererCapabilities::for_initialized_device(&[]);
 
@@ -1342,10 +1366,11 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
             record.tiling == VulkanFormatTiling::Optimal
                 && record.usages.color_attachment
                 && record.usages.transfer_src
+                && record.usages.transfer_dst
         })
         .map(|record| record.format)
     {
-        let target = renderer
+        let mut target = renderer
             .create_offscreen_render_target(offscreen_format, (2, 2).into())
             .unwrap();
         assert_eq!(target.context_id_for_tests(), renderer.context_id());
@@ -1356,6 +1381,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         assert_eq!(target.image.layout, VulkanImageLayoutState::Undefined);
         assert!(target.image.usage.color_attachment);
         assert!(target.image.usage.transfer_src);
+        assert!(target.image.usage.transfer_dst);
         assert!(target.has_color_image_for_tests());
         let color_image = target.color_image.as_ref().unwrap();
         assert_ne!(color_image.image(), vk::Image::null());
@@ -1365,7 +1391,17 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
                 .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
         );
         assert!(color_image.usage().contains(vk::ImageUsageFlags::TRANSFER_SRC));
+        assert!(color_image.usage().contains(vk::ImageUsageFlags::TRANSFER_DST));
         assert_eq!(color_image.layout().unwrap(), vk::ImageLayout::UNDEFINED);
+        renderer
+            .clear_offscreen_render_target(&mut target, Color32F::new(0.2, 0.4, 0.6, 1.0))
+            .unwrap();
+        assert_eq!(target.image.layout, VulkanImageLayoutState::TransferDst);
+        let color_image = target.color_image.as_ref().unwrap();
+        assert_eq!(
+            color_image.layout().unwrap(),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL
+        );
         Some(target)
     } else {
         None

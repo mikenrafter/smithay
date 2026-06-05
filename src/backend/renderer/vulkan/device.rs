@@ -578,9 +578,36 @@ impl VulkanDeviceState {
         self.create_bound_image(
             extent,
             format,
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn clear_offscreen_color_image(
+        &self,
+        image: &VulkanOwnedImage,
+        color: vk::ClearColorValue,
+    ) -> Result<(), VulkanError> {
+        let mut command_buffer = self.allocate_graphics_command_buffer()?;
+
+        self.begin_command_buffer(&mut command_buffer)?;
+        self.transition_image_layout(&mut command_buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL)?;
+        self.clear_color_image(&mut command_buffer, image, color)?;
+        self.end_command_buffer(&mut command_buffer)?;
+        self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn clear_color_image(
+        &self,
+        command_buffer: &mut VulkanCommandBuffer,
+        image: &VulkanOwnedImage,
+        color: vk::ClearColorValue,
+    ) -> Result<(), VulkanError> {
+        clear_color_image(command_buffer, image, color)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -943,6 +970,52 @@ fn copy_buffer_region_to_image(
     };
 
     command_buffer.referenced_buffers.push(Arc::clone(&buffer.inner));
+    command_buffer.referenced_images.push(Arc::clone(&image.inner));
+
+    Ok(())
+}
+
+fn clear_color_image(
+    command_buffer: &mut VulkanCommandBuffer,
+    image: &VulkanOwnedImage,
+    color: vk::ClearColorValue,
+) -> Result<(), VulkanError> {
+    if !image.usage().contains(vk::ImageUsageFlags::TRANSFER_DST) {
+        return Err(VulkanError::UnsupportedOperation(
+            "image transfer destination usage",
+        ));
+    }
+
+    let image_layout = command_buffer
+        .pending_layout_for(image)?
+        .unwrap_or(image.layout()?);
+    if image_layout != vk::ImageLayout::TRANSFER_DST_OPTIMAL {
+        return Err(VulkanError::UnsupportedOperation("image clear layout"));
+    }
+
+    let range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let _pool_guard = command_buffer.command_pool.lock_host_access()?;
+
+    unsafe {
+        command_buffer
+            .command_pool
+            .logical_device
+            .handle()
+            .cmd_clear_color_image(
+                command_buffer.handle,
+                image.image(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &color,
+                &[range],
+            )
+    };
+
     command_buffer.referenced_images.push(Arc::clone(&image.inner));
 
     Ok(())
