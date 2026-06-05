@@ -45,6 +45,7 @@ impl VulkanDeviceState {
         let queue_families = select_queue_families(&queue_properties)?;
         let mut capabilities = VulkanRendererCapabilities::for_initialized_device(&[]);
         capabilities.formats = super::VulkanFormatCapabilities::discover(&physical_device)?;
+        capabilities.import.memory = capabilities.formats.memory_import.iter().next().is_some();
 
         let queue_priorities = [1.0];
         let queue_create_infos = queue_families
@@ -565,6 +566,43 @@ impl VulkanDeviceState {
         let sampler = self.create_sampler(min_filter, mag_filter)?;
 
         Ok(VulkanSampledImage { sampler, view, image })
+    }
+
+    pub(super) fn update_uploaded_image_region(
+        &self,
+        image: &VulkanOwnedImage,
+        data: &[u8],
+        buffer_offset: vk::DeviceSize,
+        buffer_row_length: u32,
+        buffer_image_height: u32,
+        image_offset: vk::Offset3D,
+        extent: vk::Extent3D,
+    ) -> Result<(), VulkanError> {
+        let buffer_size = vk::DeviceSize::try_from(data.len())
+            .map_err(|_| VulkanError::UnsupportedOperation("image update data size"))?;
+        let staging = self.create_host_visible_buffer(buffer_size, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        staging.write(data)?;
+        let mut command_buffer = self.allocate_graphics_command_buffer()?;
+
+        self.begin_command_buffer(&mut command_buffer)?;
+        self.transition_image_layout(&mut command_buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL)?;
+        self.copy_buffer_region_to_image(
+            &mut command_buffer,
+            &staging,
+            image,
+            buffer_offset,
+            buffer_row_length,
+            buffer_image_height,
+            image_offset,
+            extent,
+        )?;
+        self.transition_image_layout(
+            &mut command_buffer,
+            image,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        )?;
+        self.end_command_buffer(&mut command_buffer)?;
+        self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
     }
 
     #[allow(dead_code)]

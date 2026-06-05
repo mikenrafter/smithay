@@ -4,7 +4,7 @@ use ash::vk;
 
 use crate::backend::allocator::Fourcc;
 use crate::backend::renderer::sync::Interrupted;
-use crate::backend::renderer::{Color32F, DebugFlags, Frame, Renderer, Texture, sync::Fence};
+use crate::backend::renderer::{Color32F, DebugFlags, Frame, ImportMem, Renderer, Texture, sync::Fence};
 use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
 use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 
@@ -57,8 +57,10 @@ fn frame_for_tests(
 
 fn texture_for_tests(size: Size<i32, BufferCoord>, format: Option<Fourcc>) -> VulkanTexture {
     VulkanTexture {
+        context_id: ContextId::new(),
         image: VulkanImageState::new_for_tests(size, format),
         sampled_image: None,
+        y_inverted: false,
     }
 }
 
@@ -513,6 +515,51 @@ fn initialized_device_capabilities_do_not_enable_renderer_operations() {
 }
 
 #[test]
+fn scaffold_renderer_reports_no_memory_import_formats() {
+    let renderer = VulkanRenderer::new_scaffold_for_tests();
+
+    assert!(renderer.mem_formats().next().is_none());
+}
+
+#[test]
+fn memory_update_rejects_foreign_renderer_textures() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let texture = texture_for_tests((1, 1).into(), Some(Fourcc::Abgr8888));
+
+    assert!(matches!(
+        renderer.update_memory(
+            &texture,
+            &[0x00, 0x00, 0x00, 0x00],
+            Rectangle::new((0, 0).into(), (1, 1).into()),
+        ),
+        Err(VulkanError::UnsupportedOperation("foreign memory texture"))
+    ));
+}
+
+#[test]
+fn memory_update_region_validation_rejects_out_of_bounds_regions() {
+    assert!(matches!(
+        super::update_region_to_vk((4, 4).into(), Rectangle::new((1, 1).into(), (2, 2).into())),
+        Ok((
+            vk::Offset3D { x: 1, y: 1, z: 0 },
+            vk::Extent3D {
+                width: 2,
+                height: 2,
+                depth: 1,
+            },
+        ))
+    ));
+    assert!(matches!(
+        super::update_region_to_vk((4, 4).into(), Rectangle::new((-1, 0).into(), (1, 1).into())),
+        Err(VulkanError::UnsupportedOperation("memory update region"))
+    ));
+    assert!(matches!(
+        super::update_region_to_vk((4, 4).into(), Rectangle::new((3, 3).into(), (2, 1).into())),
+        Err(VulkanError::UnsupportedOperation("memory update region"))
+    ));
+}
+
+#[test]
 fn format_usage_maps_vulkan_feature_flags() {
     let usage = format_usage_from_features(
         vk::FormatFeatureFlags::SAMPLED_IMAGE
@@ -915,11 +962,11 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         .next()
         .expect("No physical devices");
 
-    let renderer = VulkanRenderer::builder()
+    let mut renderer = VulkanRenderer::builder()
         .with_physical_device(physical_device)
         .build()
         .unwrap();
-    let caps = renderer.capabilities();
+    let caps = renderer.capabilities().clone();
 
     assert!(renderer.is_device_initialized());
     let device = renderer.device.as_ref().unwrap();
@@ -1216,14 +1263,24 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         sampled_image.image().layout().unwrap(),
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
     );
-    let texture = VulkanTexture::from_sampled_image((1, 1).into(), Fourcc::Abgr8888, sampled_image);
+    let texture = VulkanTexture::from_sampled_image(
+        renderer.context_id(),
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        sampled_image,
+        true,
+    );
     assert_eq!(texture.width(), 1);
     assert_eq!(texture.height(), 1);
     assert_eq!(texture.format(), Some(Fourcc::Abgr8888));
     assert!(texture.has_sampled_image_for_tests());
+    assert!(texture.is_y_inverted_for_tests());
     assert!(caps.device.available);
     assert!(caps.device.extensions.is_empty());
-    assert!(!caps.import.memory);
+    assert_eq!(
+        caps.import.memory,
+        caps.formats.memory_import.iter().next().is_some()
+    );
     assert!(!caps.import.dmabuf);
     assert!(!caps.export.dmabuf);
     assert!(!caps.rendering.offscreen);
@@ -1233,7 +1290,35 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         has_probed_format_support(&caps.formats),
         "expected builder-initialized renderer to expose probed non-import/export format support"
     );
-    assert!(caps.formats.memory_import.iter().next().is_none());
+    if caps.import.memory {
+        let import_format = renderer.mem_formats().next().unwrap();
+        let imported_texture = renderer
+            .import_memory(
+                &[
+                    0xff, 0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff,
+                    0xff,
+                ],
+                import_format,
+                (2, 2).into(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(imported_texture.width(), 2);
+        assert_eq!(imported_texture.height(), 2);
+        assert_eq!(imported_texture.format(), Some(import_format));
+        assert!(imported_texture.has_sampled_image_for_tests());
+        assert!(imported_texture.is_y_inverted_for_tests());
+        renderer
+            .update_memory(
+                &imported_texture,
+                &[
+                    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0xff, 0x00, 0xff, 0x00,
+                    0xff,
+                ],
+                Rectangle::new((1, 1).into(), (1, 1).into()),
+            )
+            .unwrap();
+    }
     assert!(caps.formats.dmabuf_import.iter().next().is_none());
     assert!(caps.formats.dmabuf_export.iter().next().is_none());
 }
@@ -1253,7 +1338,10 @@ fn runtime_format_discovery_finds_device_backed_formats_without_import_export() 
         has_probed_format_support(&caps),
         "expected at least one probed renderer-internal format record"
     );
-    assert!(caps.memory_import.iter().next().is_none());
+    assert_eq!(
+        caps.memory_import.iter().next().is_some(),
+        caps.records.iter().any(|record| record.usages.memory_import)
+    );
     assert!(caps.dmabuf_import.iter().next().is_none());
     assert!(caps.dmabuf_export.iter().next().is_none());
 }

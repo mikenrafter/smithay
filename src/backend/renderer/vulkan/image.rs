@@ -23,8 +23,10 @@ pub struct VulkanFrame<'renderer, 'buffer> {
 /// Vulkan texture scaffold.
 #[derive(Debug, Clone)]
 pub struct VulkanTexture {
+    pub(super) context_id: ContextId<VulkanTexture>,
     pub(super) image: VulkanImageState,
     pub(super) sampled_image: Option<Arc<VulkanSampledImage>>,
+    pub(super) y_inverted: bool,
 }
 
 /// Vulkan render target scaffold.
@@ -77,11 +79,14 @@ impl VulkanImageState {
 
 impl VulkanTexture {
     pub(crate) fn from_sampled_image(
+        context_id: ContextId<VulkanTexture>,
         size: Size<i32, BufferCoord>,
         format: Fourcc,
         sampled_image: VulkanSampledImage,
+        flipped: bool,
     ) -> Self {
         Self {
+            context_id,
             image: VulkanImageState {
                 size,
                 format: Some(format),
@@ -95,12 +100,18 @@ impl VulkanTexture {
                 sync: VulkanImageSyncState::default(),
             },
             sampled_image: Some(Arc::new(sampled_image)),
+            y_inverted: flipped,
         }
     }
 
     #[cfg(test)]
     pub(super) fn has_sampled_image_for_tests(&self) -> bool {
         self.sampled_image.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_y_inverted_for_tests(&self) -> bool {
+        self.y_inverted
     }
 }
 

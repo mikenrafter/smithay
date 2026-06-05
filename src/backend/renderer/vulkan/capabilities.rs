@@ -3,7 +3,7 @@ use std::ffi::CStr;
 use ash::vk;
 
 use crate::backend::{
-    allocator::{Fourcc, format::FormatSet},
+    allocator::{Format, Fourcc, Modifier, format::FormatSet},
     vulkan::PhysicalDevice,
 };
 
@@ -103,6 +103,7 @@ impl VulkanFormatCapabilities {
     /// traits are implemented and can import or export the advertised pairs.
     pub fn discover(physical_device: &PhysicalDevice) -> Result<Self, VulkanError> {
         let mut records = Vec::new();
+        let mut memory_import = Vec::new();
 
         for info in renderer_format_infos() {
             let mut properties = vk::FormatProperties2::default();
@@ -110,7 +111,14 @@ impl VulkanFormatCapabilities {
             unsafe { physical_device.get_format_properties(info.vk_format, &mut properties) };
 
             let format_properties = properties.format_properties;
-            let optimal_usage = format_usage_from_features(format_properties.optimal_tiling_features);
+            let mut optimal_usage = format_usage_from_features(format_properties.optimal_tiling_features);
+            optimal_usage.memory_import = optimal_usage.sampled && optimal_usage.transfer_dst;
+            if optimal_usage.memory_import {
+                memory_import.push(Format {
+                    code: info.fourcc,
+                    modifier: Modifier::Invalid,
+                });
+            }
             if optimal_usage.any_supported() {
                 records.push(VulkanFormatCapabilityRecord {
                     format: info.fourcc,
@@ -131,7 +139,7 @@ impl VulkanFormatCapabilities {
 
         Ok(Self {
             records,
-            memory_import: FormatSet::default(),
+            memory_import: memory_import.into_iter().collect(),
             dmabuf_import: FormatSet::default(),
             dmabuf_export: FormatSet::default(),
         })
