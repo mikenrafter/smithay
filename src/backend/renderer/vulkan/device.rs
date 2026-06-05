@@ -411,6 +411,62 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn image_memory_requirements(
+        &self,
+        image: vk::Image,
+    ) -> Result<vk::MemoryRequirements, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        Ok(unsafe { logical_device.handle().get_image_memory_requirements(image) })
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn bind_image_memory(
+        &self,
+        image: vk::Image,
+        memory: vk::DeviceMemory,
+        offset: vk::DeviceSize,
+    ) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        unsafe { logical_device.handle().bind_image_memory(image, memory, offset) }.map_err(VulkanError::from)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn create_bound_image(
+        &self,
+        extent: vk::Extent3D,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        required_memory_properties: vk::MemoryPropertyFlags,
+    ) -> Result<VulkanOwnedImage, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+        let memory_properties = self
+            .memory_properties
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing memory properties".to_owned()))?;
+
+        create_bound_image(
+            &logical_device,
+            memory_properties,
+            extent,
+            format,
+            usage,
+            required_memory_properties,
+        )
+    }
+
+    #[allow(dead_code)]
     pub(super) fn destroy_image(&self, image: vk::Image) -> Result<(), VulkanError> {
         let logical_device = self
             .logical_device
@@ -584,6 +640,59 @@ fn create_image(
     unsafe { logical_device.handle().create_image(&image_info, None) }.map_err(VulkanError::from)
 }
 
+fn create_bound_image(
+    logical_device: &VulkanLogicalDevice,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    extent: vk::Extent3D,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    required_memory_properties: vk::MemoryPropertyFlags,
+) -> Result<VulkanOwnedImage, VulkanError> {
+    if extent.width == 0 || extent.height == 0 || extent.depth == 0 {
+        return Err(VulkanError::UnsupportedOperation("zero-sized image"));
+    }
+
+    let image = create_image(logical_device, extent, format, usage)?;
+    let requirements = unsafe { logical_device.handle().get_image_memory_requirements(image) };
+    let memory_type_index = match find_memory_type_index(
+        memory_properties,
+        requirements.memory_type_bits,
+        required_memory_properties,
+    ) {
+        Ok(index) => index,
+        Err(err) => {
+            unsafe { logical_device.handle().destroy_image(image, None) };
+            return Err(err);
+        }
+    };
+    let memory = match allocate_memory(logical_device, requirements.size, memory_type_index) {
+        Ok(memory) => memory,
+        Err(err) => {
+            unsafe { logical_device.handle().destroy_image(image, None) };
+            return Err(err);
+        }
+    };
+
+    if let Err(err) =
+        unsafe { logical_device.handle().bind_image_memory(image, memory, 0) }.map_err(VulkanError::from)
+    {
+        unsafe {
+            logical_device.handle().free_memory(memory, None);
+            logical_device.handle().destroy_image(image, None);
+        }
+        return Err(err);
+    }
+
+    Ok(VulkanOwnedImage {
+        logical_device: logical_device.clone(),
+        image,
+        memory,
+        extent,
+        format,
+        usage,
+    })
+}
+
 /// Logical device owner placeholder.
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -694,6 +803,49 @@ impl Drop for VulkanCommandBuffer {
                 .handle()
                 .free_command_buffers(self.command_pool.handle, &[self.handle])
         };
+    }
+}
+
+/// Vulkan image bound to owned device memory.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanOwnedImage {
+    logical_device: VulkanLogicalDevice,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    extent: vk::Extent3D,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+}
+
+impl VulkanOwnedImage {
+    pub(super) fn image(&self) -> vk::Image {
+        self.image
+    }
+
+    pub(super) fn memory(&self) -> vk::DeviceMemory {
+        self.memory
+    }
+
+    pub(super) fn extent(&self) -> vk::Extent3D {
+        self.extent
+    }
+
+    pub(super) fn format(&self) -> vk::Format {
+        self.format
+    }
+
+    pub(super) fn usage(&self) -> vk::ImageUsageFlags {
+        self.usage
+    }
+}
+
+impl Drop for VulkanOwnedImage {
+    fn drop(&mut self) {
+        unsafe {
+            self.logical_device.handle().destroy_image(self.image, None);
+            self.logical_device.handle().free_memory(self.memory, None);
+        }
     }
 }
 

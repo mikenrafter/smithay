@@ -308,6 +308,27 @@ fn buffer_creation_requires_initialized_device() {
         device.destroy_image(vk::Image::null()),
         Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
     ));
+    assert!(matches!(
+        device.image_memory_requirements(vk::Image::null()),
+        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
+    ));
+    assert!(matches!(
+        device.bind_image_memory(vk::Image::null(), vk::DeviceMemory::null(), 0),
+        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
+    ));
+    assert!(matches!(
+        device.create_bound_image(
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ),
+        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
+    ));
 }
 
 #[test]
@@ -833,7 +854,30 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         )
         .unwrap();
     assert_ne!(image, vk::Image::null());
+    let image_requirements = device.image_memory_requirements(image).unwrap();
+    assert_ne!(image_requirements.memory_type_bits, 0);
     device.destroy_image(image).unwrap();
+    let owned_image = device
+        .create_bound_image(
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .unwrap();
+    assert_ne!(owned_image.image(), vk::Image::null());
+    assert_ne!(owned_image.memory(), vk::DeviceMemory::null());
+    assert_eq!(owned_image.extent().width, 1);
+    assert_eq!(owned_image.extent().height, 1);
+    assert_eq!(owned_image.extent().depth, 1);
+    assert_eq!(owned_image.format(), vk::Format::R8G8B8A8_UNORM);
+    assert!(owned_image.usage().contains(vk::ImageUsageFlags::TRANSFER_DST));
+    assert!(owned_image.usage().contains(vk::ImageUsageFlags::SAMPLED));
+    drop(owned_image);
     let mut graphics_command_buffer = device.allocate_graphics_command_buffer().unwrap();
     let mut transfer_command_buffer = device.allocate_transfer_command_buffer().unwrap();
     assert_ne!(graphics_command_buffer.handle(), vk::CommandBuffer::null());
