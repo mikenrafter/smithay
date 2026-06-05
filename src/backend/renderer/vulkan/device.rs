@@ -64,7 +64,7 @@ impl VulkanDeviceState {
                 .create_device(physical_device.handle(), &create_info, None)
         }
         .map_err(VulkanError::from)?;
-        let logical_device = VulkanLogicalDevice::new(logical_device);
+        let logical_device = VulkanLogicalDevice::new(logical_device, instance.clone());
 
         let graphics_family = queue_families
             .graphics
@@ -467,6 +467,7 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn copy_buffer_region_to_image(
         &self,
         command_buffer: &mut VulkanCommandBuffer,
@@ -568,6 +569,21 @@ impl VulkanDeviceState {
         Ok(VulkanSampledImage { sampler, view, image })
     }
 
+    #[allow(dead_code)]
+    pub(super) fn create_offscreen_color_image(
+        &self,
+        extent: vk::Extent3D,
+        format: vk::Format,
+    ) -> Result<VulkanOwnedImage, VulkanError> {
+        self.create_bound_image(
+            extent,
+            format,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn update_uploaded_image_region(
         &self,
         image: &VulkanOwnedImage,
@@ -836,6 +852,7 @@ fn copy_buffer_to_image(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_buffer_region_to_image(
     command_buffer: &mut VulkanCommandBuffer,
     buffer: &VulkanHostVisibleBuffer,
@@ -869,13 +886,13 @@ fn copy_buffer_region_to_image(
     let image_offset_z = image_offset.z as u32;
     if image_offset_x
         .checked_add(extent.width)
-        .map_or(true, |width| width > image_extent.width)
+        .is_none_or(|width| width > image_extent.width)
         || image_offset_y
             .checked_add(extent.height)
-            .map_or(true, |height| height > image_extent.height)
+            .is_none_or(|height| height > image_extent.height)
         || image_offset_z
             .checked_add(extent.depth)
-            .map_or(true, |depth| depth > image_extent.depth)
+            .is_none_or(|depth| depth > image_extent.depth)
     {
         return Err(VulkanError::UnsupportedOperation("image copy extent"));
     }
@@ -1322,21 +1339,27 @@ fn create_bound_image(
 /// Logical device owner placeholder.
 #[allow(dead_code)]
 #[derive(Clone)]
-pub(crate) struct VulkanLogicalDevice(Arc<ash::Device>);
+pub(crate) struct VulkanLogicalDevice {
+    device: Arc<ash::Device>,
+    _instance: Instance,
+}
 
 impl VulkanLogicalDevice {
-    fn new(device: ash::Device) -> Self {
-        Self(Arc::new(device))
+    fn new(device: ash::Device, instance: Instance) -> Self {
+        Self {
+            device: Arc::new(device),
+            _instance: instance,
+        }
     }
 
     pub(super) fn handle(&self) -> &ash::Device {
-        &self.0
+        &self.device
     }
 }
 
 impl Drop for VulkanLogicalDevice {
     fn drop(&mut self) {
-        if let Some(device) = Arc::get_mut(&mut self.0) {
+        if let Some(device) = Arc::get_mut(&mut self.device) {
             unsafe { device.destroy_device(None) };
         }
     }
@@ -1413,6 +1436,7 @@ pub(crate) struct VulkanCommandBuffer {
     referenced_images: Vec<Arc<VulkanOwnedImageInner>>,
 }
 
+#[allow(dead_code)]
 impl VulkanCommandBuffer {
     pub(super) fn handle(&self) -> vk::CommandBuffer {
         self.handle
@@ -1486,6 +1510,7 @@ struct VulkanOwnedImageInner {
     layout: Mutex<vk::ImageLayout>,
 }
 
+#[allow(dead_code)]
 impl VulkanOwnedImage {
     pub(super) fn image(&self) -> vk::Image {
         self.inner.image
@@ -1533,6 +1558,7 @@ pub(crate) struct VulkanImageView {
     view: vk::ImageView,
 }
 
+#[allow(dead_code)]
 impl VulkanImageView {
     pub(super) fn handle(&self) -> vk::ImageView {
         self.view
@@ -1564,6 +1590,7 @@ pub(crate) struct VulkanSampler {
     mag_filter: TextureFilter,
 }
 
+#[allow(dead_code)]
 impl VulkanSampler {
     pub(super) fn handle(&self) -> vk::Sampler {
         self.sampler
@@ -1593,6 +1620,7 @@ pub(crate) struct VulkanSampledImage {
     image: VulkanOwnedImage,
 }
 
+#[allow(dead_code)]
 impl VulkanSampledImage {
     pub(super) fn image(&self) -> &VulkanOwnedImage {
         &self.image

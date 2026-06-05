@@ -499,6 +499,20 @@ fn vulkan_renderer_builder_is_scaffold_only() {
 }
 
 #[test]
+fn offscreen_render_target_creation_requires_initialized_device() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+
+    assert!(matches!(
+        renderer.create_offscreen_render_target(Fourcc::Argb8888, (1, 1).into()),
+        Err(VulkanError::VulkanUnavailable)
+    ));
+    assert!(matches!(
+        renderer.create_offscreen_render_target(Fourcc::Argb8888, (0, 1).into()),
+        Err(VulkanError::VulkanUnavailable)
+    ));
+}
+
+#[test]
 fn initialized_device_capabilities_do_not_enable_renderer_operations() {
     let caps = VulkanRendererCapabilities::for_initialized_device(&[]);
 
@@ -648,6 +662,7 @@ fn vulkan_image_state_placeholder_tracks_target_metadata() {
     assert_eq!(target.image.layout, VulkanImageLayoutState::Undefined);
     assert_eq!(target.image.usage, VulkanImageUsage::default());
     assert_eq!(target.image.sync, VulkanImageSyncState::default());
+    assert!(!target.has_color_image_for_tests());
 }
 
 #[test]
@@ -1319,8 +1334,46 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
             )
             .unwrap();
     }
+    let retained_offscreen_target = if let Some(offscreen_format) = caps
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.color_attachment
+                && record.usages.transfer_src
+        })
+        .map(|record| record.format)
+    {
+        let target = renderer
+            .create_offscreen_render_target(offscreen_format, (2, 2).into())
+            .unwrap();
+        assert_eq!(target.context_id_for_tests(), renderer.context_id());
+        assert_eq!(target.width(), 2);
+        assert_eq!(target.height(), 2);
+        assert_eq!(target.format(), Some(offscreen_format));
+        assert_eq!(target.image.source, VulkanImageSource::Offscreen);
+        assert_eq!(target.image.layout, VulkanImageLayoutState::Undefined);
+        assert!(target.image.usage.color_attachment);
+        assert!(target.image.usage.transfer_src);
+        assert!(target.has_color_image_for_tests());
+        let color_image = target.color_image.as_ref().unwrap();
+        assert_ne!(color_image.image(), vk::Image::null());
+        assert!(
+            color_image
+                .usage()
+                .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        );
+        assert!(color_image.usage().contains(vk::ImageUsageFlags::TRANSFER_SRC));
+        assert_eq!(color_image.layout().unwrap(), vk::ImageLayout::UNDEFINED);
+        Some(target)
+    } else {
+        None
+    };
     assert!(caps.formats.dmabuf_import.iter().next().is_none());
     assert!(caps.formats.dmabuf_export.iter().next().is_none());
+    drop(renderer);
+    drop(retained_offscreen_target);
 }
 
 #[test]

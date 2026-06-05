@@ -8,7 +8,10 @@ use crate::{
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
 };
 
-use super::{VulkanError, VulkanRenderer, device::VulkanSampledImage};
+use super::{
+    VulkanError, VulkanRenderer,
+    device::{VulkanOwnedImage, VulkanSampledImage},
+};
 
 /// Vulkan frame scaffold.
 #[derive(Debug)]
@@ -26,13 +29,17 @@ pub struct VulkanTexture {
     pub(super) context_id: ContextId<VulkanTexture>,
     pub(super) image: VulkanImageState,
     pub(super) sampled_image: Option<Arc<VulkanSampledImage>>,
+    #[allow(dead_code)]
     pub(super) y_inverted: bool,
 }
 
 /// Vulkan render target scaffold.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct VulkanRenderTarget<'buffer> {
+    pub(super) context_id: ContextId<VulkanTexture>,
     pub(super) image: VulkanImageState,
+    pub(super) color_image: Option<VulkanOwnedImage>,
     pub(super) _target: PhantomData<&'buffer mut ()>,
 }
 
@@ -192,12 +199,50 @@ pub(crate) struct VulkanDmabufImportState {
 }
 
 impl VulkanRenderTarget<'_> {
+    #[allow(dead_code)]
+    pub(crate) fn from_offscreen_image(
+        context_id: ContextId<VulkanTexture>,
+        size: Size<i32, BufferCoord>,
+        format: Fourcc,
+        color_image: VulkanOwnedImage,
+    ) -> Self {
+        Self {
+            context_id,
+            image: VulkanImageState {
+                size,
+                format: Some(format),
+                source: VulkanImageSource::Offscreen,
+                usage: VulkanImageUsage {
+                    color_attachment: true,
+                    transfer_src: true,
+                    ..VulkanImageUsage::default()
+                },
+                layout: VulkanImageLayoutState::Undefined,
+                sync: VulkanImageSyncState::default(),
+            },
+            color_image: Some(color_image),
+            _target: PhantomData,
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn new_for_tests(size: Size<i32, BufferCoord>, format: Option<Fourcc>) -> Self {
         Self {
+            context_id: ContextId::new(),
             image: VulkanImageState::new_for_tests(size, format),
+            color_image: None,
             _target: PhantomData,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_color_image_for_tests(&self) -> bool {
+        self.color_image.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn context_id_for_tests(&self) -> ContextId<VulkanTexture> {
+        self.context_id.clone()
     }
 }
 

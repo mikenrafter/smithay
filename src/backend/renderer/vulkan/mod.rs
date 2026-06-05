@@ -175,6 +175,25 @@ impl VulkanRenderer {
     pub fn is_device_initialized(&self) -> bool {
         self.device.is_some() && self.capabilities.device.available
     }
+
+    #[allow(dead_code)]
+    fn create_offscreen_render_target(
+        &mut self,
+        format: Fourcc,
+        size: Size<i32, BufferCoord>,
+    ) -> Result<VulkanRenderTarget<'static>, VulkanError> {
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+        let vk_format = get_render_vk_format(format)?;
+        let extent = extent_from_size(size, "offscreen render target size")?;
+        let color_image = device.create_offscreen_color_image(extent, vk_format)?;
+
+        Ok(VulkanRenderTarget::from_offscreen_image(
+            self.context_id.clone(),
+            size,
+            format,
+            color_image,
+        ))
+    }
 }
 
 impl RendererSuper for VulkanRenderer {
@@ -365,12 +384,12 @@ fn update_region_to_vk(
         .loc
         .x
         .checked_add(region.size.w)
-        .map_or(true, |right| right > texture_size.w)
+        .is_none_or(|right| right > texture_size.w)
         || region
             .loc
             .y
             .checked_add(region.size.h)
-            .map_or(true, |bottom| bottom > texture_size.h)
+            .is_none_or(|bottom| bottom > texture_size.h)
     {
         return Err(VulkanError::UnsupportedOperation("memory update region"));
     }
