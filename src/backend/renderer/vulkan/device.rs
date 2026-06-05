@@ -388,10 +388,13 @@ impl VulkanDeviceState {
         }
 
         Ok(VulkanHostVisibleBuffer {
-            logical_device,
-            buffer,
-            memory,
-            size,
+            inner: Arc::new(VulkanHostVisibleBufferInner {
+                logical_device,
+                buffer,
+                memory,
+                size,
+                usage,
+            }),
         })
     }
 
@@ -446,6 +449,17 @@ impl VulkanDeviceState {
         new_layout: vk::ImageLayout,
     ) -> Result<(), VulkanError> {
         transition_image_layout(command_buffer, image, new_layout)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn copy_buffer_to_image(
+        &self,
+        command_buffer: &mut VulkanCommandBuffer,
+        buffer: &VulkanHostVisibleBuffer,
+        image: &VulkanOwnedImage,
+        extent: vk::Extent3D,
+    ) -> Result<(), VulkanError> {
+        copy_buffer_to_image(command_buffer, buffer, image, extent)
     }
 
     #[allow(dead_code)]
@@ -547,12 +561,16 @@ fn allocate_command_buffer(
         command_pool: Arc::clone(command_pool),
         handle,
         pending_image_layouts: Vec::new(),
+        referenced_buffers: Vec::new(),
+        referenced_images: Vec::new(),
     })
 }
 
 fn begin_command_buffer(command_buffer: &mut VulkanCommandBuffer) -> Result<(), VulkanError> {
     let _pool_guard = command_buffer.command_pool.lock_host_access()?;
     command_buffer.pending_image_layouts.clear();
+    command_buffer.referenced_buffers.clear();
+    command_buffer.referenced_images.clear();
     let begin_info =
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
@@ -653,6 +671,75 @@ fn transition_image_layout(
             resource: Arc::clone(&image.inner),
             new_layout,
         });
+
+    Ok(())
+}
+
+fn copy_buffer_to_image(
+    command_buffer: &mut VulkanCommandBuffer,
+    buffer: &VulkanHostVisibleBuffer,
+    image: &VulkanOwnedImage,
+    extent: vk::Extent3D,
+) -> Result<(), VulkanError> {
+    if !buffer.usage().contains(vk::BufferUsageFlags::TRANSFER_SRC) {
+        return Err(VulkanError::UnsupportedOperation("buffer transfer source usage"));
+    }
+    if buffer.size() == 0 {
+        return Err(VulkanError::UnsupportedOperation("empty image copy buffer"));
+    }
+    if !image.usage().contains(vk::ImageUsageFlags::TRANSFER_DST) {
+        return Err(VulkanError::UnsupportedOperation(
+            "image transfer destination usage",
+        ));
+    }
+    if extent.width == 0 || extent.height == 0 || extent.depth == 0 {
+        return Err(VulkanError::UnsupportedOperation("zero-sized image copy"));
+    }
+    let image_extent = image.extent();
+    if extent.width > image_extent.width
+        || extent.height > image_extent.height
+        || extent.depth > image_extent.depth
+    {
+        return Err(VulkanError::UnsupportedOperation("image copy extent"));
+    }
+
+    let image_layout = command_buffer
+        .pending_layout_for(image)?
+        .unwrap_or(image.layout()?);
+    if image_layout != vk::ImageLayout::TRANSFER_DST_OPTIMAL {
+        return Err(VulkanError::UnsupportedOperation("image copy layout"));
+    }
+
+    let region = vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+        .image_extent(extent);
+    let _pool_guard = command_buffer.command_pool.lock_host_access()?;
+
+    unsafe {
+        command_buffer
+            .command_pool
+            .logical_device
+            .handle()
+            .cmd_copy_buffer_to_image(
+                command_buffer.handle,
+                buffer.buffer(),
+                image.image(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            )
+    };
+
+    command_buffer.referenced_buffers.push(Arc::clone(&buffer.inner));
+    command_buffer.referenced_images.push(Arc::clone(&image.inner));
 
     Ok(())
 }
@@ -964,6 +1051,8 @@ pub(crate) struct VulkanCommandBuffer {
     command_pool: Arc<VulkanCommandPool>,
     handle: vk::CommandBuffer,
     pending_image_layouts: Vec<VulkanPendingImageLayout>,
+    referenced_buffers: Vec<Arc<VulkanHostVisibleBufferInner>>,
+    referenced_images: Vec<Arc<VulkanOwnedImageInner>>,
 }
 
 impl VulkanCommandBuffer {
@@ -990,6 +1079,8 @@ impl VulkanCommandBuffer {
         }
 
         self.pending_image_layouts.clear();
+        self.referenced_buffers.clear();
+        self.referenced_images.clear();
         Ok(())
     }
 }
@@ -1078,28 +1169,47 @@ impl Drop for VulkanOwnedImageInner {
 
 /// Host-visible buffer owner for staging-style uploads.
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct VulkanHostVisibleBuffer {
+    inner: Arc<VulkanHostVisibleBufferInner>,
+}
+
+/// Shared host-visible buffer resource kept alive by command buffers that reference it.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct VulkanHostVisibleBufferInner {
     logical_device: VulkanLogicalDevice,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
 }
 
 impl VulkanHostVisibleBuffer {
     pub(super) fn buffer(&self) -> vk::Buffer {
-        self.buffer
+        self.inner.buffer
+    }
+
+    pub(super) fn size(&self) -> vk::DeviceSize {
+        self.inner.size
+    }
+
+    pub(super) fn usage(&self) -> vk::BufferUsageFlags {
+        self.inner.usage
     }
 
     pub(super) fn write(&self, data: &[u8]) -> Result<(), VulkanError> {
-        if data.len() as vk::DeviceSize > self.size {
+        if data.len() as vk::DeviceSize > self.inner.size {
             return Err(VulkanError::UnsupportedOperation("mapped buffer write size"));
         }
 
         let mapped = unsafe {
-            self.logical_device
-                .handle()
-                .map_memory(self.memory, 0, self.size, vk::MemoryMapFlags::empty())
+            self.inner.logical_device.handle().map_memory(
+                self.inner.memory,
+                0,
+                self.inner.size,
+                vk::MemoryMapFlags::empty(),
+            )
         }
         .map_err(VulkanError::from)?;
 
@@ -1107,13 +1217,13 @@ impl VulkanHostVisibleBuffer {
             ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast::<u8>(), data.len());
         }
 
-        unsafe { self.logical_device.handle().unmap_memory(self.memory) };
+        unsafe { self.inner.logical_device.handle().unmap_memory(self.inner.memory) };
 
         Ok(())
     }
 }
 
-impl Drop for VulkanHostVisibleBuffer {
+impl Drop for VulkanHostVisibleBufferInner {
     fn drop(&mut self) {
         unsafe {
             self.logical_device.handle().destroy_buffer(self.buffer, None);

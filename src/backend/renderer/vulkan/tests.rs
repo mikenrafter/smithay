@@ -952,11 +952,30 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         ),
         Err(VulkanError::UnsupportedOperation("empty image usage"))
     ));
+    let copy_buffer = device
+        .create_host_visible_buffer(4, vk::BufferUsageFlags::TRANSFER_SRC)
+        .unwrap();
+    assert_eq!(copy_buffer.size(), 4);
+    assert!(copy_buffer.usage().contains(vk::BufferUsageFlags::TRANSFER_SRC));
+    copy_buffer.write(&[0xff, 0x00, 0x00, 0xff]).unwrap();
     let mut graphics_command_buffer = device.allocate_graphics_command_buffer().unwrap();
     let mut transfer_command_buffer = device.allocate_transfer_command_buffer().unwrap();
     assert_ne!(graphics_command_buffer.handle(), vk::CommandBuffer::null());
     assert_ne!(transfer_command_buffer.handle(), vk::CommandBuffer::null());
     device.begin_command_buffer(&mut graphics_command_buffer).unwrap();
+    assert!(matches!(
+        device.copy_buffer_to_image(
+            &mut graphics_command_buffer,
+            &copy_buffer,
+            &owned_image,
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        ),
+        Err(VulkanError::UnsupportedOperation("image copy layout"))
+    ));
     device
         .transition_image_layout(
             &mut graphics_command_buffer,
@@ -964,6 +983,19 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         )
         .unwrap();
+    device
+        .copy_buffer_to_image(
+            &mut graphics_command_buffer,
+            &copy_buffer,
+            &owned_image,
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        )
+        .unwrap();
+    drop(copy_buffer);
     device
         .transition_image_layout(
             &mut graphics_command_buffer,
