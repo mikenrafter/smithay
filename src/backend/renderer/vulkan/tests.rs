@@ -58,6 +58,7 @@ fn frame_for_tests(
 fn texture_for_tests(size: Size<i32, BufferCoord>, format: Option<Fourcc>) -> VulkanTexture {
     VulkanTexture {
         image: VulkanImageState::new_for_tests(size, format),
+        sampled_image: None,
     }
 }
 
@@ -1127,6 +1128,11 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         sampled_image.image().layout().unwrap(),
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
     );
+    let texture = VulkanTexture::from_sampled_image((1, 1).into(), Fourcc::Abgr8888, sampled_image);
+    assert_eq!(texture.width(), 1);
+    assert_eq!(texture.height(), 1);
+    assert_eq!(texture.format(), Some(Fourcc::Abgr8888));
+    assert!(texture.has_sampled_image_for_tests());
     assert!(caps.device.available);
     assert!(caps.device.extensions.is_empty());
     assert!(!caps.import.memory);

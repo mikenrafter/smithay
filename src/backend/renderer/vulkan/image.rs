@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
     backend::{
@@ -8,7 +8,7 @@ use crate::{
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
 };
 
-use super::{VulkanError, VulkanRenderer};
+use super::{VulkanError, VulkanRenderer, device::VulkanSampledImage};
 
 /// Vulkan frame scaffold.
 #[derive(Debug)]
@@ -24,6 +24,7 @@ pub struct VulkanFrame<'renderer, 'buffer> {
 #[derive(Debug, Clone)]
 pub struct VulkanTexture {
     pub(super) image: VulkanImageState,
+    pub(super) sampled_image: Option<Arc<VulkanSampledImage>>,
 }
 
 /// Vulkan render target scaffold.
@@ -71,6 +72,35 @@ impl VulkanImageState {
             layout: VulkanImageLayoutState::Undefined,
             sync: VulkanImageSyncState::default(),
         }
+    }
+}
+
+impl VulkanTexture {
+    pub(crate) fn from_sampled_image(
+        size: Size<i32, BufferCoord>,
+        format: Fourcc,
+        sampled_image: VulkanSampledImage,
+    ) -> Self {
+        Self {
+            image: VulkanImageState {
+                size,
+                format: Some(format),
+                source: VulkanImageSource::MemoryUpload,
+                usage: VulkanImageUsage {
+                    sampled: true,
+                    transfer_dst: true,
+                    ..VulkanImageUsage::default()
+                },
+                layout: VulkanImageLayoutState::ShaderReadOnly,
+                sync: VulkanImageSyncState::default(),
+            },
+            sampled_image: Some(Arc::new(sampled_image)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_sampled_image_for_tests(&self) -> bool {
+        self.sampled_image.is_some()
     }
 }
 
