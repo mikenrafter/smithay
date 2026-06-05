@@ -10,8 +10,8 @@ use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 
 use super::capabilities::{format_usage_from_features, linear_tiling_supported};
 use super::device::{
-    VulkanDeviceState, find_memory_type_index, image_layout_transition, select_queue_families,
-    tightly_packed_image_size, vulkan_filter,
+    VulkanDeviceState, find_memory_type_index, image_copy_buffer_offset, image_copy_required_size,
+    image_layout_transition, select_queue_families, tightly_packed_image_size, vulkan_filter,
 };
 use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
@@ -288,13 +288,23 @@ fn image_layout_transition_requires_matching_image_usage() {
         ),
         Err(VulkanError::UnsupportedOperation("image sampled usage"))
     ));
-    assert!(matches!(
+    assert!(
         image_layout_transition(
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        image_layout_transition(
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageUsageFlags::SAMPLED,
         ),
-        Err(VulkanError::UnsupportedOperation("image layout transition"))
+        Err(VulkanError::UnsupportedOperation(
+            "image transfer destination usage"
+        ))
     ));
 }
 
@@ -332,6 +342,36 @@ fn tightly_packed_image_size_matches_supported_renderer_formats() {
     assert!(matches!(
         tightly_packed_image_size(vk::Format::D32_SFLOAT, extent),
         Err(VulkanError::UnsupportedOperation("tightly packed image format"))
+    ));
+}
+
+#[test]
+fn image_copy_required_size_accounts_for_regions_and_row_stride() {
+    let extent = vk::Extent3D {
+        width: 2,
+        height: 2,
+        depth: 1,
+    };
+
+    assert_eq!(
+        image_copy_required_size(vk::Format::R8G8B8A8_UNORM, 0, 0, 0, extent).unwrap(),
+        16
+    );
+    assert_eq!(
+        image_copy_required_size(vk::Format::R8G8B8A8_UNORM, 4, 4, 2, extent).unwrap(),
+        28
+    );
+    assert_eq!(
+        image_copy_buffer_offset(vk::Format::R8G8B8A8_UNORM, 4, 1, 1).unwrap(),
+        20
+    );
+    assert!(matches!(
+        image_copy_required_size(vk::Format::R8G8B8A8_UNORM, 0, 1, 0, extent),
+        Err(VulkanError::UnsupportedOperation("image copy row length"))
+    ));
+    assert!(matches!(
+        image_copy_required_size(vk::Format::R8G8B8A8_UNORM, 0, 0, 1, extent),
+        Err(VulkanError::UnsupportedOperation("image copy image height"))
     ));
 }
 
@@ -1124,6 +1164,54 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert_ne!(sampled_image.image().image(), vk::Image::null());
     assert_ne!(sampled_image.view().handle(), vk::ImageView::null());
     assert_ne!(sampled_image.sampler().handle(), vk::Sampler::null());
+    assert_eq!(
+        sampled_image.image().layout().unwrap(),
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+    );
+    let update_buffer = device
+        .create_host_visible_buffer(16, vk::BufferUsageFlags::TRANSFER_SRC)
+        .unwrap();
+    update_buffer
+        .write(&[
+            0xff, 0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        ])
+        .unwrap();
+    let mut update_command_buffer = device.allocate_graphics_command_buffer().unwrap();
+    device.begin_command_buffer(&mut update_command_buffer).unwrap();
+    device
+        .transition_image_layout(
+            &mut update_command_buffer,
+            sampled_image.image(),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        )
+        .unwrap();
+    device
+        .copy_buffer_region_to_image(
+            &mut update_command_buffer,
+            &update_buffer,
+            sampled_image.image(),
+            image_copy_buffer_offset(vk::Format::R8G8B8A8_UNORM, 2, 1, 0).unwrap(),
+            2,
+            2,
+            vk::Offset3D { x: 0, y: 0, z: 0 },
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        )
+        .unwrap();
+    device
+        .transition_image_layout(
+            &mut update_command_buffer,
+            sampled_image.image(),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        )
+        .unwrap();
+    device.end_command_buffer(&mut update_command_buffer).unwrap();
+    device
+        .submit_graphics_command_buffer_and_wait(&mut update_command_buffer)
+        .unwrap();
     assert_eq!(
         sampled_image.image().layout().unwrap(),
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL

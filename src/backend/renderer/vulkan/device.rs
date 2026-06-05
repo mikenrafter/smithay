@@ -466,6 +466,30 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn copy_buffer_region_to_image(
+        &self,
+        command_buffer: &mut VulkanCommandBuffer,
+        buffer: &VulkanHostVisibleBuffer,
+        image: &VulkanOwnedImage,
+        buffer_offset: vk::DeviceSize,
+        buffer_row_length: u32,
+        buffer_image_height: u32,
+        image_offset: vk::Offset3D,
+        extent: vk::Extent3D,
+    ) -> Result<(), VulkanError> {
+        copy_buffer_region_to_image(
+            command_buffer,
+            buffer,
+            image,
+            buffer_offset,
+            buffer_row_length,
+            buffer_image_height,
+            image_offset,
+            extent,
+        )
+    }
+
+    #[allow(dead_code)]
     pub(super) fn create_uploaded_image(
         &self,
         extent: vk::Extent3D,
@@ -762,6 +786,28 @@ fn copy_buffer_to_image(
     image: &VulkanOwnedImage,
     extent: vk::Extent3D,
 ) -> Result<(), VulkanError> {
+    copy_buffer_region_to_image(
+        command_buffer,
+        buffer,
+        image,
+        0,
+        0,
+        0,
+        vk::Offset3D { x: 0, y: 0, z: 0 },
+        extent,
+    )
+}
+
+fn copy_buffer_region_to_image(
+    command_buffer: &mut VulkanCommandBuffer,
+    buffer: &VulkanHostVisibleBuffer,
+    image: &VulkanOwnedImage,
+    buffer_offset: vk::DeviceSize,
+    buffer_row_length: u32,
+    buffer_image_height: u32,
+    image_offset: vk::Offset3D,
+    extent: vk::Extent3D,
+) -> Result<(), VulkanError> {
     if !buffer.usage().contains(vk::BufferUsageFlags::TRANSFER_SRC) {
         return Err(VulkanError::UnsupportedOperation("buffer transfer source usage"));
     }
@@ -776,12 +822,34 @@ fn copy_buffer_to_image(
     if extent.width == 0 || extent.height == 0 || extent.depth == 0 {
         return Err(VulkanError::UnsupportedOperation("zero-sized image copy"));
     }
+    if image_offset.x < 0 || image_offset.y < 0 || image_offset.z < 0 {
+        return Err(VulkanError::UnsupportedOperation("image copy offset"));
+    }
     let image_extent = image.extent();
-    if extent.width > image_extent.width
-        || extent.height > image_extent.height
-        || extent.depth > image_extent.depth
+    let image_offset_x = image_offset.x as u32;
+    let image_offset_y = image_offset.y as u32;
+    let image_offset_z = image_offset.z as u32;
+    if image_offset_x
+        .checked_add(extent.width)
+        .map_or(true, |width| width > image_extent.width)
+        || image_offset_y
+            .checked_add(extent.height)
+            .map_or(true, |height| height > image_extent.height)
+        || image_offset_z
+            .checked_add(extent.depth)
+            .map_or(true, |depth| depth > image_extent.depth)
     {
         return Err(VulkanError::UnsupportedOperation("image copy extent"));
+    }
+    let required_size = image_copy_required_size(
+        image.format(),
+        buffer_offset,
+        buffer_row_length,
+        buffer_image_height,
+        extent,
+    )?;
+    if required_size > buffer.size() {
+        return Err(VulkanError::UnsupportedOperation("image copy buffer size"));
     }
 
     let image_layout = command_buffer
@@ -792,16 +860,16 @@ fn copy_buffer_to_image(
     }
 
     let region = vk::BufferImageCopy::default()
-        .buffer_offset(0)
-        .buffer_row_length(0)
-        .buffer_image_height(0)
+        .buffer_offset(buffer_offset)
+        .buffer_row_length(buffer_row_length)
+        .buffer_image_height(buffer_image_height)
         .image_subresource(vk::ImageSubresourceLayers {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             mip_level: 0,
             base_array_layer: 0,
             layer_count: 1,
         })
-        .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+        .image_offset(image_offset)
         .image_extent(extent);
     let _pool_guard = command_buffer.command_pool.lock_host_access()?;
 
@@ -865,7 +933,90 @@ pub(super) fn image_layout_transition(
                 dst_access: vk::AccessFlags::SHADER_READ,
             })
         }
+        (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => {
+            if !usage.contains(vk::ImageUsageFlags::SAMPLED) {
+                return Err(VulkanError::UnsupportedOperation("image sampled usage"));
+            }
+            if !usage.contains(vk::ImageUsageFlags::TRANSFER_DST) {
+                return Err(VulkanError::UnsupportedOperation(
+                    "image transfer destination usage",
+                ));
+            }
+
+            Ok(VulkanLayoutTransition {
+                src_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
+                dst_stage: vk::PipelineStageFlags::TRANSFER,
+                src_access: vk::AccessFlags::SHADER_READ,
+                dst_access: vk::AccessFlags::TRANSFER_WRITE,
+            })
+        }
         _ => Err(VulkanError::UnsupportedOperation("image layout transition")),
+    }
+}
+
+pub(super) fn image_copy_required_size(
+    format: vk::Format,
+    buffer_offset: vk::DeviceSize,
+    buffer_row_length: u32,
+    buffer_image_height: u32,
+    extent: vk::Extent3D,
+) -> Result<vk::DeviceSize, VulkanError> {
+    if extent.width == 0 || extent.height == 0 || extent.depth == 0 {
+        return Err(VulkanError::UnsupportedOperation("zero-sized image copy"));
+    }
+    if buffer_row_length != 0 && buffer_row_length < extent.width {
+        return Err(VulkanError::UnsupportedOperation("image copy row length"));
+    }
+    if buffer_image_height != 0 && buffer_image_height < extent.height {
+        return Err(VulkanError::UnsupportedOperation("image copy image height"));
+    }
+
+    let bytes_per_texel = format_bytes_per_texel(format)?;
+    let row_length = if buffer_row_length == 0 {
+        extent.width
+    } else {
+        buffer_row_length
+    };
+    let image_height = if buffer_image_height == 0 {
+        extent.height
+    } else {
+        buffer_image_height
+    };
+
+    u64::from(extent.depth - 1)
+        .checked_mul(u64::from(image_height))
+        .and_then(|rows| rows.checked_add(u64::from(extent.height - 1)))
+        .and_then(|rows| rows.checked_mul(u64::from(row_length)))
+        .and_then(|texels| texels.checked_add(u64::from(extent.width)))
+        .and_then(|texels| texels.checked_mul(bytes_per_texel))
+        .and_then(|bytes| bytes.checked_add(buffer_offset))
+        .ok_or(VulkanError::UnsupportedOperation("image copy data size"))
+}
+
+pub(super) fn image_copy_buffer_offset(
+    format: vk::Format,
+    row_length: u32,
+    x: u32,
+    y: u32,
+) -> Result<vk::DeviceSize, VulkanError> {
+    let bytes_per_texel = format_bytes_per_texel(format)?;
+
+    u64::from(y)
+        .checked_mul(u64::from(row_length))
+        .and_then(|texels| texels.checked_add(u64::from(x)))
+        .and_then(|texels| texels.checked_mul(bytes_per_texel))
+        .ok_or(VulkanError::UnsupportedOperation("image copy data offset"))
+}
+
+fn format_bytes_per_texel(format: vk::Format) -> Result<vk::DeviceSize, VulkanError> {
+    match format {
+        vk::Format::R5G6B5_UNORM_PACK16 => Ok(2),
+        vk::Format::B8G8R8A8_UNORM
+        | vk::Format::R8G8B8A8_UNORM
+        | vk::Format::A8B8G8R8_UNORM_PACK32
+        | vk::Format::A2R10G10B10_UNORM_PACK32
+        | vk::Format::A2B10G10R10_UNORM_PACK32 => Ok(4),
+        _ => Err(VulkanError::UnsupportedOperation("tightly packed image format")),
     }
 }
 
@@ -877,15 +1028,7 @@ pub(super) fn tightly_packed_image_size(
         return Err(VulkanError::UnsupportedOperation("zero-sized image"));
     }
 
-    let bytes_per_texel: vk::DeviceSize = match format {
-        vk::Format::R5G6B5_UNORM_PACK16 => 2,
-        vk::Format::B8G8R8A8_UNORM
-        | vk::Format::R8G8B8A8_UNORM
-        | vk::Format::A8B8G8R8_UNORM_PACK32
-        | vk::Format::A2R10G10B10_UNORM_PACK32
-        | vk::Format::A2B10G10R10_UNORM_PACK32 => 4,
-        _ => return Err(VulkanError::UnsupportedOperation("tightly packed image format")),
-    };
+    let bytes_per_texel = format_bytes_per_texel(format)?;
 
     u64::from(extent.width)
         .checked_mul(u64::from(extent.height))
