@@ -9,7 +9,9 @@ use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
 use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 
 use super::capabilities::{format_usage_from_features, linear_tiling_supported};
-use super::device::{VulkanDeviceState, find_memory_type_index, select_queue_families};
+use super::device::{
+    VulkanDeviceState, find_memory_type_index, image_layout_transition, select_queue_families,
+};
 use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
     VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalMemoryHandleType, VulkanExternalMemoryState,
@@ -245,6 +247,52 @@ fn memory_type_lookup_requires_initialized_memory_properties() {
     assert!(matches!(
         device.find_memory_type_index(u32::MAX, vk::MemoryPropertyFlags::empty()),
         Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing memory properties"
+    ));
+}
+
+#[test]
+fn image_layout_transition_requires_matching_image_usage() {
+    assert!(
+        image_layout_transition(
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageUsageFlags::TRANSFER_DST,
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        image_layout_transition(
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageUsageFlags::SAMPLED,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "image transfer destination usage"
+        ))
+    ));
+    assert!(
+        image_layout_transition(
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageUsageFlags::SAMPLED,
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        image_layout_transition(
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageUsageFlags::TRANSFER_DST,
+        ),
+        Err(VulkanError::UnsupportedOperation("image sampled usage"))
+    ));
+    assert!(matches!(
+        image_layout_transition(
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+        ),
+        Err(VulkanError::UnsupportedOperation("image layout transition"))
     ));
 }
 
@@ -877,7 +925,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert_eq!(owned_image.format(), vk::Format::R8G8B8A8_UNORM);
     assert!(owned_image.usage().contains(vk::ImageUsageFlags::TRANSFER_DST));
     assert!(owned_image.usage().contains(vk::ImageUsageFlags::SAMPLED));
-    drop(owned_image);
+    assert_eq!(owned_image.layout().unwrap(), vk::ImageLayout::UNDEFINED);
     assert!(matches!(
         device.create_bound_image(
             vk::Extent3D {
@@ -909,10 +957,30 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert_ne!(graphics_command_buffer.handle(), vk::CommandBuffer::null());
     assert_ne!(transfer_command_buffer.handle(), vk::CommandBuffer::null());
     device.begin_command_buffer(&mut graphics_command_buffer).unwrap();
+    device
+        .transition_image_layout(
+            &mut graphics_command_buffer,
+            &owned_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        )
+        .unwrap();
+    device
+        .transition_image_layout(
+            &mut graphics_command_buffer,
+            &owned_image,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        )
+        .unwrap();
+    assert_eq!(owned_image.layout().unwrap(), vk::ImageLayout::UNDEFINED);
     device.end_command_buffer(&mut graphics_command_buffer).unwrap();
     device
         .submit_graphics_command_buffer_and_wait(&mut graphics_command_buffer)
         .unwrap();
+    assert_eq!(
+        owned_image.layout().unwrap(),
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+    );
+    drop(owned_image);
     device.begin_command_buffer(&mut transfer_command_buffer).unwrap();
     device.end_command_buffer(&mut transfer_command_buffer).unwrap();
     device

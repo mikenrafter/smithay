@@ -439,6 +439,16 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn transition_image_layout(
+        &self,
+        command_buffer: &mut VulkanCommandBuffer,
+        image: &VulkanOwnedImage,
+        new_layout: vk::ImageLayout,
+    ) -> Result<(), VulkanError> {
+        transition_image_layout(command_buffer, image, new_layout)
+    }
+
+    #[allow(dead_code)]
     pub(super) fn create_bound_image(
         &self,
         extent: vk::Extent3D,
@@ -536,11 +546,13 @@ fn allocate_command_buffer(
     Ok(VulkanCommandBuffer {
         command_pool: Arc::clone(command_pool),
         handle,
+        pending_image_layouts: Vec::new(),
     })
 }
 
 fn begin_command_buffer(command_buffer: &mut VulkanCommandBuffer) -> Result<(), VulkanError> {
     let _pool_guard = command_buffer.command_pool.lock_host_access()?;
+    command_buffer.pending_image_layouts.clear();
     let begin_info =
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
@@ -585,7 +597,108 @@ fn submit_command_buffer_and_wait(
 
     unsafe { logical_device.handle().destroy_fence(fence, None) };
 
-    result
+    result.and_then(|_| command_buffer.commit_pending_image_layouts())
+}
+
+fn transition_image_layout(
+    command_buffer: &mut VulkanCommandBuffer,
+    image: &VulkanOwnedImage,
+    new_layout: vk::ImageLayout,
+) -> Result<(), VulkanError> {
+    let old_layout = command_buffer
+        .pending_layout_for(image)?
+        .unwrap_or(image.layout()?);
+    if old_layout == new_layout {
+        return Ok(());
+    }
+
+    let transition = image_layout_transition(old_layout, new_layout, image.usage())?;
+    let barrier = vk::ImageMemoryBarrier::default()
+        .old_layout(old_layout)
+        .new_layout(new_layout)
+        .src_access_mask(transition.src_access)
+        .dst_access_mask(transition.dst_access)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image.image())
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let _pool_guard = command_buffer.command_pool.lock_host_access()?;
+
+    unsafe {
+        command_buffer
+            .command_pool
+            .logical_device
+            .handle()
+            .cmd_pipeline_barrier(
+                command_buffer.handle,
+                transition.src_stage,
+                transition.dst_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            )
+    };
+
+    command_buffer
+        .pending_image_layouts
+        .push(VulkanPendingImageLayout {
+            image: image.image(),
+            resource: Arc::clone(&image.inner),
+            new_layout,
+        });
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct VulkanLayoutTransition {
+    src_stage: vk::PipelineStageFlags,
+    dst_stage: vk::PipelineStageFlags,
+    src_access: vk::AccessFlags,
+    dst_access: vk::AccessFlags,
+}
+
+pub(super) fn image_layout_transition(
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    usage: vk::ImageUsageFlags,
+) -> Result<VulkanLayoutTransition, VulkanError> {
+    match (old_layout, new_layout) {
+        (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => {
+            if !usage.contains(vk::ImageUsageFlags::TRANSFER_DST) {
+                return Err(VulkanError::UnsupportedOperation(
+                    "image transfer destination usage",
+                ));
+            }
+
+            Ok(VulkanLayoutTransition {
+                src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+                dst_stage: vk::PipelineStageFlags::TRANSFER,
+                src_access: vk::AccessFlags::empty(),
+                dst_access: vk::AccessFlags::TRANSFER_WRITE,
+            })
+        }
+        (vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) => {
+            if !usage.contains(vk::ImageUsageFlags::SAMPLED) {
+                return Err(VulkanError::UnsupportedOperation("image sampled usage"));
+            }
+
+            Ok(VulkanLayoutTransition {
+                src_stage: vk::PipelineStageFlags::TRANSFER,
+                dst_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
+                src_access: vk::AccessFlags::TRANSFER_WRITE,
+                dst_access: vk::AccessFlags::SHADER_READ,
+            })
+        }
+        _ => Err(VulkanError::UnsupportedOperation("image layout transition")),
+    }
 }
 
 pub(super) fn find_memory_type_index(
@@ -749,12 +862,15 @@ fn create_bound_image(
     }
 
     Ok(VulkanOwnedImage {
-        logical_device: logical_device.clone(),
-        image,
-        memory,
-        extent,
-        format,
-        usage,
+        inner: Arc::new(VulkanOwnedImageInner {
+            logical_device: logical_device.clone(),
+            image,
+            memory,
+            extent,
+            format,
+            usage,
+            layout: Mutex::new(vk::ImageLayout::UNDEFINED),
+        }),
     })
 }
 
@@ -847,12 +963,42 @@ impl Drop for VulkanCommandPool {
 pub(crate) struct VulkanCommandBuffer {
     command_pool: Arc<VulkanCommandPool>,
     handle: vk::CommandBuffer,
+    pending_image_layouts: Vec<VulkanPendingImageLayout>,
 }
 
 impl VulkanCommandBuffer {
     pub(super) fn handle(&self) -> vk::CommandBuffer {
         self.handle
     }
+
+    fn pending_layout_for(&self, image: &VulkanOwnedImage) -> Result<Option<vk::ImageLayout>, VulkanError> {
+        Ok(self
+            .pending_image_layouts
+            .iter()
+            .rev()
+            .find(|pending| pending.image == image.image())
+            .map(|pending| pending.new_layout))
+    }
+
+    fn commit_pending_image_layouts(&mut self) -> Result<(), VulkanError> {
+        for pending in &self.pending_image_layouts {
+            *pending
+                .resource
+                .layout
+                .lock()
+                .map_err(|_| host_synchronization_failed())? = pending.new_layout;
+        }
+
+        self.pending_image_layouts.clear();
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct VulkanPendingImageLayout {
+    image: vk::Image,
+    resource: Arc<VulkanOwnedImageInner>,
+    new_layout: vk::ImageLayout,
 }
 
 impl Drop for VulkanCommandBuffer {
@@ -873,39 +1019,55 @@ impl Drop for VulkanCommandBuffer {
 
 /// Vulkan image bound to owned device memory.
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct VulkanOwnedImage {
+    inner: Arc<VulkanOwnedImageInner>,
+}
+
+/// Shared owned image resource kept alive by command buffers that reference it.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct VulkanOwnedImageInner {
     logical_device: VulkanLogicalDevice,
     image: vk::Image,
     memory: vk::DeviceMemory,
     extent: vk::Extent3D,
     format: vk::Format,
     usage: vk::ImageUsageFlags,
+    layout: Mutex<vk::ImageLayout>,
 }
 
 impl VulkanOwnedImage {
     pub(super) fn image(&self) -> vk::Image {
-        self.image
+        self.inner.image
     }
 
     pub(super) fn memory(&self) -> vk::DeviceMemory {
-        self.memory
+        self.inner.memory
     }
 
     pub(super) fn extent(&self) -> vk::Extent3D {
-        self.extent
+        self.inner.extent
     }
 
     pub(super) fn format(&self) -> vk::Format {
-        self.format
+        self.inner.format
     }
 
     pub(super) fn usage(&self) -> vk::ImageUsageFlags {
-        self.usage
+        self.inner.usage
+    }
+
+    pub(super) fn layout(&self) -> Result<vk::ImageLayout, VulkanError> {
+        self.inner
+            .layout
+            .lock()
+            .map(|layout| *layout)
+            .map_err(|_| host_synchronization_failed())
     }
 }
 
-impl Drop for VulkanOwnedImage {
+impl Drop for VulkanOwnedImageInner {
     fn drop(&mut self) {
         unsafe {
             self.logical_device.handle().destroy_image(self.image, None);
