@@ -446,6 +446,14 @@ impl VulkanDeviceState {
         usage: vk::ImageUsageFlags,
         required_memory_properties: vk::MemoryPropertyFlags,
     ) -> Result<VulkanOwnedImage, VulkanError> {
+        let instance = self
+            .instance
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing instance".to_owned()))?;
+        let physical_device = self
+            .physical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing physical device".to_owned()))?;
         let logical_device = self
             .logical_device
             .as_ref()
@@ -455,6 +463,9 @@ impl VulkanDeviceState {
             .memory_properties
             .as_ref()
             .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing memory properties".to_owned()))?;
+
+        let _properties =
+            validate_optimal_2d_image_support(instance, physical_device, extent, format, usage)?;
 
         create_bound_image(
             &logical_device,
@@ -640,6 +651,57 @@ fn create_image(
     unsafe { logical_device.handle().create_image(&image_info, None) }.map_err(VulkanError::from)
 }
 
+fn validate_optimal_2d_image_support(
+    instance: &Instance,
+    physical_device: &PhysicalDevice,
+    extent: vk::Extent3D,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+) -> Result<vk::ImageFormatProperties, VulkanError> {
+    if usage.is_empty() {
+        return Err(VulkanError::UnsupportedOperation("empty image usage"));
+    }
+    if extent.width == 0 || extent.height == 0 || extent.depth == 0 {
+        return Err(VulkanError::UnsupportedOperation("zero-sized image"));
+    }
+
+    let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(format)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(usage)
+        .flags(vk::ImageCreateFlags::empty());
+    let mut image_format_properties = vk::ImageFormatProperties2::default();
+
+    unsafe {
+        instance.handle().get_physical_device_image_format_properties2(
+            physical_device.handle(),
+            &format_info,
+            &mut image_format_properties,
+        )
+    }
+    .map_err(|err| {
+        if err == vk::Result::ERROR_FORMAT_NOT_SUPPORTED {
+            VulkanError::UnsupportedOperation("image format unsupported")
+        } else {
+            VulkanError::from(err)
+        }
+    })?;
+
+    let properties = image_format_properties.image_format_properties;
+    if properties.max_extent.width < extent.width
+        || properties.max_extent.height < extent.height
+        || properties.max_extent.depth < extent.depth
+    {
+        return Err(VulkanError::UnsupportedOperation("image extent"));
+    }
+    if !properties.sample_counts.contains(vk::SampleCountFlags::TYPE_1) {
+        return Err(VulkanError::UnsupportedOperation("image sample count"));
+    }
+
+    Ok(properties)
+}
+
 fn create_bound_image(
     logical_device: &VulkanLogicalDevice,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
@@ -648,6 +710,9 @@ fn create_bound_image(
     usage: vk::ImageUsageFlags,
     required_memory_properties: vk::MemoryPropertyFlags,
 ) -> Result<VulkanOwnedImage, VulkanError> {
+    if usage.is_empty() {
+        return Err(VulkanError::UnsupportedOperation("empty image usage"));
+    }
     if extent.width == 0 || extent.height == 0 || extent.depth == 0 {
         return Err(VulkanError::UnsupportedOperation("zero-sized image"));
     }

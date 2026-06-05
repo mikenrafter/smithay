@@ -327,7 +327,7 @@ fn buffer_creation_requires_initialized_device() {
             vk::ImageUsageFlags::TRANSFER_DST,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         ),
-        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
+        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing instance"
     ));
 }
 
@@ -878,6 +878,32 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert!(owned_image.usage().contains(vk::ImageUsageFlags::TRANSFER_DST));
     assert!(owned_image.usage().contains(vk::ImageUsageFlags::SAMPLED));
     drop(owned_image);
+    assert!(matches!(
+        device.create_bound_image(
+            vk::Extent3D {
+                width: 0,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ),
+        Err(VulkanError::UnsupportedOperation("zero-sized image"))
+    ));
+    assert!(matches!(
+        device.create_bound_image(
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::empty(),
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ),
+        Err(VulkanError::UnsupportedOperation("empty image usage"))
+    ));
     let mut graphics_command_buffer = device.allocate_graphics_command_buffer().unwrap();
     let mut transfer_command_buffer = device.allocate_transfer_command_buffer().unwrap();
     assert_ne!(graphics_command_buffer.handle(), vk::CommandBuffer::null());
