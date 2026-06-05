@@ -11,7 +11,7 @@ use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 use super::capabilities::{format_usage_from_features, linear_tiling_supported};
 use super::device::{
     VulkanDeviceState, find_memory_type_index, image_layout_transition, select_queue_families,
-    tightly_packed_image_size,
+    tightly_packed_image_size, vulkan_filter,
 };
 use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
@@ -335,6 +335,12 @@ fn tightly_packed_image_size_matches_supported_renderer_formats() {
 }
 
 #[test]
+fn texture_filters_map_to_vulkan_filters() {
+    assert_eq!(vulkan_filter(TextureFilter::Linear), vk::Filter::LINEAR);
+    assert_eq!(vulkan_filter(TextureFilter::Nearest), vk::Filter::NEAREST);
+}
+
+#[test]
 fn buffer_creation_requires_initialized_device() {
     let device = VulkanDeviceState::empty_for_tests();
 
@@ -414,6 +420,10 @@ fn buffer_creation_requires_initialized_device() {
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         ),
         Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing instance"
+    ));
+    assert!(matches!(
+        device.create_sampler(TextureFilter::Linear, TextureFilter::Nearest),
+        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
     ));
 }
 
@@ -1074,6 +1084,17 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         uploaded_image.layout().unwrap(),
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
     );
+    let uploaded_view = device.create_image_view(&uploaded_image).unwrap();
+    assert_ne!(uploaded_view.handle(), vk::ImageView::null());
+    assert_eq!(uploaded_view.image(), uploaded_image.image());
+    let uploaded_sampler = device
+        .create_sampler(TextureFilter::Nearest, TextureFilter::Linear)
+        .unwrap();
+    assert_ne!(uploaded_sampler.handle(), vk::Sampler::null());
+    assert_eq!(uploaded_sampler.min_filter(), TextureFilter::Nearest);
+    assert_eq!(uploaded_sampler.mag_filter(), TextureFilter::Linear);
+    drop(uploaded_sampler);
+    drop(uploaded_view);
     assert!(matches!(
         device.create_uploaded_image(
             vk::Extent3D {
@@ -1086,6 +1107,26 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         ),
         Err(VulkanError::UnsupportedOperation("image upload data"))
     ));
+    let sampled_image = device
+        .create_uploaded_sampled_image(
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            &[0x00, 0x00, 0xff, 0xff],
+            TextureFilter::Linear,
+            TextureFilter::Linear,
+        )
+        .unwrap();
+    assert_ne!(sampled_image.image().image(), vk::Image::null());
+    assert_ne!(sampled_image.view().handle(), vk::ImageView::null());
+    assert_ne!(sampled_image.sampler().handle(), vk::Sampler::null());
+    assert_eq!(
+        sampled_image.image().layout().unwrap(),
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+    );
     assert!(caps.device.available);
     assert!(caps.device.extensions.is_empty());
     assert!(!caps.import.memory);

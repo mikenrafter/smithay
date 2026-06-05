@@ -6,7 +6,10 @@ use std::{
 
 use ash::vk;
 
-use crate::backend::vulkan::{Instance, PhysicalDevice};
+use crate::backend::{
+    renderer::TextureFilter,
+    vulkan::{Instance, PhysicalDevice},
+};
 
 use super::{VulkanError, VulkanRendererCapabilities};
 
@@ -501,6 +504,46 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn create_image_view(&self, image: &VulkanOwnedImage) -> Result<VulkanImageView, VulkanError> {
+        self.logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        create_image_view(image)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn create_sampler(
+        &self,
+        min_filter: TextureFilter,
+        mag_filter: TextureFilter,
+    ) -> Result<VulkanSampler, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+
+        create_sampler(&logical_device, min_filter, mag_filter)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn create_uploaded_sampled_image(
+        &self,
+        extent: vk::Extent3D,
+        format: vk::Format,
+        data: &[u8],
+        min_filter: TextureFilter,
+        mag_filter: TextureFilter,
+    ) -> Result<VulkanSampledImage, VulkanError> {
+        let image = self.create_uploaded_image(extent, format, data)?;
+        let view = self.create_image_view(&image)?;
+        let sampler = self.create_sampler(min_filter, mag_filter)?;
+
+        Ok(VulkanSampledImage { sampler, view, image })
+    }
+
+    #[allow(dead_code)]
     pub(super) fn create_bound_image(
         &self,
         extent: vk::Extent3D,
@@ -849,6 +892,77 @@ pub(super) fn tightly_packed_image_size(
         .and_then(|size| size.checked_mul(u64::from(extent.depth)))
         .and_then(|size| size.checked_mul(bytes_per_texel))
         .ok_or(VulkanError::UnsupportedOperation("image data size"))
+}
+
+fn create_image_view(image: &VulkanOwnedImage) -> Result<VulkanImageView, VulkanError> {
+    if !image.usage().contains(vk::ImageUsageFlags::SAMPLED) {
+        return Err(VulkanError::UnsupportedOperation("image sampled usage"));
+    }
+
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image.image())
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(image.format())
+        .components(vk::ComponentMapping::default())
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let view = unsafe {
+        image
+            .inner
+            .logical_device
+            .handle()
+            .create_image_view(&view_info, None)
+    }
+    .map_err(VulkanError::from)?;
+
+    Ok(VulkanImageView {
+        image: Arc::clone(&image.inner),
+        view,
+    })
+}
+
+fn create_sampler(
+    logical_device: &VulkanLogicalDevice,
+    min_filter: TextureFilter,
+    mag_filter: TextureFilter,
+) -> Result<VulkanSampler, VulkanError> {
+    let sampler_info = vk::SamplerCreateInfo::default()
+        .mag_filter(vulkan_filter(mag_filter))
+        .min_filter(vulkan_filter(min_filter))
+        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .mip_lod_bias(0.0)
+        .anisotropy_enable(false)
+        .max_anisotropy(1.0)
+        .compare_enable(false)
+        .compare_op(vk::CompareOp::ALWAYS)
+        .min_lod(0.0)
+        .max_lod(0.0)
+        .border_color(vk::BorderColor::FLOAT_TRANSPARENT_BLACK)
+        .unnormalized_coordinates(false);
+    let sampler =
+        unsafe { logical_device.handle().create_sampler(&sampler_info, None) }.map_err(VulkanError::from)?;
+
+    Ok(VulkanSampler {
+        logical_device: logical_device.clone(),
+        sampler,
+        min_filter,
+        mag_filter,
+    })
+}
+
+pub(super) fn vulkan_filter(filter: TextureFilter) -> vk::Filter {
+    match filter {
+        TextureFilter::Linear => vk::Filter::LINEAR,
+        TextureFilter::Nearest => vk::Filter::NEAREST,
+    }
 }
 
 pub(super) fn find_memory_type_index(
@@ -1227,6 +1341,88 @@ impl Drop for VulkanOwnedImageInner {
             self.logical_device.handle().destroy_image(self.image, None);
             self.logical_device.handle().free_memory(self.memory, None);
         }
+    }
+}
+
+/// Image view for a sampled Vulkan image.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanImageView {
+    image: Arc<VulkanOwnedImageInner>,
+    view: vk::ImageView,
+}
+
+impl VulkanImageView {
+    pub(super) fn handle(&self) -> vk::ImageView {
+        self.view
+    }
+
+    pub(super) fn image(&self) -> vk::Image {
+        self.image.image
+    }
+}
+
+impl Drop for VulkanImageView {
+    fn drop(&mut self) {
+        unsafe {
+            self.image
+                .logical_device
+                .handle()
+                .destroy_image_view(self.view, None)
+        };
+    }
+}
+
+/// Vulkan sampler for uploaded textures.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanSampler {
+    logical_device: VulkanLogicalDevice,
+    sampler: vk::Sampler,
+    min_filter: TextureFilter,
+    mag_filter: TextureFilter,
+}
+
+impl VulkanSampler {
+    pub(super) fn handle(&self) -> vk::Sampler {
+        self.sampler
+    }
+
+    pub(super) fn min_filter(&self) -> TextureFilter {
+        self.min_filter
+    }
+
+    pub(super) fn mag_filter(&self) -> TextureFilter {
+        self.mag_filter
+    }
+}
+
+impl Drop for VulkanSampler {
+    fn drop(&mut self) {
+        unsafe { self.logical_device.handle().destroy_sampler(self.sampler, None) };
+    }
+}
+
+/// Uploaded sampled image bundle for the future Vulkan texture path.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanSampledImage {
+    sampler: VulkanSampler,
+    view: VulkanImageView,
+    image: VulkanOwnedImage,
+}
+
+impl VulkanSampledImage {
+    pub(super) fn image(&self) -> &VulkanOwnedImage {
+        &self.image
+    }
+
+    pub(super) fn view(&self) -> &VulkanImageView {
+        &self.view
+    }
+
+    pub(super) fn sampler(&self) -> &VulkanSampler {
+        &self.sampler
     }
 }
 
