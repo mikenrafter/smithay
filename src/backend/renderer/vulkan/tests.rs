@@ -11,6 +11,7 @@ use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 use super::capabilities::{format_usage_from_features, linear_tiling_supported};
 use super::device::{
     VulkanDeviceState, find_memory_type_index, image_layout_transition, select_queue_families,
+    tightly_packed_image_size,
 };
 use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
@@ -293,6 +294,43 @@ fn image_layout_transition_requires_matching_image_usage() {
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
         ),
         Err(VulkanError::UnsupportedOperation("image layout transition"))
+    ));
+}
+
+#[test]
+fn tightly_packed_image_size_matches_supported_renderer_formats() {
+    let extent = vk::Extent3D {
+        width: 2,
+        height: 3,
+        depth: 1,
+    };
+
+    assert_eq!(
+        tightly_packed_image_size(vk::Format::R8G8B8A8_UNORM, extent).unwrap(),
+        24
+    );
+    assert_eq!(
+        tightly_packed_image_size(vk::Format::B8G8R8A8_UNORM, extent).unwrap(),
+        24
+    );
+    assert_eq!(
+        tightly_packed_image_size(vk::Format::R5G6B5_UNORM_PACK16, extent).unwrap(),
+        12
+    );
+    assert!(matches!(
+        tightly_packed_image_size(
+            vk::Format::R8G8B8A8_UNORM,
+            vk::Extent3D {
+                width: 0,
+                height: 1,
+                depth: 1,
+            },
+        ),
+        Err(VulkanError::UnsupportedOperation("zero-sized image"))
+    ));
+    assert!(matches!(
+        tightly_packed_image_size(vk::Format::D32_SFLOAT, extent),
+        Err(VulkanError::UnsupportedOperation("tightly packed image format"))
     ));
 }
 
@@ -1018,6 +1056,36 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     device
         .submit_transfer_command_buffer_and_wait(&mut transfer_command_buffer)
         .unwrap();
+    let uploaded_image = device
+        .create_uploaded_image(
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            &[0x00, 0xff, 0x00, 0xff, 0xaa],
+        )
+        .unwrap();
+    assert_ne!(uploaded_image.image(), vk::Image::null());
+    assert_eq!(uploaded_image.extent().width, 1);
+    assert_eq!(uploaded_image.format(), vk::Format::R8G8B8A8_UNORM);
+    assert_eq!(
+        uploaded_image.layout().unwrap(),
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+    );
+    assert!(matches!(
+        device.create_uploaded_image(
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            &[0x00, 0xff, 0x00],
+        ),
+        Err(VulkanError::UnsupportedOperation("image upload data"))
+    ));
     assert!(caps.device.available);
     assert!(caps.device.extensions.is_empty());
     assert!(!caps.import.memory);

@@ -463,6 +463,44 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn create_uploaded_image(
+        &self,
+        extent: vk::Extent3D,
+        format: vk::Format,
+        data: &[u8],
+    ) -> Result<VulkanOwnedImage, VulkanError> {
+        let required_size = tightly_packed_image_size(format, extent)?;
+        if (data.len() as vk::DeviceSize) < required_size {
+            return Err(VulkanError::UnsupportedOperation("image upload data"));
+        }
+        let required_len = usize::try_from(required_size)
+            .map_err(|_| VulkanError::UnsupportedOperation("image data size"))?;
+
+        let staging = self.create_host_visible_buffer(required_size, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        staging.write(&data[..required_len])?;
+        let image = self.create_bound_image(
+            extent,
+            format,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        let mut command_buffer = self.allocate_graphics_command_buffer()?;
+
+        self.begin_command_buffer(&mut command_buffer)?;
+        self.transition_image_layout(&mut command_buffer, &image, vk::ImageLayout::TRANSFER_DST_OPTIMAL)?;
+        self.copy_buffer_to_image(&mut command_buffer, &staging, &image, extent)?;
+        self.transition_image_layout(
+            &mut command_buffer,
+            &image,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        )?;
+        self.end_command_buffer(&mut command_buffer)?;
+        self.submit_graphics_command_buffer_and_wait(&mut command_buffer)?;
+
+        Ok(image)
+    }
+
+    #[allow(dead_code)]
     pub(super) fn create_bound_image(
         &self,
         extent: vk::Extent3D,
@@ -786,6 +824,31 @@ pub(super) fn image_layout_transition(
         }
         _ => Err(VulkanError::UnsupportedOperation("image layout transition")),
     }
+}
+
+pub(super) fn tightly_packed_image_size(
+    format: vk::Format,
+    extent: vk::Extent3D,
+) -> Result<vk::DeviceSize, VulkanError> {
+    if extent.width == 0 || extent.height == 0 || extent.depth == 0 {
+        return Err(VulkanError::UnsupportedOperation("zero-sized image"));
+    }
+
+    let bytes_per_texel: vk::DeviceSize = match format {
+        vk::Format::R5G6B5_UNORM_PACK16 => 2,
+        vk::Format::B8G8R8A8_UNORM
+        | vk::Format::R8G8B8A8_UNORM
+        | vk::Format::A8B8G8R8_UNORM_PACK32
+        | vk::Format::A2R10G10B10_UNORM_PACK32
+        | vk::Format::A2B10G10R10_UNORM_PACK32 => 4,
+        _ => return Err(VulkanError::UnsupportedOperation("tightly packed image format")),
+    };
+
+    u64::from(extent.width)
+        .checked_mul(u64::from(extent.height))
+        .and_then(|size| size.checked_mul(u64::from(extent.depth)))
+        .and_then(|size| size.checked_mul(bytes_per_texel))
+        .ok_or(VulkanError::UnsupportedOperation("image data size"))
 }
 
 pub(super) fn find_memory_type_index(
