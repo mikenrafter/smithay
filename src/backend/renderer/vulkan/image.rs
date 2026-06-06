@@ -12,8 +12,8 @@ use crate::{
 
 use super::{
     VulkanError, VulkanRenderer, clear_color_value_for_format,
-    device::{VulkanDeviceState, VulkanOwnedImage, VulkanSampledImage},
-    format::get_render_vk_format,
+    device::{VulkanDeviceState, VulkanOwnedImage, VulkanSampledImage, VulkanSampledTextureDrawConstants},
+    format::{get_format_info, get_render_vk_format},
 };
 
 /// Vulkan frame scaffold.
@@ -371,7 +371,7 @@ impl Frame for VulkanFrame<'_, '_> {
         if src_transform != Transform::Normal || self.transform != Transform::Normal {
             return Err(VulkanError::UnsupportedOperation("render texture transform"));
         }
-        if alpha != 1.0 {
+        if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
             return Err(VulkanError::UnsupportedOperation("render texture alpha"));
         }
         if texture.y_inverted {
@@ -397,6 +397,11 @@ impl Frame for VulkanFrame<'_, '_> {
             .sampled_image
             .as_ref()
             .ok_or(VulkanError::UnsupportedOperation("render texture image"))?;
+        let texture_format = texture
+            .image
+            .format
+            .ok_or(VulkanError::UnsupportedOperation("render texture format"))?;
+        let force_opaque_alpha = get_format_info(texture_format)?.opaque_alpha;
 
         let pipeline =
             device.create_builtin_sampled_texture_graphics_pipeline(get_render_vk_format(target_format)?)?;
@@ -411,8 +416,12 @@ impl Frame for VulkanFrame<'_, '_> {
             color_image,
             &descriptor_set,
             &pipeline,
-            draw_area,
-            uv_rect,
+            VulkanSampledTextureDrawConstants {
+                draw_area,
+                uv_rect,
+                alpha,
+                force_opaque_alpha,
+            },
         )?;
         target.image.layout = VulkanImageLayoutState::ColorAttachment;
         Ok(())

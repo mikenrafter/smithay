@@ -14,7 +14,15 @@ use crate::backend::{
 use super::{VulkanError, VulkanRendererCapabilities};
 
 const SAMPLED_TEXTURE_FULL_UV_RECT: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
-const SAMPLED_TEXTURE_UV_RECT_PUSH_CONSTANT_SIZE: u32 = 16;
+const SAMPLED_TEXTURE_DRAW_CONSTANT_SIZE: u32 = 24;
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct VulkanSampledTextureDrawConstants {
+    pub(super) draw_area: vk::Rect2D,
+    pub(super) uv_rect: [f32; 4],
+    pub(super) alpha: f32,
+    pub(super) force_opaque_alpha: bool,
+}
 
 /// Device state placeholder for the future Vulkan renderer implementation.
 #[allow(dead_code)]
@@ -767,6 +775,21 @@ impl VulkanDeviceState {
             shaders.color_format,
             vk::ImageUsageFlags::COLOR_ATTACHMENT,
         )?;
+        // SAFETY: `physical_device` belongs to `instance`, and querying format properties is
+        // read-only with no additional extension or lifetime requirements.
+        let format_properties = unsafe {
+            instance
+                .handle()
+                .get_physical_device_format_properties(physical_device.handle(), shaders.color_format)
+        };
+        if !format_properties
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND)
+        {
+            return Err(VulkanError::UnsupportedOperation(
+                "graphics pipeline blend format",
+            ));
+        }
 
         let vertex_shader = create_shader_module(&logical_device, shaders.vertex)?;
         let fragment_shader = create_shader_module(&logical_device, shaders.fragment)?;
@@ -802,7 +825,8 @@ impl VulkanDeviceState {
         // They contain compatible vertex/fragment `main` entry points, no non-built-in vertex
         // inputs, matching location interfaces, set 0 binding 0 as a combined image sampler, and
         // one color output compatible with the renderer's UNORM color-attachment formats. The
-        // fragment shader reads a 16-byte push-constant UV rectangle covered by the pipeline layout.
+        // fragment shader reads a 24-byte push-constant block containing a UV rectangle, global
+        // alpha value, and opaque-alpha flag covered by the pipeline layout.
         let shaders = unsafe {
             VulkanSampledTexturePipelineShaders::from_spirv_unchecked(
                 color_format,
@@ -833,8 +857,12 @@ impl VulkanDeviceState {
             target,
             descriptor_set,
             pipeline,
-            draw_area,
-            SAMPLED_TEXTURE_FULL_UV_RECT,
+            VulkanSampledTextureDrawConstants {
+                draw_area,
+                uv_rect: SAMPLED_TEXTURE_FULL_UV_RECT,
+                alpha: 1.0,
+                force_opaque_alpha: false,
+            },
         )
     }
 
@@ -844,16 +872,15 @@ impl VulkanDeviceState {
         target: &VulkanOwnedImage,
         descriptor_set: &VulkanSampledTextureDescriptorSet,
         pipeline: &VulkanSampledTextureGraphicsPipeline,
-        draw_area: vk::Rect2D,
-        uv_rect: [f32; 4],
+        draw_constants: VulkanSampledTextureDrawConstants,
     ) -> Result<(), VulkanError> {
         let logical_device = self
             .logical_device
             .as_ref()
             .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
         validate_sampled_texture_draw_inputs(logical_device, target, descriptor_set, pipeline)?;
-        validate_sampled_texture_draw_area(target, draw_area)?;
-        validate_sampled_texture_uv_rect(uv_rect)?;
+        validate_sampled_texture_draw_area(target, draw_constants.draw_area)?;
+        validate_sampled_texture_draw_constants(draw_constants)?;
 
         let view = self.create_color_attachment_image_view(target)?;
         let framebuffer = create_single_color_framebuffer(pipeline.render_pass(), &view, target.extent())?;
@@ -872,8 +899,7 @@ impl VulkanDeviceState {
             pipeline,
             descriptor_set,
             &framebuffer,
-            draw_area,
-            uv_rect,
+            draw_constants,
         )?;
         self.end_command_buffer(&mut command_buffer)?;
         self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
@@ -1377,8 +1403,7 @@ fn record_sampled_texture_draw(
     pipeline: &VulkanSampledTextureGraphicsPipeline,
     descriptor_set: &VulkanSampledTextureDescriptorSet,
     framebuffer: &VulkanFramebuffer,
-    draw_area: vk::Rect2D,
-    uv_rect: [f32; 4],
+    draw_constants: VulkanSampledTextureDrawConstants,
 ) -> Result<(), VulkanError> {
     if !target.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
         return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
@@ -1389,8 +1414,8 @@ fn record_sampled_texture_draw(
         descriptor_set,
         pipeline,
     )?;
-    validate_sampled_texture_draw_area(target, draw_area)?;
-    validate_sampled_texture_uv_rect(uv_rect)?;
+    validate_sampled_texture_draw_area(target, draw_constants.draw_area)?;
+    validate_sampled_texture_draw_constants(draw_constants)?;
 
     let image_layout = command_buffer
         .pending_layout_for(target)?
@@ -1417,23 +1442,23 @@ fn record_sampled_texture_draw(
         .render_area(render_area)
         .clear_values(&clear_values);
     let viewport = [vk::Viewport {
-        x: draw_area.offset.x as f32,
-        y: draw_area.offset.y as f32,
-        width: draw_area.extent.width as f32,
-        height: draw_area.extent.height as f32,
+        x: draw_constants.draw_area.offset.x as f32,
+        y: draw_constants.draw_area.offset.y as f32,
+        width: draw_constants.draw_area.extent.width as f32,
+        height: draw_constants.draw_area.extent.height as f32,
         min_depth: 0.0,
         max_depth: 1.0,
     }];
-    let scissors = [draw_area];
+    let scissors = [draw_constants.draw_area];
     let descriptor_sets = [descriptor_set.handle()];
-    let uv_rect_push_constants = uv_rect_push_constant_bytes(uv_rect);
+    let draw_constant_bytes = sampled_texture_draw_constant_bytes(draw_constants);
     let _pool_guard = command_buffer.command_pool.lock_host_access()?;
 
     // SAFETY: All bound objects were created from the same logical device by private constructors.
     // `target` is in COLOR_ATTACHMENT_OPTIMAL for the duration of the render pass, the framebuffer
     // uses the same render pass as `pipeline`, dynamic viewport/scissor are set before drawing, and
     // `descriptor_set` retains the sampled image resources it references, and the pipeline layout
-    // contains a fragment-stage push-constant range covering the 16 bytes written here. The command
+    // contains a fragment-stage push-constant range covering the 24 bytes written here. The command
     // buffer is host synchronized by the command-pool lock.
     unsafe {
         let device = command_buffer.command_pool.logical_device.handle();
@@ -1458,7 +1483,7 @@ fn record_sampled_texture_draw(
             pipeline.layout().pipeline_layout().handle(),
             vk::ShaderStageFlags::FRAGMENT,
             0,
-            &uv_rect_push_constants,
+            &draw_constant_bytes,
         );
         device.cmd_draw(command_buffer.handle, 3, 1, 0, 0);
         device.cmd_end_render_pass(command_buffer.handle);
@@ -1524,31 +1549,47 @@ fn validate_sampled_texture_draw_area(
     Ok(())
 }
 
-fn validate_sampled_texture_uv_rect(uv_rect: [f32; 4]) -> Result<(), VulkanError> {
-    let [u_offset, v_offset, u_scale, v_scale] = uv_rect;
+fn validate_sampled_texture_draw_constants(
+    draw_constants: VulkanSampledTextureDrawConstants,
+) -> Result<(), VulkanError> {
+    let [u_offset, v_offset, u_scale, v_scale] = draw_constants.uv_rect;
     const UV_RECT_EPSILON: f32 = 0.000_001;
 
-    if !uv_rect.iter().all(|component| component.is_finite())
+    if !draw_constants
+        .uv_rect
+        .iter()
+        .all(|component| component.is_finite())
+        || !draw_constants.alpha.is_finite()
         || u_offset < 0.0
         || v_offset < 0.0
         || u_scale <= 0.0
         || v_scale <= 0.0
         || u_offset + u_scale > 1.0 + UV_RECT_EPSILON
         || v_offset + v_scale > 1.0 + UV_RECT_EPSILON
+        || !(0.0..=1.0).contains(&draw_constants.alpha)
     {
-        return Err(VulkanError::UnsupportedOperation("sampled texture uv rect"));
+        return Err(VulkanError::UnsupportedOperation(
+            "sampled texture draw constants",
+        ));
     }
 
     Ok(())
 }
 
-fn uv_rect_push_constant_bytes(uv_rect: [f32; 4]) -> [u8; 16] {
-    let [u_offset, v_offset, u_scale, v_scale] = uv_rect;
-    let mut bytes = [0; 16];
+fn sampled_texture_draw_constant_bytes(draw_constants: VulkanSampledTextureDrawConstants) -> [u8; 24] {
+    let [u_offset, v_offset, u_scale, v_scale] = draw_constants.uv_rect;
+    let force_opaque_alpha = if draw_constants.force_opaque_alpha {
+        1.0f32
+    } else {
+        0.0
+    };
+    let mut bytes = [0; 24];
     bytes[0..4].copy_from_slice(&u_offset.to_ne_bytes());
     bytes[4..8].copy_from_slice(&v_offset.to_ne_bytes());
     bytes[8..12].copy_from_slice(&u_scale.to_ne_bytes());
     bytes[12..16].copy_from_slice(&v_scale.to_ne_bytes());
+    bytes[16..20].copy_from_slice(&draw_constants.alpha.to_ne_bytes());
+    bytes[20..24].copy_from_slice(&force_opaque_alpha.to_ne_bytes());
     bytes
 }
 
@@ -2531,7 +2572,7 @@ impl<'code> VulkanSampledTexturePipelineShaders<'code> {
     /// pipeline uses an empty vertex-input state. The fragment module must provide a `main` entry
     /// point with the fragment execution model. Their location interfaces must match, the fragment
     /// module must use descriptor set 0 binding 0 as a single `COMBINED_IMAGE_SAMPLER`. If the
-    /// fragment module reads push constants, those reads must fit inside the first 16 bytes provided
+    /// fragment module reads push constants, those reads must fit inside the first 24 bytes provided
     /// by this sampled-texture pipeline layout. Its color output must be compatible with a single
     /// `color_format` color attachment in subpass 0 of the render pass used by the scaffold.
     pub(super) unsafe fn from_spirv_unchecked(
@@ -2598,34 +2639,50 @@ const BUILTIN_TEXTURED_VERTEX_SHADER_SPIRV: &[u32] = &[
 ];
 
 const BUILTIN_TEXTURED_FRAGMENT_SHADER_SPIRV: &[u32] = &[
-    0x07230203, 0x00010000, 0x0008000b, 0x00000022, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x07230203, 0x00010000, 0x0008000b, 0x00000037, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
-    0x0007000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x0000001a, 0x00030010,
+    0x0007000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x0000001a, 0x00000031, 0x00030010,
     0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d,
-    0x00000000, 0x00050005, 0x00000009, 0x5f74756f, 0x6f6c6f63, 0x00000072, 0x00030005, 0x0000000d,
-    0x00786574, 0x00040005, 0x0000000f, 0x65527655, 0x00007463, 0x00050006, 0x0000000f, 0x00000000,
-    0x725f7675, 0x00746365, 0x00030005, 0x00000011, 0x00006370, 0x00040005, 0x0000001a, 0x76755f76,
-    0x00000000, 0x00040047, 0x00000009, 0x0000001e, 0x00000000, 0x00040047, 0x0000000d, 0x00000021,
-    0x00000000, 0x00040047, 0x0000000d, 0x00000022, 0x00000000, 0x00030047, 0x0000000f, 0x00000002,
-    0x00050048, 0x0000000f, 0x00000000, 0x00000023, 0x00000000, 0x00040047, 0x0000001a, 0x0000001e,
-    0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006,
-    0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008, 0x00000003,
-    0x00000007, 0x0004003b, 0x00000008, 0x00000009, 0x00000003, 0x00090019, 0x0000000a, 0x00000006,
-    0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x0003001b, 0x0000000b,
-    0x0000000a, 0x00040020, 0x0000000c, 0x00000000, 0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d,
-    0x00000000, 0x0003001e, 0x0000000f, 0x00000007, 0x00040020, 0x00000010, 0x00000009, 0x0000000f,
-    0x0004003b, 0x00000010, 0x00000011, 0x00000009, 0x00040015, 0x00000012, 0x00000020, 0x00000001,
-    0x0004002b, 0x00000012, 0x00000013, 0x00000000, 0x00040017, 0x00000014, 0x00000006, 0x00000002,
-    0x00040020, 0x00000015, 0x00000009, 0x00000007, 0x00040020, 0x00000019, 0x00000001, 0x00000014,
-    0x0004003b, 0x00000019, 0x0000001a, 0x00000001, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
-    0x00000003, 0x000200f8, 0x00000005, 0x0004003d, 0x0000000b, 0x0000000e, 0x0000000d, 0x00050041,
-    0x00000015, 0x00000016, 0x00000011, 0x00000013, 0x0004003d, 0x00000007, 0x00000017, 0x00000016,
-    0x0007004f, 0x00000014, 0x00000018, 0x00000017, 0x00000017, 0x00000000, 0x00000001, 0x0004003d,
-    0x00000014, 0x0000001b, 0x0000001a, 0x00050041, 0x00000015, 0x0000001c, 0x00000011, 0x00000013,
-    0x0004003d, 0x00000007, 0x0000001d, 0x0000001c, 0x0007004f, 0x00000014, 0x0000001e, 0x0000001d,
-    0x0000001d, 0x00000002, 0x00000003, 0x00050085, 0x00000014, 0x0000001f, 0x0000001b, 0x0000001e,
-    0x00050081, 0x00000014, 0x00000020, 0x00000018, 0x0000001f, 0x00050057, 0x00000007, 0x00000021,
-    0x0000000e, 0x00000020, 0x0003003e, 0x00000009, 0x00000021, 0x000100fd, 0x00010038,
+    0x00000000, 0x00040005, 0x00000009, 0x6f6c6f63, 0x00000072, 0x00030005, 0x0000000d, 0x00786574,
+    0x00060005, 0x0000000f, 0x77617244, 0x736e6f43, 0x746e6174, 0x00000073, 0x00050006, 0x0000000f,
+    0x00000000, 0x725f7675, 0x00746365, 0x00050006, 0x0000000f, 0x00000001, 0x68706c61, 0x00000061,
+    0x00080006, 0x0000000f, 0x00000002, 0x63726f66, 0x706f5f65, 0x65757161, 0x706c615f, 0x00006168,
+    0x00030005, 0x00000011, 0x00006370, 0x00040005, 0x0000001a, 0x76755f76, 0x00000000, 0x00050005,
+    0x00000031, 0x5f74756f, 0x6f6c6f63, 0x00000072, 0x00040047, 0x0000000d, 0x00000021, 0x00000000,
+    0x00040047, 0x0000000d, 0x00000022, 0x00000000, 0x00030047, 0x0000000f, 0x00000002, 0x00050048,
+    0x0000000f, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x0000000f, 0x00000001, 0x00000023,
+    0x00000010, 0x00050048, 0x0000000f, 0x00000002, 0x00000023, 0x00000014, 0x00040047, 0x0000001a,
+    0x0000001e, 0x00000000, 0x00040047, 0x00000031, 0x0000001e, 0x00000000, 0x00020013, 0x00000002,
+    0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007,
+    0x00000006, 0x00000004, 0x00040020, 0x00000008, 0x00000007, 0x00000007, 0x00090019, 0x0000000a,
+    0x00000006, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x0003001b,
+    0x0000000b, 0x0000000a, 0x00040020, 0x0000000c, 0x00000000, 0x0000000b, 0x0004003b, 0x0000000c,
+    0x0000000d, 0x00000000, 0x0005001e, 0x0000000f, 0x00000007, 0x00000006, 0x00000006, 0x00040020,
+    0x00000010, 0x00000009, 0x0000000f, 0x0004003b, 0x00000010, 0x00000011, 0x00000009, 0x00040015,
+    0x00000012, 0x00000020, 0x00000001, 0x0004002b, 0x00000012, 0x00000013, 0x00000000, 0x00040017,
+    0x00000014, 0x00000006, 0x00000002, 0x00040020, 0x00000015, 0x00000009, 0x00000007, 0x00040020,
+    0x00000019, 0x00000001, 0x00000014, 0x0004003b, 0x00000019, 0x0000001a, 0x00000001, 0x0004002b,
+    0x00000012, 0x00000022, 0x00000002, 0x00040020, 0x00000023, 0x00000009, 0x00000006, 0x0004002b,
+    0x00000006, 0x00000026, 0x00000000, 0x00020014, 0x00000027, 0x0004002b, 0x00000006, 0x0000002b,
+    0x3f800000, 0x00040015, 0x0000002c, 0x00000020, 0x00000000, 0x0004002b, 0x0000002c, 0x0000002d,
+    0x00000003, 0x00040020, 0x0000002e, 0x00000007, 0x00000006, 0x00040020, 0x00000030, 0x00000003,
+    0x00000007, 0x0004003b, 0x00000030, 0x00000031, 0x00000003, 0x0004002b, 0x00000012, 0x00000033,
+    0x00000001, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005,
+    0x0004003b, 0x00000008, 0x00000009, 0x00000007, 0x0004003d, 0x0000000b, 0x0000000e, 0x0000000d,
+    0x00050041, 0x00000015, 0x00000016, 0x00000011, 0x00000013, 0x0004003d, 0x00000007, 0x00000017,
+    0x00000016, 0x0007004f, 0x00000014, 0x00000018, 0x00000017, 0x00000017, 0x00000000, 0x00000001,
+    0x0004003d, 0x00000014, 0x0000001b, 0x0000001a, 0x00050041, 0x00000015, 0x0000001c, 0x00000011,
+    0x00000013, 0x0004003d, 0x00000007, 0x0000001d, 0x0000001c, 0x0007004f, 0x00000014, 0x0000001e,
+    0x0000001d, 0x0000001d, 0x00000002, 0x00000003, 0x00050085, 0x00000014, 0x0000001f, 0x0000001b,
+    0x0000001e, 0x00050081, 0x00000014, 0x00000020, 0x00000018, 0x0000001f, 0x00050057, 0x00000007,
+    0x00000021, 0x0000000e, 0x00000020, 0x0003003e, 0x00000009, 0x00000021, 0x00050041, 0x00000023,
+    0x00000024, 0x00000011, 0x00000022, 0x0004003d, 0x00000006, 0x00000025, 0x00000024, 0x000500b7,
+    0x00000027, 0x00000028, 0x00000025, 0x00000026, 0x000300f7, 0x0000002a, 0x00000000, 0x000400fa,
+    0x00000028, 0x00000029, 0x0000002a, 0x000200f8, 0x00000029, 0x00050041, 0x0000002e, 0x0000002f,
+    0x00000009, 0x0000002d, 0x0003003e, 0x0000002f, 0x0000002b, 0x000200f9, 0x0000002a, 0x000200f8,
+    0x0000002a, 0x0004003d, 0x00000007, 0x00000032, 0x00000009, 0x00050041, 0x00000023, 0x00000034,
+    0x00000011, 0x00000033, 0x0004003d, 0x00000006, 0x00000035, 0x00000034, 0x0005008e, 0x00000007,
+    0x00000036, 0x00000032, 0x00000035, 0x0003003e, 0x00000031, 0x00000036, 0x000100fd, 0x00010038,
 ];
 
 impl Drop for VulkanShaderModule {
@@ -2846,13 +2903,13 @@ fn create_pipeline_layout_for_descriptor_set_layout(
     let push_constant_ranges = [vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::FRAGMENT)
         .offset(0)
-        .size(SAMPLED_TEXTURE_UV_RECT_PUSH_CONSTANT_SIZE)];
+        .size(SAMPLED_TEXTURE_DRAW_CONSTANT_SIZE)];
     let create_info = vk::PipelineLayoutCreateInfo::default()
         .set_layouts(&set_layouts)
         .push_constant_ranges(&push_constant_ranges);
     // SAFETY: `descriptor_set_layout.logical_device` is a live Vulkan device and owns the
     // descriptor-set layout handle used here, so the set layout and pipeline layout belong to the
-    // same device. The push-constant range is 16 bytes, starts at offset 0, is a multiple of 4, and
+    // same device. The push-constant range is 24 bytes, starts at offset 0, is a multiple of 4, and
     // is exposed to the fragment shader. No allocation callbacks are used.
     let handle = unsafe {
         descriptor_set_layout
@@ -2992,12 +3049,20 @@ fn create_sampled_texture_graphics_pipeline(
         .line_width(1.0);
     let multisample =
         vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
-    let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default().color_write_mask(
-        vk::ColorComponentFlags::R
-            | vk::ColorComponentFlags::G
-            | vk::ColorComponentFlags::B
-            | vk::ColorComponentFlags::A,
-    )];
+    let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::ONE)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .alpha_blend_op(vk::BlendOp::ADD)
+        .color_write_mask(
+            vk::ColorComponentFlags::R
+                | vk::ColorComponentFlags::G
+                | vk::ColorComponentFlags::B
+                | vk::ColorComponentFlags::A,
+        )];
     let color_blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
@@ -3015,9 +3080,10 @@ fn create_sampled_texture_graphics_pipeline(
         .subpass(0);
     // SAFETY: All handles are validated to belong to `logical_device`. Shader modules contain
     // caller-validated SPIR-V and remain alive for the duration of pipeline creation. The render
-    // pass has one color attachment at subpass 0, and the fixed-function state describes a simple
-    // triangle-list pipeline with dynamic viewport/scissor. All create-info slices live through the
-    // call and no allocation callbacks are used.
+    // pass has one blend-capable color attachment at subpass 0, and the fixed-function state
+    // describes a simple triangle-list pipeline with dynamic viewport/scissor and premultiplied
+    // alpha blending. All create-info slices live through the call and no allocation callbacks are
+    // used.
     let pipelines = unsafe {
         logical_device
             .handle()
