@@ -2,17 +2,19 @@
 //!
 //! This module establishes the renderer-side structure for a future native Vulkan backend. It is
 //! intentionally incomplete: it can initialize an explicit Vulkan device, upload sampled textures
-//! from CPU memory, and exercise a narrow private offscreen frame-render path, but it does not
-//! expose general Vulkan rendering support, present to KMS, implement HDR, or perform
-//! colour-management policy.
+//! from CPU memory, and exercise a narrow offscreen frame-render path through Smithay's public
+//! [`Bind`] and [`Offscreen`] traits, but it does not expose general Vulkan rendering support,
+//! present to KMS, implement HDR, or perform colour-management policy.
 //!
 //! Downstream compositors must not treat the presence of this module or the `renderer_vulkan`
-//! feature as Vulkan rendering support. Real enablement must be added incrementally behind explicit
-//! capability bits, with tests and stub failure paths before enabling working functionality.
+//! feature as broad Vulkan rendering support. Real enablement must be added incrementally behind
+//! explicit capability bits, with tests and stub failure paths before enabling working
+//! functionality.
 //!
-//! Smithay's optional renderer traits, such as `ImportDma`, `Bind`, `Offscreen`, `ExportMem`, and
-//! `Blit`, are capability surfaces. The scaffold intentionally does not implement those traits for
-//! [`VulkanRenderer`] until the corresponding capability bit can become true.
+//! Smithay's optional renderer traits are capability surfaces. This module currently implements
+//! `ImportMem`, `Bind`, and `Offscreen` for the tested in-memory/offscreen path only. `ImportDma`,
+//! `ExportMem`, `ExportDma`, explicit sync, blit/copy, and presentation remain unsupported until
+//! the corresponding capability bit can become true with coverage.
 //!
 //! Intended implementation order:
 //!
@@ -43,10 +45,10 @@
 use crate::{
     backend::vulkan::PhysicalDevice,
     backend::{
-        allocator::{Format, Fourcc, Modifier},
+        allocator::{Format, Fourcc, Modifier, format::FormatSet},
         renderer::{
-            Color32F, ContextId, DebugFlags, ImportMem, Renderer, RendererSuper, TextureFilter,
-            sync::SyncPoint,
+            Bind, Color32F, ContextId, DebugFlags, ImportMem, Offscreen, Renderer, RendererSuper,
+            TextureFilter, sync::SyncPoint,
         },
     },
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
@@ -176,6 +178,17 @@ impl VulkanRenderer {
     /// This does not imply that rendering, import, export, or presentation operations are supported.
     pub fn is_device_initialized(&self) -> bool {
         self.device.is_some() && self.capabilities.device.available
+    }
+
+    fn render_target_formats(&self) -> FormatSet {
+        self.capabilities.formats.render_target_formats()
+    }
+
+    fn render_target_format_supported(&self, format: Fourcc) -> bool {
+        self.render_target_formats().contains(&Format {
+            code: format,
+            modifier: Modifier::Invalid,
+        })
     }
 
     #[allow(dead_code)]
@@ -323,6 +336,48 @@ impl Renderer for VulkanRenderer {
 
     fn cleanup_texture_cache(&mut self) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+impl<'target> Bind<VulkanRenderTarget<'target>> for VulkanRenderer {
+    fn bind<'a>(
+        &mut self,
+        target: &'a mut VulkanRenderTarget<'target>,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        if target.context_id != self.context_id {
+            return Err(VulkanError::UnsupportedOperation("foreign render target"));
+        }
+        if target.image.source != image::VulkanImageSource::Offscreen {
+            return Err(VulkanError::UnsupportedOperation("render target"));
+        }
+        if target.color_image.is_none() {
+            return Err(VulkanError::UnsupportedOperation("render target image"));
+        }
+
+        Ok(VulkanRenderTarget {
+            context_id: target.context_id.clone(),
+            image: target.image.clone(),
+            color_image: target.color_image.clone(),
+            _target: std::marker::PhantomData,
+        })
+    }
+
+    fn supported_formats(&self) -> Option<FormatSet> {
+        Some(self.render_target_formats())
+    }
+}
+
+impl Offscreen<VulkanRenderTarget<'static>> for VulkanRenderer {
+    fn create_buffer(
+        &mut self,
+        format: Fourcc,
+        size: Size<i32, BufferCoord>,
+    ) -> Result<VulkanRenderTarget<'static>, Self::Error> {
+        if !self.render_target_format_supported(format) {
+            return Err(VulkanError::UnsupportedFormat(format));
+        }
+
+        self.create_offscreen_render_target(format, size)
     }
 }
 

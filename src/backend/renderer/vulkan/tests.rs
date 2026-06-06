@@ -2,9 +2,11 @@ use std::{marker::PhantomData, os::unix::io::OwnedFd, sync::Arc};
 
 use ash::vk;
 
-use crate::backend::allocator::Fourcc;
+use crate::backend::allocator::{Format, Fourcc, Modifier};
 use crate::backend::renderer::sync::Interrupted;
-use crate::backend::renderer::{Color32F, DebugFlags, Frame, ImportMem, Renderer, Texture, sync::Fence};
+use crate::backend::renderer::{
+    Bind, Color32F, DebugFlags, Frame, ImportMem, Offscreen, Renderer, Texture, sync::Fence,
+};
 use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
 use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 
@@ -80,6 +82,25 @@ fn render_target_for_tests(
         image,
         color_image: None,
         _target: PhantomData,
+    }
+}
+
+fn render_target_format_record_for_tests(
+    format: Fourcc,
+    tiling: VulkanFormatTiling,
+    color_attachment_blend: bool,
+) -> VulkanFormatCapabilityRecord {
+    VulkanFormatCapabilityRecord {
+        format,
+        tiling,
+        usages: VulkanFormatUsage {
+            sampled: true,
+            color_attachment: true,
+            color_attachment_blend,
+            transfer_src: true,
+            transfer_dst: true,
+            ..VulkanFormatUsage::default()
+        },
     }
 }
 
@@ -726,7 +747,7 @@ fn clear_color_value_preserves_format_alpha_semantics() {
 }
 
 #[test]
-fn initialized_device_capabilities_do_not_enable_renderer_operations() {
+fn initialized_device_capabilities_do_not_enable_format_backed_rendering_before_discovery() {
     let caps = VulkanRendererCapabilities::for_initialized_device(&[]);
 
     assert!(caps.device.available);
@@ -739,6 +760,115 @@ fn initialized_device_capabilities_do_not_enable_renderer_operations() {
     assert!(!caps.rendering.blit);
     assert!(!caps.sync.explicit);
     assert!(caps.formats.records.is_empty());
+}
+
+#[test]
+fn public_offscreen_create_buffer_requires_initialized_device() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+
+    assert!(matches!(
+        Offscreen::<VulkanRenderTarget<'static>>::create_buffer(
+            &mut renderer,
+            Fourcc::Abgr8888,
+            (1, 1).into(),
+        ),
+        Err(VulkanError::UnsupportedFormat(Fourcc::Abgr8888))
+    ));
+
+    renderer.capabilities.formats.records = vec![render_target_format_record_for_tests(
+        Fourcc::Abgr8888,
+        VulkanFormatTiling::Optimal,
+        true,
+    )];
+
+    assert!(matches!(
+        Offscreen::<VulkanRenderTarget<'static>>::create_buffer(
+            &mut renderer,
+            Fourcc::Abgr8888,
+            (1, 1).into(),
+        ),
+        Err(VulkanError::VulkanUnavailable)
+    ));
+}
+
+#[test]
+fn public_bind_rejects_invalid_vulkan_targets_before_device_lookup() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut foreign_target = render_target_for_tests(
+        ContextId::new(),
+        VulkanImageSource::Offscreen,
+        (1, 1).into(),
+        Some(Fourcc::Abgr8888),
+    );
+    let mut non_offscreen_target = render_target_for_tests(
+        renderer.context_id(),
+        VulkanImageSource::Uninitialized,
+        (1, 1).into(),
+        Some(Fourcc::Abgr8888),
+    );
+    let mut missing_image_target = render_target_for_tests(
+        renderer.context_id(),
+        VulkanImageSource::Offscreen,
+        (1, 1).into(),
+        Some(Fourcc::Abgr8888),
+    );
+
+    assert!(matches!(
+        Bind::bind(&mut renderer, &mut foreign_target),
+        Err(VulkanError::UnsupportedOperation("foreign render target"))
+    ));
+    assert!(matches!(
+        Bind::bind(&mut renderer, &mut non_offscreen_target),
+        Err(VulkanError::UnsupportedOperation("render target"))
+    ));
+    assert!(matches!(
+        Bind::bind(&mut renderer, &mut missing_image_target),
+        Err(VulkanError::UnsupportedOperation("render target image"))
+    ));
+}
+
+#[test]
+fn public_bind_supported_formats_match_probed_render_targets() {
+    let renderer = VulkanRenderer::new_scaffold_for_tests();
+    let formats = <VulkanRenderer as Bind<VulkanRenderTarget<'static>>>::supported_formats(&renderer)
+        .expect("Vulkan render targets have format metadata");
+
+    assert!(formats.iter().next().is_none());
+}
+
+#[test]
+fn public_bind_supported_formats_filter_provisional_render_target_capabilities() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.capabilities.formats.records = vec![
+        render_target_format_record_for_tests(Fourcc::Abgr8888, VulkanFormatTiling::Optimal, true),
+        render_target_format_record_for_tests(Fourcc::Xrgb2101010, VulkanFormatTiling::Optimal, true),
+        render_target_format_record_for_tests(Fourcc::Argb8888, VulkanFormatTiling::Optimal, false),
+        render_target_format_record_for_tests(Fourcc::Xrgb8888, VulkanFormatTiling::Linear, true),
+    ];
+
+    let formats = <VulkanRenderer as Bind<VulkanRenderTarget<'static>>>::supported_formats(&renderer)
+        .expect("Vulkan render targets have format metadata");
+
+    assert!(formats.contains(&Format {
+        code: Fourcc::Abgr8888,
+        modifier: Modifier::Invalid,
+    }));
+    assert!(!formats.contains(&Format {
+        code: Fourcc::Xrgb2101010,
+        modifier: Modifier::Invalid,
+    }));
+    assert!(!formats.contains(&Format {
+        code: Fourcc::Argb8888,
+        modifier: Modifier::Invalid,
+    }));
+    assert!(!formats.contains(&Format {
+        code: Fourcc::Xrgb8888,
+        modifier: Modifier::Invalid,
+    }));
+    assert!(renderer.render_target_format_supported(Fourcc::Abgr8888));
+    assert!(!renderer.render_target_format_supported(Fourcc::Xrgb2101010));
+    assert!(!renderer.render_target_format_supported(Fourcc::Argb8888));
+    assert!(!renderer.render_target_format_supported(Fourcc::Xrgb8888));
 }
 
 #[test]
@@ -1843,7 +1973,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     );
     assert!(!caps.import.dmabuf);
     assert!(!caps.export.dmabuf);
-    assert!(!caps.rendering.offscreen);
+    assert!(caps.rendering.offscreen);
     assert!(!caps.rendering.blit);
     assert!(!caps.sync.explicit);
     assert!(
@@ -2159,6 +2289,90 @@ fn runtime_frame_render_texture_draws_uploaded_sampled_image() {
 
     assert_eq!(target.image.layout, VulkanImageLayoutState::ColorAttachment);
     let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
+    assert_eq!(readback, [0, 0, 255, 255]);
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_public_offscreen_bind_renders_uploaded_sampled_image() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let mut renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let Some(render_format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.sampled
+                && record.usages.color_attachment
+                && record.usages.color_attachment_blend
+                && record.usages.transfer_src
+                && record.usages.transfer_dst
+        })
+        .map(|record| record.format)
+    else {
+        return;
+    };
+
+    let sampled_image = renderer
+        .device
+        .as_ref()
+        .unwrap()
+        .create_uploaded_sampled_image(
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            super::get_render_vk_format(render_format).unwrap(),
+            &[0x00, 0x00, 0xff, 0xff],
+            TextureFilter::Nearest,
+            TextureFilter::Nearest,
+        )
+        .unwrap();
+    let texture = VulkanTexture::from_sampled_image(
+        renderer.context_id(),
+        (1, 1).into(),
+        render_format,
+        sampled_image,
+        false,
+    );
+    let mut target =
+        Offscreen::<VulkanRenderTarget<'static>>::create_buffer(&mut renderer, render_format, (1, 1).into())
+            .unwrap();
+    let mut framebuffer = Bind::bind(&mut renderer, &mut target).unwrap();
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((1, 1)))];
+        let mut frame = renderer
+            .render(&mut framebuffer, (1, 1).into(), Transform::Normal)
+            .unwrap();
+
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::from_size((1.0, 1.0).into()),
+                Rectangle::from_size((1, 1).into()),
+                &full_damage,
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .unwrap();
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    let readback = renderer.read_offscreen_render_target(&mut framebuffer).unwrap();
     assert_eq!(readback, [0, 0, 255, 255]);
 }
 

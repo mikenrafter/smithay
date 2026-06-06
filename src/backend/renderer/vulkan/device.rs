@@ -57,6 +57,12 @@ impl VulkanDeviceState {
         let mut capabilities = VulkanRendererCapabilities::for_initialized_device(&[]);
         capabilities.formats = super::VulkanFormatCapabilities::discover(&physical_device)?;
         capabilities.import.memory = capabilities.formats.memory_import.iter().next().is_some();
+        capabilities.rendering.offscreen = capabilities
+            .formats
+            .render_target_formats()
+            .iter()
+            .next()
+            .is_some();
 
         let queue_priorities = [1.0];
         let queue_create_infos = queue_families

@@ -7,7 +7,10 @@ use crate::backend::{
     vulkan::PhysicalDevice,
 };
 
-use super::{VulkanError, format::renderer_format_infos};
+use super::{
+    VulkanError,
+    format::{get_format_info, renderer_format_infos},
+};
 
 /// Top-level Vulkan renderer capabilities.
 #[non_exhaustive]
@@ -143,6 +146,26 @@ impl VulkanFormatCapabilities {
             dmabuf_import: FormatSet::default(),
             dmabuf_export: FormatSet::default(),
         })
+    }
+
+    pub(super) fn render_target_formats(&self) -> FormatSet {
+        self.records
+            .iter()
+            .filter(|record| {
+                record.tiling == VulkanFormatTiling::Optimal
+                    && get_format_info(record.format)
+                        .map(|info| !info.is_10bit)
+                        .unwrap_or(false)
+                    && record.usages.color_attachment
+                    && record.usages.color_attachment_blend
+                    && record.usages.transfer_src
+                    && record.usages.transfer_dst
+            })
+            .map(|record| Format {
+                code: record.format,
+                modifier: Modifier::Invalid,
+            })
+            .collect()
     }
 }
 
