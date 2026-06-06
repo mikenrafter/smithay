@@ -1302,7 +1302,7 @@ fn frame_finish_is_signaled_without_submitted_work() {
 }
 
 #[test]
-fn frame_render_texture_supports_axis_aligned_transforms_before_device_lookup() {
+fn frame_render_texture_supports_source_transforms_before_device_lookup() {
     let context_id = ContextId::new();
     let mut texture = texture_for_tests((2, 3).into(), Some(Fourcc::Argb8888));
     texture.context_id = context_id.clone();
@@ -1310,41 +1310,12 @@ fn frame_render_texture_supports_axis_aligned_transforms_before_device_lookup() 
 
     for transform in [
         Transform::Normal,
-        Transform::_180,
-        Transform::Flipped,
-        Transform::Flipped180,
-    ] {
-        let mut frame = frame_for_tests(context_id.clone(), (8, 6).into(), Transform::Normal);
-
-        assert!(
-            matches!(
-                frame.render_texture_from_to(
-                    &texture,
-                    Rectangle::from_size((2.0, 3.0).into()),
-                    Rectangle::from_size((8, 6).into()),
-                    &damage,
-                    &[],
-                    transform,
-                    0.5,
-                ),
-                Err(VulkanError::UnsupportedOperation("render texture device"))
-            ),
-            "transform {transform:?}"
-        );
-    }
-}
-
-#[test]
-fn frame_render_texture_rejects_rotated_transforms_cleanly() {
-    let context_id = ContextId::new();
-    let mut texture = texture_for_tests((2, 3).into(), Some(Fourcc::Argb8888));
-    texture.context_id = context_id.clone();
-    let damage = [Rectangle::from_size((8, 6).into())];
-
-    for transform in [
         Transform::_90,
+        Transform::_180,
         Transform::_270,
+        Transform::Flipped,
         Transform::Flipped90,
+        Transform::Flipped180,
         Transform::Flipped270,
     ] {
         let mut frame = frame_for_tests(context_id.clone(), (8, 6).into(), Transform::Normal);
@@ -1360,7 +1331,7 @@ fn frame_render_texture_rejects_rotated_transforms_cleanly() {
                     transform,
                     0.5,
                 ),
-                Err(VulkanError::UnsupportedOperation("render texture transform"))
+                Err(VulkanError::UnsupportedOperation("render texture device"))
             ),
             "transform {transform:?}"
         );
@@ -1482,7 +1453,7 @@ fn frame_render_texture_rejects_narrow_path_preconditions_before_device_lookup()
         &[],
         Transform::_90,
         1.0,
-        "render texture transform",
+        "render texture device",
     );
     assert_render_texture_error(
         &texture,
@@ -1535,7 +1506,7 @@ fn source_to_uv_rect_flips_y_for_y_inverted_textures() {
             false,
             Transform::Normal,
         ),
-        Some([0.0, 0.25, 1.0, 0.5])
+        Some(([0.0, 0.25], [1.0, 0.0], [0.0, 0.5]))
     );
     assert_eq!(
         source_to_uv_rect(
@@ -1544,7 +1515,7 @@ fn source_to_uv_rect_flips_y_for_y_inverted_textures() {
             true,
             Transform::Normal,
         ),
-        Some([0.0, 0.75, 1.0, -0.5])
+        Some(([0.0, 0.75], [1.0, 0.0], [0.0, -0.5]))
     );
     assert_eq!(
         source_to_uv_rect(
@@ -1553,7 +1524,7 @@ fn source_to_uv_rect_flips_y_for_y_inverted_textures() {
             true,
             Transform::Normal,
         ),
-        Some([0.0, 1.0, 1.0, -0.25])
+        Some(([0.0, 1.0], [1.0, 0.0], [0.0, -0.25]))
     );
     assert_eq!(
         source_to_uv_rect(
@@ -1562,35 +1533,46 @@ fn source_to_uv_rect_flips_y_for_y_inverted_textures() {
             true,
             Transform::Normal,
         ),
-        Some([0.0, 0.5, 1.0, -0.25])
+        Some(([0.0, 0.5], [1.0, 0.0], [0.0, -0.25]))
     );
 }
 
 #[test]
-fn source_to_uv_rect_supports_axis_aligned_source_transforms() {
+fn source_to_uv_rect_supports_source_transforms() {
     let src = Rectangle::new((1.0, 1.0).into(), (2.0, 2.0).into());
     let texture_size = Size::<i32, BufferCoord>::from((4, 4));
 
     assert_eq!(
         source_to_uv_rect(texture_size, src, false, Transform::Normal),
-        Some([0.25, 0.25, 0.5, 0.5])
+        Some(([0.25, 0.25], [0.5, 0.0], [0.0, 0.5]))
+    );
+    assert_eq!(
+        source_to_uv_rect(texture_size, src, false, Transform::_90),
+        Some(([0.25, 0.75], [0.0, -0.5], [0.5, 0.0]))
     );
     assert_eq!(
         source_to_uv_rect(texture_size, src, false, Transform::_180),
-        Some([0.75, 0.75, -0.5, -0.5])
+        Some(([0.75, 0.75], [-0.5, 0.0], [0.0, -0.5]))
+    );
+    assert_eq!(
+        source_to_uv_rect(texture_size, src, false, Transform::_270),
+        Some(([0.75, 0.25], [0.0, 0.5], [-0.5, 0.0]))
     );
     assert_eq!(
         source_to_uv_rect(texture_size, src, false, Transform::Flipped),
-        Some([0.75, 0.25, -0.5, 0.5])
+        Some(([0.75, 0.25], [-0.5, 0.0], [0.0, 0.5]))
+    );
+    assert_eq!(
+        source_to_uv_rect(texture_size, src, false, Transform::Flipped90),
+        Some(([0.25, 0.25], [0.0, 0.5], [0.5, 0.0]))
     );
     assert_eq!(
         source_to_uv_rect(texture_size, src, false, Transform::Flipped180),
-        Some([0.25, 0.75, 0.5, -0.5])
+        Some(([0.25, 0.75], [0.5, 0.0], [0.0, -0.5]))
     );
-    assert_eq!(source_to_uv_rect(texture_size, src, false, Transform::_90), None);
     assert_eq!(
         source_to_uv_rect(texture_size, src, false, Transform::Flipped270),
-        None
+        Some(([0.75, 0.75], [0.0, -0.5], [-0.5, 0.0]))
     );
 }
 
@@ -2650,7 +2632,7 @@ fn runtime_frame_render_texture_crops_y_inverted_texture() {
 
 #[test]
 #[ignore = "requires a working Vulkan loader and physical device"]
-fn runtime_frame_render_texture_applies_axis_aligned_source_transforms() {
+fn runtime_frame_render_texture_applies_source_transforms() {
     let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
     let physical_device = PhysicalDevice::enumerate(&instance)
         .unwrap()
@@ -2710,16 +2692,32 @@ fn runtime_frame_render_texture_applies_axis_aligned_source_transforms() {
     );
     let cases: &[(Transform, &[u8])] = &[
         (
+            Transform::_90,
+            &[0, 0, 255, 255, 255, 0, 0, 255, 255, 255, 255, 255, 0, 255, 0, 255],
+        ),
+        (
             Transform::Flipped,
             &[0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255, 0, 0, 255, 255],
+        ),
+        (
+            Transform::Flipped90,
+            &[255, 0, 0, 255, 0, 0, 255, 255, 0, 255, 0, 255, 255, 255, 255, 255],
         ),
         (
             Transform::Flipped180,
             &[0, 0, 255, 255, 255, 255, 255, 255, 255, 0, 0, 255, 0, 255, 0, 255],
         ),
         (
+            Transform::Flipped270,
+            &[255, 255, 255, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 0, 0, 255],
+        ),
+        (
             Transform::_180,
             &[255, 255, 255, 255, 0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255],
+        ),
+        (
+            Transform::_270,
+            &[0, 255, 0, 255, 255, 255, 255, 255, 255, 0, 0, 255, 0, 0, 255, 255],
         ),
     ];
 

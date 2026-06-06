@@ -358,11 +358,12 @@ impl Frame for VulkanFrame<'_, '_> {
         if !is_full_target_damage(self.output_size, damage) {
             return Err(VulkanError::UnsupportedOperation("render texture damage"));
         }
-        if self.transform != Transform::Normal || !is_axis_aligned_sampled_texture_transform(src_transform) {
+        if self.transform != Transform::Normal {
             return Err(VulkanError::UnsupportedOperation("render texture transform"));
         }
-        let uv_rect = source_to_uv_rect(texture.image.size, src, texture.y_inverted, src_transform)
-            .ok_or(VulkanError::UnsupportedOperation("render texture source"))?;
+        let (uv_origin, uv_x_axis, uv_y_axis) =
+            source_to_uv_rect(texture.image.size, src, texture.y_inverted, src_transform)
+                .ok_or(VulkanError::UnsupportedOperation("render texture source"))?;
         let draw_area = output_destination_to_vk_rect(self.output_size, dst)
             .ok_or(VulkanError::UnsupportedOperation("render texture destination"))?;
         if draw_area.extent.width == 0 || draw_area.extent.height == 0 {
@@ -414,7 +415,9 @@ impl Frame for VulkanFrame<'_, '_> {
             &pipeline,
             VulkanSampledTextureDrawConstants {
                 draw_area,
-                uv_rect,
+                uv_origin,
+                uv_x_axis,
+                uv_y_axis,
                 alpha,
                 force_opaque_alpha,
             },
@@ -444,19 +447,12 @@ fn is_full_target_damage(output_size: Size<i32, Physical>, damage: &[Rectangle<i
     damage.len() == 1 && damage[0] == Rectangle::from_size(output_size)
 }
 
-fn is_axis_aligned_sampled_texture_transform(transform: Transform) -> bool {
-    matches!(
-        transform,
-        Transform::Normal | Transform::_180 | Transform::Flipped | Transform::Flipped180
-    )
-}
-
 pub(super) fn source_to_uv_rect(
     texture_size: Size<i32, BufferCoord>,
     src: Rectangle<f64, BufferCoord>,
     y_inverted: bool,
     src_transform: Transform,
-) -> Option<[f32; 4]> {
+) -> Option<([f32; 2], [f32; 2], [f32; 2])> {
     if texture_size.w <= 0
         || texture_size.h <= 0
         || !src.loc.x.is_finite()
@@ -481,8 +477,11 @@ pub(super) fn source_to_uv_rect(
         Transform::Normal => ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)),
         Transform::_180 => ((1.0, 1.0), (-1.0, 0.0), (0.0, -1.0)),
         Transform::Flipped => ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0)),
+        Transform::_90 => ((0.0, 1.0), (0.0, -1.0), (1.0, 0.0)),
+        Transform::_270 => ((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)),
+        Transform::Flipped90 => ((0.0, 0.0), (0.0, 1.0), (1.0, 0.0)),
         Transform::Flipped180 => ((0.0, 1.0), (1.0, 0.0), (0.0, -1.0)),
-        Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270 => return None,
+        Transform::Flipped270 => ((1.0, 1.0), (0.0, -1.0), (-1.0, 0.0)),
     };
     let uv_at = |x: f64, y: f64| {
         let u = (src.loc.x + x * src.size.w) / f64::from(texture_size.w);
@@ -494,7 +493,11 @@ pub(super) fn source_to_uv_rect(
     let x_end = uv_at(origin.0 + x_axis.0, origin.1 + x_axis.1);
     let y_end = uv_at(origin.0 + y_axis.0, origin.1 + y_axis.1);
 
-    Some([offset.0, offset.1, x_end.0 - offset.0, y_end.1 - offset.1])
+    Some((
+        [offset.0, offset.1],
+        [x_end.0 - offset.0, x_end.1 - offset.1],
+        [y_end.0 - offset.0, y_end.1 - offset.1],
+    ))
 }
 
 fn output_destination_to_vk_rect(

@@ -13,13 +13,14 @@ use crate::backend::{
 
 use super::{VulkanError, VulkanRendererCapabilities};
 
-const SAMPLED_TEXTURE_FULL_UV_RECT: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
-const SAMPLED_TEXTURE_DRAW_CONSTANT_SIZE: u32 = 24;
+const SAMPLED_TEXTURE_DRAW_CONSTANT_SIZE: u32 = 32;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct VulkanSampledTextureDrawConstants {
     pub(super) draw_area: vk::Rect2D,
-    pub(super) uv_rect: [f32; 4],
+    pub(super) uv_origin: [f32; 2],
+    pub(super) uv_x_axis: [f32; 2],
+    pub(super) uv_y_axis: [f32; 2],
     pub(super) alpha: f32,
     pub(super) force_opaque_alpha: bool,
 }
@@ -831,8 +832,8 @@ impl VulkanDeviceState {
         // They contain compatible vertex/fragment `main` entry points, no non-built-in vertex
         // inputs, matching location interfaces, set 0 binding 0 as a combined image sampler, and
         // one color output compatible with the renderer's UNORM color-attachment formats. The
-        // fragment shader reads a 24-byte push-constant block containing a UV rectangle, global
-        // alpha value, and opaque-alpha flag covered by the pipeline layout.
+        // fragment shader reads a 32-byte push-constant block containing affine UV mapping axes,
+        // global alpha value, and opaque-alpha flag covered by the pipeline layout.
         let shaders = unsafe {
             VulkanSampledTexturePipelineShaders::from_spirv_unchecked(
                 color_format,
@@ -865,7 +866,9 @@ impl VulkanDeviceState {
             pipeline,
             VulkanSampledTextureDrawConstants {
                 draw_area,
-                uv_rect: SAMPLED_TEXTURE_FULL_UV_RECT,
+                uv_origin: [0.0, 0.0],
+                uv_x_axis: [1.0, 0.0],
+                uv_y_axis: [0.0, 1.0],
                 alpha: 1.0,
                 force_opaque_alpha: false,
             },
@@ -1464,7 +1467,7 @@ fn record_sampled_texture_draw(
     // `target` is in COLOR_ATTACHMENT_OPTIMAL for the duration of the render pass, the framebuffer
     // uses the same render pass as `pipeline`, dynamic viewport/scissor are set before drawing, and
     // `descriptor_set` retains the sampled image resources it references, and the pipeline layout
-    // contains a fragment-stage push-constant range covering the 24 bytes written here. The command
+    // contains a fragment-stage push-constant range covering the 32 bytes written here. The command
     // buffer is host synchronized by the command-pool lock.
     unsafe {
         let device = command_buffer.command_pool.logical_device.handle();
@@ -1558,23 +1561,37 @@ fn validate_sampled_texture_draw_area(
 fn validate_sampled_texture_draw_constants(
     draw_constants: VulkanSampledTextureDrawConstants,
 ) -> Result<(), VulkanError> {
-    let [u_offset, v_offset, u_scale, v_scale] = draw_constants.uv_rect;
     const UV_RECT_EPSILON: f32 = 0.000_001;
-    let u_end = u_offset + u_scale;
-    let v_end = v_offset + v_scale;
     let uv_range = -UV_RECT_EPSILON..=1.0 + UV_RECT_EPSILON;
+    let [u_origin, v_origin] = draw_constants.uv_origin;
+    let [u_x_axis, v_x_axis] = draw_constants.uv_x_axis;
+    let [u_y_axis, v_y_axis] = draw_constants.uv_y_axis;
+    let uv_corners = [
+        [u_origin, v_origin],
+        [u_origin + u_x_axis, v_origin + v_x_axis],
+        [u_origin + u_y_axis, v_origin + v_y_axis],
+        [u_origin + u_x_axis + u_y_axis, v_origin + v_x_axis + v_y_axis],
+    ];
+    let determinant = u_x_axis * v_y_axis - u_y_axis * v_x_axis;
 
     if !draw_constants
-        .uv_rect
+        .uv_origin
         .iter()
         .all(|component| component.is_finite())
+        || !draw_constants
+            .uv_x_axis
+            .iter()
+            .all(|component| component.is_finite())
+        || !draw_constants
+            .uv_y_axis
+            .iter()
+            .all(|component| component.is_finite())
+        || !uv_corners
+            .iter()
+            .flatten()
+            .all(|component| uv_range.contains(component))
         || !draw_constants.alpha.is_finite()
-        || u_scale == 0.0
-        || v_scale == 0.0
-        || !uv_range.contains(&u_offset)
-        || !uv_range.contains(&u_end)
-        || !uv_range.contains(&v_offset)
-        || !uv_range.contains(&v_end)
+        || determinant == 0.0
         || !(0.0..=1.0).contains(&draw_constants.alpha)
     {
         return Err(VulkanError::UnsupportedOperation(
@@ -1585,20 +1602,24 @@ fn validate_sampled_texture_draw_constants(
     Ok(())
 }
 
-fn sampled_texture_draw_constant_bytes(draw_constants: VulkanSampledTextureDrawConstants) -> [u8; 24] {
-    let [u_offset, v_offset, u_scale, v_scale] = draw_constants.uv_rect;
+fn sampled_texture_draw_constant_bytes(draw_constants: VulkanSampledTextureDrawConstants) -> [u8; 32] {
+    let [u_origin, v_origin] = draw_constants.uv_origin;
+    let [u_x_axis, v_x_axis] = draw_constants.uv_x_axis;
+    let [u_y_axis, v_y_axis] = draw_constants.uv_y_axis;
     let force_opaque_alpha = if draw_constants.force_opaque_alpha {
         1.0f32
     } else {
         0.0
     };
-    let mut bytes = [0; 24];
-    bytes[0..4].copy_from_slice(&u_offset.to_ne_bytes());
-    bytes[4..8].copy_from_slice(&v_offset.to_ne_bytes());
-    bytes[8..12].copy_from_slice(&u_scale.to_ne_bytes());
-    bytes[12..16].copy_from_slice(&v_scale.to_ne_bytes());
-    bytes[16..20].copy_from_slice(&draw_constants.alpha.to_ne_bytes());
-    bytes[20..24].copy_from_slice(&force_opaque_alpha.to_ne_bytes());
+    let mut bytes = [0; 32];
+    bytes[0..4].copy_from_slice(&u_origin.to_ne_bytes());
+    bytes[4..8].copy_from_slice(&v_origin.to_ne_bytes());
+    bytes[8..12].copy_from_slice(&u_x_axis.to_ne_bytes());
+    bytes[12..16].copy_from_slice(&v_x_axis.to_ne_bytes());
+    bytes[16..20].copy_from_slice(&u_y_axis.to_ne_bytes());
+    bytes[20..24].copy_from_slice(&v_y_axis.to_ne_bytes());
+    bytes[24..28].copy_from_slice(&draw_constants.alpha.to_ne_bytes());
+    bytes[28..32].copy_from_slice(&force_opaque_alpha.to_ne_bytes());
     bytes
 }
 
@@ -2581,7 +2602,7 @@ impl<'code> VulkanSampledTexturePipelineShaders<'code> {
     /// pipeline uses an empty vertex-input state. The fragment module must provide a `main` entry
     /// point with the fragment execution model. Their location interfaces must match, the fragment
     /// module must use descriptor set 0 binding 0 as a single `COMBINED_IMAGE_SAMPLER`. If the
-    /// fragment module reads push constants, those reads must fit inside the first 24 bytes provided
+    /// fragment module reads push constants, those reads must fit inside the first 32 bytes provided
     /// by this sampled-texture pipeline layout. Its color output must be compatible with a single
     /// `color_format` color attachment in subpass 0 of the render pass used by the scaffold.
     pub(super) unsafe fn from_spirv_unchecked(
@@ -2648,50 +2669,61 @@ const BUILTIN_TEXTURED_VERTEX_SHADER_SPIRV: &[u32] = &[
 ];
 
 const BUILTIN_TEXTURED_FRAGMENT_SHADER_SPIRV: &[u32] = &[
-    0x07230203, 0x00010000, 0x0008000b, 0x00000037, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x07230203, 0x00010000, 0x0008000b, 0x00000044, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
-    0x0007000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x0000001a, 0x00000031, 0x00030010,
+    0x0007000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000013, 0x0000003e, 0x00030010,
     0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d,
-    0x00000000, 0x00040005, 0x00000009, 0x6f6c6f63, 0x00000072, 0x00030005, 0x0000000d, 0x00786574,
-    0x00060005, 0x0000000f, 0x77617244, 0x736e6f43, 0x746e6174, 0x00000073, 0x00050006, 0x0000000f,
-    0x00000000, 0x725f7675, 0x00746365, 0x00050006, 0x0000000f, 0x00000001, 0x68706c61, 0x00000061,
-    0x00080006, 0x0000000f, 0x00000002, 0x63726f66, 0x706f5f65, 0x65757161, 0x706c615f, 0x00006168,
-    0x00030005, 0x00000011, 0x00006370, 0x00040005, 0x0000001a, 0x76755f76, 0x00000000, 0x00050005,
-    0x00000031, 0x5f74756f, 0x6f6c6f63, 0x00000072, 0x00040047, 0x0000000d, 0x00000021, 0x00000000,
-    0x00040047, 0x0000000d, 0x00000022, 0x00000000, 0x00030047, 0x0000000f, 0x00000002, 0x00050048,
-    0x0000000f, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x0000000f, 0x00000001, 0x00000023,
-    0x00000010, 0x00050048, 0x0000000f, 0x00000002, 0x00000023, 0x00000014, 0x00040047, 0x0000001a,
-    0x0000001e, 0x00000000, 0x00040047, 0x00000031, 0x0000001e, 0x00000000, 0x00020013, 0x00000002,
-    0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007,
-    0x00000006, 0x00000004, 0x00040020, 0x00000008, 0x00000007, 0x00000007, 0x00090019, 0x0000000a,
-    0x00000006, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x0003001b,
-    0x0000000b, 0x0000000a, 0x00040020, 0x0000000c, 0x00000000, 0x0000000b, 0x0004003b, 0x0000000c,
-    0x0000000d, 0x00000000, 0x0005001e, 0x0000000f, 0x00000007, 0x00000006, 0x00000006, 0x00040020,
-    0x00000010, 0x00000009, 0x0000000f, 0x0004003b, 0x00000010, 0x00000011, 0x00000009, 0x00040015,
-    0x00000012, 0x00000020, 0x00000001, 0x0004002b, 0x00000012, 0x00000013, 0x00000000, 0x00040017,
-    0x00000014, 0x00000006, 0x00000002, 0x00040020, 0x00000015, 0x00000009, 0x00000007, 0x00040020,
-    0x00000019, 0x00000001, 0x00000014, 0x0004003b, 0x00000019, 0x0000001a, 0x00000001, 0x0004002b,
-    0x00000012, 0x00000022, 0x00000002, 0x00040020, 0x00000023, 0x00000009, 0x00000006, 0x0004002b,
-    0x00000006, 0x00000026, 0x00000000, 0x00020014, 0x00000027, 0x0004002b, 0x00000006, 0x0000002b,
-    0x3f800000, 0x00040015, 0x0000002c, 0x00000020, 0x00000000, 0x0004002b, 0x0000002c, 0x0000002d,
-    0x00000003, 0x00040020, 0x0000002e, 0x00000007, 0x00000006, 0x00040020, 0x00000030, 0x00000003,
-    0x00000007, 0x0004003b, 0x00000030, 0x00000031, 0x00000003, 0x0004002b, 0x00000012, 0x00000033,
-    0x00000001, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005,
-    0x0004003b, 0x00000008, 0x00000009, 0x00000007, 0x0004003d, 0x0000000b, 0x0000000e, 0x0000000d,
-    0x00050041, 0x00000015, 0x00000016, 0x00000011, 0x00000013, 0x0004003d, 0x00000007, 0x00000017,
-    0x00000016, 0x0007004f, 0x00000014, 0x00000018, 0x00000017, 0x00000017, 0x00000000, 0x00000001,
-    0x0004003d, 0x00000014, 0x0000001b, 0x0000001a, 0x00050041, 0x00000015, 0x0000001c, 0x00000011,
-    0x00000013, 0x0004003d, 0x00000007, 0x0000001d, 0x0000001c, 0x0007004f, 0x00000014, 0x0000001e,
-    0x0000001d, 0x0000001d, 0x00000002, 0x00000003, 0x00050085, 0x00000014, 0x0000001f, 0x0000001b,
-    0x0000001e, 0x00050081, 0x00000014, 0x00000020, 0x00000018, 0x0000001f, 0x00050057, 0x00000007,
-    0x00000021, 0x0000000e, 0x00000020, 0x0003003e, 0x00000009, 0x00000021, 0x00050041, 0x00000023,
-    0x00000024, 0x00000011, 0x00000022, 0x0004003d, 0x00000006, 0x00000025, 0x00000024, 0x000500b7,
-    0x00000027, 0x00000028, 0x00000025, 0x00000026, 0x000300f7, 0x0000002a, 0x00000000, 0x000400fa,
-    0x00000028, 0x00000029, 0x0000002a, 0x000200f8, 0x00000029, 0x00050041, 0x0000002e, 0x0000002f,
-    0x00000009, 0x0000002d, 0x0003003e, 0x0000002f, 0x0000002b, 0x000200f9, 0x0000002a, 0x000200f8,
-    0x0000002a, 0x0004003d, 0x00000007, 0x00000032, 0x00000009, 0x00050041, 0x00000023, 0x00000034,
-    0x00000011, 0x00000033, 0x0004003d, 0x00000006, 0x00000035, 0x00000034, 0x0005008e, 0x00000007,
-    0x00000036, 0x00000032, 0x00000035, 0x0003003e, 0x00000031, 0x00000036, 0x000100fd, 0x00010038,
+    0x00000000, 0x00030005, 0x00000009, 0x00007675, 0x00060005, 0x0000000a, 0x77617244, 0x736e6f43,
+    0x746e6174, 0x00000073, 0x00060006, 0x0000000a, 0x00000000, 0x6f5f7675, 0x69676972, 0x0000006e,
+    0x00060006, 0x0000000a, 0x00000001, 0x785f7675, 0x6978615f, 0x00000073, 0x00060006, 0x0000000a,
+    0x00000002, 0x795f7675, 0x6978615f, 0x00000073, 0x00050006, 0x0000000a, 0x00000003, 0x68706c61,
+    0x00000061, 0x00080006, 0x0000000a, 0x00000004, 0x63726f66, 0x706f5f65, 0x65757161, 0x706c615f,
+    0x00006168, 0x00030005, 0x0000000c, 0x00006370, 0x00040005, 0x00000013, 0x76755f76, 0x00000000,
+    0x00040005, 0x00000028, 0x6f6c6f63, 0x00000072, 0x00030005, 0x0000002c, 0x00786574, 0x00050005,
+    0x0000003e, 0x5f74756f, 0x6f6c6f63, 0x00000072, 0x00030047, 0x0000000a, 0x00000002, 0x00050048,
+    0x0000000a, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x0000000a, 0x00000001, 0x00000023,
+    0x00000008, 0x00050048, 0x0000000a, 0x00000002, 0x00000023, 0x00000010, 0x00050048, 0x0000000a,
+    0x00000003, 0x00000023, 0x00000018, 0x00050048, 0x0000000a, 0x00000004, 0x00000023, 0x0000001c,
+    0x00040047, 0x00000013, 0x0000001e, 0x00000000, 0x00040047, 0x0000002c, 0x00000021, 0x00000000,
+    0x00040047, 0x0000002c, 0x00000022, 0x00000000, 0x00040047, 0x0000003e, 0x0000001e, 0x00000000,
+    0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020,
+    0x00040017, 0x00000007, 0x00000006, 0x00000002, 0x00040020, 0x00000008, 0x00000007, 0x00000007,
+    0x0007001e, 0x0000000a, 0x00000007, 0x00000007, 0x00000007, 0x00000006, 0x00000006, 0x00040020,
+    0x0000000b, 0x00000009, 0x0000000a, 0x0004003b, 0x0000000b, 0x0000000c, 0x00000009, 0x00040015,
+    0x0000000d, 0x00000020, 0x00000001, 0x0004002b, 0x0000000d, 0x0000000e, 0x00000000, 0x00040020,
+    0x0000000f, 0x00000009, 0x00000007, 0x00040020, 0x00000012, 0x00000001, 0x00000007, 0x0004003b,
+    0x00000012, 0x00000013, 0x00000001, 0x00040015, 0x00000014, 0x00000020, 0x00000000, 0x0004002b,
+    0x00000014, 0x00000015, 0x00000000, 0x00040020, 0x00000016, 0x00000001, 0x00000006, 0x0004002b,
+    0x0000000d, 0x00000019, 0x00000001, 0x0004002b, 0x00000014, 0x0000001e, 0x00000001, 0x0004002b,
+    0x0000000d, 0x00000021, 0x00000002, 0x00040017, 0x00000026, 0x00000006, 0x00000004, 0x00040020,
+    0x00000027, 0x00000007, 0x00000026, 0x00090019, 0x00000029, 0x00000006, 0x00000001, 0x00000000,
+    0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x0003001b, 0x0000002a, 0x00000029, 0x00040020,
+    0x0000002b, 0x00000000, 0x0000002a, 0x0004003b, 0x0000002b, 0x0000002c, 0x00000000, 0x0004002b,
+    0x0000000d, 0x00000030, 0x00000004, 0x00040020, 0x00000031, 0x00000009, 0x00000006, 0x0004002b,
+    0x00000006, 0x00000034, 0x00000000, 0x00020014, 0x00000035, 0x0004002b, 0x00000006, 0x00000039,
+    0x3f800000, 0x0004002b, 0x00000014, 0x0000003a, 0x00000003, 0x00040020, 0x0000003b, 0x00000007,
+    0x00000006, 0x00040020, 0x0000003d, 0x00000003, 0x00000026, 0x0004003b, 0x0000003d, 0x0000003e,
+    0x00000003, 0x0004002b, 0x0000000d, 0x00000040, 0x00000003, 0x00050036, 0x00000002, 0x00000004,
+    0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000008, 0x00000009, 0x00000007,
+    0x0004003b, 0x00000027, 0x00000028, 0x00000007, 0x00050041, 0x0000000f, 0x00000010, 0x0000000c,
+    0x0000000e, 0x0004003d, 0x00000007, 0x00000011, 0x00000010, 0x00050041, 0x00000016, 0x00000017,
+    0x00000013, 0x00000015, 0x0004003d, 0x00000006, 0x00000018, 0x00000017, 0x00050041, 0x0000000f,
+    0x0000001a, 0x0000000c, 0x00000019, 0x0004003d, 0x00000007, 0x0000001b, 0x0000001a, 0x0005008e,
+    0x00000007, 0x0000001c, 0x0000001b, 0x00000018, 0x00050081, 0x00000007, 0x0000001d, 0x00000011,
+    0x0000001c, 0x00050041, 0x00000016, 0x0000001f, 0x00000013, 0x0000001e, 0x0004003d, 0x00000006,
+    0x00000020, 0x0000001f, 0x00050041, 0x0000000f, 0x00000022, 0x0000000c, 0x00000021, 0x0004003d,
+    0x00000007, 0x00000023, 0x00000022, 0x0005008e, 0x00000007, 0x00000024, 0x00000023, 0x00000020,
+    0x00050081, 0x00000007, 0x00000025, 0x0000001d, 0x00000024, 0x0003003e, 0x00000009, 0x00000025,
+    0x0004003d, 0x0000002a, 0x0000002d, 0x0000002c, 0x0004003d, 0x00000007, 0x0000002e, 0x00000009,
+    0x00050057, 0x00000026, 0x0000002f, 0x0000002d, 0x0000002e, 0x0003003e, 0x00000028, 0x0000002f,
+    0x00050041, 0x00000031, 0x00000032, 0x0000000c, 0x00000030, 0x0004003d, 0x00000006, 0x00000033,
+    0x00000032, 0x000500b7, 0x00000035, 0x00000036, 0x00000033, 0x00000034, 0x000300f7, 0x00000038,
+    0x00000000, 0x000400fa, 0x00000036, 0x00000037, 0x00000038, 0x000200f8, 0x00000037, 0x00050041,
+    0x0000003b, 0x0000003c, 0x00000028, 0x0000003a, 0x0003003e, 0x0000003c, 0x00000039, 0x000200f9,
+    0x00000038, 0x000200f8, 0x00000038, 0x0004003d, 0x00000026, 0x0000003f, 0x00000028, 0x00050041,
+    0x00000031, 0x00000041, 0x0000000c, 0x00000040, 0x0004003d, 0x00000006, 0x00000042, 0x00000041,
+    0x0005008e, 0x00000026, 0x00000043, 0x0000003f, 0x00000042, 0x0003003e, 0x0000003e, 0x00000043,
+    0x000100fd, 0x00010038,
 ];
 
 impl Drop for VulkanShaderModule {
@@ -2918,7 +2950,7 @@ fn create_pipeline_layout_for_descriptor_set_layout(
         .push_constant_ranges(&push_constant_ranges);
     // SAFETY: `descriptor_set_layout.logical_device` is a live Vulkan device and owns the
     // descriptor-set layout handle used here, so the set layout and pipeline layout belong to the
-    // same device. The push-constant range is 24 bytes, starts at offset 0, is a multiple of 4, and
+    // same device. The push-constant range is 32 bytes, starts at offset 0, is a multiple of 4, and
     // is exposed to the fragment shader. No allocation callbacks are used.
     let handle = unsafe {
         descriptor_set_layout
