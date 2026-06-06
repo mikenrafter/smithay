@@ -773,7 +773,7 @@ impl VulkanDeviceState {
             pipeline_layout,
             descriptor_set_layout,
         };
-        let render_pass = create_single_color_render_pass(&logical_device, shaders.color_format)?;
+        let render_pass = create_single_color_load_render_pass(&logical_device, shaders.color_format)?;
         let pipeline = create_sampled_texture_graphics_pipeline(
             &logical_device,
             &render_pass,
@@ -817,11 +817,31 @@ impl VulkanDeviceState {
         descriptor_set: &VulkanSampledTextureDescriptorSet,
         pipeline: &VulkanSampledTextureGraphicsPipeline,
     ) -> Result<(), VulkanError> {
+        let draw_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: target.extent().width,
+                height: target.extent().height,
+            },
+        };
+
+        self.render_sampled_texture_to_color_image_in(target, descriptor_set, pipeline, draw_area)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn render_sampled_texture_to_color_image_in(
+        &self,
+        target: &VulkanOwnedImage,
+        descriptor_set: &VulkanSampledTextureDescriptorSet,
+        pipeline: &VulkanSampledTextureGraphicsPipeline,
+        draw_area: vk::Rect2D,
+    ) -> Result<(), VulkanError> {
         let logical_device = self
             .logical_device
             .as_ref()
             .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
         validate_sampled_texture_draw_inputs(logical_device, target, descriptor_set, pipeline)?;
+        validate_sampled_texture_draw_area(target, draw_area)?;
 
         let view = self.create_color_attachment_image_view(target)?;
         let framebuffer = create_single_color_framebuffer(pipeline.render_pass(), &view, target.extent())?;
@@ -833,12 +853,14 @@ impl VulkanDeviceState {
             target,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         )?;
+        synchronize_color_attachment_load(&mut command_buffer, target)?;
         record_sampled_texture_draw(
             &mut command_buffer,
             target,
             pipeline,
             descriptor_set,
             &framebuffer,
+            draw_area,
         )?;
         self.end_command_buffer(&mut command_buffer)?;
         self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
@@ -1342,6 +1364,7 @@ fn record_sampled_texture_draw(
     pipeline: &VulkanSampledTextureGraphicsPipeline,
     descriptor_set: &VulkanSampledTextureDescriptorSet,
     framebuffer: &VulkanFramebuffer,
+    draw_area: vk::Rect2D,
 ) -> Result<(), VulkanError> {
     if !target.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
         return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
@@ -1352,6 +1375,7 @@ fn record_sampled_texture_draw(
         descriptor_set,
         pipeline,
     )?;
+    validate_sampled_texture_draw_area(target, draw_area)?;
 
     let image_layout = command_buffer
         .pending_layout_for(target)?
@@ -1378,14 +1402,14 @@ fn record_sampled_texture_draw(
         .render_area(render_area)
         .clear_values(&clear_values);
     let viewport = [vk::Viewport {
-        x: 0.0,
-        y: 0.0,
-        width: target.extent().width as f32,
-        height: target.extent().height as f32,
+        x: draw_area.offset.x as f32,
+        y: draw_area.offset.y as f32,
+        width: draw_area.extent.width as f32,
+        height: draw_area.extent.height as f32,
         min_depth: 0.0,
         max_depth: 1.0,
     }];
-    let scissors = [render_area];
+    let scissors = [draw_area];
     let descriptor_sets = [descriptor_set.handle()];
     let _pool_guard = command_buffer.command_pool.lock_host_access()?;
 
@@ -1445,6 +1469,89 @@ fn validate_sampled_texture_draw_inputs(
     if descriptor_set.sampled_image().image().layout()? != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
         return Err(VulkanError::UnsupportedOperation("sampled texture layout"));
     }
+
+    Ok(())
+}
+
+fn validate_sampled_texture_draw_area(
+    target: &VulkanOwnedImage,
+    draw_area: vk::Rect2D,
+) -> Result<(), VulkanError> {
+    if draw_area.extent.width == 0 || draw_area.extent.height == 0 {
+        return Err(VulkanError::UnsupportedOperation("sampled texture draw area"));
+    }
+    if draw_area.offset.x < 0 || draw_area.offset.y < 0 {
+        return Err(VulkanError::UnsupportedOperation("sampled texture draw area"));
+    }
+
+    let x_end = u32::try_from(draw_area.offset.x)
+        .ok()
+        .and_then(|x| x.checked_add(draw_area.extent.width))
+        .ok_or(VulkanError::UnsupportedOperation("sampled texture draw area"))?;
+    let y_end = u32::try_from(draw_area.offset.y)
+        .ok()
+        .and_then(|y| y.checked_add(draw_area.extent.height))
+        .ok_or(VulkanError::UnsupportedOperation("sampled texture draw area"))?;
+
+    if x_end > target.extent().width || y_end > target.extent().height {
+        return Err(VulkanError::UnsupportedOperation("sampled texture draw area"));
+    }
+
+    Ok(())
+}
+
+fn synchronize_color_attachment_load(
+    command_buffer: &mut VulkanCommandBuffer,
+    image: &VulkanOwnedImage,
+) -> Result<(), VulkanError> {
+    if !image.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+        return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
+    }
+
+    let image_layout = command_buffer
+        .pending_layout_for(image)?
+        .unwrap_or(image.layout()?);
+    if image_layout != vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+        return Err(VulkanError::UnsupportedOperation("image color attachment layout"));
+    }
+
+    let barrier = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image.image())
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let _pool_guard = command_buffer.command_pool.lock_host_access()?;
+
+    // SAFETY: The image is a color attachment in COLOR_ATTACHMENT_OPTIMAL. This same-layout
+    // barrier makes prior transfer/color attachment writes visible to the following load-op render
+    // pass and subsequent color writes. Queue-family ownership is unchanged.
+    unsafe {
+        command_buffer
+            .command_pool
+            .logical_device
+            .handle()
+            .cmd_pipeline_barrier(
+                command_buffer.handle,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::BY_REGION,
+                &[],
+                &[],
+                &[barrier],
+            )
+    };
+
+    command_buffer.referenced_images.push(Arc::clone(&image.inner));
 
     Ok(())
 }
@@ -2945,10 +3052,25 @@ fn create_single_color_render_pass(
     logical_device: &VulkanLogicalDevice,
     format: vk::Format,
 ) -> Result<VulkanRenderPass, VulkanError> {
+    create_single_color_render_pass_with_load_op(logical_device, format, vk::AttachmentLoadOp::CLEAR)
+}
+
+fn create_single_color_load_render_pass(
+    logical_device: &VulkanLogicalDevice,
+    format: vk::Format,
+) -> Result<VulkanRenderPass, VulkanError> {
+    create_single_color_render_pass_with_load_op(logical_device, format, vk::AttachmentLoadOp::LOAD)
+}
+
+fn create_single_color_render_pass_with_load_op(
+    logical_device: &VulkanLogicalDevice,
+    format: vk::Format,
+    load_op: vk::AttachmentLoadOp,
+) -> Result<VulkanRenderPass, VulkanError> {
     let attachments = [vk::AttachmentDescription::default()
         .format(format)
         .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .load_op(load_op)
         .store_op(vk::AttachmentStoreOp::STORE)
         .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)

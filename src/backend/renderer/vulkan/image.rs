@@ -1,5 +1,7 @@
 use std::{marker::PhantomData, sync::Arc};
 
+use ash::vk;
+
 use crate::{
     backend::{
         allocator::{Fourcc, Modifier},
@@ -359,7 +361,9 @@ impl Frame for VulkanFrame<'_, '_> {
         if !is_full_texture_source(texture.image.size, src) {
             return Err(VulkanError::UnsupportedOperation("render texture source"));
         }
-        if !is_full_output_destination(self.output_size, dst) {
+        let draw_area = output_destination_to_vk_rect(self.output_size, dst)
+            .ok_or(VulkanError::UnsupportedOperation("render texture destination"))?;
+        if draw_area.extent.width == 0 || draw_area.extent.height == 0 {
             return Err(VulkanError::UnsupportedOperation("render texture destination"));
         }
         if !opaque_regions.is_empty() {
@@ -404,7 +408,12 @@ impl Frame for VulkanFrame<'_, '_> {
             Arc::clone(sampled_image),
         )?;
 
-        device.render_sampled_texture_to_color_image(color_image, &descriptor_set, &pipeline)?;
+        device.render_sampled_texture_to_color_image_in(
+            color_image,
+            &descriptor_set,
+            &pipeline,
+            draw_area,
+        )?;
         target.image.layout = VulkanImageLayoutState::ColorAttachment;
         Ok(())
     }
@@ -437,6 +446,27 @@ fn is_full_texture_source(texture_size: Size<i32, BufferCoord>, src: Rectangle<f
         && src.size.h == f64::from(texture_size.h)
 }
 
-fn is_full_output_destination(output_size: Size<i32, Physical>, dst: Rectangle<i32, Physical>) -> bool {
-    dst == Rectangle::from_size(output_size)
+fn output_destination_to_vk_rect(
+    output_size: Size<i32, Physical>,
+    dst: Rectangle<i32, Physical>,
+) -> Option<vk::Rect2D> {
+    if dst.loc.x < 0 || dst.loc.y < 0 || dst.size.w <= 0 || dst.size.h <= 0 {
+        return None;
+    }
+    let x_end = dst.loc.x.checked_add(dst.size.w)?;
+    let y_end = dst.loc.y.checked_add(dst.size.h)?;
+    if x_end > output_size.w || y_end > output_size.h {
+        return None;
+    }
+
+    Some(vk::Rect2D {
+        offset: vk::Offset2D {
+            x: dst.loc.x,
+            y: dst.loc.y,
+        },
+        extent: vk::Extent2D {
+            width: u32::try_from(dst.size.w).ok()?,
+            height: u32::try_from(dst.size.h).ok()?,
+        },
+    })
 }
