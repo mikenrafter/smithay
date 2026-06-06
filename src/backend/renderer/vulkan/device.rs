@@ -735,6 +735,61 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn create_sampled_texture_graphics_pipeline(
+        &self,
+        shaders: VulkanSampledTexturePipelineShaders<'_>,
+    ) -> Result<VulkanSampledTextureGraphicsPipeline, VulkanError> {
+        let instance = self
+            .instance
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing instance".to_owned()))?;
+        let physical_device = self
+            .physical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing physical device".to_owned()))?;
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+
+        let _format_properties = validate_optimal_2d_image_support(
+            instance,
+            physical_device,
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            shaders.color_format,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        )?;
+
+        let vertex_shader = create_shader_module(&logical_device, shaders.vertex)?;
+        let fragment_shader = create_shader_module(&logical_device, shaders.fragment)?;
+        let descriptor_set_layout = create_sampled_texture_descriptor_set_layout(&logical_device)?;
+        let pipeline_layout = create_pipeline_layout_for_descriptor_set_layout(&descriptor_set_layout)?;
+        let sampled_texture_layout = VulkanSampledTexturePipelineLayout {
+            pipeline_layout,
+            descriptor_set_layout,
+        };
+        let render_pass = create_single_color_render_pass(&logical_device, shaders.color_format)?;
+        let pipeline = create_sampled_texture_graphics_pipeline(
+            &logical_device,
+            &render_pass,
+            sampled_texture_layout.pipeline_layout(),
+            &vertex_shader,
+            &fragment_shader,
+        )?;
+
+        Ok(VulkanSampledTextureGraphicsPipeline {
+            render_pass,
+            layout: sampled_texture_layout,
+            pipeline,
+        })
+    }
+
+    #[allow(dead_code)]
     pub(super) fn read_image_to_tightly_packed_buffer(
         &self,
         image: &VulkanOwnedImage,
@@ -2038,9 +2093,20 @@ impl Drop for VulkanImageView {
 }
 
 #[derive(Debug)]
-struct VulkanRenderPass {
+pub(crate) struct VulkanRenderPass {
     logical_device: VulkanLogicalDevice,
     handle: vk::RenderPass,
+}
+
+#[allow(dead_code)]
+impl VulkanRenderPass {
+    pub(super) fn handle(&self) -> vk::RenderPass {
+        self.handle
+    }
+
+    fn logical_device(&self) -> &VulkanLogicalDevice {
+        &self.logical_device
+    }
 }
 
 impl Drop for VulkanRenderPass {
@@ -2082,6 +2148,10 @@ impl VulkanShaderModule {
     pub(super) fn handle(&self) -> vk::ShaderModule {
         self.handle
     }
+
+    fn logical_device(&self) -> &VulkanLogicalDevice {
+        &self.logical_device
+    }
 }
 
 /// SPIR-V shader-module code that has been validated by the caller.
@@ -2110,6 +2180,46 @@ impl<'code> VulkanShaderSpirv<'code> {
 
     fn words(&self) -> &'code [u32] {
         self.words
+    }
+}
+
+/// Pair of SPIR-V modules compatible with the sampled-texture graphics pipeline scaffold.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VulkanSampledTexturePipelineShaders<'code> {
+    color_format: vk::Format,
+    vertex: VulkanShaderSpirv<'code>,
+    fragment: VulkanShaderSpirv<'code>,
+}
+
+#[allow(dead_code)]
+impl<'code> VulkanSampledTexturePipelineShaders<'code> {
+    /// Creates a sampled-texture shader pair without validating module contents or interfaces.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure both slices contain valid SPIR-V modules for Vulkan shader modules.
+    /// The vertex module must provide a `main` entry point with the vertex execution model. The
+    /// vertex module must not declare non-built-in vertex input attributes, because the scaffold
+    /// pipeline uses an empty vertex-input state. The fragment module must provide a `main` entry
+    /// point with the fragment execution model. Their location interfaces must match, the fragment
+    /// module must use descriptor set 0 binding 0 as a single `COMBINED_IMAGE_SAMPLER`, and its
+    /// color output must be compatible with a single `color_format` color attachment in subpass 0 of
+    /// the render pass used by the scaffold.
+    pub(super) unsafe fn from_spirv_unchecked(
+        color_format: vk::Format,
+        vertex_words: &'code [u32],
+        fragment_words: &'code [u32],
+    ) -> Result<Self, VulkanError> {
+        Ok(Self {
+            color_format,
+            // SAFETY: The safety contract of this constructor includes the shader-module validity
+            // required by `VulkanShaderSpirv::from_words_unchecked` for both modules.
+            vertex: unsafe { VulkanShaderSpirv::from_words_unchecked(vertex_words)? },
+            // SAFETY: The safety contract of this constructor includes the shader-module validity
+            // required by `VulkanShaderSpirv::from_words_unchecked` for both modules.
+            fragment: unsafe { VulkanShaderSpirv::from_words_unchecked(fragment_words)? },
+        })
     }
 }
 
@@ -2156,6 +2266,10 @@ impl VulkanPipelineLayout {
     pub(super) fn handle(&self) -> vk::PipelineLayout {
         self.handle
     }
+
+    fn logical_device(&self) -> &VulkanLogicalDevice {
+        &self.logical_device
+    }
 }
 
 impl Drop for VulkanPipelineLayout {
@@ -2185,6 +2299,30 @@ fn create_empty_pipeline_layout(
         logical_device: logical_device.clone(),
         handle,
     })
+}
+
+/// Vulkan graphics pipeline owner for future textured rendering.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanGraphicsPipeline {
+    logical_device: VulkanLogicalDevice,
+    handle: vk::Pipeline,
+}
+
+#[allow(dead_code)]
+impl VulkanGraphicsPipeline {
+    pub(super) fn handle(&self) -> vk::Pipeline {
+        self.handle
+    }
+}
+
+impl Drop for VulkanGraphicsPipeline {
+    fn drop(&mut self) {
+        // SAFETY: `self.handle` was created from `self.logical_device` and this owner destroys it
+        // exactly once. `VulkanLogicalDevice` is retained by value, so the device outlives the
+        // graphics pipeline. The pipeline is not shared, satisfying host synchronization.
+        unsafe { self.logical_device.handle().destroy_pipeline(self.handle, None) };
+    }
 }
 
 /// Descriptor-set layout for binding one sampled texture to a fragment shader.
@@ -2260,6 +2398,30 @@ impl VulkanSampledTexturePipelineLayout {
 
     pub(super) fn descriptor_set_layout(&self) -> &VulkanDescriptorSetLayout {
         &self.descriptor_set_layout
+    }
+}
+
+/// Render-pass, pipeline-layout, and graphics-pipeline bundle for future sampled-texture draws.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanSampledTextureGraphicsPipeline {
+    render_pass: VulkanRenderPass,
+    layout: VulkanSampledTexturePipelineLayout,
+    pipeline: VulkanGraphicsPipeline,
+}
+
+#[allow(dead_code)]
+impl VulkanSampledTextureGraphicsPipeline {
+    pub(super) fn render_pass(&self) -> &VulkanRenderPass {
+        &self.render_pass
+    }
+
+    pub(super) fn layout(&self) -> &VulkanSampledTexturePipelineLayout {
+        &self.layout
+    }
+
+    pub(super) fn pipeline(&self) -> &VulkanGraphicsPipeline {
+        &self.pipeline
     }
 }
 
@@ -2367,6 +2529,96 @@ fn create_sampled_texture_descriptor_pool(
             max_sets,
             host_access: Mutex::new(()),
         }),
+    })
+}
+
+fn create_sampled_texture_graphics_pipeline(
+    logical_device: &VulkanLogicalDevice,
+    render_pass: &VulkanRenderPass,
+    pipeline_layout: &VulkanPipelineLayout,
+    vertex_shader: &VulkanShaderModule,
+    fragment_shader: &VulkanShaderModule,
+) -> Result<VulkanGraphicsPipeline, VulkanError> {
+    if !logical_device.is_same_device(render_pass.logical_device())
+        || !logical_device.is_same_device(pipeline_layout.logical_device())
+        || !logical_device.is_same_device(vertex_shader.logical_device())
+        || !logical_device.is_same_device(fragment_shader.logical_device())
+    {
+        return Err(VulkanError::UnsupportedOperation("graphics pipeline device"));
+    }
+
+    let entry_point = c"main";
+    let shader_stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vertex_shader.handle())
+            .name(entry_point),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(fragment_shader.handle())
+            .name(entry_point),
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+    let input_assembly =
+        vk::PipelineInputAssemblyStateCreateInfo::default().topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+    let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+    let multisample =
+        vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default().color_write_mask(
+        vk::ColorComponentFlags::R
+            | vk::ColorComponentFlags::G
+            | vk::ColorComponentFlags::B
+            | vk::ColorComponentFlags::A,
+    )];
+    let color_blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&shader_stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization)
+        .multisample_state(&multisample)
+        .color_blend_state(&color_blend)
+        .dynamic_state(&dynamic_state)
+        .layout(pipeline_layout.handle())
+        .render_pass(render_pass.handle())
+        .subpass(0);
+    // SAFETY: All handles are validated to belong to `logical_device`. Shader modules contain
+    // caller-validated SPIR-V and remain alive for the duration of pipeline creation. The render
+    // pass has one color attachment at subpass 0, and the fixed-function state describes a simple
+    // triangle-list pipeline with dynamic viewport/scissor. All create-info slices live through the
+    // call and no allocation callbacks are used.
+    let pipelines = unsafe {
+        logical_device
+            .handle()
+            .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+    }
+    .map_err(|(pipelines, err)| {
+        for pipeline in pipelines {
+            // SAFETY: `pipeline` was returned by the failed create call for this device and is not
+            // otherwise owned.
+            unsafe { logical_device.handle().destroy_pipeline(pipeline, None) };
+        }
+        VulkanError::from(err)
+    })?;
+
+    let handle = pipelines
+        .into_iter()
+        .next()
+        .ok_or_else(|| VulkanError::DeviceInitializationFailed("no graphics pipeline created".to_owned()))?;
+
+    Ok(VulkanGraphicsPipeline {
+        logical_device: logical_device.clone(),
+        handle,
     })
 }
 
