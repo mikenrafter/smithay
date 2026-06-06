@@ -628,6 +628,16 @@ fn sampled_texture_descriptor_pool_creation_requires_initialized_device() {
 }
 
 #[test]
+fn sampled_texture_pipeline_layout_creation_requires_initialized_device() {
+    let device = VulkanDeviceState::empty_for_tests();
+
+    assert!(matches!(
+        device.create_sampled_texture_pipeline_layout(),
+        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
+    ));
+}
+
+#[test]
 fn vulkan_renderer_builder_is_scaffold_only() {
     assert!(matches!(
         VulkanRenderer::builder().build(),

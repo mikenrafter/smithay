@@ -701,6 +701,25 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn create_sampled_texture_pipeline_layout(
+        &self,
+    ) -> Result<VulkanSampledTexturePipelineLayout, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+
+        let descriptor_set_layout = create_sampled_texture_descriptor_set_layout(&logical_device)?;
+        let pipeline_layout = create_pipeline_layout_for_descriptor_set_layout(&descriptor_set_layout)?;
+
+        Ok(VulkanSampledTexturePipelineLayout {
+            pipeline_layout,
+            descriptor_set_layout,
+        })
+    }
+
+    #[allow(dead_code)]
     pub(super) fn read_image_to_tightly_packed_buffer(
         &self,
         image: &VulkanOwnedImage,
@@ -2198,6 +2217,47 @@ fn create_sampled_texture_descriptor_set_layout(
 
     Ok(VulkanDescriptorSetLayout {
         logical_device: logical_device.clone(),
+        handle,
+    })
+}
+
+/// Pipeline layout and descriptor-set layout pair for future sampled-texture rendering.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanSampledTexturePipelineLayout {
+    pipeline_layout: VulkanPipelineLayout,
+    descriptor_set_layout: VulkanDescriptorSetLayout,
+}
+
+#[allow(dead_code)]
+impl VulkanSampledTexturePipelineLayout {
+    pub(super) fn pipeline_layout(&self) -> &VulkanPipelineLayout {
+        &self.pipeline_layout
+    }
+
+    pub(super) fn descriptor_set_layout(&self) -> &VulkanDescriptorSetLayout {
+        &self.descriptor_set_layout
+    }
+}
+
+fn create_pipeline_layout_for_descriptor_set_layout(
+    descriptor_set_layout: &VulkanDescriptorSetLayout,
+) -> Result<VulkanPipelineLayout, VulkanError> {
+    let set_layouts = [descriptor_set_layout.handle()];
+    let create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+    // SAFETY: `descriptor_set_layout.logical_device` is a live Vulkan device and owns the
+    // descriptor-set layout handle used here, so the set layout and pipeline layout belong to the
+    // same device. There are no push-constant ranges or allocation callbacks.
+    let handle = unsafe {
+        descriptor_set_layout
+            .logical_device
+            .handle()
+            .create_pipeline_layout(&create_info, None)
+    }
+    .map_err(VulkanError::from)?;
+
+    Ok(VulkanPipelineLayout {
+        logical_device: descriptor_set_layout.logical_device.clone(),
         handle,
     })
 }
