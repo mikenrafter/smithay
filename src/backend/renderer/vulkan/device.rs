@@ -941,7 +941,7 @@ impl VulkanDeviceState {
             pipeline_layout,
             descriptor_set_layout,
         };
-        let render_pass = create_single_color_load_render_pass(&logical_device, shaders.color_format)?;
+        let render_pass = self.single_color_load_render_pass(shaders.color_format)?;
         let pipeline = create_sampled_texture_graphics_pipeline(
             &logical_device,
             &render_pass,
@@ -1065,7 +1065,7 @@ impl VulkanDeviceState {
             unsafe { VulkanShaderSpirv::from_words_unchecked(BUILTIN_SOLID_FRAGMENT_SHADER_SPIRV)? },
         )?;
         let layout = create_solid_color_pipeline_layout(&logical_device)?;
-        let render_pass = create_single_color_load_render_pass(&logical_device, color_format)?;
+        let render_pass = self.single_color_load_render_pass(color_format)?;
         let pipeline = create_sampled_texture_graphics_pipeline(
             &logical_device,
             &render_pass,
@@ -3443,7 +3443,7 @@ impl VulkanSampledTexturePipelineLayout {
 pub(crate) struct VulkanSampledTextureGraphicsPipeline {
     color_format: vk::Format,
     blend_enabled: bool,
-    render_pass: VulkanRenderPass,
+    render_pass: Arc<VulkanRenderPass>,
     layout: VulkanSampledTexturePipelineLayout,
     pipeline: VulkanGraphicsPipeline,
 }
@@ -3459,6 +3459,11 @@ impl VulkanSampledTextureGraphicsPipeline {
     }
 
     pub(super) fn render_pass(&self) -> &VulkanRenderPass {
+        self.render_pass.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) fn render_pass_arc(&self) -> &Arc<VulkanRenderPass> {
         &self.render_pass
     }
 
@@ -3477,7 +3482,7 @@ impl VulkanSampledTextureGraphicsPipeline {
 pub(crate) struct VulkanSolidColorGraphicsPipeline {
     color_format: vk::Format,
     blend_enabled: bool,
-    render_pass: VulkanRenderPass,
+    render_pass: Arc<VulkanRenderPass>,
     layout: VulkanPipelineLayout,
     pipeline: VulkanGraphicsPipeline,
 }
@@ -3493,6 +3498,11 @@ impl VulkanSolidColorGraphicsPipeline {
     }
 
     pub(super) fn render_pass(&self) -> &VulkanRenderPass {
+        self.render_pass.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) fn render_pass_arc(&self) -> &Arc<VulkanRenderPass> {
         &self.render_pass
     }
 
@@ -3792,13 +3802,6 @@ fn create_sampled_texture_descriptor_set(
         sampled_image,
         handle,
     })
-}
-
-fn create_single_color_load_render_pass(
-    logical_device: &VulkanLogicalDevice,
-    format: vk::Format,
-) -> Result<VulkanRenderPass, VulkanError> {
-    create_single_color_render_pass_with_load_op(logical_device, format, vk::AttachmentLoadOp::LOAD)
 }
 
 fn create_single_color_render_pass_with_load_op(

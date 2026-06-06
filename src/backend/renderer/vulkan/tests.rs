@@ -2639,6 +2639,10 @@ fn runtime_builtin_graphics_pipelines_are_cached() {
     assert!(Arc::ptr_eq(&sampled_blend_a, &sampled_blend_b));
     assert!(!Arc::ptr_eq(&sampled_blend_a, &sampled_opaque));
 
+    let load_render_pass = device.single_color_load_render_pass(pipeline_format).unwrap();
+    assert!(Arc::ptr_eq(sampled_blend_a.render_pass_arc(), &load_render_pass));
+    assert!(Arc::ptr_eq(sampled_opaque.render_pass_arc(), &load_render_pass));
+
     let solid_blend_a = device
         .builtin_solid_color_graphics_pipeline(pipeline_format, true)
         .unwrap();
@@ -2650,10 +2654,11 @@ fn runtime_builtin_graphics_pipelines_are_cached() {
         .unwrap();
     assert!(Arc::ptr_eq(&solid_blend_a, &solid_blend_b));
     assert!(!Arc::ptr_eq(&solid_blend_a, &solid_opaque));
+    assert!(Arc::ptr_eq(solid_blend_a.render_pass_arc(), &load_render_pass));
+    assert!(Arc::ptr_eq(solid_opaque.render_pass_arc(), &load_render_pass));
 
     let clear_render_pass_a = device.single_color_clear_render_pass(pipeline_format).unwrap();
     let clear_render_pass_b = device.single_color_clear_render_pass(pipeline_format).unwrap();
-    let load_render_pass = device.single_color_load_render_pass(pipeline_format).unwrap();
     assert!(Arc::ptr_eq(&clear_render_pass_a, &clear_render_pass_b));
     assert!(!Arc::ptr_eq(&clear_render_pass_a, &load_render_pass));
 
