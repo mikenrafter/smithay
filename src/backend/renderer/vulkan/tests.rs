@@ -1666,6 +1666,39 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
 
 #[test]
 #[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_sampled_texture_descriptor_scaffolds_create_with_first_physical_device() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let device = renderer.device.as_ref().unwrap();
+
+    let descriptor_set_layout = device.create_sampled_texture_descriptor_set_layout().unwrap();
+    assert_ne!(descriptor_set_layout.handle(), vk::DescriptorSetLayout::null());
+
+    let descriptor_pool = device.create_sampled_texture_descriptor_pool(2).unwrap();
+    assert_ne!(descriptor_pool.handle(), vk::DescriptorPool::null());
+    assert_eq!(descriptor_pool.max_sets(), 2);
+
+    let sampled_texture_layout = device.create_sampled_texture_pipeline_layout().unwrap();
+    assert_ne!(
+        sampled_texture_layout.descriptor_set_layout().handle(),
+        vk::DescriptorSetLayout::null()
+    );
+    assert_ne!(
+        sampled_texture_layout.pipeline_layout().handle(),
+        vk::PipelineLayout::null()
+    );
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
 fn runtime_format_discovery_finds_device_backed_formats_without_import_export() {
     let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
     let physical_device = PhysicalDevice::enumerate(&instance)
