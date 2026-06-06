@@ -670,6 +670,37 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn create_sampled_texture_descriptor_set_layout(
+        &self,
+    ) -> Result<VulkanDescriptorSetLayout, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+
+        create_sampled_texture_descriptor_set_layout(&logical_device)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn create_sampled_texture_descriptor_pool(
+        &self,
+        max_sets: u32,
+    ) -> Result<VulkanDescriptorPool, VulkanError> {
+        if max_sets == 0 {
+            return Err(VulkanError::UnsupportedOperation("descriptor pool capacity"));
+        }
+
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+
+        create_sampled_texture_descriptor_pool(&logical_device, max_sets)
+    }
+
+    #[allow(dead_code)]
     pub(super) fn read_image_to_tightly_packed_buffer(
         &self,
         image: &VulkanOwnedImage,
@@ -2115,6 +2146,119 @@ fn create_empty_pipeline_layout(
     Ok(VulkanPipelineLayout {
         logical_device: logical_device.clone(),
         handle,
+    })
+}
+
+/// Descriptor-set layout for binding one sampled texture to a fragment shader.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanDescriptorSetLayout {
+    logical_device: VulkanLogicalDevice,
+    handle: vk::DescriptorSetLayout,
+}
+
+#[allow(dead_code)]
+impl VulkanDescriptorSetLayout {
+    pub(super) fn handle(&self) -> vk::DescriptorSetLayout {
+        self.handle
+    }
+}
+
+impl Drop for VulkanDescriptorSetLayout {
+    fn drop(&mut self) {
+        // SAFETY: `self.handle` was created from `self.logical_device` and this owner destroys it
+        // exactly once. `VulkanLogicalDevice` is retained by value, so the device outlives the
+        // descriptor-set layout. The layout is not shared, satisfying host synchronization.
+        unsafe {
+            self.logical_device
+                .handle()
+                .destroy_descriptor_set_layout(self.handle, None)
+        };
+    }
+}
+
+fn create_sampled_texture_descriptor_set_layout(
+    logical_device: &VulkanLogicalDevice,
+) -> Result<VulkanDescriptorSetLayout, VulkanError> {
+    let bindings = [vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+    let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    // SAFETY: `logical_device` is a live Vulkan device. The single binding has descriptor count 1,
+    // a valid descriptor type, and a non-empty shader stage mask. No immutable samplers or
+    // allocation callbacks are used.
+    let handle = unsafe {
+        logical_device
+            .handle()
+            .create_descriptor_set_layout(&create_info, None)
+    }
+    .map_err(VulkanError::from)?;
+
+    Ok(VulkanDescriptorSetLayout {
+        logical_device: logical_device.clone(),
+        handle,
+    })
+}
+
+/// Descriptor pool for future sampled-texture descriptor sets.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanDescriptorPool {
+    logical_device: VulkanLogicalDevice,
+    handle: vk::DescriptorPool,
+    max_sets: u32,
+}
+
+#[allow(dead_code)]
+impl VulkanDescriptorPool {
+    pub(super) fn handle(&self) -> vk::DescriptorPool {
+        self.handle
+    }
+
+    pub(super) fn max_sets(&self) -> u32 {
+        self.max_sets
+    }
+}
+
+impl Drop for VulkanDescriptorPool {
+    fn drop(&mut self) {
+        // SAFETY: `self.handle` was created from `self.logical_device` and this owner destroys it
+        // exactly once. `VulkanLogicalDevice` is retained by value, so the device outlives the
+        // descriptor pool. The pool is not shared, satisfying host synchronization for destruction.
+        unsafe {
+            self.logical_device
+                .handle()
+                .destroy_descriptor_pool(self.handle, None)
+        };
+    }
+}
+
+fn create_sampled_texture_descriptor_pool(
+    logical_device: &VulkanLogicalDevice,
+    max_sets: u32,
+) -> Result<VulkanDescriptorPool, VulkanError> {
+    if max_sets == 0 {
+        return Err(VulkanError::UnsupportedOperation("descriptor pool capacity"));
+    }
+
+    let pool_sizes = [vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(max_sets)];
+    let create_info = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(max_sets)
+        .pool_sizes(&pool_sizes);
+    // SAFETY: `logical_device` is a live Vulkan device. Local validation rejects zero `max_sets`,
+    // and this create info provides the same non-zero combined-image-sampler descriptor count. No
+    // allocation callbacks are used.
+    let handle = unsafe { logical_device.handle().create_descriptor_pool(&create_info, None) }
+        .map_err(VulkanError::from)?;
+
+    Ok(VulkanDescriptorPool {
+        logical_device: logical_device.clone(),
+        handle,
+        max_sets,
     })
 }
 
