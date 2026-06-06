@@ -1302,22 +1302,19 @@ fn frame_finish_is_signaled_without_submitted_work() {
 }
 
 #[test]
-fn frame_render_texture_rejects_every_transform_cleanly() {
-    let texture = texture_for_tests((2, 3).into(), Some(Fourcc::Argb8888));
-    let transforms = [
-        Transform::Normal,
-        Transform::_90,
-        Transform::_180,
-        Transform::_270,
-        Transform::Flipped,
-        Transform::Flipped90,
-        Transform::Flipped180,
-        Transform::Flipped270,
-    ];
+fn frame_render_texture_supports_axis_aligned_transforms_before_device_lookup() {
+    let context_id = ContextId::new();
+    let mut texture = texture_for_tests((2, 3).into(), Some(Fourcc::Argb8888));
+    texture.context_id = context_id.clone();
     let damage = [Rectangle::from_size((8, 6).into())];
 
-    for transform in transforms {
-        let mut frame = frame_for_tests(ContextId::new(), (8, 6).into(), Transform::Normal);
+    for transform in [
+        Transform::Normal,
+        Transform::_180,
+        Transform::Flipped,
+        Transform::Flipped180,
+    ] {
+        let mut frame = frame_for_tests(context_id.clone(), (8, 6).into(), Transform::Normal);
 
         assert!(
             matches!(
@@ -1330,7 +1327,40 @@ fn frame_render_texture_rejects_every_transform_cleanly() {
                     transform,
                     0.5,
                 ),
-                Err(VulkanError::UnsupportedOperation(_))
+                Err(VulkanError::UnsupportedOperation("render texture device"))
+            ),
+            "transform {transform:?}"
+        );
+    }
+}
+
+#[test]
+fn frame_render_texture_rejects_rotated_transforms_cleanly() {
+    let context_id = ContextId::new();
+    let mut texture = texture_for_tests((2, 3).into(), Some(Fourcc::Argb8888));
+    texture.context_id = context_id.clone();
+    let damage = [Rectangle::from_size((8, 6).into())];
+
+    for transform in [
+        Transform::_90,
+        Transform::_270,
+        Transform::Flipped90,
+        Transform::Flipped270,
+    ] {
+        let mut frame = frame_for_tests(context_id.clone(), (8, 6).into(), Transform::Normal);
+
+        assert!(
+            matches!(
+                frame.render_texture_from_to(
+                    &texture,
+                    Rectangle::from_size((2.0, 3.0).into()),
+                    Rectangle::from_size((8, 6).into()),
+                    &damage,
+                    &[],
+                    transform,
+                    0.5,
+                ),
+                Err(VulkanError::UnsupportedOperation("render texture transform"))
             ),
             "transform {transform:?}"
         );
@@ -1502,7 +1532,8 @@ fn source_to_uv_rect_flips_y_for_y_inverted_textures() {
         source_to_uv_rect(
             (2, 4).into(),
             Rectangle::new((0.0, 1.0).into(), (2.0, 2.0).into()),
-            false
+            false,
+            Transform::Normal,
         ),
         Some([0.0, 0.25, 1.0, 0.5])
     );
@@ -1510,7 +1541,8 @@ fn source_to_uv_rect_flips_y_for_y_inverted_textures() {
         source_to_uv_rect(
             (2, 4).into(),
             Rectangle::new((0.0, 1.0).into(), (2.0, 2.0).into()),
-            true
+            true,
+            Transform::Normal,
         ),
         Some([0.0, 0.75, 1.0, -0.5])
     );
@@ -1518,7 +1550,8 @@ fn source_to_uv_rect_flips_y_for_y_inverted_textures() {
         source_to_uv_rect(
             (2, 4).into(),
             Rectangle::new((0.0, 0.0).into(), (2.0, 1.0).into()),
-            true
+            true,
+            Transform::Normal,
         ),
         Some([0.0, 1.0, 1.0, -0.25])
     );
@@ -1526,9 +1559,38 @@ fn source_to_uv_rect_flips_y_for_y_inverted_textures() {
         source_to_uv_rect(
             (2, 4).into(),
             Rectangle::new((0.0, 2.0).into(), (2.0, 1.0).into()),
-            true
+            true,
+            Transform::Normal,
         ),
         Some([0.0, 0.5, 1.0, -0.25])
+    );
+}
+
+#[test]
+fn source_to_uv_rect_supports_axis_aligned_source_transforms() {
+    let src = Rectangle::new((1.0, 1.0).into(), (2.0, 2.0).into());
+    let texture_size = Size::<i32, BufferCoord>::from((4, 4));
+
+    assert_eq!(
+        source_to_uv_rect(texture_size, src, false, Transform::Normal),
+        Some([0.25, 0.25, 0.5, 0.5])
+    );
+    assert_eq!(
+        source_to_uv_rect(texture_size, src, false, Transform::_180),
+        Some([0.75, 0.75, -0.5, -0.5])
+    );
+    assert_eq!(
+        source_to_uv_rect(texture_size, src, false, Transform::Flipped),
+        Some([0.75, 0.25, -0.5, 0.5])
+    );
+    assert_eq!(
+        source_to_uv_rect(texture_size, src, false, Transform::Flipped180),
+        Some([0.25, 0.75, 0.5, -0.5])
+    );
+    assert_eq!(source_to_uv_rect(texture_size, src, false, Transform::_90), None);
+    assert_eq!(
+        source_to_uv_rect(texture_size, src, false, Transform::Flipped270),
+        None
     );
 }
 
@@ -2584,6 +2646,115 @@ fn runtime_frame_render_texture_crops_y_inverted_texture() {
 
     let readback = renderer.read_offscreen_render_target(&mut framebuffer).unwrap();
     assert_eq!(readback, [255, 255, 255, 255]);
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_frame_render_texture_applies_axis_aligned_source_transforms() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let mut renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let Some(render_format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.sampled
+                && record.usages.color_attachment
+                && record.usages.color_attachment_blend
+                && record.usages.transfer_src
+                && record.usages.transfer_dst
+        })
+        .map(|record| record.format)
+    else {
+        return;
+    };
+
+    let sampled_image = renderer
+        .device
+        .as_ref()
+        .unwrap()
+        .create_uploaded_sampled_image(
+            vk::Extent3D {
+                width: 2,
+                height: 2,
+                depth: 1,
+            },
+            super::get_render_vk_format(render_format).unwrap(),
+            &[
+                255, 0, 0, 255, // top-left
+                0, 255, 0, 255, // top-right
+                0, 0, 255, 255, // bottom-left
+                255, 255, 255, 255, // bottom-right
+            ],
+            TextureFilter::Nearest,
+            TextureFilter::Nearest,
+        )
+        .unwrap();
+    let texture = VulkanTexture::from_sampled_image(
+        renderer.context_id(),
+        (2, 2).into(),
+        render_format,
+        sampled_image,
+        false,
+    );
+    let cases: &[(Transform, &[u8])] = &[
+        (
+            Transform::Flipped,
+            &[0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255, 0, 0, 255, 255],
+        ),
+        (
+            Transform::Flipped180,
+            &[0, 0, 255, 255, 255, 255, 255, 255, 255, 0, 0, 255, 0, 255, 0, 255],
+        ),
+        (
+            Transform::_180,
+            &[255, 255, 255, 255, 0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255],
+        ),
+    ];
+
+    for (transform, expected) in cases {
+        let mut target = Offscreen::<VulkanRenderTarget<'static>>::create_buffer(
+            &mut renderer,
+            render_format,
+            (2, 2).into(),
+        )
+        .unwrap();
+        let mut framebuffer = Bind::bind(&mut renderer, &mut target).unwrap();
+
+        {
+            let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((2, 2)))];
+            let mut frame = renderer
+                .render(&mut framebuffer, (2, 2).into(), Transform::Normal)
+                .unwrap();
+
+            frame
+                .render_texture_from_to(
+                    &texture,
+                    Rectangle::from_size((2.0, 2.0).into()),
+                    Rectangle::from_size((2, 2).into()),
+                    &full_damage,
+                    &[],
+                    *transform,
+                    1.0,
+                )
+                .unwrap();
+            assert!(frame.finish().unwrap().is_reached());
+        }
+
+        let readback = renderer.read_offscreen_render_target(&mut framebuffer).unwrap();
+        assert_eq!(&readback, expected, "transform {transform:?}");
+    }
 }
 
 #[test]

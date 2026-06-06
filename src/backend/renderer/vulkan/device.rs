@@ -1569,7 +1569,7 @@ fn validate_sampled_texture_draw_constants(
         .iter()
         .all(|component| component.is_finite())
         || !draw_constants.alpha.is_finite()
-        || u_scale <= 0.0
+        || u_scale == 0.0
         || v_scale == 0.0
         || !uv_range.contains(&u_offset)
         || !uv_range.contains(&u_end)
