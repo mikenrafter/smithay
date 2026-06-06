@@ -1,4 +1,4 @@
-//! Format mapping helpers for the Vulkan renderer scaffold.
+//! Format mapping helpers for the Vulkan renderer.
 //!
 //! These helpers are table-driven and do not require a live Vulkan device. They only describe
 //! renderer-side DRM fourcc to Vulkan format mappings and basic format semantics; actual device
@@ -20,7 +20,7 @@ use super::VulkanError;
 pub struct VulkanFormatInfo {
     /// DRM format.
     pub fourcc: Fourcc,
-    /// Vulkan format used by the renderer scaffold.
+    /// Vulkan format used by the renderer.
     pub vk_format: vk::Format,
     /// Whether the DRM format carries alpha.
     pub has_alpha: bool,
@@ -185,7 +185,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_scaffold_formats_have_table_mapping_and_semantics() {
+    fn all_renderer_formats_have_table_mapping_and_semantics() {
         for info in FORMAT_TABLE.iter().copied() {
             let format_info = get_format_info(info.fourcc).unwrap();
             assert_eq!(format_info.vk_format, info.vk_format);
@@ -196,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_format_table_has_no_duplicate_fourcc_entries() {
+    fn renderer_format_table_has_no_duplicate_fourcc_entries() {
         let mut seen = HashSet::new();
 
         for info in FORMAT_TABLE.iter().copied() {
@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn formats_outside_scaffold_table_return_unsupported() {
+    fn formats_outside_renderer_table_return_unsupported() {
         assert!(matches!(
             get_format_info(Fourcc::Bgra8888),
             Err(VulkanError::UnsupportedFormat(Fourcc::Bgra8888))

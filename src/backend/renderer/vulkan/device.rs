@@ -50,7 +50,7 @@ pub(super) struct VulkanSolidColorDrawConstants {
     pub(super) color: [f32; 4],
 }
 
-/// Device state placeholder for the future Vulkan renderer implementation.
+/// Device state for the provisional Vulkan in-memory/offscreen renderer.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct VulkanDeviceState {
@@ -2768,7 +2768,7 @@ fn create_bound_image(
     })
 }
 
-/// Logical device owner placeholder.
+/// Logical device owner retained by Vulkan resource wrappers.
 #[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct VulkanLogicalDevice {
@@ -3107,7 +3107,7 @@ impl<'code> VulkanShaderSpirv<'code> {
     }
 }
 
-/// Pair of SPIR-V modules compatible with the sampled-texture graphics pipeline scaffold.
+/// Pair of SPIR-V modules compatible with the sampled-texture graphics pipeline.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct VulkanSampledTexturePipelineShaders<'code> {
@@ -3124,13 +3124,13 @@ impl<'code> VulkanSampledTexturePipelineShaders<'code> {
     ///
     /// The caller must ensure both slices contain valid SPIR-V modules for Vulkan shader modules.
     /// The vertex module must provide a `main` entry point with the vertex execution model. The
-    /// vertex module must not declare non-built-in vertex input attributes, because the scaffold
+    /// vertex module must not declare non-built-in vertex input attributes, because the renderer
     /// pipeline uses an empty vertex-input state. The fragment module must provide a `main` entry
     /// point with the fragment execution model. Their location interfaces must match, the fragment
     /// module must use descriptor set 0 binding 0 as a single `COMBINED_IMAGE_SAMPLER`. If the
     /// fragment module reads push constants, those reads must fit inside the first 32 bytes provided
     /// by this sampled-texture pipeline layout. Its color output must be compatible with a single
-    /// `color_format` color attachment in subpass 0 of the render pass used by the scaffold.
+    /// `color_format` color attachment in subpass 0 of the render pass used by the renderer.
     pub(super) unsafe fn from_spirv_unchecked(
         color_format: vk::Format,
         vertex_words: &'code [u32],
@@ -3947,7 +3947,7 @@ impl Drop for VulkanSampler {
     }
 }
 
-/// Uploaded sampled image bundle for the future Vulkan texture path.
+/// Uploaded sampled image bundle for the Vulkan texture path.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct VulkanSampledImage {
@@ -4063,7 +4063,7 @@ impl Drop for VulkanHostVisibleBufferInner {
     }
 }
 
-/// Queue family placeholders discovered during device initialization.
+/// Queue family indices discovered during device initialization.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct VulkanQueueFamilies {
     pub(super) graphics: Option<u32>,

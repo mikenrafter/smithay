@@ -3,11 +3,11 @@
 //! Collection of common traits and implementations
 //! to facilitate (possible hardware-accelerated) rendering.
 //!
-//! Renderer implementations and scaffolds:
+//! Renderer implementations:
 //!
 //! - Raw OpenGL ES 2
 //! - Pixman software rendering
-//! - Vulkan renderer scaffold, gated behind `renderer_vulkan` and intentionally non-functional
+//! - Provisional Vulkan in-memory/offscreen renderer, gated behind `renderer_vulkan`
 
 use crate::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Scale, Size, Transform, ids::id_gen};
 use glam::Affine2;

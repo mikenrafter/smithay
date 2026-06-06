@@ -211,7 +211,7 @@ fn vulkan_format_capability_record_is_per_tiling_marker() {
 }
 
 #[test]
-fn vulkan_device_state_placeholder_starts_empty() {
+fn vulkan_device_state_uninitialized_starts_empty() {
     let device = VulkanDeviceState::empty_for_tests();
     assert!(device.instance.is_none());
     assert!(device.physical_device.is_none());
@@ -692,7 +692,7 @@ fn sampled_texture_pipeline_layout_creation_requires_initialized_device() {
 }
 
 #[test]
-fn vulkan_renderer_builder_is_scaffold_only() {
+fn vulkan_renderer_builder_requires_explicit_physical_device() {
     assert!(matches!(
         VulkanRenderer::builder().build(),
         Err(VulkanError::VulkanUnavailable)
@@ -874,7 +874,7 @@ fn public_bind_supported_formats_filter_provisional_render_target_capabilities()
 }
 
 #[test]
-fn scaffold_renderer_reports_no_memory_import_formats() {
+fn uninitialized_renderer_reports_no_memory_import_formats() {
     let renderer = VulkanRenderer::new_scaffold_for_tests();
 
     assert!(renderer.mem_formats().next().is_none());
@@ -997,7 +997,7 @@ fn queue_family_selection_uses_graphics_for_transfer_fallback() {
 }
 
 #[test]
-fn vulkan_image_state_placeholder_tracks_target_metadata() {
+fn vulkan_image_state_tracks_target_metadata() {
     let target = VulkanRenderTarget::new_for_tests((2, 3).into(), Some(Fourcc::Argb8888));
     assert_eq!(target.width(), 2);
     assert_eq!(target.height(), 3);
@@ -1011,7 +1011,7 @@ fn vulkan_image_state_placeholder_tracks_target_metadata() {
 }
 
 #[test]
-fn vulkan_texture_placeholder_tracks_texture_metadata() {
+fn vulkan_texture_tracks_texture_metadata() {
     let texture = texture_for_tests((5, 7).into(), None);
 
     assert_eq!(texture.width(), 5);
@@ -1106,7 +1106,7 @@ fn vulkan_api_context_invalidation_policy_is_explicit() {
 }
 
 #[test]
-fn external_memory_metadata_placeholder_tracks_planes() {
+fn external_memory_metadata_tracks_planes() {
     let memory = VulkanExternalMemoryState {
         handle_type: VulkanExternalMemoryHandleType::Dmabuf,
         format: Fourcc::Argb8888,
@@ -1224,7 +1224,7 @@ fn renderer_render_rejects_missing_offscreen_image_before_device_lookup() {
 }
 
 #[test]
-fn frame_metadata_accessors_report_scaffold_state() {
+fn frame_metadata_accessors_report_uninitialized_state() {
     let context_id = ContextId::new();
     let frame = frame_for_tests(context_id.clone(), (11, 13).into(), Transform::Flipped270);
 
@@ -2478,7 +2478,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
 
 #[test]
 #[ignore = "requires a working Vulkan loader and physical device"]
-fn runtime_sampled_texture_descriptor_scaffolds_create_with_first_physical_device() {
+fn runtime_sampled_texture_descriptor_resources_create_with_first_physical_device() {
     let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
     let physical_device = PhysicalDevice::enumerate(&instance)
         .unwrap()

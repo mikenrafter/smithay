@@ -1,20 +1,20 @@
-//! Native Vulkan renderer scaffold.
+//! Native Vulkan renderer.
 //!
-//! This module establishes the renderer-side structure for a future native Vulkan backend. It is
-//! intentionally incomplete: it can initialize an explicit Vulkan device, upload sampled textures
-//! from CPU memory, and exercise a narrow offscreen frame-render path through Smithay's public
-//! [`Bind`] and [`Offscreen`] traits, but it does not expose general Vulkan rendering support,
-//! present to KMS, implement HDR, or perform colour-management policy.
+//! This module provides a provisional, opt-in Vulkan renderer for an explicit [`PhysicalDevice`]. It
+//! can upload sampled textures from CPU memory and render to in-memory/offscreen targets through
+//! Smithay's public [`ImportMem`], [`Bind`], [`Offscreen`], and [`Renderer`] traits. It remains
+//! intentionally incomplete and does not expose general Vulkan compositor support, present to KMS,
+//! implement HDR, or perform colour-management policy.
 //!
 //! Downstream compositors must not treat the presence of this module or the `renderer_vulkan`
 //! feature as broad Vulkan rendering support. Real enablement must be added incrementally behind
 //! explicit capability bits, with tests and stub failure paths before enabling working
 //! functionality.
 //!
-//! Smithay's optional renderer traits are capability surfaces. This module currently implements
-//! `ImportMem`, `Bind`, and `Offscreen` for the tested in-memory/offscreen path only. `ImportDma`,
-//! `ExportMem`, `ExportDma`, explicit sync, blit/copy, and presentation remain unsupported until
-//! the corresponding capability bit can become true with coverage.
+//! Smithay's optional renderer traits are capability surfaces. This module currently supports the
+//! tested CPU-memory/offscreen path only. `ImportDma`, `ExportMem`, `ExportDma`, explicit sync,
+//! blit/copy, and presentation remain unsupported until the corresponding capability bit can become
+//! true with coverage.
 //!
 //! Intended implementation order:
 //!
@@ -77,7 +77,7 @@ use self::{
     format::{get_format_info, get_render_vk_format},
 };
 
-/// Native Vulkan renderer scaffold.
+/// Provisional native Vulkan renderer for explicit-device in-memory/offscreen rendering.
 #[derive(Debug)]
 pub struct VulkanRenderer {
     context_id: ContextId<VulkanTexture>,
@@ -88,11 +88,10 @@ pub struct VulkanRenderer {
     device: Option<VulkanDeviceState>,
 }
 
-/// Builder for future Vulkan renderer initialization.
+/// Builder for explicit Vulkan renderer initialization.
 ///
-/// The builder records the ownership shape expected by the real implementation. It can initialize a
-/// logical Vulkan device from an explicitly provided [`PhysicalDevice`], but rendering/import/export
-/// operations remain unsupported until the corresponding capability bits can become true.
+/// The builder initializes a logical Vulkan device from an explicitly provided [`PhysicalDevice`].
+/// Public operations remain limited to the capability bits advertised by the initialized renderer.
 #[derive(Debug, Default, Clone)]
 pub struct VulkanRendererBuilder {
     physical_device: Option<PhysicalDevice>,
@@ -141,15 +140,15 @@ impl VulkanRenderer {
         Self::builder().build()
     }
 
-    /// Creates a builder for future Vulkan renderer initialization.
+    /// Creates a builder for explicit Vulkan renderer initialization.
     pub fn builder() -> VulkanRendererBuilder {
         VulkanRendererBuilder::new()
     }
 
-    /// Returns the scaffold capabilities without constructing a renderer.
+    /// Returns the uninitialized/default capabilities without constructing a renderer.
     ///
-    /// This is the only capability query available until real Vulkan device initialization exists.
-    /// All capability bits are false and all format/extension sets are empty.
+    /// All capability bits are false and all format/extension sets are empty until a renderer is
+    /// initialized with an explicit [`PhysicalDevice`].
     pub fn scaffold_capabilities() -> VulkanRendererCapabilities {
         VulkanRendererCapabilities::default()
     }
@@ -168,7 +167,9 @@ impl VulkanRenderer {
 
     /// Returns the discovered Vulkan renderer capabilities.
     ///
-    /// All capability bits are false and all format/extension sets are empty in the scaffold.
+    /// Uninitialized test renderers report all capability bits as false and all format/extension
+    /// sets as empty. Renderers built with an explicit [`PhysicalDevice`] report discovered device
+    /// and format capabilities.
     pub fn capabilities(&self) -> &VulkanRendererCapabilities {
         &self.capabilities
     }

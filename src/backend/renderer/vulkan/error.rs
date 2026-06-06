@@ -1,6 +1,6 @@
 use crate::backend::{SwapBuffersError, allocator::Fourcc};
 
-/// Error returned by the Vulkan renderer scaffold.
+/// Error returned by the Vulkan renderer.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum VulkanError {
@@ -10,7 +10,7 @@ pub enum VulkanError {
     /// A required Vulkan extension is missing.
     #[error("Missing required Vulkan extension: {0}")]
     MissingRequiredExtension(String),
-    /// The requested operation is not supported by the scaffold.
+    /// The requested operation is not supported by the current Vulkan renderer capability set.
     #[error("Unsupported Vulkan renderer operation: {0}")]
     UnsupportedOperation(&'static str),
     /// The requested format is unsupported.

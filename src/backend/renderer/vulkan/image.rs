@@ -19,7 +19,7 @@ use super::{
     format::{get_format_info, get_render_vk_format},
 };
 
-/// Vulkan frame scaffold.
+/// Vulkan frame for the provisional in-memory/offscreen renderer.
 #[derive(Debug)]
 pub struct VulkanFrame<'renderer, 'buffer> {
     pub(super) context_id: ContextId<VulkanTexture>,
@@ -30,7 +30,7 @@ pub struct VulkanFrame<'renderer, 'buffer> {
     pub(super) _renderer: PhantomData<&'renderer mut VulkanRenderer>,
 }
 
-/// Vulkan texture scaffold.
+/// Vulkan texture tracked by the renderer.
 #[derive(Debug, Clone)]
 pub struct VulkanTexture {
     pub(super) context_id: ContextId<VulkanTexture>,
@@ -40,7 +40,7 @@ pub struct VulkanTexture {
     pub(super) y_inverted: bool,
 }
 
-/// Vulkan render target scaffold.
+/// Vulkan render target tracked by the renderer.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct VulkanRenderTarget<'buffer> {
@@ -50,7 +50,7 @@ pub struct VulkanRenderTarget<'buffer> {
     pub(super) _target: PhantomData<&'buffer mut ()>,
 }
 
-/// Vulkan image state placeholder shared by textures and render targets.
+/// Vulkan image state shared by textures and render targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VulkanImageState {
     pub(super) size: Size<i32, BufferCoord>,
@@ -141,7 +141,7 @@ pub(crate) enum VulkanImageSource {
     Swapchain,
 }
 
-/// Image usage bits tracked by the renderer scaffold.
+/// Image usage bits tracked by the renderer.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VulkanImageUsage {
     pub(super) sampled: bool,
@@ -152,7 +152,7 @@ pub(crate) struct VulkanImageUsage {
     pub(super) host_visible: bool,
 }
 
-/// Coarse image layout state tracked by the renderer scaffold.
+/// Coarse image layout state tracked by the renderer.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VulkanImageLayoutState {
@@ -164,14 +164,14 @@ pub(crate) enum VulkanImageLayoutState {
     Present,
 }
 
-/// Synchronization state tracked by the renderer scaffold.
+/// Synchronization state tracked by the renderer.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VulkanImageSyncState {
     pub(super) pending_write: bool,
     pub(super) exportable_sync: bool,
 }
 
-/// External-memory metadata placeholder for future dmabuf import/export support.
+/// External-memory metadata reserved for future dmabuf import/export support.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VulkanExternalMemoryState {
@@ -197,7 +197,7 @@ pub(crate) struct VulkanDmabufPlane {
     pub(super) stride: u32,
 }
 
-/// Import metadata placeholder for a future `ImportDma` implementation.
+/// Import metadata reserved for a future `ImportDma` implementation.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VulkanDmabufImportState {
