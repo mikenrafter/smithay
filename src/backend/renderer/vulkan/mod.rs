@@ -1,8 +1,9 @@
 //! Native Vulkan renderer scaffold.
 //!
 //! This module establishes the renderer-side structure for a future native Vulkan backend. It is
-//! intentionally incomplete: it can initialize an explicit Vulkan device and upload sampled textures
-//! from CPU memory, but it does not render frames, present to KMS, implement HDR, or perform
+//! intentionally incomplete: it can initialize an explicit Vulkan device, upload sampled textures
+//! from CPU memory, and exercise a narrow private offscreen frame-render path, but it does not
+//! expose general Vulkan rendering support, present to KMS, implement HDR, or perform
 //! colour-management policy.
 //!
 //! Downstream compositors must not treat the presence of this module or the `renderer_vulkan`

@@ -11,6 +11,7 @@ use crate::{
 use super::{
     VulkanError, VulkanRenderer, clear_color_value_for_format,
     device::{VulkanDeviceState, VulkanOwnedImage, VulkanSampledImage},
+    format::get_render_vk_format,
 };
 
 /// Vulkan frame scaffold.
@@ -337,19 +338,75 @@ impl Frame for VulkanFrame<'_, '_> {
 
     fn render_texture_from_to(
         &mut self,
-        _texture: &Self::TextureId,
-        _src: Rectangle<f64, BufferCoord>,
-        _dst: Rectangle<i32, Physical>,
+        texture: &Self::TextureId,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
-        _opaque_regions: &[Rectangle<i32, Physical>],
-        _src_transform: Transform,
-        _alpha: f32,
+        opaque_regions: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
     ) -> Result<(), Self::Error> {
         if damage.is_empty() {
             return Ok(());
         }
 
-        Err(VulkanError::UnsupportedOperation("render texture"))
+        if texture.context_id != self.context_id {
+            return Err(VulkanError::UnsupportedOperation("foreign render texture"));
+        }
+        if !is_full_target_damage(self.output_size, damage) {
+            return Err(VulkanError::UnsupportedOperation("render texture damage"));
+        }
+        if !is_full_texture_source(texture.image.size, src) {
+            return Err(VulkanError::UnsupportedOperation("render texture source"));
+        }
+        if !is_full_output_destination(self.output_size, dst) {
+            return Err(VulkanError::UnsupportedOperation("render texture destination"));
+        }
+        if !opaque_regions.is_empty() {
+            return Err(VulkanError::UnsupportedOperation("render texture opaque regions"));
+        }
+        if src_transform != Transform::Normal || self.transform != Transform::Normal {
+            return Err(VulkanError::UnsupportedOperation("render texture transform"));
+        }
+        if alpha != 1.0 {
+            return Err(VulkanError::UnsupportedOperation("render texture alpha"));
+        }
+        if texture.y_inverted {
+            return Err(VulkanError::UnsupportedOperation("render texture y-inverted"));
+        }
+
+        let device = self
+            .device
+            .ok_or(VulkanError::UnsupportedOperation("render texture device"))?;
+        let target = self
+            .target
+            .as_deref_mut()
+            .ok_or(VulkanError::UnsupportedOperation("render texture target"))?;
+        let color_image = target
+            .color_image
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("offscreen target image"))?;
+        let target_format = target
+            .image
+            .format
+            .ok_or(VulkanError::UnsupportedOperation("offscreen target format"))?;
+        let sampled_image = texture
+            .sampled_image
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("render texture image"))?;
+
+        let pipeline =
+            device.create_builtin_sampled_texture_graphics_pipeline(get_render_vk_format(target_format)?)?;
+        let descriptor_pool = device.create_sampled_texture_descriptor_pool(1)?;
+        let descriptor_set = device.create_sampled_texture_descriptor_set(
+            &descriptor_pool,
+            pipeline.layout().descriptor_set_layout(),
+            Arc::clone(sampled_image),
+        )?;
+
+        device.render_sampled_texture_to_color_image(color_image, &descriptor_set, &pipeline)?;
+        target.image.layout = VulkanImageLayoutState::ColorAttachment;
+        Ok(())
     }
 
     fn transformation(&self) -> Transform {
@@ -371,4 +428,15 @@ impl Frame for VulkanFrame<'_, '_> {
 
 fn is_full_target_damage(output_size: Size<i32, Physical>, damage: &[Rectangle<i32, Physical>]) -> bool {
     damage.len() == 1 && damage[0] == Rectangle::from_size(output_size)
+}
+
+fn is_full_texture_source(texture_size: Size<i32, BufferCoord>, src: Rectangle<f64, BufferCoord>) -> bool {
+    src.loc.x == 0.0
+        && src.loc.y == 0.0
+        && src.size.w == f64::from(texture_size.w)
+        && src.size.h == f64::from(texture_size.h)
+}
+
+fn is_full_output_destination(output_size: Size<i32, Physical>, dst: Rectangle<i32, Physical>) -> bool {
+    dst == Rectangle::from_size(output_size)
 }

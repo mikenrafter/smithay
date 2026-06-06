@@ -1207,6 +1207,185 @@ fn frame_render_texture_rejects_every_transform_cleanly() {
 }
 
 #[test]
+fn frame_render_texture_rejects_narrow_path_preconditions_before_device_lookup() {
+    let output_size = Size::from((8, 6));
+    let full_src = Rectangle::from_size((2.0, 3.0).into());
+    let full_dst = Rectangle::from_size(output_size);
+    let full_damage = [Rectangle::from_size(output_size)];
+    let opaque_region = [Rectangle::from_size((1, 1).into())];
+
+    fn assert_render_texture_error(
+        texture: &VulkanTexture,
+        frame_context_id: ContextId<VulkanTexture>,
+        frame_transform: Transform,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+        expected: &'static str,
+    ) {
+        let mut frame = frame_for_tests(frame_context_id, (8, 6).into(), frame_transform);
+
+        assert!(
+            matches!(
+                frame.render_texture_from_to(
+                    texture,
+                    src,
+                    dst,
+                    damage,
+                    opaque_regions,
+                    src_transform,
+                    alpha,
+                ),
+                Err(VulkanError::UnsupportedOperation(reason)) if reason == expected
+            ),
+            "expected UnsupportedOperation({expected:?})"
+        );
+    }
+
+    let frame_context_id = ContextId::new();
+    let mut texture = texture_for_tests((2, 3).into(), Some(Fourcc::Argb8888));
+
+    assert_render_texture_error(
+        &texture,
+        frame_context_id.clone(),
+        Transform::Normal,
+        full_src,
+        full_dst,
+        &full_damage,
+        &[],
+        Transform::Normal,
+        1.0,
+        "foreign render texture",
+    );
+
+    texture.context_id = frame_context_id.clone();
+
+    assert_render_texture_error(
+        &texture,
+        frame_context_id.clone(),
+        Transform::Normal,
+        full_src,
+        full_dst,
+        &[Rectangle::from_size((1, 1).into())],
+        &[],
+        Transform::Normal,
+        1.0,
+        "render texture damage",
+    );
+    assert_render_texture_error(
+        &texture,
+        frame_context_id.clone(),
+        Transform::Normal,
+        Rectangle::new((1.0, 0.0).into(), (1.0, 3.0).into()),
+        full_dst,
+        &full_damage,
+        &[],
+        Transform::Normal,
+        1.0,
+        "render texture source",
+    );
+    assert_render_texture_error(
+        &texture,
+        frame_context_id.clone(),
+        Transform::Normal,
+        full_src,
+        Rectangle::from_size((7, 6).into()),
+        &full_damage,
+        &[],
+        Transform::Normal,
+        1.0,
+        "render texture destination",
+    );
+    assert_render_texture_error(
+        &texture,
+        frame_context_id.clone(),
+        Transform::Normal,
+        full_src,
+        full_dst,
+        &full_damage,
+        &opaque_region,
+        Transform::Normal,
+        1.0,
+        "render texture opaque regions",
+    );
+    assert_render_texture_error(
+        &texture,
+        frame_context_id.clone(),
+        Transform::Normal,
+        full_src,
+        full_dst,
+        &full_damage,
+        &[],
+        Transform::_90,
+        1.0,
+        "render texture transform",
+    );
+    assert_render_texture_error(
+        &texture,
+        frame_context_id.clone(),
+        Transform::_90,
+        full_src,
+        full_dst,
+        &full_damage,
+        &[],
+        Transform::Normal,
+        1.0,
+        "render texture transform",
+    );
+    assert_render_texture_error(
+        &texture,
+        frame_context_id.clone(),
+        Transform::Normal,
+        full_src,
+        full_dst,
+        &full_damage,
+        &[],
+        Transform::Normal,
+        0.5,
+        "render texture alpha",
+    );
+
+    texture.y_inverted = true;
+    assert_render_texture_error(
+        &texture,
+        frame_context_id,
+        Transform::Normal,
+        full_src,
+        full_dst,
+        &full_damage,
+        &[],
+        Transform::Normal,
+        1.0,
+        "render texture y-inverted",
+    );
+}
+
+#[test]
+fn frame_render_texture_reaches_device_lookup_for_supported_narrow_preconditions() {
+    let context_id = ContextId::new();
+    let mut frame = frame_for_tests(context_id.clone(), (8, 6).into(), Transform::Normal);
+    let mut texture = texture_for_tests((2, 3).into(), Some(Fourcc::Argb8888));
+    texture.context_id = context_id;
+    let damage = [Rectangle::from_size((8, 6).into())];
+
+    assert!(matches!(
+        frame.render_texture_from_to(
+            &texture,
+            Rectangle::from_size((2.0, 3.0).into()),
+            Rectangle::from_size((8, 6).into()),
+            &damage,
+            &[],
+            Transform::Normal,
+            1.0,
+        ),
+        Err(VulkanError::UnsupportedOperation("render texture device"))
+    ));
+}
+
+#[test]
 fn renderer_filters_roundtrip_as_state() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     assert_eq!(renderer.downscale_filter, TextureFilter::Linear);
@@ -1876,6 +2055,89 @@ fn runtime_sampled_texture_descriptor_scaffolds_create_with_first_physical_devic
         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
     );
     let readback = device.read_image_to_tightly_packed_buffer(&target).unwrap();
+    assert_eq!(readback, [0, 0, 255, 255]);
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_frame_render_texture_draws_uploaded_sampled_image() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let mut renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let Some(render_format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.sampled
+                && record.usages.color_attachment
+                && record.usages.transfer_src
+                && record.usages.transfer_dst
+        })
+        .map(|record| record.format)
+    else {
+        return;
+    };
+
+    let sampled_image = renderer
+        .device
+        .as_ref()
+        .unwrap()
+        .create_uploaded_sampled_image(
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            super::get_render_vk_format(render_format).unwrap(),
+            &[0x00, 0x00, 0xff, 0xff],
+            TextureFilter::Linear,
+            TextureFilter::Linear,
+        )
+        .unwrap();
+    let texture = VulkanTexture::from_sampled_image(
+        renderer.context_id(),
+        (1, 1).into(),
+        render_format,
+        sampled_image,
+        false,
+    );
+    let mut target = renderer
+        .create_offscreen_render_target(render_format, (1, 1).into())
+        .unwrap();
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((1, 1)))];
+        let mut frame = renderer
+            .render(&mut target, (1, 1).into(), Transform::Normal)
+            .unwrap();
+
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::from_size((1.0, 1.0).into()),
+                Rectangle::from_size((1, 1).into()),
+                &full_damage,
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .unwrap();
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    assert_eq!(target.image.layout, VulkanImageLayoutState::ColorAttachment);
+    let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
     assert_eq!(readback, [0, 0, 255, 255]);
 }
 
