@@ -14,6 +14,7 @@ use crate::backend::{
 use super::{VulkanError, VulkanRendererCapabilities};
 
 const SAMPLED_TEXTURE_DRAW_CONSTANT_SIZE: u32 = 32;
+const SOLID_COLOR_DRAW_CONSTANT_SIZE: u32 = 16;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct VulkanSampledTextureDrawConstants {
@@ -24,6 +25,13 @@ pub(super) struct VulkanSampledTextureDrawConstants {
     pub(super) uv_y_axis: [f32; 2],
     pub(super) alpha: f32,
     pub(super) force_opaque_alpha: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct VulkanSolidColorDrawConstants {
+    pub(super) draw_area: vk::Rect2D,
+    pub(super) scissor_area: vk::Rect2D,
+    pub(super) color: [f32; 4],
 }
 
 /// Device state placeholder for the future Vulkan renderer implementation.
@@ -887,6 +895,86 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn create_builtin_solid_color_graphics_pipeline(
+        &self,
+        color_format: vk::Format,
+        blend_enabled: bool,
+    ) -> Result<VulkanSolidColorGraphicsPipeline, VulkanError> {
+        let instance = self
+            .instance
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing instance".to_owned()))?;
+        let physical_device = self
+            .physical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing physical device".to_owned()))?;
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+
+        let _format_properties = validate_optimal_2d_image_support(
+            instance,
+            physical_device,
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            color_format,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        )?;
+        // SAFETY: `physical_device` belongs to `instance`, and querying format properties is
+        // read-only with no additional extension or lifetime requirements.
+        let format_properties = unsafe {
+            instance
+                .handle()
+                .get_physical_device_format_properties(physical_device.handle(), color_format)
+        };
+        if blend_enabled
+            && !format_properties
+                .optimal_tiling_features
+                .contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND)
+        {
+            return Err(VulkanError::UnsupportedOperation("solid pipeline blend format"));
+        }
+
+        let vertex_shader = create_shader_module(
+            &logical_device,
+            // SAFETY: This built-in shader module was generated from local GLSL by
+            // glslangValidator. It contains a vertex `main` entry point with no non-built-in inputs
+            // and emits a fullscreen triangle suitable for dynamic viewport/scissor rendering.
+            unsafe { VulkanShaderSpirv::from_words_unchecked(BUILTIN_TEXTURED_VERTEX_SHADER_SPIRV)? },
+        )?;
+        let fragment_shader = create_shader_module(
+            &logical_device,
+            // SAFETY: This built-in shader module was generated from local GLSL by
+            // glslangValidator. It contains a fragment `main` entry point, writes one location-0
+            // color output, and reads a 16-byte fragment push-constant block containing `vec4 color`.
+            unsafe { VulkanShaderSpirv::from_words_unchecked(BUILTIN_SOLID_FRAGMENT_SHADER_SPIRV)? },
+        )?;
+        let layout = create_solid_color_pipeline_layout(&logical_device)?;
+        let render_pass = create_single_color_load_render_pass(&logical_device, color_format)?;
+        let pipeline = create_sampled_texture_graphics_pipeline(
+            &logical_device,
+            &render_pass,
+            &layout,
+            &vertex_shader,
+            &fragment_shader,
+            blend_enabled,
+        )?;
+
+        Ok(VulkanSolidColorGraphicsPipeline {
+            color_format,
+            blend_enabled,
+            render_pass,
+            layout,
+            pipeline,
+        })
+    }
+
+    #[allow(dead_code)]
     pub(super) fn render_sampled_texture_to_color_image(
         &self,
         target: &VulkanOwnedImage,
@@ -949,6 +1037,44 @@ impl VulkanDeviceState {
             target,
             pipeline,
             descriptor_set,
+            &framebuffer,
+            draw_constants,
+        )?;
+        self.end_command_buffer(&mut command_buffer)?;
+        self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn render_solid_color_to_color_image_in(
+        &self,
+        target: &VulkanOwnedImage,
+        pipeline: &VulkanSolidColorGraphicsPipeline,
+        draw_constants: VulkanSolidColorDrawConstants,
+    ) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        validate_solid_color_draw_inputs(logical_device, target, pipeline)?;
+        validate_color_attachment_area(target, draw_constants.draw_area, "solid color draw area")?;
+        validate_color_attachment_area(target, draw_constants.scissor_area, "solid color draw area")?;
+        validate_solid_color_draw_constants(draw_constants)?;
+
+        let view = self.create_color_attachment_image_view(target)?;
+        let framebuffer = create_single_color_framebuffer(pipeline.render_pass(), &view, target.extent())?;
+        let mut command_buffer = self.allocate_graphics_command_buffer()?;
+
+        self.begin_command_buffer(&mut command_buffer)?;
+        self.transition_image_layout(
+            &mut command_buffer,
+            target,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        )?;
+        synchronize_color_attachment_load(&mut command_buffer, target)?;
+        record_solid_color_draw(
+            &mut command_buffer,
+            target,
+            pipeline,
             &framebuffer,
             draw_constants,
         )?;
@@ -1615,6 +1741,113 @@ fn record_sampled_texture_draw(
     Ok(())
 }
 
+fn record_solid_color_draw(
+    command_buffer: &mut VulkanCommandBuffer,
+    target: &VulkanOwnedImage,
+    pipeline: &VulkanSolidColorGraphicsPipeline,
+    framebuffer: &VulkanFramebuffer,
+    draw_constants: VulkanSolidColorDrawConstants,
+) -> Result<(), VulkanError> {
+    if !target.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+        return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
+    }
+    validate_solid_color_draw_inputs(&command_buffer.command_pool.logical_device, target, pipeline)?;
+    validate_color_attachment_area(target, draw_constants.draw_area, "solid color draw area")?;
+    validate_color_attachment_area(target, draw_constants.scissor_area, "solid color draw area")?;
+    validate_solid_color_draw_constants(draw_constants)?;
+
+    let image_layout = command_buffer
+        .pending_layout_for(target)?
+        .unwrap_or(target.layout()?);
+    if image_layout != vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+        return Err(VulkanError::UnsupportedOperation("image color attachment layout"));
+    }
+
+    let render_area = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: vk::Extent2D {
+            width: target.extent().width,
+            height: target.extent().height,
+        },
+    };
+    let begin_info = vk::RenderPassBeginInfo::default()
+        .render_pass(pipeline.render_pass().handle())
+        .framebuffer(framebuffer.handle)
+        .render_area(render_area);
+    let viewport = [vk::Viewport {
+        x: draw_constants.draw_area.offset.x as f32,
+        y: draw_constants.draw_area.offset.y as f32,
+        width: draw_constants.draw_area.extent.width as f32,
+        height: draw_constants.draw_area.extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    let scissors = [draw_constants.scissor_area];
+    let draw_constant_bytes = solid_color_draw_constant_bytes(draw_constants);
+    let _pool_guard = command_buffer.command_pool.lock_host_access()?;
+
+    // SAFETY: All bound objects were created from the same logical device by private constructors.
+    // `target` is in COLOR_ATTACHMENT_OPTIMAL for the duration of the render pass, the framebuffer
+    // uses the same render pass as `pipeline`, dynamic viewport/scissor are set before drawing, and
+    // the pipeline layout contains a fragment-stage push-constant range covering the 16 bytes
+    // written here. The command buffer is host synchronized by the command-pool lock.
+    unsafe {
+        let device = command_buffer.command_pool.logical_device.handle();
+        device.cmd_begin_render_pass(command_buffer.handle, &begin_info, vk::SubpassContents::INLINE);
+        device.cmd_bind_pipeline(
+            command_buffer.handle,
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline.pipeline().handle(),
+        );
+        device.cmd_set_viewport(command_buffer.handle, 0, &viewport);
+        device.cmd_set_scissor(command_buffer.handle, 0, &scissors);
+        device.cmd_push_constants(
+            command_buffer.handle,
+            pipeline.layout().handle(),
+            vk::ShaderStageFlags::FRAGMENT,
+            0,
+            &draw_constant_bytes,
+        );
+        device.cmd_draw(command_buffer.handle, 3, 1, 0, 0);
+        device.cmd_end_render_pass(command_buffer.handle);
+    }
+
+    command_buffer.referenced_images.push(Arc::clone(&target.inner));
+
+    Ok(())
+}
+
+fn validate_solid_color_draw_inputs(
+    logical_device: &VulkanLogicalDevice,
+    target: &VulkanOwnedImage,
+    pipeline: &VulkanSolidColorGraphicsPipeline,
+) -> Result<(), VulkanError> {
+    if target.format() != pipeline.color_format() {
+        return Err(VulkanError::UnsupportedOperation("solid pipeline format"));
+    }
+    if !logical_device.is_same_device(&target.inner.logical_device)
+        || !logical_device.is_same_device(pipeline.render_pass().logical_device())
+        || !logical_device.is_same_device(pipeline.layout().logical_device())
+        || !logical_device.is_same_device(pipeline.pipeline().logical_device())
+    {
+        return Err(VulkanError::UnsupportedOperation("solid color draw device"));
+    }
+
+    Ok(())
+}
+
+fn validate_solid_color_draw_constants(
+    draw_constants: VulkanSolidColorDrawConstants,
+) -> Result<(), VulkanError> {
+    if !draw_constants.color.iter().all(|component| component.is_finite())
+        || !(0.0..=1.0).contains(&draw_constants.color[3])
+    {
+        return Err(VulkanError::UnsupportedOperation("solid color draw constants"));
+    }
+
+    Ok(())
+}
+
 fn validate_sampled_texture_draw_inputs(
     logical_device: &VulkanLogicalDevice,
     target: &VulkanOwnedImage,
@@ -1734,6 +1967,16 @@ fn sampled_texture_draw_constant_bytes(draw_constants: VulkanSampledTextureDrawC
     bytes[20..24].copy_from_slice(&v_y_axis.to_ne_bytes());
     bytes[24..28].copy_from_slice(&draw_constants.alpha.to_ne_bytes());
     bytes[28..32].copy_from_slice(&force_opaque_alpha.to_ne_bytes());
+    bytes
+}
+
+fn solid_color_draw_constant_bytes(draw_constants: VulkanSolidColorDrawConstants) -> [u8; 16] {
+    let [r, g, b, a] = draw_constants.color;
+    let mut bytes = [0; 16];
+    bytes[0..4].copy_from_slice(&r.to_ne_bytes());
+    bytes[4..8].copy_from_slice(&g.to_ne_bytes());
+    bytes[8..12].copy_from_slice(&b.to_ne_bytes());
+    bytes[12..16].copy_from_slice(&a.to_ne_bytes());
     bytes
 }
 
@@ -2840,6 +3083,25 @@ const BUILTIN_TEXTURED_FRAGMENT_SHADER_SPIRV: &[u32] = &[
     0x000100fd, 0x00010038,
 ];
 
+const BUILTIN_SOLID_FRAGMENT_SHADER_SPIRV: &[u32] = &[
+    0x07230203, 0x00010000, 0x0008000b, 0x00000012, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0006000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x00030010, 0x00000004,
+    0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000,
+    0x00050005, 0x00000009, 0x5f74756f, 0x6f6c6f63, 0x00000072, 0x00060005, 0x0000000a, 0x77617244,
+    0x736e6f43, 0x746e6174, 0x00000073, 0x00050006, 0x0000000a, 0x00000000, 0x6f6c6f63, 0x00000072,
+    0x00030005, 0x0000000c, 0x00006370, 0x00040047, 0x00000009, 0x0000001e, 0x00000000, 0x00030047,
+    0x0000000a, 0x00000002, 0x00050048, 0x0000000a, 0x00000000, 0x00000023, 0x00000000, 0x00020013,
+    0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017,
+    0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008, 0x00000003, 0x00000007, 0x0004003b,
+    0x00000008, 0x00000009, 0x00000003, 0x0003001e, 0x0000000a, 0x00000007, 0x00040020, 0x0000000b,
+    0x00000009, 0x0000000a, 0x0004003b, 0x0000000b, 0x0000000c, 0x00000009, 0x00040015, 0x0000000d,
+    0x00000020, 0x00000001, 0x0004002b, 0x0000000d, 0x0000000e, 0x00000000, 0x00040020, 0x0000000f,
+    0x00000009, 0x00000007, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8,
+    0x00000005, 0x00050041, 0x0000000f, 0x00000010, 0x0000000c, 0x0000000e, 0x0004003d, 0x00000007,
+    0x00000011, 0x00000010, 0x0003003e, 0x00000009, 0x00000011, 0x000100fd, 0x00010038,
+];
+
 impl Drop for VulkanShaderModule {
     fn drop(&mut self) {
         // SAFETY: `self.handle` was created from `self.logical_device` and this owner destroys it
@@ -2909,6 +3171,26 @@ fn create_empty_pipeline_layout(
     // SAFETY: `logical_device` is a live Vulkan device. The create info has no descriptor set
     // layouts or push-constant ranges, which is valid for an empty pipeline layout, and no
     // allocation callbacks are used.
+    let handle = unsafe { logical_device.handle().create_pipeline_layout(&create_info, None) }
+        .map_err(VulkanError::from)?;
+
+    Ok(VulkanPipelineLayout {
+        logical_device: logical_device.clone(),
+        handle,
+    })
+}
+
+fn create_solid_color_pipeline_layout(
+    logical_device: &VulkanLogicalDevice,
+) -> Result<VulkanPipelineLayout, VulkanError> {
+    let push_constant_ranges = [vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        .offset(0)
+        .size(SOLID_COLOR_DRAW_CONSTANT_SIZE)];
+    let create_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_constant_ranges);
+    // SAFETY: `logical_device` is a live Vulkan device. The push-constant range is 16 bytes, starts
+    // at offset 0, is a multiple of 4, and is exposed to the fragment shader. No descriptor set
+    // layouts or allocation callbacks are used.
     let handle = unsafe { logical_device.handle().create_pipeline_layout(&create_info, None) }
         .map_err(VulkanError::from)?;
 
@@ -3048,6 +3330,40 @@ impl VulkanSampledTextureGraphicsPipeline {
     }
 
     pub(super) fn layout(&self) -> &VulkanSampledTexturePipelineLayout {
+        &self.layout
+    }
+
+    pub(super) fn pipeline(&self) -> &VulkanGraphicsPipeline {
+        &self.pipeline
+    }
+}
+
+/// Render-pass, pipeline-layout, and graphics-pipeline bundle for solid-color draws.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanSolidColorGraphicsPipeline {
+    color_format: vk::Format,
+    blend_enabled: bool,
+    render_pass: VulkanRenderPass,
+    layout: VulkanPipelineLayout,
+    pipeline: VulkanGraphicsPipeline,
+}
+
+#[allow(dead_code)]
+impl VulkanSolidColorGraphicsPipeline {
+    pub(super) fn color_format(&self) -> vk::Format {
+        self.color_format
+    }
+
+    pub(super) fn blend_enabled(&self) -> bool {
+        self.blend_enabled
+    }
+
+    pub(super) fn render_pass(&self) -> &VulkanRenderPass {
+        &self.render_pass
+    }
+
+    pub(super) fn layout(&self) -> &VulkanPipelineLayout {
         &self.layout
     }
 

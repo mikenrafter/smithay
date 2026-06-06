@@ -1360,7 +1360,17 @@ fn frame_draw_solid_rejects_preconditions_before_device_lookup() {
         Rectangle::from_size((4, 4).into()),
         &full_damage,
         Color32F::new(0.0, 0.0, 0.0, 0.5),
-        "draw solid alpha",
+        "draw solid device",
+    );
+    assert_draw_solid_error(
+        Transform::Normal,
+        Rectangle::from_size((4, 4).into()),
+        &[
+            Rectangle::new((0, 0).into(), (2, 2).into()),
+            Rectangle::new((1, 1).into(), (2, 2).into()),
+        ],
+        Color32F::new(0.0, 0.0, 0.0, 0.5),
+        "draw solid damage",
     );
     assert_draw_solid_error(
         Transform::Normal,
@@ -2741,6 +2751,67 @@ fn runtime_frame_draw_solid_respects_destination_local_damage() {
         readback,
         [255, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 255, 0, 255]
     );
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_frame_draw_solid_blends_translucent_color() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let mut renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let Some(render_format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.color_attachment
+                && record.usages.color_attachment_blend
+                && record.usages.transfer_src
+                && record.usages.transfer_dst
+        })
+        .map(|record| record.format)
+    else {
+        return;
+    };
+
+    let mut target = renderer
+        .create_offscreen_render_target(render_format, (1, 1).into())
+        .unwrap();
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((1, 1)))];
+        let mut frame = renderer
+            .render(&mut target, (1, 1).into(), Transform::Normal)
+            .unwrap();
+
+        frame
+            .clear(Color32F::new(1.0, 0.0, 0.0, 1.0), &full_damage)
+            .unwrap();
+        frame
+            .draw_solid(
+                Rectangle::from_size((1, 1).into()),
+                &full_damage,
+                Color32F::new(0.0, 0.0, 0.5, 0.5),
+            )
+            .unwrap();
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
+    assert!((127..=128).contains(&readback[0]), "red channel {readback:?}");
+    assert_eq!(readback[1], 0);
+    assert!((127..=128).contains(&readback[2]), "blue channel {readback:?}");
+    assert_eq!(readback[3], 255);
 }
 
 #[test]

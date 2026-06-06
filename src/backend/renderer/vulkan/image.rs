@@ -12,7 +12,10 @@ use crate::{
 
 use super::{
     VulkanError, VulkanRenderer, clear_color_value_for_format,
-    device::{VulkanDeviceState, VulkanOwnedImage, VulkanSampledImage, VulkanSampledTextureDrawConstants},
+    device::{
+        VulkanDeviceState, VulkanOwnedImage, VulkanSampledImage, VulkanSampledTextureDrawConstants,
+        VulkanSolidColorDrawConstants,
+    },
     format::{get_format_info, get_render_vk_format},
 };
 
@@ -354,14 +357,19 @@ impl Frame for VulkanFrame<'_, '_> {
         if self.transform != Transform::Normal {
             return Err(VulkanError::UnsupportedOperation("draw solid transform"));
         }
-        if !color.is_opaque() {
-            return Err(VulkanError::UnsupportedOperation("draw solid alpha"));
-        }
         let clear_areas = draw_solid_damage_to_clear_areas(self.output_size, dst, damage)
             .ok_or(VulkanError::UnsupportedOperation("draw solid damage"))?;
         if clear_areas.is_empty() {
             return Ok(());
         }
+        if !color.is_opaque() && rects_overlap(&clear_areas) {
+            return Err(VulkanError::UnsupportedOperation("draw solid damage"));
+        }
+        let draw_region = Rectangle::from_size(self.output_size)
+            .intersection(dst)
+            .ok_or(VulkanError::UnsupportedOperation("draw solid destination"))?;
+        let draw_area = output_destination_to_vk_rect(self.output_size, draw_region)
+            .ok_or(VulkanError::UnsupportedOperation("draw solid destination"))?;
 
         let device = self
             .device
@@ -379,11 +387,27 @@ impl Frame for VulkanFrame<'_, '_> {
             .format
             .ok_or(VulkanError::UnsupportedOperation("offscreen target format"))?;
 
-        device.clear_color_attachment_image_in(
-            color_image,
-            clear_color_value_for_format(format, color)?,
-            &clear_areas,
-        )?;
+        if color.is_opaque() {
+            device.clear_color_attachment_image_in(
+                color_image,
+                clear_color_value_for_format(format, color)?,
+                &clear_areas,
+            )?;
+        } else {
+            let pipeline =
+                device.create_builtin_solid_color_graphics_pipeline(get_render_vk_format(format)?, true)?;
+            for scissor_area in clear_areas {
+                device.render_solid_color_to_color_image_in(
+                    color_image,
+                    &pipeline,
+                    VulkanSolidColorDrawConstants {
+                        draw_area,
+                        scissor_area,
+                        color: color.components(),
+                    },
+                )?;
+            }
+        }
         target.image.layout = VulkanImageLayoutState::ColorAttachment;
         Ok(())
     }
@@ -636,6 +660,27 @@ pub(super) fn draw_solid_damage_to_clear_areas(
         .into_iter()
         .map(|clear| output_destination_to_vk_rect(output_size, clear))
         .collect()
+}
+
+fn rects_overlap(rects: &[vk::Rect2D]) -> bool {
+    rects.iter().enumerate().any(|(index, rect)| {
+        rects[index + 1..]
+            .iter()
+            .any(|other| vk_rects_overlap(*rect, *other))
+    })
+}
+
+fn vk_rects_overlap(a: vk::Rect2D, b: vk::Rect2D) -> bool {
+    let a_x = i64::from(a.offset.x);
+    let a_y = i64::from(a.offset.y);
+    let b_x = i64::from(b.offset.x);
+    let b_y = i64::from(b.offset.y);
+    let a_x_end = a_x + i64::from(a.extent.width);
+    let a_y_end = a_y + i64::from(a.extent.height);
+    let b_x_end = b_x + i64::from(b.extent.width);
+    let b_y_end = b_y + i64::from(b.extent.height);
+
+    a_x < b_x_end && b_x < a_x_end && a_y < b_y_end && b_y < a_y_end
 }
 
 pub(super) fn render_texture_damage_to_scissor_areas(
