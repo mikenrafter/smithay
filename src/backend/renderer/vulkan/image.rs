@@ -9,8 +9,8 @@ use crate::{
 };
 
 use super::{
-    VulkanError, VulkanRenderer,
-    device::{VulkanOwnedImage, VulkanSampledImage},
+    VulkanError, VulkanRenderer, clear_color_value_for_format,
+    device::{VulkanDeviceState, VulkanOwnedImage, VulkanSampledImage},
 };
 
 /// Vulkan frame scaffold.
@@ -19,8 +19,9 @@ pub struct VulkanFrame<'renderer, 'buffer> {
     pub(super) context_id: ContextId<VulkanTexture>,
     pub(super) output_size: Size<i32, Physical>,
     pub(super) transform: Transform,
+    pub(super) device: Option<&'renderer VulkanDeviceState>,
+    pub(super) target: Option<&'renderer mut VulkanRenderTarget<'buffer>>,
     pub(super) _renderer: PhantomData<&'renderer mut VulkanRenderer>,
-    pub(super) _target: PhantomData<&'renderer mut VulkanRenderTarget<'buffer>>,
 }
 
 /// Vulkan texture scaffold.
@@ -291,12 +292,34 @@ impl Frame for VulkanFrame<'_, '_> {
         self.context_id.clone()
     }
 
-    fn clear(&mut self, _color: Color32F, _at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
-        if _at.is_empty() {
+    fn clear(&mut self, color: Color32F, at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
+        if at.is_empty() {
             return Ok(());
         }
 
-        Err(VulkanError::UnsupportedOperation("clear"))
+        if !is_full_target_damage(self.output_size, at) {
+            return Err(VulkanError::UnsupportedOperation("partial clear"));
+        }
+
+        let device = self
+            .device
+            .ok_or(VulkanError::UnsupportedOperation("clear device"))?;
+        let target = self
+            .target
+            .as_deref_mut()
+            .ok_or(VulkanError::UnsupportedOperation("clear target"))?;
+        let color_image = target
+            .color_image
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("offscreen target image"))?;
+        let format = target
+            .image
+            .format
+            .ok_or(VulkanError::UnsupportedOperation("offscreen target format"))?;
+
+        device.clear_offscreen_color_image(color_image, clear_color_value_for_format(format, color)?)?;
+        target.image.layout = VulkanImageLayoutState::TransferDst;
+        Ok(())
     }
 
     fn draw_solid(
@@ -344,4 +367,8 @@ impl Frame for VulkanFrame<'_, '_> {
     fn finish(self) -> Result<SyncPoint, Self::Error> {
         Ok(SyncPoint::signaled())
     }
+}
+
+fn is_full_target_damage(output_size: Size<i32, Physical>, damage: &[Rectangle<i32, Physical>]) -> bool {
+    damage.len() == 1 && damage[0] == Rectangle::from_size(output_size)
 }

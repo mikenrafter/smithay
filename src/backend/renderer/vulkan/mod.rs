@@ -282,14 +282,38 @@ impl Renderer for VulkanRenderer {
 
     fn render<'frame, 'buffer>(
         &'frame mut self,
-        _framebuffer: &'frame mut Self::Framebuffer<'buffer>,
-        _output_size: Size<i32, Physical>,
-        _dst_transform: Transform,
+        framebuffer: &'frame mut Self::Framebuffer<'buffer>,
+        output_size: Size<i32, Physical>,
+        dst_transform: Transform,
     ) -> Result<Self::Frame<'frame, 'buffer>, Self::Error>
     where
         'buffer: 'frame,
     {
-        Err(VulkanError::UnsupportedOperation("frame creation"))
+        if framebuffer.context_id != self.context_id {
+            return Err(VulkanError::UnsupportedOperation("foreign render target"));
+        }
+        if framebuffer.image.source != image::VulkanImageSource::Offscreen {
+            return Err(VulkanError::UnsupportedOperation("render target"));
+        }
+        if framebuffer.color_image.is_none() {
+            return Err(VulkanError::UnsupportedOperation("render target image"));
+        }
+        if output_size.w <= 0 || output_size.h <= 0 {
+            return Err(VulkanError::UnsupportedOperation("frame size"));
+        }
+        if framebuffer.image.size.w != output_size.w || framebuffer.image.size.h != output_size.h {
+            return Err(VulkanError::UnsupportedOperation("frame size"));
+        }
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+
+        Ok(VulkanFrame {
+            context_id: self.context_id.clone(),
+            output_size,
+            transform: dst_transform,
+            device: Some(device),
+            target: Some(framebuffer),
+            _renderer: std::marker::PhantomData,
+        })
     }
 
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {

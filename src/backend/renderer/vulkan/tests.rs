@@ -50,8 +50,9 @@ fn frame_for_tests(
         context_id,
         output_size,
         transform,
+        device: None,
+        target: None,
         _renderer: PhantomData,
-        _target: PhantomData,
     }
 }
 
@@ -323,6 +324,24 @@ fn image_layout_transition_requires_matching_image_usage() {
             vk::ImageUsageFlags::TRANSFER_DST,
         ),
         Err(VulkanError::UnsupportedOperation("image transfer source usage"))
+    ));
+    assert!(
+        image_layout_transition(
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        image_layout_transition(
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageUsageFlags::TRANSFER_SRC,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "image transfer destination usage"
+        ))
     ));
 }
 
@@ -1438,6 +1457,23 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL
         );
         assert_eq!(readback, [51, 102, 153, 255].repeat(4));
+        {
+            let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((2, 2)))];
+            let renderer_context = renderer.context_id();
+            let mut frame = renderer
+                .render(&mut target, (2, 2).into(), Transform::Normal)
+                .unwrap();
+            assert_eq!(frame.context_id(), renderer_context);
+            assert_eq!(frame.output_size(), Size::from((2, 2)));
+            assert_eq!(frame.transformation(), Transform::Normal);
+            frame
+                .clear(Color32F::new(1.0, 0.0, 0.0, 1.0), &full_damage)
+                .unwrap();
+            assert!(frame.finish().unwrap().is_reached());
+        }
+        assert_eq!(target.image.layout, VulkanImageLayoutState::TransferDst);
+        let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
+        assert_eq!(readback, [255, 0, 0, 255].repeat(4));
         Some(target)
     } else {
         None

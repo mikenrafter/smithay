@@ -1195,6 +1195,23 @@ pub(super) fn image_layout_transition(
                 dst_access: vk::AccessFlags::TRANSFER_READ,
             })
         }
+        (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => {
+            if !usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) {
+                return Err(VulkanError::UnsupportedOperation("image transfer source usage"));
+            }
+            if !usage.contains(vk::ImageUsageFlags::TRANSFER_DST) {
+                return Err(VulkanError::UnsupportedOperation(
+                    "image transfer destination usage",
+                ));
+            }
+
+            Ok(VulkanLayoutTransition {
+                src_stage: vk::PipelineStageFlags::TRANSFER,
+                dst_stage: vk::PipelineStageFlags::TRANSFER,
+                src_access: vk::AccessFlags::TRANSFER_READ,
+                dst_access: vk::AccessFlags::TRANSFER_WRITE,
+            })
+        }
         _ => Err(VulkanError::UnsupportedOperation("image layout transition")),
     }
 }
