@@ -70,6 +70,8 @@ pub(crate) struct VulkanDeviceState {
     single_color_render_passes:
         Mutex<HashMap<(vk::Format, VulkanSingleColorRenderPassLoadOp), Arc<VulkanRenderPass>>>,
     sampled_texture_descriptor_set_layout: Mutex<Option<Arc<VulkanDescriptorSetLayout>>>,
+    sampled_texture_pipeline_layout: Mutex<Option<Arc<VulkanSampledTexturePipelineLayout>>>,
+    solid_color_pipeline_layout: Mutex<Option<Arc<VulkanPipelineLayout>>>,
 }
 
 impl VulkanDeviceState {
@@ -153,6 +155,8 @@ impl VulkanDeviceState {
             builtin_solid_color_pipelines: Mutex::new(HashMap::new()),
             single_color_render_passes: Mutex::new(HashMap::new()),
             sampled_texture_descriptor_set_layout: Mutex::new(None),
+            sampled_texture_pipeline_layout: Mutex::new(None),
+            solid_color_pipeline_layout: Mutex::new(None),
         })
     }
 
@@ -173,6 +177,8 @@ impl VulkanDeviceState {
             builtin_solid_color_pipelines: Mutex::new(HashMap::new()),
             single_color_render_passes: Mutex::new(HashMap::new()),
             sampled_texture_descriptor_set_layout: Mutex::new(None),
+            sampled_texture_pipeline_layout: Mutex::new(None),
+            solid_color_pipeline_layout: Mutex::new(None),
         }
     }
 
@@ -871,6 +877,43 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn sampled_texture_pipeline_layout(
+        &self,
+    ) -> Result<Arc<VulkanSampledTexturePipelineLayout>, VulkanError> {
+        let mut layout = self
+            .sampled_texture_pipeline_layout
+            .lock()
+            .map_err(|_| host_synchronization_failed())?;
+        if let Some(layout) = layout.as_ref() {
+            return Ok(Arc::clone(layout));
+        }
+
+        let cached = Arc::new(self.create_sampled_texture_pipeline_layout()?);
+        *layout = Some(Arc::clone(&cached));
+        Ok(cached)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn solid_color_pipeline_layout(&self) -> Result<Arc<VulkanPipelineLayout>, VulkanError> {
+        let mut layout = self
+            .solid_color_pipeline_layout
+            .lock()
+            .map_err(|_| host_synchronization_failed())?;
+        if let Some(layout) = layout.as_ref() {
+            return Ok(Arc::clone(layout));
+        }
+
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+        let cached = Arc::new(create_solid_color_pipeline_layout(&logical_device)?);
+        *layout = Some(Arc::clone(&cached));
+        Ok(cached)
+    }
+
+    #[allow(dead_code)]
     pub(super) fn create_sampled_texture_descriptor_set(
         &self,
         pool: &VulkanDescriptorPool,
@@ -935,12 +978,7 @@ impl VulkanDeviceState {
 
         let vertex_shader = create_shader_module(&logical_device, shaders.vertex)?;
         let fragment_shader = create_shader_module(&logical_device, shaders.fragment)?;
-        let descriptor_set_layout = self.sampled_texture_descriptor_set_layout()?;
-        let pipeline_layout = create_pipeline_layout_for_descriptor_set_layout(&descriptor_set_layout)?;
-        let sampled_texture_layout = VulkanSampledTexturePipelineLayout {
-            pipeline_layout,
-            descriptor_set_layout,
-        };
+        let sampled_texture_layout = self.sampled_texture_pipeline_layout()?;
         let render_pass = self.single_color_load_render_pass(shaders.color_format)?;
         let pipeline = create_sampled_texture_graphics_pipeline(
             &logical_device,
@@ -1064,7 +1102,7 @@ impl VulkanDeviceState {
             // color output, and reads a 16-byte fragment push-constant block containing `vec4 color`.
             unsafe { VulkanShaderSpirv::from_words_unchecked(BUILTIN_SOLID_FRAGMENT_SHADER_SPIRV)? },
         )?;
-        let layout = create_solid_color_pipeline_layout(&logical_device)?;
+        let layout = self.solid_color_pipeline_layout()?;
         let render_pass = self.single_color_load_render_pass(color_format)?;
         let pipeline = create_sampled_texture_graphics_pipeline(
             &logical_device,
@@ -3286,7 +3324,9 @@ impl Drop for VulkanPipelineLayout {
     fn drop(&mut self) {
         // SAFETY: `self.handle` was created from `self.logical_device` and this owner destroys it
         // exactly once. `VulkanLogicalDevice` is retained by value, so the device outlives the
-        // pipeline layout. The layout is not shared, satisfying host synchronization for destruction.
+        // pipeline layout. Cached/shared layouts are owned through `Arc`, so this final drop runs
+        // only after there are no remaining safe references or users, satisfying host
+        // synchronization for destruction.
         unsafe {
             self.logical_device
                 .handle()
@@ -3444,7 +3484,7 @@ pub(crate) struct VulkanSampledTextureGraphicsPipeline {
     color_format: vk::Format,
     blend_enabled: bool,
     render_pass: Arc<VulkanRenderPass>,
-    layout: VulkanSampledTexturePipelineLayout,
+    layout: Arc<VulkanSampledTexturePipelineLayout>,
     pipeline: VulkanGraphicsPipeline,
 }
 
@@ -3468,6 +3508,11 @@ impl VulkanSampledTextureGraphicsPipeline {
     }
 
     pub(super) fn layout(&self) -> &VulkanSampledTexturePipelineLayout {
+        self.layout.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) fn layout_arc(&self) -> &Arc<VulkanSampledTexturePipelineLayout> {
         &self.layout
     }
 
@@ -3483,7 +3528,7 @@ pub(crate) struct VulkanSolidColorGraphicsPipeline {
     color_format: vk::Format,
     blend_enabled: bool,
     render_pass: Arc<VulkanRenderPass>,
-    layout: VulkanPipelineLayout,
+    layout: Arc<VulkanPipelineLayout>,
     pipeline: VulkanGraphicsPipeline,
 }
 
@@ -3507,6 +3552,11 @@ impl VulkanSolidColorGraphicsPipeline {
     }
 
     pub(super) fn layout(&self) -> &VulkanPipelineLayout {
+        self.layout.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) fn layout_arc(&self) -> &Arc<VulkanPipelineLayout> {
         &self.layout
     }
 
