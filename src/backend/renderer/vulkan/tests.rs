@@ -2656,6 +2656,10 @@ fn runtime_builtin_graphics_pipelines_are_cached() {
     let load_render_pass = device.single_color_load_render_pass(pipeline_format).unwrap();
     assert!(Arc::ptr_eq(&clear_render_pass_a, &clear_render_pass_b));
     assert!(!Arc::ptr_eq(&clear_render_pass_a, &load_render_pass));
+
+    let descriptor_layout_a = device.sampled_texture_descriptor_set_layout().unwrap();
+    let descriptor_layout_b = device.sampled_texture_descriptor_set_layout().unwrap();
+    assert!(Arc::ptr_eq(&descriptor_layout_a, &descriptor_layout_b));
 }
 
 #[test]

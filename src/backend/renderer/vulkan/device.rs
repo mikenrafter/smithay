@@ -69,6 +69,7 @@ pub(crate) struct VulkanDeviceState {
     builtin_solid_color_pipelines: Mutex<HashMap<(vk::Format, bool), Arc<VulkanSolidColorGraphicsPipeline>>>,
     single_color_render_passes:
         Mutex<HashMap<(vk::Format, VulkanSingleColorRenderPassLoadOp), Arc<VulkanRenderPass>>>,
+    sampled_texture_descriptor_set_layout: Mutex<Option<Arc<VulkanDescriptorSetLayout>>>,
 }
 
 impl VulkanDeviceState {
@@ -151,6 +152,7 @@ impl VulkanDeviceState {
             builtin_sampled_texture_pipelines: Mutex::new(HashMap::new()),
             builtin_solid_color_pipelines: Mutex::new(HashMap::new()),
             single_color_render_passes: Mutex::new(HashMap::new()),
+            sampled_texture_descriptor_set_layout: Mutex::new(None),
         })
     }
 
@@ -170,6 +172,7 @@ impl VulkanDeviceState {
             builtin_sampled_texture_pipelines: Mutex::new(HashMap::new()),
             builtin_solid_color_pipelines: Mutex::new(HashMap::new()),
             single_color_render_passes: Mutex::new(HashMap::new()),
+            sampled_texture_descriptor_set_layout: Mutex::new(None),
         }
     }
 
@@ -815,6 +818,28 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn sampled_texture_descriptor_set_layout(
+        &self,
+    ) -> Result<Arc<VulkanDescriptorSetLayout>, VulkanError> {
+        let mut layout = self
+            .sampled_texture_descriptor_set_layout
+            .lock()
+            .map_err(|_| host_synchronization_failed())?;
+        if let Some(layout) = layout.as_ref() {
+            return Ok(Arc::clone(layout));
+        }
+
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+        let cached = Arc::new(create_sampled_texture_descriptor_set_layout(&logical_device)?);
+        *layout = Some(Arc::clone(&cached));
+        Ok(cached)
+    }
+
+    #[allow(dead_code)]
     pub(super) fn create_sampled_texture_descriptor_pool(
         &self,
         max_sets: u32,
@@ -836,13 +861,7 @@ impl VulkanDeviceState {
     pub(super) fn create_sampled_texture_pipeline_layout(
         &self,
     ) -> Result<VulkanSampledTexturePipelineLayout, VulkanError> {
-        let logical_device = self
-            .logical_device
-            .as_ref()
-            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
-            .clone();
-
-        let descriptor_set_layout = create_sampled_texture_descriptor_set_layout(&logical_device)?;
+        let descriptor_set_layout = self.sampled_texture_descriptor_set_layout()?;
         let pipeline_layout = create_pipeline_layout_for_descriptor_set_layout(&descriptor_set_layout)?;
 
         Ok(VulkanSampledTexturePipelineLayout {
@@ -916,7 +935,7 @@ impl VulkanDeviceState {
 
         let vertex_shader = create_shader_module(&logical_device, shaders.vertex)?;
         let fragment_shader = create_shader_module(&logical_device, shaders.fragment)?;
-        let descriptor_set_layout = create_sampled_texture_descriptor_set_layout(&logical_device)?;
+        let descriptor_set_layout = self.sampled_texture_descriptor_set_layout()?;
         let pipeline_layout = create_pipeline_layout_for_descriptor_set_layout(&descriptor_set_layout)?;
         let sampled_texture_layout = VulkanSampledTexturePipelineLayout {
             pipeline_layout,
@@ -3363,7 +3382,9 @@ impl Drop for VulkanDescriptorSetLayout {
     fn drop(&mut self) {
         // SAFETY: `self.handle` was created from `self.logical_device` and this owner destroys it
         // exactly once. `VulkanLogicalDevice` is retained by value, so the device outlives the
-        // descriptor-set layout. The layout is not shared, satisfying host synchronization.
+        // descriptor-set layout. Cached/shared layouts are owned through `Arc`, so this final drop
+        // runs only after there are no remaining safe references or users, satisfying host
+        // synchronization.
         unsafe {
             self.logical_device
                 .handle()
@@ -3402,7 +3423,7 @@ fn create_sampled_texture_descriptor_set_layout(
 #[derive(Debug)]
 pub(crate) struct VulkanSampledTexturePipelineLayout {
     pipeline_layout: VulkanPipelineLayout,
-    descriptor_set_layout: VulkanDescriptorSetLayout,
+    descriptor_set_layout: Arc<VulkanDescriptorSetLayout>,
 }
 
 #[allow(dead_code)]
@@ -3412,7 +3433,7 @@ impl VulkanSampledTexturePipelineLayout {
     }
 
     pub(super) fn descriptor_set_layout(&self) -> &VulkanDescriptorSetLayout {
-        &self.descriptor_set_layout
+        self.descriptor_set_layout.as_ref()
     }
 }
 
