@@ -358,9 +358,8 @@ impl Frame for VulkanFrame<'_, '_> {
         if !is_full_target_damage(self.output_size, damage) {
             return Err(VulkanError::UnsupportedOperation("render texture damage"));
         }
-        if !is_full_texture_source(texture.image.size, src) {
-            return Err(VulkanError::UnsupportedOperation("render texture source"));
-        }
+        let uv_rect = source_to_uv_rect(texture.image.size, src)
+            .ok_or(VulkanError::UnsupportedOperation("render texture source"))?;
         let draw_area = output_destination_to_vk_rect(self.output_size, dst)
             .ok_or(VulkanError::UnsupportedOperation("render texture destination"))?;
         if draw_area.extent.width == 0 || draw_area.extent.height == 0 {
@@ -413,6 +412,7 @@ impl Frame for VulkanFrame<'_, '_> {
             &descriptor_set,
             &pipeline,
             draw_area,
+            uv_rect,
         )?;
         target.image.layout = VulkanImageLayoutState::ColorAttachment;
         Ok(())
@@ -439,11 +439,36 @@ fn is_full_target_damage(output_size: Size<i32, Physical>, damage: &[Rectangle<i
     damage.len() == 1 && damage[0] == Rectangle::from_size(output_size)
 }
 
-fn is_full_texture_source(texture_size: Size<i32, BufferCoord>, src: Rectangle<f64, BufferCoord>) -> bool {
-    src.loc.x == 0.0
-        && src.loc.y == 0.0
-        && src.size.w == f64::from(texture_size.w)
-        && src.size.h == f64::from(texture_size.h)
+fn source_to_uv_rect(
+    texture_size: Size<i32, BufferCoord>,
+    src: Rectangle<f64, BufferCoord>,
+) -> Option<[f32; 4]> {
+    if texture_size.w <= 0
+        || texture_size.h <= 0
+        || !src.loc.x.is_finite()
+        || !src.loc.y.is_finite()
+        || !src.size.w.is_finite()
+        || !src.size.h.is_finite()
+        || src.loc.x < 0.0
+        || src.loc.y < 0.0
+        || src.size.w <= 0.0
+        || src.size.h <= 0.0
+    {
+        return None;
+    }
+
+    let x_end = src.loc.x + src.size.w;
+    let y_end = src.loc.y + src.size.h;
+    if x_end > f64::from(texture_size.w) || y_end > f64::from(texture_size.h) {
+        return None;
+    }
+
+    Some([
+        (src.loc.x / f64::from(texture_size.w)) as f32,
+        (src.loc.y / f64::from(texture_size.h)) as f32,
+        (src.size.w / f64::from(texture_size.w)) as f32,
+        (src.size.h / f64::from(texture_size.h)) as f32,
+    ])
 }
 
 fn output_destination_to_vk_rect(

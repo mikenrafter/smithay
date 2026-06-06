@@ -1279,7 +1279,7 @@ fn frame_render_texture_rejects_narrow_path_preconditions_before_device_lookup()
         &texture,
         frame_context_id.clone(),
         Transform::Normal,
-        Rectangle::new((1.0, 0.0).into(), (1.0, 3.0).into()),
+        Rectangle::new((1.0, 0.0).into(), (2.0, 3.0).into()),
         full_dst,
         &full_damage,
         &[],
@@ -1370,27 +1370,24 @@ fn frame_render_texture_reaches_device_lookup_for_supported_narrow_preconditions
     texture.context_id = context_id;
     let damage = [Rectangle::from_size((8, 6).into())];
 
-    for dst in [
-        Rectangle::from_size((8, 6).into()),
-        Rectangle::new((1, 2).into(), (3, 4).into()),
+    for src in [
+        Rectangle::from_size((2.0, 3.0).into()),
+        Rectangle::new((1.0, 1.0).into(), (1.0, 2.0).into()),
     ] {
-        let mut frame = frame_for_tests(texture.context_id.clone(), (8, 6).into(), Transform::Normal);
+        for dst in [
+            Rectangle::from_size((8, 6).into()),
+            Rectangle::new((1, 2).into(), (3, 4).into()),
+        ] {
+            let mut frame = frame_for_tests(texture.context_id.clone(), (8, 6).into(), Transform::Normal);
 
-        assert!(
-            matches!(
-                frame.render_texture_from_to(
-                    &texture,
-                    Rectangle::from_size((2.0, 3.0).into()),
-                    dst,
-                    &damage,
-                    &[],
-                    Transform::Normal,
-                    1.0,
+            assert!(
+                matches!(
+                    frame.render_texture_from_to(&texture, src, dst, &damage, &[], Transform::Normal, 1.0,),
+                    Err(VulkanError::UnsupportedOperation("render texture device"))
                 ),
-                Err(VulkanError::UnsupportedOperation("render texture device"))
-            ),
-            "dst {dst:?}"
-        );
+                "src {src:?} dst {dst:?}"
+            );
+        }
     }
 }
 
@@ -2233,6 +2230,88 @@ fn runtime_frame_render_texture_draws_to_destination_rectangle() {
 
     let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
     assert_eq!(readback, [255, 0, 0, 255, 0, 0, 255, 255]);
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_frame_render_texture_draws_cropped_source() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let mut renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let Some(render_format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.sampled
+                && record.usages.color_attachment
+                && record.usages.transfer_src
+                && record.usages.transfer_dst
+        })
+        .map(|record| record.format)
+    else {
+        return;
+    };
+
+    let sampled_image = renderer
+        .device
+        .as_ref()
+        .unwrap()
+        .create_uploaded_sampled_image(
+            vk::Extent3D {
+                width: 2,
+                height: 1,
+                depth: 1,
+            },
+            super::get_render_vk_format(render_format).unwrap(),
+            &[255, 0, 0, 255, 0, 0, 255, 255],
+            TextureFilter::Nearest,
+            TextureFilter::Nearest,
+        )
+        .unwrap();
+    let texture = VulkanTexture::from_sampled_image(
+        renderer.context_id(),
+        (2, 1).into(),
+        render_format,
+        sampled_image,
+        false,
+    );
+    let mut target = renderer
+        .create_offscreen_render_target(render_format, (2, 1).into())
+        .unwrap();
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((2, 1)))];
+        let mut frame = renderer
+            .render(&mut target, (2, 1).into(), Transform::Normal)
+            .unwrap();
+
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::new((1.0, 0.0).into(), (1.0, 1.0).into()),
+                Rectangle::from_size((2, 1).into()),
+                &full_damage,
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .unwrap();
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
+    assert_eq!(readback, [0, 0, 255, 255, 0, 0, 255, 255]);
 }
 
 #[test]
