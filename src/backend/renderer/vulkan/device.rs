@@ -1560,18 +1560,21 @@ fn validate_sampled_texture_draw_constants(
 ) -> Result<(), VulkanError> {
     let [u_offset, v_offset, u_scale, v_scale] = draw_constants.uv_rect;
     const UV_RECT_EPSILON: f32 = 0.000_001;
+    let u_end = u_offset + u_scale;
+    let v_end = v_offset + v_scale;
+    let uv_range = -UV_RECT_EPSILON..=1.0 + UV_RECT_EPSILON;
 
     if !draw_constants
         .uv_rect
         .iter()
         .all(|component| component.is_finite())
         || !draw_constants.alpha.is_finite()
-        || u_offset < 0.0
-        || v_offset < 0.0
         || u_scale <= 0.0
-        || v_scale <= 0.0
-        || u_offset + u_scale > 1.0 + UV_RECT_EPSILON
-        || v_offset + v_scale > 1.0 + UV_RECT_EPSILON
+        || v_scale == 0.0
+        || !uv_range.contains(&u_offset)
+        || !uv_range.contains(&u_end)
+        || !uv_range.contains(&v_offset)
+        || !uv_range.contains(&v_end)
         || !(0.0..=1.0).contains(&draw_constants.alpha)
     {
         return Err(VulkanError::UnsupportedOperation(

@@ -20,6 +20,7 @@ use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
     VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalMemoryHandleType, VulkanExternalMemoryState,
     VulkanImageLayoutState, VulkanImageSource, VulkanImageState, VulkanImageSyncState, VulkanImageUsage,
+    source_to_uv_rect,
 };
 use super::*;
 
@@ -1491,7 +1492,43 @@ fn frame_render_texture_rejects_narrow_path_preconditions_before_device_lookup()
         &[],
         Transform::Normal,
         1.0,
-        "render texture y-inverted",
+        "render texture device",
+    );
+}
+
+#[test]
+fn source_to_uv_rect_flips_y_for_y_inverted_textures() {
+    assert_eq!(
+        source_to_uv_rect(
+            (2, 4).into(),
+            Rectangle::new((0.0, 1.0).into(), (2.0, 2.0).into()),
+            false
+        ),
+        Some([0.0, 0.25, 1.0, 0.5])
+    );
+    assert_eq!(
+        source_to_uv_rect(
+            (2, 4).into(),
+            Rectangle::new((0.0, 1.0).into(), (2.0, 2.0).into()),
+            true
+        ),
+        Some([0.0, 0.75, 1.0, -0.5])
+    );
+    assert_eq!(
+        source_to_uv_rect(
+            (2, 4).into(),
+            Rectangle::new((0.0, 0.0).into(), (2.0, 1.0).into()),
+            true
+        ),
+        Some([0.0, 1.0, 1.0, -0.25])
+    );
+    assert_eq!(
+        source_to_uv_rect(
+            (2, 4).into(),
+            Rectangle::new((0.0, 2.0).into(), (2.0, 1.0).into()),
+            true
+        ),
+        Some([0.0, 0.5, 1.0, -0.25])
     );
 }
 
@@ -2374,6 +2411,179 @@ fn runtime_public_offscreen_bind_renders_uploaded_sampled_image() {
 
     let readback = renderer.read_offscreen_render_target(&mut framebuffer).unwrap();
     assert_eq!(readback, [0, 0, 255, 255]);
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_frame_render_texture_flips_y_inverted_texture() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let mut renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let Some(render_format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.sampled
+                && record.usages.color_attachment
+                && record.usages.color_attachment_blend
+                && record.usages.transfer_src
+                && record.usages.transfer_dst
+        })
+        .map(|record| record.format)
+    else {
+        return;
+    };
+
+    let sampled_image = renderer
+        .device
+        .as_ref()
+        .unwrap()
+        .create_uploaded_sampled_image(
+            vk::Extent3D {
+                width: 1,
+                height: 2,
+                depth: 1,
+            },
+            super::get_render_vk_format(render_format).unwrap(),
+            &[255, 0, 0, 255, 0, 0, 255, 255],
+            TextureFilter::Nearest,
+            TextureFilter::Nearest,
+        )
+        .unwrap();
+    let texture = VulkanTexture::from_sampled_image(
+        renderer.context_id(),
+        (1, 2).into(),
+        render_format,
+        sampled_image,
+        true,
+    );
+    let mut target =
+        Offscreen::<VulkanRenderTarget<'static>>::create_buffer(&mut renderer, render_format, (1, 2).into())
+            .unwrap();
+    let mut framebuffer = Bind::bind(&mut renderer, &mut target).unwrap();
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((1, 2)))];
+        let mut frame = renderer
+            .render(&mut framebuffer, (1, 2).into(), Transform::Normal)
+            .unwrap();
+
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::from_size((1.0, 2.0).into()),
+                Rectangle::from_size((1, 2).into()),
+                &full_damage,
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .unwrap();
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    let readback = renderer.read_offscreen_render_target(&mut framebuffer).unwrap();
+    assert_eq!(readback, [0, 0, 255, 255, 255, 0, 0, 255]);
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_frame_render_texture_crops_y_inverted_texture() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let mut renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let Some(render_format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.sampled
+                && record.usages.color_attachment
+                && record.usages.color_attachment_blend
+                && record.usages.transfer_src
+                && record.usages.transfer_dst
+        })
+        .map(|record| record.format)
+    else {
+        return;
+    };
+
+    let sampled_image = renderer
+        .device
+        .as_ref()
+        .unwrap()
+        .create_uploaded_sampled_image(
+            vk::Extent3D {
+                width: 1,
+                height: 4,
+                depth: 1,
+            },
+            super::get_render_vk_format(render_format).unwrap(),
+            &[
+                255, 0, 0, 255, // red
+                0, 255, 0, 255, // green
+                0, 0, 255, 255, // blue
+                255, 255, 255, 255, // white
+            ],
+            TextureFilter::Nearest,
+            TextureFilter::Nearest,
+        )
+        .unwrap();
+    let texture = VulkanTexture::from_sampled_image(
+        renderer.context_id(),
+        (1, 4).into(),
+        render_format,
+        sampled_image,
+        true,
+    );
+    let mut target =
+        Offscreen::<VulkanRenderTarget<'static>>::create_buffer(&mut renderer, render_format, (1, 1).into())
+            .unwrap();
+    let mut framebuffer = Bind::bind(&mut renderer, &mut target).unwrap();
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((1, 1)))];
+        let mut frame = renderer
+            .render(&mut framebuffer, (1, 1).into(), Transform::Normal)
+            .unwrap();
+
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::new((0.0, 0.0).into(), (1.0, 1.0).into()),
+                Rectangle::from_size((1, 1).into()),
+                &full_damage,
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .unwrap();
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    let readback = renderer.read_offscreen_render_target(&mut framebuffer).unwrap();
+    assert_eq!(readback, [255, 255, 255, 255]);
 }
 
 #[test]

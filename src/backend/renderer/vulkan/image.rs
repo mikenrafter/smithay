@@ -358,7 +358,7 @@ impl Frame for VulkanFrame<'_, '_> {
         if !is_full_target_damage(self.output_size, damage) {
             return Err(VulkanError::UnsupportedOperation("render texture damage"));
         }
-        let uv_rect = source_to_uv_rect(texture.image.size, src)
+        let uv_rect = source_to_uv_rect(texture.image.size, src, texture.y_inverted)
             .ok_or(VulkanError::UnsupportedOperation("render texture source"))?;
         let draw_area = output_destination_to_vk_rect(self.output_size, dst)
             .ok_or(VulkanError::UnsupportedOperation("render texture destination"))?;
@@ -374,10 +374,6 @@ impl Frame for VulkanFrame<'_, '_> {
         if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
             return Err(VulkanError::UnsupportedOperation("render texture alpha"));
         }
-        if texture.y_inverted {
-            return Err(VulkanError::UnsupportedOperation("render texture y-inverted"));
-        }
-
         let device = self
             .device
             .ok_or(VulkanError::UnsupportedOperation("render texture device"))?;
@@ -448,9 +444,10 @@ fn is_full_target_damage(output_size: Size<i32, Physical>, damage: &[Rectangle<i
     damage.len() == 1 && damage[0] == Rectangle::from_size(output_size)
 }
 
-fn source_to_uv_rect(
+pub(super) fn source_to_uv_rect(
     texture_size: Size<i32, BufferCoord>,
     src: Rectangle<f64, BufferCoord>,
+    y_inverted: bool,
 ) -> Option<[f32; 4]> {
     if texture_size.w <= 0
         || texture_size.h <= 0
@@ -472,12 +469,20 @@ fn source_to_uv_rect(
         return None;
     }
 
-    Some([
-        (src.loc.x / f64::from(texture_size.w)) as f32,
-        (src.loc.y / f64::from(texture_size.h)) as f32,
-        (src.size.w / f64::from(texture_size.w)) as f32,
-        (src.size.h / f64::from(texture_size.h)) as f32,
-    ])
+    let u_offset = (src.loc.x / f64::from(texture_size.w)) as f32;
+    let u_scale = (src.size.w / f64::from(texture_size.w)) as f32;
+    let mut v_scale = (src.size.h / f64::from(texture_size.h)) as f32;
+    let v_offset = if y_inverted {
+        (1.0 - src.loc.y / f64::from(texture_size.h)) as f32
+    } else {
+        (src.loc.y / f64::from(texture_size.h)) as f32
+    };
+
+    if y_inverted {
+        v_scale = -v_scale;
+    }
+
+    Some([u_offset, v_offset, u_scale, v_scale])
 }
 
 fn output_destination_to_vk_rect(
