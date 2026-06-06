@@ -1828,7 +1828,12 @@ fn runtime_sampled_texture_descriptor_scaffolds_create_with_first_physical_devic
         .formats
         .records
         .iter()
-        .find(|record| record.tiling == VulkanFormatTiling::Optimal && record.usages.color_attachment)
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.color_attachment
+                && record.usages.transfer_src
+        })
         .map(|record| super::get_render_vk_format(record.format).unwrap())
     else {
         return;
@@ -1852,6 +1857,26 @@ fn runtime_sampled_texture_descriptor_scaffolds_create_with_first_physical_devic
         vk::PipelineLayout::null()
     );
     assert_ne!(graphics_pipeline.pipeline().handle(), vk::Pipeline::null());
+
+    let target = device
+        .create_offscreen_color_image(
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            pipeline_format,
+        )
+        .unwrap();
+    device
+        .render_sampled_texture_to_color_image(&target, &descriptor_set, &graphics_pipeline)
+        .unwrap();
+    assert_eq!(
+        target.layout().unwrap(),
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+    );
+    let readback = device.read_image_to_tightly_packed_buffer(&target).unwrap();
+    assert_eq!(readback, [0, 0, 255, 255]);
 }
 
 #[test]

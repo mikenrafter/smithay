@@ -783,10 +783,45 @@ impl VulkanDeviceState {
         )?;
 
         Ok(VulkanSampledTextureGraphicsPipeline {
+            color_format: shaders.color_format,
             render_pass,
             layout: sampled_texture_layout,
             pipeline,
         })
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn render_sampled_texture_to_color_image(
+        &self,
+        target: &VulkanOwnedImage,
+        descriptor_set: &VulkanSampledTextureDescriptorSet,
+        pipeline: &VulkanSampledTextureGraphicsPipeline,
+    ) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        validate_sampled_texture_draw_inputs(logical_device, target, descriptor_set, pipeline)?;
+
+        let view = self.create_color_attachment_image_view(target)?;
+        let framebuffer = create_single_color_framebuffer(pipeline.render_pass(), &view, target.extent())?;
+        let mut command_buffer = self.allocate_graphics_command_buffer()?;
+
+        self.begin_command_buffer(&mut command_buffer)?;
+        self.transition_image_layout(
+            &mut command_buffer,
+            target,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        )?;
+        record_sampled_texture_draw(
+            &mut command_buffer,
+            target,
+            pipeline,
+            descriptor_set,
+            &framebuffer,
+        )?;
+        self.end_command_buffer(&mut command_buffer)?;
+        self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
     }
 
     #[allow(dead_code)]
@@ -1277,6 +1312,119 @@ fn record_color_attachment_clear(
     }
 
     command_buffer.referenced_images.push(Arc::clone(&image.inner));
+
+    Ok(())
+}
+
+fn record_sampled_texture_draw(
+    command_buffer: &mut VulkanCommandBuffer,
+    target: &VulkanOwnedImage,
+    pipeline: &VulkanSampledTextureGraphicsPipeline,
+    descriptor_set: &VulkanSampledTextureDescriptorSet,
+    framebuffer: &VulkanFramebuffer,
+) -> Result<(), VulkanError> {
+    if !target.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+        return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
+    }
+    validate_sampled_texture_draw_inputs(
+        &command_buffer.command_pool.logical_device,
+        target,
+        descriptor_set,
+        pipeline,
+    )?;
+
+    let image_layout = command_buffer
+        .pending_layout_for(target)?
+        .unwrap_or(target.layout()?);
+    if image_layout != vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+        return Err(VulkanError::UnsupportedOperation("image color attachment layout"));
+    }
+
+    let render_area = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: vk::Extent2D {
+            width: target.extent().width,
+            height: target.extent().height,
+        },
+    };
+    let clear_values = [vk::ClearValue {
+        color: vk::ClearColorValue {
+            float32: [0.0, 0.0, 0.0, 0.0],
+        },
+    }];
+    let begin_info = vk::RenderPassBeginInfo::default()
+        .render_pass(pipeline.render_pass().handle())
+        .framebuffer(framebuffer.handle)
+        .render_area(render_area)
+        .clear_values(&clear_values);
+    let viewport = [vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: target.extent().width as f32,
+        height: target.extent().height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    let scissors = [render_area];
+    let descriptor_sets = [descriptor_set.handle()];
+    let _pool_guard = command_buffer.command_pool.lock_host_access()?;
+
+    // SAFETY: All bound objects were created from the same logical device by private constructors.
+    // `target` is in COLOR_ATTACHMENT_OPTIMAL for the duration of the render pass, the framebuffer
+    // uses the same render pass as `pipeline`, dynamic viewport/scissor are set before drawing, and
+    // `descriptor_set` retains the sampled image resources it references. The command buffer is host
+    // synchronized by the command-pool lock.
+    unsafe {
+        let device = command_buffer.command_pool.logical_device.handle();
+        device.cmd_begin_render_pass(command_buffer.handle, &begin_info, vk::SubpassContents::INLINE);
+        device.cmd_bind_pipeline(
+            command_buffer.handle,
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline.pipeline().handle(),
+        );
+        device.cmd_bind_descriptor_sets(
+            command_buffer.handle,
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline.layout().pipeline_layout().handle(),
+            0,
+            &descriptor_sets,
+            &[],
+        );
+        device.cmd_set_viewport(command_buffer.handle, 0, &viewport);
+        device.cmd_set_scissor(command_buffer.handle, 0, &scissors);
+        device.cmd_draw(command_buffer.handle, 3, 1, 0, 0);
+        device.cmd_end_render_pass(command_buffer.handle);
+    }
+
+    command_buffer.referenced_images.push(Arc::clone(&target.inner));
+    command_buffer
+        .referenced_images
+        .push(Arc::clone(&descriptor_set.sampled_image().image().inner));
+
+    Ok(())
+}
+
+fn validate_sampled_texture_draw_inputs(
+    logical_device: &VulkanLogicalDevice,
+    target: &VulkanOwnedImage,
+    descriptor_set: &VulkanSampledTextureDescriptorSet,
+    pipeline: &VulkanSampledTextureGraphicsPipeline,
+) -> Result<(), VulkanError> {
+    if target.format() != pipeline.color_format() {
+        return Err(VulkanError::UnsupportedOperation("graphics pipeline format"));
+    }
+    if !logical_device.is_same_device(&target.inner.logical_device)
+        || !logical_device.is_same_device(pipeline.render_pass().logical_device())
+        || !logical_device.is_same_device(pipeline.layout().pipeline_layout().logical_device())
+        || !logical_device.is_same_device(pipeline.pipeline().logical_device())
+        || !logical_device.is_same_device(descriptor_set.pool().logical_device())
+        || !logical_device.is_same_device(descriptor_set.sampled_image().logical_device())
+    {
+        return Err(VulkanError::UnsupportedOperation("sampled texture draw device"));
+    }
+    if descriptor_set.sampled_image().image().layout()? != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+        return Err(VulkanError::UnsupportedOperation("sampled texture layout"));
+    }
 
     Ok(())
 }
@@ -2314,6 +2462,10 @@ impl VulkanGraphicsPipeline {
     pub(super) fn handle(&self) -> vk::Pipeline {
         self.handle
     }
+
+    fn logical_device(&self) -> &VulkanLogicalDevice {
+        &self.logical_device
+    }
 }
 
 impl Drop for VulkanGraphicsPipeline {
@@ -2405,6 +2557,7 @@ impl VulkanSampledTexturePipelineLayout {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct VulkanSampledTextureGraphicsPipeline {
+    color_format: vk::Format,
     render_pass: VulkanRenderPass,
     layout: VulkanSampledTexturePipelineLayout,
     pipeline: VulkanGraphicsPipeline,
@@ -2412,6 +2565,10 @@ pub(crate) struct VulkanSampledTextureGraphicsPipeline {
 
 #[allow(dead_code)]
 impl VulkanSampledTextureGraphicsPipeline {
+    pub(super) fn color_format(&self) -> vk::Format {
+        self.color_format
+    }
+
     pub(super) fn render_pass(&self) -> &VulkanRenderPass {
         &self.render_pass
     }
