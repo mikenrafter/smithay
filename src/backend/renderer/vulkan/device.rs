@@ -720,6 +720,21 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn create_sampled_texture_descriptor_set(
+        &self,
+        pool: &VulkanDescriptorPool,
+        descriptor_set_layout: &VulkanDescriptorSetLayout,
+        sampled_image: Arc<VulkanSampledImage>,
+    ) -> Result<VulkanSampledTextureDescriptorSet, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        create_sampled_texture_descriptor_set(logical_device, pool, descriptor_set_layout, sampled_image)
+    }
+
+    #[allow(dead_code)]
     pub(super) fn read_image_to_tightly_packed_buffer(
         &self,
         image: &VulkanOwnedImage,
@@ -1793,6 +1808,10 @@ impl VulkanLogicalDevice {
     pub(super) fn handle(&self) -> &ash::Device {
         &self.device
     }
+
+    fn is_same_device(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.device, &other.device)
+    }
 }
 
 impl Drop for VulkanLogicalDevice {
@@ -2181,6 +2200,10 @@ impl VulkanDescriptorSetLayout {
     pub(super) fn handle(&self) -> vk::DescriptorSetLayout {
         self.handle
     }
+
+    fn logical_device(&self) -> &VulkanLogicalDevice {
+        &self.logical_device
+    }
 }
 
 impl Drop for VulkanDescriptorSetLayout {
@@ -2293,6 +2316,10 @@ impl VulkanDescriptorPool {
             .lock()
             .map_err(|_| host_synchronization_failed())
     }
+
+    fn logical_device(&self) -> &VulkanLogicalDevice {
+        &self.inner.logical_device
+    }
 }
 
 impl Drop for VulkanDescriptorPoolInner {
@@ -2340,6 +2367,81 @@ fn create_sampled_texture_descriptor_pool(
             max_sets,
             host_access: Mutex::new(()),
         }),
+    })
+}
+
+/// Descriptor set binding one uploaded sampled image.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanSampledTextureDescriptorSet {
+    pool: VulkanDescriptorPool,
+    sampled_image: Arc<VulkanSampledImage>,
+    handle: vk::DescriptorSet,
+}
+
+#[allow(dead_code)]
+impl VulkanSampledTextureDescriptorSet {
+    pub(super) fn handle(&self) -> vk::DescriptorSet {
+        self.handle
+    }
+
+    pub(super) fn pool(&self) -> &VulkanDescriptorPool {
+        &self.pool
+    }
+
+    pub(super) fn sampled_image(&self) -> &Arc<VulkanSampledImage> {
+        &self.sampled_image
+    }
+}
+
+fn create_sampled_texture_descriptor_set(
+    logical_device: &VulkanLogicalDevice,
+    pool: &VulkanDescriptorPool,
+    descriptor_set_layout: &VulkanDescriptorSetLayout,
+    sampled_image: Arc<VulkanSampledImage>,
+) -> Result<VulkanSampledTextureDescriptorSet, VulkanError> {
+    if !logical_device.is_same_device(pool.logical_device())
+        || !logical_device.is_same_device(descriptor_set_layout.logical_device())
+        || !logical_device.is_same_device(sampled_image.logical_device())
+    {
+        return Err(VulkanError::UnsupportedOperation("descriptor set device"));
+    }
+    if sampled_image.image().layout()? != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+        return Err(VulkanError::UnsupportedOperation("sampled texture layout"));
+    }
+
+    let _pool_guard = pool.lock_host_access()?;
+    let set_layouts = [descriptor_set_layout.handle()];
+    let allocate_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(pool.handle())
+        .set_layouts(&set_layouts);
+    // SAFETY: `pool` and `descriptor_set_layout` are validated to belong to `logical_device`.
+    // The pool is host-locked for allocation and the set-layout slice lives through the call.
+    let descriptor_sets = unsafe { logical_device.handle().allocate_descriptor_sets(&allocate_info) }
+        .map_err(VulkanError::from)?;
+    let handle = descriptor_sets
+        .into_iter()
+        .next()
+        .ok_or_else(|| VulkanError::DeviceInitializationFailed("no descriptor set allocated".to_owned()))?;
+    let image_infos = [vk::DescriptorImageInfo::default()
+        .sampler(sampled_image.sampler().handle())
+        .image_view(sampled_image.view().handle())
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+    let writes = [vk::WriteDescriptorSet::default()
+        .dst_set(handle)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .image_info(&image_infos)];
+    // SAFETY: `handle` was allocated from `pool` on `logical_device`, binding 0 exists in
+    // `descriptor_set_layout` as one combined-image-sampler descriptor, and `sampled_image` retains
+    // the sampler and image view referenced by this write. The descriptor set is newly allocated and
+    // not concurrently accessed.
+    unsafe { logical_device.handle().update_descriptor_sets(&writes, &[]) };
+
+    Ok(VulkanSampledTextureDescriptorSet {
+        pool: pool.clone(),
+        sampled_image,
+        handle,
     })
 }
 
@@ -2456,6 +2558,10 @@ impl VulkanSampledImage {
 
     pub(super) fn sampler(&self) -> &VulkanSampler {
         &self.sampler
+    }
+
+    fn logical_device(&self) -> &VulkanLogicalDevice {
+        &self.image.inner.logical_device
     }
 }
 

@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, os::unix::io::OwnedFd};
+use std::{marker::PhantomData, os::unix::io::OwnedFd, sync::Arc};
 
 use ash::vk;
 
@@ -1694,6 +1694,35 @@ fn runtime_sampled_texture_descriptor_scaffolds_create_with_first_physical_devic
     assert_ne!(
         sampled_texture_layout.pipeline_layout().handle(),
         vk::PipelineLayout::null()
+    );
+
+    let sampled_image = Arc::new(
+        device
+            .create_uploaded_sampled_image(
+                vk::Extent3D {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                vk::Format::R8G8B8A8_UNORM,
+                &[0x00, 0x00, 0xff, 0xff],
+                TextureFilter::Linear,
+                TextureFilter::Linear,
+            )
+            .unwrap(),
+    );
+    let descriptor_set = device
+        .create_sampled_texture_descriptor_set(
+            &descriptor_pool,
+            sampled_texture_layout.descriptor_set_layout(),
+            Arc::clone(&sampled_image),
+        )
+        .unwrap();
+    assert_ne!(descriptor_set.handle(), vk::DescriptorSet::null());
+    assert_eq!(descriptor_set.pool().max_sets(), 2);
+    assert_eq!(
+        descriptor_set.sampled_image().image().image(),
+        sampled_image.image().image()
     );
 }
 
