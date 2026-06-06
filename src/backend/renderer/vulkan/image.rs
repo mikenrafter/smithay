@@ -327,15 +327,49 @@ impl Frame for VulkanFrame<'_, '_> {
 
     fn draw_solid(
         &mut self,
-        _dst: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
-        _color: Color32F,
+        color: Color32F,
     ) -> Result<(), Self::Error> {
         if damage.is_empty() {
             return Ok(());
         }
 
-        Err(VulkanError::UnsupportedOperation("draw solid"))
+        if self.transform != Transform::Normal {
+            return Err(VulkanError::UnsupportedOperation("draw solid transform"));
+        }
+        if !color.is_opaque() {
+            return Err(VulkanError::UnsupportedOperation("draw solid alpha"));
+        }
+        let clear_areas = draw_solid_damage_to_clear_areas(self.output_size, dst, damage)
+            .ok_or(VulkanError::UnsupportedOperation("draw solid damage"))?;
+        if clear_areas.is_empty() {
+            return Ok(());
+        }
+
+        let device = self
+            .device
+            .ok_or(VulkanError::UnsupportedOperation("draw solid device"))?;
+        let target = self
+            .target
+            .as_deref_mut()
+            .ok_or(VulkanError::UnsupportedOperation("draw solid target"))?;
+        let color_image = target
+            .color_image
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("offscreen target image"))?;
+        let format = target
+            .image
+            .format
+            .ok_or(VulkanError::UnsupportedOperation("offscreen target format"))?;
+
+        device.clear_color_attachment_image_in(
+            color_image,
+            clear_color_value_for_format(format, color)?,
+            &clear_areas,
+        )?;
+        target.image.layout = VulkanImageLayoutState::ColorAttachment;
+        Ok(())
     }
 
     fn render_texture_from_to(
@@ -532,6 +566,52 @@ pub(super) fn damage_to_scissor_areas(
     scissor_rects
         .into_iter()
         .map(|scissor| output_destination_to_vk_rect(output_size, scissor))
+        .collect()
+}
+
+pub(super) fn draw_solid_damage_to_clear_areas(
+    output_size: Size<i32, Physical>,
+    dst: Rectangle<i32, Physical>,
+    damage: &[Rectangle<i32, Physical>],
+) -> Option<Vec<vk::Rect2D>> {
+    if output_size.w <= 0 || output_size.h <= 0 || dst.size.w <= 0 || dst.size.h <= 0 {
+        return None;
+    }
+
+    let output = Rectangle::from_size(output_size);
+    let Some(draw_region) = output.intersection(dst) else {
+        return Some(Vec::new());
+    };
+    let mut clear_rects = Vec::new();
+
+    for damage in damage {
+        if damage.size.w <= 0 || damage.size.h <= 0 {
+            continue;
+        }
+        let translated_damage = Rectangle::new(
+            (
+                dst.loc.x.checked_add(damage.loc.x)?,
+                dst.loc.y.checked_add(damage.loc.y)?,
+            )
+                .into(),
+            damage.size,
+        );
+        let Some(clear) = output
+            .intersection(translated_damage)
+            .and_then(|damage| draw_region.intersection(damage))
+        else {
+            continue;
+        };
+
+        if clear.size.w <= 0 || clear.size.h <= 0 {
+            continue;
+        }
+        clear_rects.push(clear);
+    }
+
+    clear_rects
+        .into_iter()
+        .map(|clear| output_destination_to_vk_rect(output_size, clear))
         .collect()
 }
 

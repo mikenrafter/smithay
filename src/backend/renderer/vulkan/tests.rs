@@ -20,7 +20,8 @@ use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
     VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalMemoryHandleType, VulkanExternalMemoryState,
     VulkanImageLayoutState, VulkanImageSource, VulkanImageState, VulkanImageSyncState, VulkanImageUsage,
-    damage_to_scissor_areas, render_texture_damage_to_scissor_areas, source_to_uv_rect,
+    damage_to_scissor_areas, draw_solid_damage_to_clear_areas, render_texture_damage_to_scissor_areas,
+    source_to_uv_rect,
 };
 use super::*;
 
@@ -1292,6 +1293,77 @@ fn frame_rejects_non_empty_work() {
 }
 
 #[test]
+fn frame_draw_solid_rejects_preconditions_before_device_lookup() {
+    let context_id = ContextId::new();
+    let full_damage = [Rectangle::from_size((4, 4).into())];
+
+    fn assert_draw_solid_error(
+        frame_transform: Transform,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        color: Color32F,
+        expected: &'static str,
+    ) {
+        let mut frame = frame_for_tests(ContextId::new(), (4, 4).into(), frame_transform);
+
+        assert!(
+            matches!(
+                frame.draw_solid(dst, damage, color),
+                Err(VulkanError::UnsupportedOperation(reason)) if reason == expected
+            ),
+            "expected UnsupportedOperation({expected:?})"
+        );
+    }
+
+    assert_draw_solid_error(
+        Transform::_90,
+        Rectangle::from_size((4, 4).into()),
+        &full_damage,
+        Color32F::BLACK,
+        "draw solid transform",
+    );
+    assert_draw_solid_error(
+        Transform::Normal,
+        Rectangle::from_size((4, 4).into()),
+        &full_damage,
+        Color32F::new(0.0, 0.0, 0.0, 0.5),
+        "draw solid alpha",
+    );
+    assert_draw_solid_error(
+        Transform::Normal,
+        Rectangle::new((3, 0).into(), (2, 4).into()),
+        &full_damage,
+        Color32F::BLACK,
+        "draw solid device",
+    );
+    assert_draw_solid_error(
+        Transform::Normal,
+        Rectangle::from_size((4, 4).into()),
+        &[
+            Rectangle::new((0, 0).into(), (2, 2).into()),
+            Rectangle::new((1, 1).into(), (2, 2).into()),
+        ],
+        Color32F::BLACK,
+        "draw solid device",
+    );
+
+    let mut frame = frame_for_tests(context_id, (4, 4).into(), Transform::Normal);
+    assert!(
+        frame
+            .draw_solid(
+                Rectangle::new((5, 0).into(), (1, 1).into()),
+                &full_damage,
+                Color32F::BLACK,
+            )
+            .is_ok()
+    );
+    assert!(matches!(
+        frame.draw_solid(Rectangle::from_size((4, 4).into()), &full_damage, Color32F::BLACK),
+        Err(VulkanError::UnsupportedOperation("draw solid device"))
+    ));
+}
+
+#[test]
 fn frame_finish_is_signaled_without_submitted_work() {
     let frame = frame_for_tests(ContextId::new(), (1, 1).into(), Transform::Normal);
     let sync = frame.finish().unwrap();
@@ -1629,6 +1701,34 @@ fn damage_to_scissor_areas_rejects_overlapping_clipped_damage() {
     ];
 
     assert_eq!(damage_to_scissor_areas(output_size, dst, &damage), None);
+}
+
+#[test]
+fn draw_solid_damage_to_clear_areas_clips_and_accepts_overlap() {
+    let output_size = Size::<i32, Physical>::from((4, 1));
+    let dst = Rectangle::new((1, 0).into(), (4, 1).into());
+    let damage = [
+        Rectangle::new((0, 0).into(), (2, 1).into()),
+        Rectangle::new((1, 0).into(), (3, 1).into()),
+    ];
+
+    assert_eq!(
+        draw_solid_damage_to_clear_areas(output_size, dst, &damage),
+        Some(vec![
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 1, y: 0 },
+                extent: vk::Extent2D { width: 2, height: 1 },
+            },
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 2, y: 0 },
+                extent: vk::Extent2D { width: 2, height: 1 },
+            },
+        ])
+    );
+    assert_eq!(
+        draw_solid_damage_to_clear_areas(output_size, Rectangle::new((5, 0).into(), (1, 1).into()), &damage,),
+        Some(Vec::new())
+    );
 }
 
 #[test]
@@ -2504,6 +2604,78 @@ fn runtime_frame_render_texture_draws_uploaded_sampled_image() {
     assert_eq!(target.image.layout, VulkanImageLayoutState::ColorAttachment);
     let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
     assert_eq!(readback, [0, 0, 255, 255]);
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_frame_draw_solid_respects_destination_local_damage() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let mut renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let Some(render_format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.color_attachment
+                && record.usages.transfer_src
+                && record.usages.transfer_dst
+        })
+        .map(|record| record.format)
+    else {
+        return;
+    };
+
+    let mut target = renderer
+        .create_offscreen_render_target(render_format, (4, 1).into())
+        .unwrap();
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 1)))];
+        let overlapping_damage = [
+            Rectangle::new((0, 0).into(), (2, 1).into()),
+            Rectangle::new((1, 0).into(), (2, 1).into()),
+        ];
+        let clipped_damage = [Rectangle::from_size(Size::<i32, Physical>::from((3, 1)))];
+        let mut frame = renderer
+            .render(&mut target, (4, 1).into(), Transform::Normal)
+            .unwrap();
+
+        frame
+            .clear(Color32F::new(1.0, 0.0, 0.0, 1.0), &full_damage)
+            .unwrap();
+        frame
+            .draw_solid(
+                Rectangle::new((1, 0).into(), (2, 1).into()),
+                &overlapping_damage,
+                Color32F::new(0.0, 0.0, 1.0, 1.0),
+            )
+            .unwrap();
+        frame
+            .draw_solid(
+                Rectangle::new((3, 0).into(), (3, 1).into()),
+                &clipped_damage,
+                Color32F::new(0.0, 1.0, 0.0, 1.0),
+            )
+            .unwrap();
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
+    assert_eq!(
+        readback,
+        [255, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 255, 0, 255]
+    );
 }
 
 #[test]

@@ -652,6 +652,41 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn clear_color_attachment_image_in(
+        &self,
+        image: &VulkanOwnedImage,
+        color: vk::ClearColorValue,
+        clear_areas: &[vk::Rect2D],
+    ) -> Result<(), VulkanError> {
+        if clear_areas.is_empty() {
+            return Ok(());
+        }
+
+        let view = self.create_color_attachment_image_view(image)?;
+        let render_pass = create_single_color_load_render_pass(&image.inner.logical_device, image.format())?;
+        let framebuffer = create_single_color_framebuffer(&render_pass, &view, image.extent())?;
+        let mut command_buffer = self.allocate_graphics_command_buffer()?;
+
+        self.begin_command_buffer(&mut command_buffer)?;
+        self.transition_image_layout(
+            &mut command_buffer,
+            image,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        )?;
+        synchronize_color_attachment_load(&mut command_buffer, image)?;
+        record_color_attachment_clear_rects(
+            &mut command_buffer,
+            image,
+            &render_pass,
+            &framebuffer,
+            color,
+            clear_areas,
+        )?;
+        self.end_command_buffer(&mut command_buffer)?;
+        self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
+    }
+
+    #[allow(dead_code)]
     pub(super) fn create_color_attachment_image_view(
         &self,
         image: &VulkanOwnedImage,
@@ -1413,6 +1448,72 @@ fn record_color_attachment_clear(
     Ok(())
 }
 
+fn record_color_attachment_clear_rects(
+    command_buffer: &mut VulkanCommandBuffer,
+    image: &VulkanOwnedImage,
+    render_pass: &VulkanRenderPass,
+    framebuffer: &VulkanFramebuffer,
+    color: vk::ClearColorValue,
+    clear_areas: &[vk::Rect2D],
+) -> Result<(), VulkanError> {
+    if clear_areas.is_empty() {
+        return Ok(());
+    }
+    if !image.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+        return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
+    }
+
+    let image_layout = command_buffer
+        .pending_layout_for(image)?
+        .unwrap_or(image.layout()?);
+    if image_layout != vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+        return Err(VulkanError::UnsupportedOperation("image color attachment layout"));
+    }
+    for clear_area in clear_areas {
+        validate_color_attachment_area(image, *clear_area, "color attachment clear area")?;
+    }
+
+    let render_area = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: vk::Extent2D {
+            width: image.extent().width,
+            height: image.extent().height,
+        },
+    };
+    let begin_info = vk::RenderPassBeginInfo::default()
+        .render_pass(render_pass.handle)
+        .framebuffer(framebuffer.handle)
+        .render_area(render_area);
+    let clear_attachments = [vk::ClearAttachment::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .color_attachment(0)
+        .clear_value(vk::ClearValue { color })];
+    let clear_rects = clear_areas
+        .iter()
+        .copied()
+        .map(|rect| vk::ClearRect {
+            rect,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .collect::<Vec<_>>();
+    let _pool_guard = command_buffer.command_pool.lock_host_access()?;
+
+    // SAFETY: The image is in COLOR_ATTACHMENT_OPTIMAL, the framebuffer and render pass were
+    // created for this image view and device, all clear rectangles are validated to be non-empty and
+    // inside the framebuffer, and the command buffer is host synchronized by the command-pool lock.
+    unsafe {
+        let device = command_buffer.command_pool.logical_device.handle();
+        device.cmd_begin_render_pass(command_buffer.handle, &begin_info, vk::SubpassContents::INLINE);
+        device.cmd_clear_attachments(command_buffer.handle, &clear_attachments, &clear_rects);
+        device.cmd_end_render_pass(command_buffer.handle);
+    }
+
+    command_buffer.referenced_images.push(Arc::clone(&image.inner));
+
+    Ok(())
+}
+
 fn record_sampled_texture_draw(
     command_buffer: &mut VulkanCommandBuffer,
     target: &VulkanOwnedImage,
@@ -1543,24 +1644,29 @@ fn validate_sampled_texture_draw_area(
     target: &VulkanOwnedImage,
     draw_area: vk::Rect2D,
 ) -> Result<(), VulkanError> {
-    if draw_area.extent.width == 0 || draw_area.extent.height == 0 {
-        return Err(VulkanError::UnsupportedOperation("sampled texture draw area"));
-    }
-    if draw_area.offset.x < 0 || draw_area.offset.y < 0 {
-        return Err(VulkanError::UnsupportedOperation("sampled texture draw area"));
+    validate_color_attachment_area(target, draw_area, "sampled texture draw area")
+}
+
+fn validate_color_attachment_area(
+    target: &VulkanOwnedImage,
+    area: vk::Rect2D,
+    reason: &'static str,
+) -> Result<(), VulkanError> {
+    if area.extent.width == 0 || area.extent.height == 0 || area.offset.x < 0 || area.offset.y < 0 {
+        return Err(VulkanError::UnsupportedOperation(reason));
     }
 
-    let x_end = u32::try_from(draw_area.offset.x)
+    let x_end = u32::try_from(area.offset.x)
         .ok()
-        .and_then(|x| x.checked_add(draw_area.extent.width))
-        .ok_or(VulkanError::UnsupportedOperation("sampled texture draw area"))?;
-    let y_end = u32::try_from(draw_area.offset.y)
+        .and_then(|x| x.checked_add(area.extent.width))
+        .ok_or(VulkanError::UnsupportedOperation(reason))?;
+    let y_end = u32::try_from(area.offset.y)
         .ok()
-        .and_then(|y| y.checked_add(draw_area.extent.height))
-        .ok_or(VulkanError::UnsupportedOperation("sampled texture draw area"))?;
+        .and_then(|y| y.checked_add(area.extent.height))
+        .ok_or(VulkanError::UnsupportedOperation(reason))?;
 
     if x_end > target.extent().width || y_end > target.extent().height {
-        return Err(VulkanError::UnsupportedOperation("sampled texture draw area"));
+        return Err(VulkanError::UnsupportedOperation(reason));
     }
 
     Ok(())
