@@ -222,6 +222,28 @@ impl VulkanRenderer {
         target.image.layout = image::VulkanImageLayoutState::TransferDst;
         Ok(())
     }
+
+    #[allow(dead_code)]
+    fn read_offscreen_render_target(
+        &mut self,
+        target: &mut VulkanRenderTarget<'_>,
+    ) -> Result<Vec<u8>, VulkanError> {
+        if target.context_id != self.context_id {
+            return Err(VulkanError::UnsupportedOperation("foreign offscreen target"));
+        }
+        if target.image.source != image::VulkanImageSource::Offscreen {
+            return Err(VulkanError::UnsupportedOperation("offscreen target"));
+        }
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+        let color_image = target
+            .color_image
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("offscreen target image"))?;
+
+        let data = device.read_image_to_tightly_packed_buffer(color_image)?;
+        target.image.layout = image::VulkanImageLayoutState::TransferSrc;
+        Ok(data)
+    }
 }
 
 impl RendererSuper for VulkanRenderer {

@@ -308,6 +308,22 @@ fn image_layout_transition_requires_matching_image_usage() {
             "image transfer destination usage"
         ))
     ));
+    assert!(
+        image_layout_transition(
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        image_layout_transition(
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageUsageFlags::TRANSFER_DST,
+        ),
+        Err(VulkanError::UnsupportedOperation("image transfer source usage"))
+    ));
 }
 
 #[test]
@@ -519,6 +535,17 @@ fn offscreen_render_target_clear_rejects_foreign_targets() {
 
     assert!(matches!(
         renderer.clear_offscreen_render_target(&mut target, Color32F::BLACK),
+        Err(VulkanError::UnsupportedOperation("foreign offscreen target"))
+    ));
+}
+
+#[test]
+fn offscreen_render_target_read_rejects_foreign_targets() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut target = VulkanRenderTarget::new_for_tests((1, 1).into(), Some(Fourcc::Argb8888));
+
+    assert!(matches!(
+        renderer.read_offscreen_render_target(&mut target),
         Err(VulkanError::UnsupportedOperation("foreign offscreen target"))
     ));
 }
@@ -1363,7 +1390,8 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         .records
         .iter()
         .find(|record| {
-            record.tiling == VulkanFormatTiling::Optimal
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
                 && record.usages.color_attachment
                 && record.usages.transfer_src
                 && record.usages.transfer_dst
@@ -1402,6 +1430,14 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
             color_image.layout().unwrap(),
             vk::ImageLayout::TRANSFER_DST_OPTIMAL
         );
+        let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
+        assert_eq!(target.image.layout, VulkanImageLayoutState::TransferSrc);
+        let color_image = target.color_image.as_ref().unwrap();
+        assert_eq!(
+            color_image.layout().unwrap(),
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+        );
+        assert_eq!(readback, [51, 102, 153, 255].repeat(4));
         Some(target)
     } else {
         None

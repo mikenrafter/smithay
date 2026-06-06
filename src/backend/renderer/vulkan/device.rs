@@ -610,6 +610,36 @@ impl VulkanDeviceState {
         clear_color_image(command_buffer, image, color)
     }
 
+    #[allow(dead_code)]
+    pub(super) fn read_image_to_tightly_packed_buffer(
+        &self,
+        image: &VulkanOwnedImage,
+    ) -> Result<Vec<u8>, VulkanError> {
+        let readback_size = tightly_packed_image_size(image.format(), image.extent())?;
+        let readback_buffer =
+            self.create_host_visible_buffer(readback_size, vk::BufferUsageFlags::TRANSFER_DST)?;
+        let mut command_buffer = self.allocate_graphics_command_buffer()?;
+
+        self.begin_command_buffer(&mut command_buffer)?;
+        self.transition_image_layout(&mut command_buffer, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)?;
+        self.copy_image_to_buffer(&mut command_buffer, image, &readback_buffer, image.extent())?;
+        self.end_command_buffer(&mut command_buffer)?;
+        self.submit_graphics_command_buffer_and_wait(&mut command_buffer)?;
+
+        readback_buffer.read()
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn copy_image_to_buffer(
+        &self,
+        command_buffer: &mut VulkanCommandBuffer,
+        image: &VulkanOwnedImage,
+        buffer: &VulkanHostVisibleBuffer,
+        extent: vk::Extent3D,
+    ) -> Result<(), VulkanError> {
+        copy_image_to_buffer(command_buffer, image, buffer, extent)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn update_uploaded_image_region(
         &self,
@@ -1021,6 +1051,76 @@ fn clear_color_image(
     Ok(())
 }
 
+fn copy_image_to_buffer(
+    command_buffer: &mut VulkanCommandBuffer,
+    image: &VulkanOwnedImage,
+    buffer: &VulkanHostVisibleBuffer,
+    extent: vk::Extent3D,
+) -> Result<(), VulkanError> {
+    if !image.usage().contains(vk::ImageUsageFlags::TRANSFER_SRC) {
+        return Err(VulkanError::UnsupportedOperation("image transfer source usage"));
+    }
+    if !buffer.usage().contains(vk::BufferUsageFlags::TRANSFER_DST) {
+        return Err(VulkanError::UnsupportedOperation(
+            "buffer transfer destination usage",
+        ));
+    }
+    if extent.width == 0 || extent.height == 0 || extent.depth == 0 {
+        return Err(VulkanError::UnsupportedOperation("zero-sized image copy"));
+    }
+    let image_extent = image.extent();
+    if extent.width > image_extent.width
+        || extent.height > image_extent.height
+        || extent.depth > image_extent.depth
+    {
+        return Err(VulkanError::UnsupportedOperation("image copy extent"));
+    }
+    let required_size = tightly_packed_image_size(image.format(), extent)?;
+    if required_size > buffer.size() {
+        return Err(VulkanError::UnsupportedOperation("image copy buffer size"));
+    }
+
+    let image_layout = command_buffer
+        .pending_layout_for(image)?
+        .unwrap_or(image.layout()?);
+    if image_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
+        return Err(VulkanError::UnsupportedOperation("image copy layout"));
+    }
+
+    let region = vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+        .image_extent(extent);
+    let _pool_guard = command_buffer.command_pool.lock_host_access()?;
+
+    unsafe {
+        command_buffer
+            .command_pool
+            .logical_device
+            .handle()
+            .cmd_copy_image_to_buffer(
+                command_buffer.handle,
+                image.image(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer.buffer(),
+                &[region],
+            )
+    };
+
+    command_buffer.referenced_images.push(Arc::clone(&image.inner));
+    command_buffer.referenced_buffers.push(Arc::clone(&buffer.inner));
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct VulkanLayoutTransition {
     src_stage: vk::PipelineStageFlags,
@@ -1076,6 +1176,23 @@ pub(super) fn image_layout_transition(
                 dst_stage: vk::PipelineStageFlags::TRANSFER,
                 src_access: vk::AccessFlags::SHADER_READ,
                 dst_access: vk::AccessFlags::TRANSFER_WRITE,
+            })
+        }
+        (vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL) => {
+            if !usage.contains(vk::ImageUsageFlags::TRANSFER_DST) {
+                return Err(VulkanError::UnsupportedOperation(
+                    "image transfer destination usage",
+                ));
+            }
+            if !usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) {
+                return Err(VulkanError::UnsupportedOperation("image transfer source usage"));
+            }
+
+            Ok(VulkanLayoutTransition {
+                src_stage: vk::PipelineStageFlags::TRANSFER,
+                dst_stage: vk::PipelineStageFlags::TRANSFER,
+                src_access: vk::AccessFlags::TRANSFER_WRITE,
+                dst_access: vk::AccessFlags::TRANSFER_READ,
             })
         }
         _ => Err(VulkanError::UnsupportedOperation("image layout transition")),
@@ -1761,6 +1878,29 @@ impl VulkanHostVisibleBuffer {
         unsafe { self.inner.logical_device.handle().unmap_memory(self.inner.memory) };
 
         Ok(())
+    }
+
+    pub(super) fn read(&self) -> Result<Vec<u8>, VulkanError> {
+        let len = usize::try_from(self.inner.size)
+            .map_err(|_| VulkanError::UnsupportedOperation("mapped buffer read size"))?;
+        let mapped = unsafe {
+            self.inner.logical_device.handle().map_memory(
+                self.inner.memory,
+                0,
+                self.inner.size,
+                vk::MemoryMapFlags::empty(),
+            )
+        }
+        .map_err(VulkanError::from)?;
+
+        let mut data = vec![0; len];
+        unsafe {
+            ptr::copy_nonoverlapping(mapped.cast::<u8>(), data.as_mut_ptr(), len);
+        }
+
+        unsafe { self.inner.logical_device.handle().unmap_memory(self.inner.memory) };
+
+        Ok(data)
     }
 }
 
