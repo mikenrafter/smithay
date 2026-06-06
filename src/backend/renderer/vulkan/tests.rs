@@ -20,7 +20,7 @@ use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
     VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalMemoryHandleType, VulkanExternalMemoryState,
     VulkanImageLayoutState, VulkanImageSource, VulkanImageState, VulkanImageSyncState, VulkanImageUsage,
-    source_to_uv_rect,
+    damage_to_scissor_areas, source_to_uv_rect,
 };
 use super::*;
 
@@ -1405,7 +1405,7 @@ fn frame_render_texture_rejects_narrow_path_preconditions_before_device_lookup()
         &[],
         Transform::Normal,
         1.0,
-        "render texture damage",
+        "render texture device",
     );
     assert_render_texture_error(
         &texture,
@@ -1574,6 +1574,61 @@ fn source_to_uv_rect_supports_source_transforms() {
         source_to_uv_rect(texture_size, src, false, Transform::Flipped270),
         Some(([0.75, 0.75], [0.0, -0.5], [-0.5, 0.0]))
     );
+}
+
+#[test]
+fn damage_to_scissor_areas_clips_damage_to_destination_and_output() {
+    let output_size = Size::<i32, Physical>::from((6, 4));
+    let dst = Rectangle::new((1, 1).into(), (4, 2).into());
+    let damage = [
+        Rectangle::new((0, 0).into(), (3, 2).into()),
+        Rectangle::new((3, 1).into(), (4, 4).into()),
+        Rectangle::new((0, 3).into(), (1, 1).into()),
+        Rectangle::new((2, 2).into(), (0, 1).into()),
+    ];
+    let scissors = damage_to_scissor_areas(output_size, dst, &damage).unwrap();
+
+    assert_eq!(
+        scissors,
+        vec![
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 1, y: 1 },
+                extent: vk::Extent2D { width: 3, height: 2 },
+            },
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 4, y: 2 },
+                extent: vk::Extent2D { width: 1, height: 1 },
+            },
+        ]
+    );
+}
+
+#[test]
+fn damage_to_scissor_areas_ignores_non_overlapping_damage() {
+    let output_size = Size::<i32, Physical>::from((4, 4));
+    let dst = Rectangle::new((1, 1).into(), (2, 2).into());
+    let damage = [Rectangle::new((2, 2).into(), (1, 1).into())];
+
+    assert_eq!(
+        damage_to_scissor_areas(output_size, dst, &damage),
+        Some(Vec::new())
+    );
+    assert_eq!(
+        damage_to_scissor_areas((0, 4).into(), dst, &[Rectangle::from_size((1, 1).into())]),
+        None
+    );
+}
+
+#[test]
+fn damage_to_scissor_areas_rejects_overlapping_clipped_damage() {
+    let output_size = Size::<i32, Physical>::from((4, 4));
+    let dst = Rectangle::new((1, 1).into(), (3, 3).into());
+    let damage = [
+        Rectangle::new((0, 0).into(), (2, 2).into()),
+        Rectangle::new((1, 1).into(), (2, 2).into()),
+    ];
+
+    assert_eq!(damage_to_scissor_areas(output_size, dst, &damage), None);
 }
 
 #[test]
@@ -2839,6 +2894,96 @@ fn runtime_frame_render_texture_draws_to_destination_rectangle() {
 
     let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
     assert_eq!(readback, [255, 0, 0, 255, 0, 0, 255, 255]);
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_frame_render_texture_respects_partial_damage_scissor() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let mut renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let Some(render_format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.sampled
+                && record.usages.color_attachment
+                && record.usages.color_attachment_blend
+                && record.usages.transfer_src
+                && record.usages.transfer_dst
+        })
+        .map(|record| record.format)
+    else {
+        return;
+    };
+
+    let sampled_image = renderer
+        .device
+        .as_ref()
+        .unwrap()
+        .create_uploaded_sampled_image(
+            vk::Extent3D {
+                width: 2,
+                height: 1,
+                depth: 1,
+            },
+            super::get_render_vk_format(render_format).unwrap(),
+            &[0, 0, 255, 255, 0, 0, 255, 255],
+            TextureFilter::Nearest,
+            TextureFilter::Nearest,
+        )
+        .unwrap();
+    let texture = VulkanTexture::from_sampled_image(
+        renderer.context_id(),
+        (2, 1).into(),
+        render_format,
+        sampled_image,
+        false,
+    );
+    let mut target = renderer
+        .create_offscreen_render_target(render_format, (4, 1).into())
+        .unwrap();
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 1)))];
+        let partial_damage = [Rectangle::new((1, 0).into(), (1, 1).into())];
+        let mut frame = renderer
+            .render(&mut target, (4, 1).into(), Transform::Normal)
+            .unwrap();
+
+        frame
+            .clear(Color32F::new(1.0, 0.0, 0.0, 1.0), &full_damage)
+            .unwrap();
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::from_size((2.0, 1.0).into()),
+                Rectangle::new((1, 0).into(), (2, 1).into()),
+                &partial_damage,
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .unwrap();
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
+    assert_eq!(
+        readback,
+        [255, 0, 0, 255, 255, 0, 0, 255, 0, 0, 255, 255, 255, 0, 0, 255]
+    );
 }
 
 #[test]

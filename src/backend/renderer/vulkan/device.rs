@@ -18,6 +18,7 @@ const SAMPLED_TEXTURE_DRAW_CONSTANT_SIZE: u32 = 32;
 #[derive(Debug, Clone, Copy)]
 pub(super) struct VulkanSampledTextureDrawConstants {
     pub(super) draw_area: vk::Rect2D,
+    pub(super) scissor_area: vk::Rect2D,
     pub(super) uv_origin: [f32; 2],
     pub(super) uv_x_axis: [f32; 2],
     pub(super) uv_y_axis: [f32; 2],
@@ -866,6 +867,7 @@ impl VulkanDeviceState {
             pipeline,
             VulkanSampledTextureDrawConstants {
                 draw_area,
+                scissor_area: draw_area,
                 uv_origin: [0.0, 0.0],
                 uv_x_axis: [1.0, 0.0],
                 uv_y_axis: [0.0, 1.0],
@@ -1424,6 +1426,7 @@ fn record_sampled_texture_draw(
         pipeline,
     )?;
     validate_sampled_texture_draw_area(target, draw_constants.draw_area)?;
+    validate_sampled_texture_draw_area(target, draw_constants.scissor_area)?;
     validate_sampled_texture_draw_constants(draw_constants)?;
 
     let image_layout = command_buffer
@@ -1458,7 +1461,7 @@ fn record_sampled_texture_draw(
         min_depth: 0.0,
         max_depth: 1.0,
     }];
-    let scissors = [draw_constants.draw_area];
+    let scissors = [draw_constants.scissor_area];
     let descriptor_sets = [descriptor_set.handle()];
     let draw_constant_bytes = sampled_texture_draw_constant_bytes(draw_constants);
     let _pool_guard = command_buffer.command_pool.lock_host_access()?;

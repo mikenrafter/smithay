@@ -355,9 +355,6 @@ impl Frame for VulkanFrame<'_, '_> {
         if texture.context_id != self.context_id {
             return Err(VulkanError::UnsupportedOperation("foreign render texture"));
         }
-        if !is_full_target_damage(self.output_size, damage) {
-            return Err(VulkanError::UnsupportedOperation("render texture damage"));
-        }
         if self.transform != Transform::Normal {
             return Err(VulkanError::UnsupportedOperation("render texture transform"));
         }
@@ -368,6 +365,11 @@ impl Frame for VulkanFrame<'_, '_> {
             .ok_or(VulkanError::UnsupportedOperation("render texture destination"))?;
         if draw_area.extent.width == 0 || draw_area.extent.height == 0 {
             return Err(VulkanError::UnsupportedOperation("render texture destination"));
+        }
+        let scissor_areas = damage_to_scissor_areas(self.output_size, dst, damage)
+            .ok_or(VulkanError::UnsupportedOperation("render texture damage"))?;
+        if scissor_areas.is_empty() {
+            return Ok(());
         }
         if !opaque_regions.is_empty() {
             return Err(VulkanError::UnsupportedOperation("render texture opaque regions"));
@@ -409,19 +411,22 @@ impl Frame for VulkanFrame<'_, '_> {
             Arc::clone(sampled_image),
         )?;
 
-        device.render_sampled_texture_to_color_image_in(
-            color_image,
-            &descriptor_set,
-            &pipeline,
-            VulkanSampledTextureDrawConstants {
-                draw_area,
-                uv_origin,
-                uv_x_axis,
-                uv_y_axis,
-                alpha,
-                force_opaque_alpha,
-            },
-        )?;
+        for scissor_area in scissor_areas {
+            device.render_sampled_texture_to_color_image_in(
+                color_image,
+                &descriptor_set,
+                &pipeline,
+                VulkanSampledTextureDrawConstants {
+                    draw_area,
+                    scissor_area,
+                    uv_origin,
+                    uv_x_axis,
+                    uv_y_axis,
+                    alpha,
+                    force_opaque_alpha,
+                },
+            )?;
+        }
         target.image.layout = VulkanImageLayoutState::ColorAttachment;
         Ok(())
     }
@@ -445,6 +450,53 @@ impl Frame for VulkanFrame<'_, '_> {
 
 fn is_full_target_damage(output_size: Size<i32, Physical>, damage: &[Rectangle<i32, Physical>]) -> bool {
     damage.len() == 1 && damage[0] == Rectangle::from_size(output_size)
+}
+
+pub(super) fn damage_to_scissor_areas(
+    output_size: Size<i32, Physical>,
+    dst: Rectangle<i32, Physical>,
+    damage: &[Rectangle<i32, Physical>],
+) -> Option<Vec<vk::Rect2D>> {
+    if output_size.w <= 0 || output_size.h <= 0 || dst.size.w <= 0 || dst.size.h <= 0 {
+        return None;
+    }
+
+    let output = Rectangle::from_size(output_size);
+    let draw_region = output.intersection(dst)?;
+    let mut scissor_rects = Vec::new();
+
+    for damage in damage {
+        if damage.size.w <= 0 || damage.size.h <= 0 {
+            continue;
+        }
+        let translated_damage = Rectangle::new(
+            (
+                dst.loc.x.checked_add(damage.loc.x)?,
+                dst.loc.y.checked_add(damage.loc.y)?,
+            )
+                .into(),
+            damage.size,
+        );
+        let Some(scissor) = output
+            .intersection(translated_damage)
+            .and_then(|damage| draw_region.intersection(damage))
+        else {
+            continue;
+        };
+
+        if scissor.size.w <= 0 || scissor.size.h <= 0 {
+            continue;
+        }
+        if scissor_rects.iter().any(|existing| scissor.overlaps(*existing)) {
+            return None;
+        }
+        scissor_rects.push(scissor);
+    }
+
+    scissor_rects
+        .into_iter()
+        .map(|scissor| output_destination_to_vk_rect(output_size, scissor))
+        .collect()
 }
 
 pub(super) fn source_to_uv_rect(
