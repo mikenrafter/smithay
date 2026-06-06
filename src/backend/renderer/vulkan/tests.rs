@@ -10,8 +10,9 @@ use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 
 use super::capabilities::{format_usage_from_features, linear_tiling_supported};
 use super::device::{
-    VulkanDeviceState, find_memory_type_index, image_copy_buffer_offset, image_copy_required_size,
-    image_layout_transition, select_queue_families, tightly_packed_image_size, vulkan_filter,
+    VulkanDeviceState, VulkanShaderSpirv, find_memory_type_index, image_copy_buffer_offset,
+    image_copy_required_size, image_layout_transition, select_queue_families, tightly_packed_image_size,
+    vulkan_filter,
 };
 use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
@@ -62,6 +63,23 @@ fn texture_for_tests(size: Size<i32, BufferCoord>, format: Option<Fourcc>) -> Vu
         image: VulkanImageState::new_for_tests(size, format),
         sampled_image: None,
         y_inverted: false,
+    }
+}
+
+fn render_target_for_tests(
+    context_id: ContextId<VulkanTexture>,
+    source: VulkanImageSource,
+    size: Size<i32, BufferCoord>,
+    format: Option<Fourcc>,
+) -> VulkanRenderTarget<'static> {
+    let mut image = VulkanImageState::new_for_tests(size, format);
+    image.source = source;
+
+    VulkanRenderTarget {
+        context_id,
+        image,
+        color_image: None,
+        _target: PhantomData,
     }
 }
 
@@ -558,6 +576,28 @@ fn transfer_command_buffer_allocation_requires_initialized_device() {
 }
 
 #[test]
+fn shader_module_creation_rejects_empty_code() {
+    // SAFETY: Empty input is rejected before a `VulkanShaderSpirv` value is produced, so this does
+    // not claim invalid SPIR-V is usable by Vulkan.
+    let empty_spirv = unsafe { VulkanShaderSpirv::from_words_unchecked(&[]) };
+
+    assert!(matches!(
+        empty_spirv,
+        Err(VulkanError::UnsupportedOperation("shader module code"))
+    ));
+}
+
+#[test]
+fn pipeline_layout_creation_requires_initialized_device() {
+    let device = VulkanDeviceState::empty_for_tests();
+
+    assert!(matches!(
+        device.create_empty_pipeline_layout(),
+        Err(VulkanError::DeviceInitializationFailed(message)) if message == "missing logical device"
+    ));
+}
+
+#[test]
 fn vulkan_renderer_builder_is_scaffold_only() {
     assert!(matches!(
         VulkanRenderer::builder().build(),
@@ -910,6 +950,74 @@ fn unsupported_frame_creation_returns_clean_error() {
         .render(&mut target, (1, 1).into(), Transform::Normal)
         .unwrap_err();
     assert!(matches!(err, VulkanError::UnsupportedOperation(_)));
+}
+
+#[test]
+fn renderer_render_rejects_foreign_targets_before_device_lookup() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut target = render_target_for_tests(
+        ContextId::new(),
+        VulkanImageSource::Offscreen,
+        (1, 1).into(),
+        Some(Fourcc::Argb8888),
+    );
+
+    assert!(matches!(
+        renderer.render(&mut target, (1, 1).into(), Transform::Normal),
+        Err(VulkanError::UnsupportedOperation("foreign render target"))
+    ));
+}
+
+#[test]
+fn renderer_render_rejects_non_offscreen_targets_before_device_lookup() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut target = render_target_for_tests(
+        renderer.context_id(),
+        VulkanImageSource::Uninitialized,
+        (1, 1).into(),
+        Some(Fourcc::Argb8888),
+    );
+
+    assert!(matches!(
+        renderer.render(&mut target, (1, 1).into(), Transform::Normal),
+        Err(VulkanError::UnsupportedOperation("render target"))
+    ));
+}
+
+#[test]
+fn renderer_render_validates_output_size_before_device_lookup() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut target = render_target_for_tests(
+        renderer.context_id(),
+        VulkanImageSource::Offscreen,
+        (2, 2).into(),
+        Some(Fourcc::Argb8888),
+    );
+
+    assert!(matches!(
+        renderer.render(&mut target, (0, 2).into(), Transform::Normal),
+        Err(VulkanError::UnsupportedOperation("frame size"))
+    ));
+    assert!(matches!(
+        renderer.render(&mut target, (1, 2).into(), Transform::Normal),
+        Err(VulkanError::UnsupportedOperation("frame size"))
+    ));
+}
+
+#[test]
+fn renderer_render_rejects_missing_offscreen_image_before_device_lookup() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut target = render_target_for_tests(
+        renderer.context_id(),
+        VulkanImageSource::Offscreen,
+        (1, 1).into(),
+        Some(Fourcc::Argb8888),
+    );
+
+    assert!(matches!(
+        renderer.render(&mut target, (1, 1).into(), Transform::Normal),
+        Err(VulkanError::UnsupportedOperation("render target image"))
+    ));
 }
 
 #[test]

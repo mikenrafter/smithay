@@ -295,14 +295,14 @@ impl Renderer for VulkanRenderer {
         if framebuffer.image.source != image::VulkanImageSource::Offscreen {
             return Err(VulkanError::UnsupportedOperation("render target"));
         }
-        if framebuffer.color_image.is_none() {
-            return Err(VulkanError::UnsupportedOperation("render target image"));
-        }
         if output_size.w <= 0 || output_size.h <= 0 {
             return Err(VulkanError::UnsupportedOperation("frame size"));
         }
         if framebuffer.image.size.w != output_size.w || framebuffer.image.size.h != output_size.h {
             return Err(VulkanError::UnsupportedOperation("frame size"));
+        }
+        if framebuffer.color_image.is_none() {
+            return Err(VulkanError::UnsupportedOperation("render target image"));
         }
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
 

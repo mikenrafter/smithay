@@ -645,6 +645,31 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn create_shader_module(
+        &self,
+        spirv: VulkanShaderSpirv<'_>,
+    ) -> Result<VulkanShaderModule, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+
+        create_shader_module(&logical_device, spirv)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn create_empty_pipeline_layout(&self) -> Result<VulkanPipelineLayout, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+
+        create_empty_pipeline_layout(&logical_device)
+    }
+
+    #[allow(dead_code)]
     pub(super) fn read_image_to_tightly_packed_buffer(
         &self,
         image: &VulkanOwnedImage,
@@ -1973,6 +1998,124 @@ impl Drop for VulkanFramebuffer {
                 .destroy_framebuffer(self.handle, None)
         };
     }
+}
+
+/// Vulkan shader module owner for future graphics pipelines.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanShaderModule {
+    logical_device: VulkanLogicalDevice,
+    handle: vk::ShaderModule,
+}
+
+#[allow(dead_code)]
+impl VulkanShaderModule {
+    pub(super) fn handle(&self) -> vk::ShaderModule {
+        self.handle
+    }
+}
+
+/// SPIR-V shader-module code that has been validated by the caller.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VulkanShaderSpirv<'code> {
+    words: &'code [u32],
+}
+
+#[allow(dead_code)]
+impl<'code> VulkanShaderSpirv<'code> {
+    /// Creates a SPIR-V code wrapper without validating the module contents.
+    ///
+    /// # Safety
+    ///
+    /// If this returns `Ok`, the caller must ensure `words` contains valid SPIR-V code for a
+    /// Vulkan shader module. The slice type guarantees `pCode` alignment and `codeSize` being a
+    /// multiple of four. This constructor only rejects empty input before a wrapper is created.
+    pub(super) unsafe fn from_words_unchecked(words: &'code [u32]) -> Result<Self, VulkanError> {
+        if words.is_empty() {
+            return Err(VulkanError::UnsupportedOperation("shader module code"));
+        }
+
+        Ok(Self { words })
+    }
+
+    fn words(&self) -> &'code [u32] {
+        self.words
+    }
+}
+
+impl Drop for VulkanShaderModule {
+    fn drop(&mut self) {
+        // SAFETY: `self.handle` was created from `self.logical_device` and this owner destroys it
+        // exactly once. `VulkanLogicalDevice` is retained by value, so the device outlives the
+        // shader module. The module is not shared, satisfying host synchronization for destruction.
+        unsafe {
+            self.logical_device
+                .handle()
+                .destroy_shader_module(self.handle, None)
+        };
+    }
+}
+
+fn create_shader_module(
+    logical_device: &VulkanLogicalDevice,
+    spirv: VulkanShaderSpirv<'_>,
+) -> Result<VulkanShaderModule, VulkanError> {
+    let create_info = vk::ShaderModuleCreateInfo::default().code(spirv.words());
+    // SAFETY: `logical_device` is a live Vulkan device. `VulkanShaderSpirv` guarantees non-empty
+    // caller-validated SPIR-V, while `&[u32]` gives `pCode` proper alignment and a `codeSize` that
+    // is a multiple of four. No allocation callbacks are used.
+    let handle = unsafe { logical_device.handle().create_shader_module(&create_info, None) }
+        .map_err(VulkanError::from)?;
+
+    Ok(VulkanShaderModule {
+        logical_device: logical_device.clone(),
+        handle,
+    })
+}
+
+/// Vulkan pipeline layout owner for future graphics pipelines.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanPipelineLayout {
+    logical_device: VulkanLogicalDevice,
+    handle: vk::PipelineLayout,
+}
+
+#[allow(dead_code)]
+impl VulkanPipelineLayout {
+    pub(super) fn handle(&self) -> vk::PipelineLayout {
+        self.handle
+    }
+}
+
+impl Drop for VulkanPipelineLayout {
+    fn drop(&mut self) {
+        // SAFETY: `self.handle` was created from `self.logical_device` and this owner destroys it
+        // exactly once. `VulkanLogicalDevice` is retained by value, so the device outlives the
+        // pipeline layout. The layout is not shared, satisfying host synchronization for destruction.
+        unsafe {
+            self.logical_device
+                .handle()
+                .destroy_pipeline_layout(self.handle, None)
+        };
+    }
+}
+
+fn create_empty_pipeline_layout(
+    logical_device: &VulkanLogicalDevice,
+) -> Result<VulkanPipelineLayout, VulkanError> {
+    let create_info = vk::PipelineLayoutCreateInfo::default();
+    // SAFETY: `logical_device` is a live Vulkan device. The create info has no descriptor set
+    // layouts or push-constant ranges, which is valid for an empty pipeline layout, and no
+    // allocation callbacks are used.
+    let handle = unsafe { logical_device.handle().create_pipeline_layout(&create_info, None) }
+        .map_err(VulkanError::from)?;
+
+    Ok(VulkanPipelineLayout {
+        logical_device: logical_device.clone(),
+        handle,
+    })
 }
 
 fn create_single_color_render_pass(
