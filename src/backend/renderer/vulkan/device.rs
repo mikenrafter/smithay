@@ -2264,29 +2264,47 @@ fn create_pipeline_layout_for_descriptor_set_layout(
 
 /// Descriptor pool for future sampled-texture descriptor sets.
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct VulkanDescriptorPool {
+    inner: Arc<VulkanDescriptorPoolInner>,
+}
+
+#[derive(Debug)]
+struct VulkanDescriptorPoolInner {
     logical_device: VulkanLogicalDevice,
     handle: vk::DescriptorPool,
     max_sets: u32,
+    host_access: Mutex<()>,
 }
 
 #[allow(dead_code)]
 impl VulkanDescriptorPool {
     pub(super) fn handle(&self) -> vk::DescriptorPool {
-        self.handle
+        self.inner.handle
     }
 
     pub(super) fn max_sets(&self) -> u32 {
-        self.max_sets
+        self.inner.max_sets
+    }
+
+    fn lock_host_access(&self) -> Result<MutexGuard<'_, ()>, VulkanError> {
+        self.inner
+            .host_access
+            .lock()
+            .map_err(|_| host_synchronization_failed())
     }
 }
 
-impl Drop for VulkanDescriptorPool {
+impl Drop for VulkanDescriptorPoolInner {
     fn drop(&mut self) {
+        let _pool_guard = self
+            .host_access
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // SAFETY: `self.handle` was created from `self.logical_device` and this owner destroys it
         // exactly once. `VulkanLogicalDevice` is retained by value, so the device outlives the
-        // descriptor pool. The pool is not shared, satisfying host synchronization for destruction.
+        // descriptor pool. The host-access lock serializes destruction with future pool allocation,
+        // free, and reset operations that use the same lock.
         unsafe {
             self.logical_device
                 .handle()
@@ -2316,9 +2334,12 @@ fn create_sampled_texture_descriptor_pool(
         .map_err(VulkanError::from)?;
 
     Ok(VulkanDescriptorPool {
-        logical_device: logical_device.clone(),
-        handle,
-        max_sets,
+        inner: Arc::new(VulkanDescriptorPoolInner {
+            logical_device: logical_device.clone(),
+            handle,
+            max_sets,
+            host_access: Mutex::new(()),
+        }),
     })
 }
 
