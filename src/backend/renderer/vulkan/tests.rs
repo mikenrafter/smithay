@@ -20,8 +20,8 @@ use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
     VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalMemoryHandleType, VulkanExternalMemoryState,
     VulkanImageLayoutState, VulkanImageSource, VulkanImageState, VulkanImageSyncState, VulkanImageUsage,
-    damage_to_scissor_areas, draw_solid_damage_to_clear_areas, render_texture_damage_to_scissor_areas,
-    source_to_uv_rect,
+    clear_damage_to_clear_areas, damage_to_scissor_areas, draw_solid_damage_to_clear_areas,
+    render_texture_damage_to_scissor_areas, source_to_uv_rect,
 };
 use super::*;
 
@@ -1293,6 +1293,39 @@ fn frame_rejects_non_empty_work() {
 }
 
 #[test]
+fn frame_clear_accepts_partial_damage_before_device_lookup() {
+    let mut frame = frame_for_tests(ContextId::new(), (4, 4).into(), Transform::Normal);
+    let partial_damage = [Rectangle::new((1, 1).into(), (2, 2).into())];
+    let overlapping_damage = [
+        Rectangle::new((0, 0).into(), (2, 2).into()),
+        Rectangle::new((1, 1).into(), (2, 2).into()),
+    ];
+
+    assert!(matches!(
+        frame.clear(Color32F::TRANSPARENT, &partial_damage),
+        Err(VulkanError::UnsupportedOperation("clear device"))
+    ));
+    assert!(matches!(
+        frame.clear(Color32F::TRANSPARENT, &overlapping_damage),
+        Err(VulkanError::UnsupportedOperation("clear device"))
+    ));
+    assert!(
+        frame
+            .clear(
+                Color32F::TRANSPARENT,
+                &[Rectangle::new((5, 0).into(), (1, 1).into())]
+            )
+            .is_ok()
+    );
+
+    let mut transformed_frame = frame_for_tests(ContextId::new(), (4, 4).into(), Transform::Flipped270);
+    assert!(matches!(
+        transformed_frame.clear(Color32F::TRANSPARENT, &partial_damage),
+        Err(VulkanError::UnsupportedOperation("clear transform"))
+    ));
+}
+
+#[test]
 fn frame_draw_solid_rejects_preconditions_before_device_lookup() {
     let context_id = ContextId::new();
     let full_damage = [Rectangle::from_size((4, 4).into())];
@@ -1701,6 +1734,38 @@ fn damage_to_scissor_areas_rejects_overlapping_clipped_damage() {
     ];
 
     assert_eq!(damage_to_scissor_areas(output_size, dst, &damage), None);
+}
+
+#[test]
+fn clear_damage_to_clear_areas_clips_and_accepts_overlap() {
+    let output_size = Size::<i32, Physical>::from((4, 1));
+    let damage = [
+        Rectangle::new((0, 0).into(), (2, 1).into()),
+        Rectangle::new((1, 0).into(), (4, 1).into()),
+        Rectangle::new((5, 0).into(), (1, 1).into()),
+    ];
+
+    assert_eq!(
+        clear_damage_to_clear_areas(output_size, &damage),
+        Some(vec![
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D { width: 2, height: 1 },
+            },
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 1, y: 0 },
+                extent: vk::Extent2D { width: 3, height: 1 },
+            },
+        ])
+    );
+    assert_eq!(
+        clear_damage_to_clear_areas(output_size, &[Rectangle::new((5, 0).into(), (1, 1).into())]),
+        Some(Vec::new())
+    );
+    assert_eq!(
+        clear_damage_to_clear_areas((0, 1).into(), &[Rectangle::from_size((1, 1).into())]),
+        None
+    );
 }
 
 #[test]
@@ -2675,6 +2740,63 @@ fn runtime_frame_draw_solid_respects_destination_local_damage() {
     assert_eq!(
         readback,
         [255, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 255, 0, 255]
+    );
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_frame_clear_respects_partial_damage() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let mut renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let Some(render_format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.color_attachment
+                && record.usages.transfer_src
+                && record.usages.transfer_dst
+        })
+        .map(|record| record.format)
+    else {
+        return;
+    };
+
+    let mut target = renderer
+        .create_offscreen_render_target(render_format, (4, 1).into())
+        .unwrap();
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 1)))];
+        let partial_damage = [Rectangle::new((1, 0).into(), (2, 1).into())];
+        let mut frame = renderer
+            .render(&mut target, (4, 1).into(), Transform::Normal)
+            .unwrap();
+
+        frame
+            .clear(Color32F::new(1.0, 0.0, 0.0, 1.0), &full_damage)
+            .unwrap();
+        frame
+            .clear(Color32F::new(0.0, 0.0, 1.0, 1.0), &partial_damage)
+            .unwrap();
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
+    assert_eq!(
+        readback,
+        [255, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255, 255, 0, 0, 255]
     );
 }
 

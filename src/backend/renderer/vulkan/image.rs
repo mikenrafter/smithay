@@ -300,9 +300,20 @@ impl Frame for VulkanFrame<'_, '_> {
             return Ok(());
         }
 
-        if !is_full_target_damage(self.output_size, at) {
-            return Err(VulkanError::UnsupportedOperation("partial clear"));
-        }
+        let full_target_clear = is_full_target_damage(self.output_size, at);
+        let clear_areas = if full_target_clear {
+            None
+        } else {
+            if self.transform != Transform::Normal {
+                return Err(VulkanError::UnsupportedOperation("clear transform"));
+            }
+            let clear_areas = clear_damage_to_clear_areas(self.output_size, at)
+                .ok_or(VulkanError::UnsupportedOperation("clear damage"))?;
+            if clear_areas.is_empty() {
+                return Ok(());
+            }
+            Some(clear_areas)
+        };
 
         let device = self
             .device
@@ -320,7 +331,12 @@ impl Frame for VulkanFrame<'_, '_> {
             .format
             .ok_or(VulkanError::UnsupportedOperation("offscreen target format"))?;
 
-        device.clear_color_attachment_image(color_image, clear_color_value_for_format(format, color)?)?;
+        let color = clear_color_value_for_format(format, color)?;
+        if full_target_clear {
+            device.clear_color_attachment_image(color_image, color)?;
+        } else if let Some(clear_areas) = clear_areas {
+            device.clear_color_attachment_image_in(color_image, color, clear_areas.as_slice())?;
+        }
         target.image.layout = VulkanImageLayoutState::ColorAttachment;
         Ok(())
     }
@@ -520,6 +536,13 @@ impl Frame for VulkanFrame<'_, '_> {
 
 fn is_full_target_damage(output_size: Size<i32, Physical>, damage: &[Rectangle<i32, Physical>]) -> bool {
     damage.len() == 1 && damage[0] == Rectangle::from_size(output_size)
+}
+
+pub(super) fn clear_damage_to_clear_areas(
+    output_size: Size<i32, Physical>,
+    damage: &[Rectangle<i32, Physical>],
+) -> Option<Vec<vk::Rect2D>> {
+    draw_solid_damage_to_clear_areas(output_size, Rectangle::from_size(output_size), damage)
 }
 
 pub(super) fn damage_to_scissor_areas(
