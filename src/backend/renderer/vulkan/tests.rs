@@ -20,7 +20,7 @@ use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
     VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalMemoryHandleType, VulkanExternalMemoryState,
     VulkanImageLayoutState, VulkanImageSource, VulkanImageState, VulkanImageSyncState, VulkanImageUsage,
-    damage_to_scissor_areas, source_to_uv_rect,
+    damage_to_scissor_areas, render_texture_damage_to_scissor_areas, source_to_uv_rect,
 };
 use super::*;
 
@@ -1441,7 +1441,7 @@ fn frame_render_texture_rejects_narrow_path_preconditions_before_device_lookup()
         &opaque_region,
         Transform::Normal,
         1.0,
-        "render texture opaque regions",
+        "render texture device",
     );
     assert_render_texture_error(
         &texture,
@@ -1629,6 +1629,81 @@ fn damage_to_scissor_areas_rejects_overlapping_clipped_damage() {
     ];
 
     assert_eq!(damage_to_scissor_areas(output_size, dst, &damage), None);
+}
+
+#[test]
+fn render_texture_damage_to_scissor_areas_splits_opaque_regions() {
+    let output_size = Size::<i32, Physical>::from((6, 1));
+    let dst = Rectangle::new((1, 0).into(), (4, 1).into());
+    let damage = [Rectangle::from_size((4, 1).into())];
+    let opaque_regions = [Rectangle::new((1, 0).into(), (2, 1).into())];
+
+    let (non_opaque, opaque) =
+        render_texture_damage_to_scissor_areas(output_size, dst, &damage, &opaque_regions, false, 1.0)
+            .unwrap();
+
+    assert_eq!(
+        non_opaque,
+        vec![
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 1, y: 0 },
+                extent: vk::Extent2D { width: 1, height: 1 },
+            },
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 4, y: 0 },
+                extent: vk::Extent2D { width: 1, height: 1 },
+            },
+        ]
+    );
+    assert_eq!(
+        opaque,
+        vec![vk::Rect2D {
+            offset: vk::Offset2D { x: 2, y: 0 },
+            extent: vk::Extent2D { width: 2, height: 1 },
+        }]
+    );
+}
+
+#[test]
+fn render_texture_damage_to_scissor_areas_ignores_opaque_regions_with_global_alpha() {
+    let output_size = Size::<i32, Physical>::from((6, 1));
+    let dst = Rectangle::new((1, 0).into(), (4, 1).into());
+    let damage = [Rectangle::from_size((4, 1).into())];
+    let opaque_regions = [Rectangle::new((1, 0).into(), (2, 1).into())];
+
+    let (non_opaque, opaque) =
+        render_texture_damage_to_scissor_areas(output_size, dst, &damage, &opaque_regions, false, 0.5)
+            .unwrap();
+
+    assert_eq!(
+        non_opaque,
+        vec![vk::Rect2D {
+            offset: vk::Offset2D { x: 1, y: 0 },
+            extent: vk::Extent2D { width: 4, height: 1 },
+        }]
+    );
+    assert!(opaque.is_empty());
+}
+
+#[test]
+fn render_texture_damage_to_scissor_areas_treats_implicit_opaque_as_opaque() {
+    let output_size = Size::<i32, Physical>::from((6, 1));
+    let dst = Rectangle::new((1, 0).into(), (4, 1).into());
+    let damage = [Rectangle::from_size((4, 1).into())];
+    let opaque_regions = [Rectangle::new((1, 0).into(), (1, 1).into())];
+
+    let (non_opaque, opaque) =
+        render_texture_damage_to_scissor_areas(output_size, dst, &damage, &opaque_regions, true, 1.0)
+            .unwrap();
+
+    assert!(non_opaque.is_empty());
+    assert_eq!(
+        opaque,
+        vec![vk::Rect2D {
+            offset: vk::Offset2D { x: 1, y: 0 },
+            extent: vk::Extent2D { width: 4, height: 1 },
+        }]
+    );
 }
 
 #[test]
@@ -2315,8 +2390,11 @@ fn runtime_sampled_texture_descriptor_scaffolds_create_with_first_physical_devic
         )
     }
     .unwrap();
-    let graphics_pipeline = device.create_sampled_texture_graphics_pipeline(shaders).unwrap();
+    let graphics_pipeline = device
+        .create_sampled_texture_graphics_pipeline(shaders, true)
+        .unwrap();
     assert_ne!(graphics_pipeline.render_pass().handle(), vk::RenderPass::null());
+    assert!(graphics_pipeline.blend_enabled());
     assert_ne!(
         graphics_pipeline.layout().pipeline_layout().handle(),
         vk::PipelineLayout::null()
@@ -3156,6 +3234,100 @@ fn runtime_frame_render_texture_blends_global_alpha() {
     assert_eq!(readback[1], 0);
     assert!((127..=128).contains(&readback[2]), "blue channel {readback:?}");
     assert_eq!(readback[3], 255);
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_frame_render_texture_accepts_opaque_regions() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let mut renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let Some(render_format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.sampled
+                && record.usages.color_attachment
+                && record.usages.color_attachment_blend
+                && record.usages.transfer_src
+                && record.usages.transfer_dst
+        })
+        .map(|record| record.format)
+    else {
+        return;
+    };
+
+    let sampled_image = renderer
+        .device
+        .as_ref()
+        .unwrap()
+        .create_uploaded_sampled_image(
+            vk::Extent3D {
+                width: 2,
+                height: 1,
+                depth: 1,
+            },
+            super::get_render_vk_format(render_format).unwrap(),
+            &[0, 0, 255, 255, 0, 0, 128, 128],
+            TextureFilter::Nearest,
+            TextureFilter::Nearest,
+        )
+        .unwrap();
+    let texture = VulkanTexture::from_sampled_image(
+        renderer.context_id(),
+        (2, 1).into(),
+        render_format,
+        sampled_image,
+        false,
+    );
+    let mut target = renderer
+        .create_offscreen_render_target(render_format, (4, 1).into())
+        .unwrap();
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 1)))];
+        let texture_damage = [Rectangle::from_size(Size::<i32, Physical>::from((2, 1)))];
+        let opaque_regions = [Rectangle::from_size(Size::<i32, Physical>::from((1, 1)))];
+        let mut frame = renderer
+            .render(&mut target, (4, 1).into(), Transform::Normal)
+            .unwrap();
+
+        frame
+            .clear(Color32F::new(1.0, 0.0, 0.0, 1.0), &full_damage)
+            .unwrap();
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::from_size((2.0, 1.0).into()),
+                Rectangle::new((1, 0).into(), (2, 1).into()),
+                &texture_damage,
+                &opaque_regions,
+                Transform::Normal,
+                1.0,
+            )
+            .unwrap();
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
+    assert_eq!(&readback[0..4], &[255, 0, 0, 255]);
+    assert_eq!(&readback[4..8], &[0, 0, 255, 255]);
+    assert!((127..=128).contains(&readback[8]), "red channel {readback:?}");
+    assert_eq!(readback[9], 0);
+    assert!((127..=128).contains(&readback[10]), "blue channel {readback:?}");
+    assert_eq!(readback[11], 255);
+    assert_eq!(&readback[12..16], &[255, 0, 0, 255]);
 }
 
 #[test]

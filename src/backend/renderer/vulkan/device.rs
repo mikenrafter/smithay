@@ -757,6 +757,7 @@ impl VulkanDeviceState {
     pub(super) fn create_sampled_texture_graphics_pipeline(
         &self,
         shaders: VulkanSampledTexturePipelineShaders<'_>,
+        blend_enabled: bool,
     ) -> Result<VulkanSampledTextureGraphicsPipeline, VulkanError> {
         let instance = self
             .instance
@@ -790,9 +791,10 @@ impl VulkanDeviceState {
                 .handle()
                 .get_physical_device_format_properties(physical_device.handle(), shaders.color_format)
         };
-        if !format_properties
-            .optimal_tiling_features
-            .contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND)
+        if blend_enabled
+            && !format_properties
+                .optimal_tiling_features
+                .contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND)
         {
             return Err(VulkanError::UnsupportedOperation(
                 "graphics pipeline blend format",
@@ -814,10 +816,12 @@ impl VulkanDeviceState {
             sampled_texture_layout.pipeline_layout(),
             &vertex_shader,
             &fragment_shader,
+            blend_enabled,
         )?;
 
         Ok(VulkanSampledTextureGraphicsPipeline {
             color_format: shaders.color_format,
+            blend_enabled,
             render_pass,
             layout: sampled_texture_layout,
             pipeline,
@@ -828,6 +832,7 @@ impl VulkanDeviceState {
     pub(super) fn create_builtin_sampled_texture_graphics_pipeline(
         &self,
         color_format: vk::Format,
+        blend_enabled: bool,
     ) -> Result<VulkanSampledTextureGraphicsPipeline, VulkanError> {
         // SAFETY: These built-in shader modules were generated from local GLSL by glslangValidator.
         // They contain compatible vertex/fragment `main` entry points, no non-built-in vertex
@@ -843,7 +848,7 @@ impl VulkanDeviceState {
             )
         }?;
 
-        self.create_sampled_texture_graphics_pipeline(shaders)
+        self.create_sampled_texture_graphics_pipeline(shaders, blend_enabled)
     }
 
     #[allow(dead_code)]
@@ -2916,6 +2921,7 @@ impl VulkanSampledTexturePipelineLayout {
 #[derive(Debug)]
 pub(crate) struct VulkanSampledTextureGraphicsPipeline {
     color_format: vk::Format,
+    blend_enabled: bool,
     render_pass: VulkanRenderPass,
     layout: VulkanSampledTexturePipelineLayout,
     pipeline: VulkanGraphicsPipeline,
@@ -2925,6 +2931,10 @@ pub(crate) struct VulkanSampledTextureGraphicsPipeline {
 impl VulkanSampledTextureGraphicsPipeline {
     pub(super) fn color_format(&self) -> vk::Format {
         self.color_format
+    }
+
+    pub(super) fn blend_enabled(&self) -> bool {
+        self.blend_enabled
     }
 
     pub(super) fn render_pass(&self) -> &VulkanRenderPass {
@@ -3060,6 +3070,7 @@ fn create_sampled_texture_graphics_pipeline(
     pipeline_layout: &VulkanPipelineLayout,
     vertex_shader: &VulkanShaderModule,
     fragment_shader: &VulkanShaderModule,
+    blend_enabled: bool,
 ) -> Result<VulkanGraphicsPipeline, VulkanError> {
     if !logical_device.is_same_device(render_pass.logical_device())
         || !logical_device.is_same_device(pipeline_layout.logical_device())
@@ -3094,7 +3105,7 @@ fn create_sampled_texture_graphics_pipeline(
     let multisample =
         vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
     let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-        .blend_enable(true)
+        .blend_enable(blend_enabled)
         .src_color_blend_factor(vk::BlendFactor::ONE)
         .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
         .color_blend_op(vk::BlendOp::ADD)
@@ -3124,10 +3135,10 @@ fn create_sampled_texture_graphics_pipeline(
         .subpass(0);
     // SAFETY: All handles are validated to belong to `logical_device`. Shader modules contain
     // caller-validated SPIR-V and remain alive for the duration of pipeline creation. The render
-    // pass has one blend-capable color attachment at subpass 0, and the fixed-function state
-    // describes a simple triangle-list pipeline with dynamic viewport/scissor and premultiplied
-    // alpha blending. All create-info slices live through the call and no allocation callbacks are
-    // used.
+    // pass has one color attachment at subpass 0, and the fixed-function state describes a simple
+    // triangle-list pipeline with dynamic viewport/scissor and either premultiplied alpha blending
+    // or blending disabled for opaque regions. All create-info slices live through the call and no
+    // allocation callbacks are used.
     let pipelines = unsafe {
         logical_device
             .handle()

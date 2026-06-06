@@ -366,14 +366,6 @@ impl Frame for VulkanFrame<'_, '_> {
         if draw_area.extent.width == 0 || draw_area.extent.height == 0 {
             return Err(VulkanError::UnsupportedOperation("render texture destination"));
         }
-        let scissor_areas = damage_to_scissor_areas(self.output_size, dst, damage)
-            .ok_or(VulkanError::UnsupportedOperation("render texture damage"))?;
-        if scissor_areas.is_empty() {
-            return Ok(());
-        }
-        if !opaque_regions.is_empty() {
-            return Err(VulkanError::UnsupportedOperation("render texture opaque regions"));
-        }
         if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
             return Err(VulkanError::UnsupportedOperation("render texture alpha"));
         }
@@ -401,31 +393,75 @@ impl Frame for VulkanFrame<'_, '_> {
             .format
             .ok_or(VulkanError::UnsupportedOperation("render texture format"))?;
         let force_opaque_alpha = get_format_info(texture_format)?.opaque_alpha;
+        let (non_opaque_scissor_areas, opaque_scissor_areas) = render_texture_damage_to_scissor_areas(
+            self.output_size,
+            dst,
+            damage,
+            opaque_regions,
+            force_opaque_alpha && alpha == 1.0,
+            alpha,
+        )
+        .ok_or(VulkanError::UnsupportedOperation("render texture damage"))?;
+        if non_opaque_scissor_areas.is_empty() && opaque_scissor_areas.is_empty() {
+            return Ok(());
+        }
 
-        let pipeline =
-            device.create_builtin_sampled_texture_graphics_pipeline(get_render_vk_format(target_format)?)?;
-        let descriptor_pool = device.create_sampled_texture_descriptor_pool(1)?;
-        let descriptor_set = device.create_sampled_texture_descriptor_set(
-            &descriptor_pool,
-            pipeline.layout().descriptor_set_layout(),
-            Arc::clone(sampled_image),
-        )?;
+        let target_vk_format = get_render_vk_format(target_format)?;
+        let descriptor_set_count = if non_opaque_scissor_areas.is_empty() { 0 } else { 1 }
+            + if opaque_scissor_areas.is_empty() { 0 } else { 1 };
+        let descriptor_pool = device.create_sampled_texture_descriptor_pool(descriptor_set_count)?;
 
-        for scissor_area in scissor_areas {
-            device.render_sampled_texture_to_color_image_in(
-                color_image,
-                &descriptor_set,
-                &pipeline,
-                VulkanSampledTextureDrawConstants {
-                    draw_area,
-                    scissor_area,
-                    uv_origin,
-                    uv_x_axis,
-                    uv_y_axis,
-                    alpha,
-                    force_opaque_alpha,
-                },
+        if !non_opaque_scissor_areas.is_empty() {
+            let pipeline = device.create_builtin_sampled_texture_graphics_pipeline(target_vk_format, true)?;
+            let descriptor_set = device.create_sampled_texture_descriptor_set(
+                &descriptor_pool,
+                pipeline.layout().descriptor_set_layout(),
+                Arc::clone(sampled_image),
             )?;
+
+            for scissor_area in non_opaque_scissor_areas {
+                device.render_sampled_texture_to_color_image_in(
+                    color_image,
+                    &descriptor_set,
+                    &pipeline,
+                    VulkanSampledTextureDrawConstants {
+                        draw_area,
+                        scissor_area,
+                        uv_origin,
+                        uv_x_axis,
+                        uv_y_axis,
+                        alpha,
+                        force_opaque_alpha,
+                    },
+                )?;
+            }
+        }
+
+        if !opaque_scissor_areas.is_empty() {
+            let pipeline =
+                device.create_builtin_sampled_texture_graphics_pipeline(target_vk_format, false)?;
+            let descriptor_set = device.create_sampled_texture_descriptor_set(
+                &descriptor_pool,
+                pipeline.layout().descriptor_set_layout(),
+                Arc::clone(sampled_image),
+            )?;
+
+            for scissor_area in opaque_scissor_areas {
+                device.render_sampled_texture_to_color_image_in(
+                    color_image,
+                    &descriptor_set,
+                    &pipeline,
+                    VulkanSampledTextureDrawConstants {
+                        draw_area,
+                        scissor_area,
+                        uv_origin,
+                        uv_x_axis,
+                        uv_y_axis,
+                        alpha,
+                        force_opaque_alpha,
+                    },
+                )?;
+            }
         }
         target.image.layout = VulkanImageLayoutState::ColorAttachment;
         Ok(())
@@ -497,6 +533,36 @@ pub(super) fn damage_to_scissor_areas(
         .into_iter()
         .map(|scissor| output_destination_to_vk_rect(output_size, scissor))
         .collect()
+}
+
+pub(super) fn render_texture_damage_to_scissor_areas(
+    output_size: Size<i32, Physical>,
+    dst: Rectangle<i32, Physical>,
+    damage: &[Rectangle<i32, Physical>],
+    opaque_regions: &[Rectangle<i32, Physical>],
+    is_implicit_opaque: bool,
+    alpha: f32,
+) -> Option<(Vec<vk::Rect2D>, Vec<vk::Rect2D>)> {
+    let mut non_opaque_damage = Vec::new();
+    let mut opaque_damage = Vec::new();
+
+    if is_implicit_opaque {
+        opaque_damage.extend_from_slice(damage);
+    } else if alpha != 1.0 || opaque_regions.is_empty() {
+        non_opaque_damage.extend_from_slice(damage);
+    } else {
+        non_opaque_damage.extend_from_slice(damage);
+        opaque_damage.extend_from_slice(damage);
+        non_opaque_damage =
+            Rectangle::subtract_rects_many_in_place(non_opaque_damage, opaque_regions.iter().copied());
+        opaque_damage =
+            Rectangle::subtract_rects_many_in_place(opaque_damage, non_opaque_damage.iter().copied());
+    }
+
+    Some((
+        damage_to_scissor_areas(output_size, dst, &non_opaque_damage)?,
+        damage_to_scissor_areas(output_size, dst, &opaque_damage)?,
+    ))
 }
 
 pub(super) fn source_to_uv_rect(
