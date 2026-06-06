@@ -395,7 +395,7 @@ impl Frame for VulkanFrame<'_, '_> {
             )?;
         } else {
             let pipeline =
-                device.create_builtin_solid_color_graphics_pipeline(get_render_vk_format(format)?, true)?;
+                device.builtin_solid_color_graphics_pipeline(get_render_vk_format(format)?, true)?;
             for scissor_area in clear_areas {
                 device.render_solid_color_to_color_image_in(
                     color_image,
@@ -486,7 +486,7 @@ impl Frame for VulkanFrame<'_, '_> {
         let descriptor_pool = device.create_sampled_texture_descriptor_pool(descriptor_set_count)?;
 
         if !non_opaque_scissor_areas.is_empty() {
-            let pipeline = device.create_builtin_sampled_texture_graphics_pipeline(target_vk_format, true)?;
+            let pipeline = device.builtin_sampled_texture_graphics_pipeline(target_vk_format, true)?;
             let descriptor_set = device.create_sampled_texture_descriptor_set(
                 &descriptor_pool,
                 pipeline.layout().descriptor_set_layout(),
@@ -512,8 +512,7 @@ impl Frame for VulkanFrame<'_, '_> {
         }
 
         if !opaque_scissor_areas.is_empty() {
-            let pipeline =
-                device.create_builtin_sampled_texture_graphics_pipeline(target_vk_format, false)?;
+            let pipeline = device.builtin_sampled_texture_graphics_pipeline(target_vk_format, false)?;
             let descriptor_set = device.create_sampled_texture_descriptor_set(
                 &descriptor_pool,
                 pipeline.layout().descriptor_set_layout(),

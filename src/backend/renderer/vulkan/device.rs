@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::c_void,
     ptr,
     sync::{Arc, Mutex, MutexGuard},
@@ -48,6 +49,9 @@ pub(crate) struct VulkanDeviceState {
     pub(super) memory_properties: Option<vk::PhysicalDeviceMemoryProperties>,
     pub(super) capabilities: VulkanRendererCapabilities,
     pub(super) enabled_extensions: Vec<String>,
+    builtin_sampled_texture_pipelines:
+        Mutex<HashMap<(vk::Format, bool), Arc<VulkanSampledTextureGraphicsPipeline>>>,
+    builtin_solid_color_pipelines: Mutex<HashMap<(vk::Format, bool), Arc<VulkanSolidColorGraphicsPipeline>>>,
 }
 
 impl VulkanDeviceState {
@@ -127,6 +131,8 @@ impl VulkanDeviceState {
             memory_properties: Some(memory_properties),
             capabilities,
             enabled_extensions: Vec::new(),
+            builtin_sampled_texture_pipelines: Mutex::new(HashMap::new()),
+            builtin_solid_color_pipelines: Mutex::new(HashMap::new()),
         })
     }
 
@@ -143,6 +149,8 @@ impl VulkanDeviceState {
             memory_properties: None,
             capabilities: VulkanRendererCapabilities::default(),
             enabled_extensions: Vec::new(),
+            builtin_sampled_texture_pipelines: Mutex::new(HashMap::new()),
+            builtin_solid_color_pipelines: Mutex::new(HashMap::new()),
         }
     }
 
@@ -895,6 +903,27 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn builtin_sampled_texture_graphics_pipeline(
+        &self,
+        color_format: vk::Format,
+        blend_enabled: bool,
+    ) -> Result<Arc<VulkanSampledTextureGraphicsPipeline>, VulkanError> {
+        let key = (color_format, blend_enabled);
+        let mut pipelines = self
+            .builtin_sampled_texture_pipelines
+            .lock()
+            .map_err(|_| host_synchronization_failed())?;
+        if let Some(pipeline) = pipelines.get(&key) {
+            return Ok(Arc::clone(pipeline));
+        }
+
+        let pipeline =
+            Arc::new(self.create_builtin_sampled_texture_graphics_pipeline(color_format, blend_enabled)?);
+        pipelines.insert(key, Arc::clone(&pipeline));
+        Ok(pipeline)
+    }
+
+    #[allow(dead_code)]
     pub(super) fn create_builtin_solid_color_graphics_pipeline(
         &self,
         color_format: vk::Format,
@@ -972,6 +1001,27 @@ impl VulkanDeviceState {
             layout,
             pipeline,
         })
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn builtin_solid_color_graphics_pipeline(
+        &self,
+        color_format: vk::Format,
+        blend_enabled: bool,
+    ) -> Result<Arc<VulkanSolidColorGraphicsPipeline>, VulkanError> {
+        let key = (color_format, blend_enabled);
+        let mut pipelines = self
+            .builtin_solid_color_pipelines
+            .lock()
+            .map_err(|_| host_synchronization_failed())?;
+        if let Some(pipeline) = pipelines.get(&key) {
+            return Ok(Arc::clone(pipeline));
+        }
+
+        let pipeline =
+            Arc::new(self.create_builtin_solid_color_graphics_pipeline(color_format, blend_enabled)?);
+        pipelines.insert(key, Arc::clone(&pipeline));
+        Ok(pipeline)
     }
 
     #[allow(dead_code)]

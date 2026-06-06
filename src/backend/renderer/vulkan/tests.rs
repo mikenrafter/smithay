@@ -2599,6 +2599,61 @@ fn runtime_sampled_texture_descriptor_scaffolds_create_with_first_physical_devic
 
 #[test]
 #[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_builtin_graphics_pipelines_are_cached() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let device = renderer.device.as_ref().unwrap();
+    let Some(pipeline_format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.color_attachment
+                && record.usages.color_attachment_blend
+        })
+        .map(|record| super::get_render_vk_format(record.format).unwrap())
+    else {
+        return;
+    };
+
+    let sampled_blend_a = device
+        .builtin_sampled_texture_graphics_pipeline(pipeline_format, true)
+        .unwrap();
+    let sampled_blend_b = device
+        .builtin_sampled_texture_graphics_pipeline(pipeline_format, true)
+        .unwrap();
+    let sampled_opaque = device
+        .builtin_sampled_texture_graphics_pipeline(pipeline_format, false)
+        .unwrap();
+    assert!(Arc::ptr_eq(&sampled_blend_a, &sampled_blend_b));
+    assert!(!Arc::ptr_eq(&sampled_blend_a, &sampled_opaque));
+
+    let solid_blend_a = device
+        .builtin_solid_color_graphics_pipeline(pipeline_format, true)
+        .unwrap();
+    let solid_blend_b = device
+        .builtin_solid_color_graphics_pipeline(pipeline_format, true)
+        .unwrap();
+    let solid_opaque = device
+        .builtin_solid_color_graphics_pipeline(pipeline_format, false)
+        .unwrap();
+    assert!(Arc::ptr_eq(&solid_blend_a, &solid_blend_b));
+    assert!(!Arc::ptr_eq(&solid_blend_a, &solid_opaque));
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
 fn runtime_frame_render_texture_draws_uploaded_sampled_image() {
     let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
     let physical_device = PhysicalDevice::enumerate(&instance)
