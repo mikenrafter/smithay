@@ -343,6 +343,38 @@ fn image_layout_transition_requires_matching_image_usage() {
             "image transfer destination usage"
         ))
     ));
+    assert!(
+        image_layout_transition(
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        )
+        .is_ok()
+    );
+    assert!(
+        image_layout_transition(
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        )
+        .is_ok()
+    );
+    assert!(
+        image_layout_transition(
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        )
+        .is_ok()
+    );
+    assert!(
+        image_layout_transition(
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -1471,7 +1503,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
                 .unwrap();
             assert!(frame.finish().unwrap().is_reached());
         }
-        assert_eq!(target.image.layout, VulkanImageLayoutState::TransferDst);
+        assert_eq!(target.image.layout, VulkanImageLayoutState::ColorAttachment);
         let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
         assert_eq!(readback, [255, 0, 0, 255].repeat(4));
         Some(target)

@@ -317,8 +317,8 @@ impl Frame for VulkanFrame<'_, '_> {
             .format
             .ok_or(VulkanError::UnsupportedOperation("offscreen target format"))?;
 
-        device.clear_offscreen_color_image(color_image, clear_color_value_for_format(format, color)?)?;
-        target.image.layout = VulkanImageLayoutState::TransferDst;
+        device.clear_color_attachment_image(color_image, clear_color_value_for_format(format, color)?)?;
+        target.image.layout = VulkanImageLayoutState::ColorAttachment;
         Ok(())
     }
 

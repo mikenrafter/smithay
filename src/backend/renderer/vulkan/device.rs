@@ -611,6 +611,40 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn clear_color_attachment_image(
+        &self,
+        image: &VulkanOwnedImage,
+        color: vk::ClearColorValue,
+    ) -> Result<(), VulkanError> {
+        let view = self.create_color_attachment_image_view(image)?;
+        let render_pass = create_single_color_render_pass(&image.inner.logical_device, image.format())?;
+        let framebuffer = create_single_color_framebuffer(&render_pass, &view, image.extent())?;
+        let mut command_buffer = self.allocate_graphics_command_buffer()?;
+
+        self.begin_command_buffer(&mut command_buffer)?;
+        self.transition_image_layout(
+            &mut command_buffer,
+            image,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        )?;
+        record_color_attachment_clear(&mut command_buffer, image, &render_pass, &framebuffer, color)?;
+        self.end_command_buffer(&mut command_buffer)?;
+        self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn create_color_attachment_image_view(
+        &self,
+        image: &VulkanOwnedImage,
+    ) -> Result<VulkanImageView, VulkanError> {
+        self.logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+
+        create_color_attachment_image_view(image)
+    }
+
+    #[allow(dead_code)]
     pub(super) fn read_image_to_tightly_packed_buffer(
         &self,
         image: &VulkanOwnedImage,
@@ -1051,6 +1085,57 @@ fn clear_color_image(
     Ok(())
 }
 
+fn record_color_attachment_clear(
+    command_buffer: &mut VulkanCommandBuffer,
+    image: &VulkanOwnedImage,
+    render_pass: &VulkanRenderPass,
+    framebuffer: &VulkanFramebuffer,
+    color: vk::ClearColorValue,
+) -> Result<(), VulkanError> {
+    if !image.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+        return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
+    }
+
+    let image_layout = command_buffer
+        .pending_layout_for(image)?
+        .unwrap_or(image.layout()?);
+    if image_layout != vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+        return Err(VulkanError::UnsupportedOperation("image color attachment layout"));
+    }
+
+    let clear_values = [vk::ClearValue { color }];
+    let render_area = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: vk::Extent2D {
+            width: image.extent().width,
+            height: image.extent().height,
+        },
+    };
+    let begin_info = vk::RenderPassBeginInfo::default()
+        .render_pass(render_pass.handle)
+        .framebuffer(framebuffer.handle)
+        .render_area(render_area)
+        .clear_values(&clear_values);
+    let _pool_guard = command_buffer.command_pool.lock_host_access()?;
+
+    unsafe {
+        command_buffer
+            .command_pool
+            .logical_device
+            .handle()
+            .cmd_begin_render_pass(command_buffer.handle, &begin_info, vk::SubpassContents::INLINE);
+        command_buffer
+            .command_pool
+            .logical_device
+            .handle()
+            .cmd_end_render_pass(command_buffer.handle);
+    }
+
+    command_buffer.referenced_images.push(Arc::clone(&image.inner));
+
+    Ok(())
+}
+
 fn copy_image_to_buffer(
     command_buffer: &mut VulkanCommandBuffer,
     image: &VulkanOwnedImage,
@@ -1212,6 +1297,65 @@ pub(super) fn image_layout_transition(
                 dst_access: vk::AccessFlags::TRANSFER_WRITE,
             })
         }
+        (vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) => {
+            if !usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+                return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
+            }
+
+            Ok(VulkanLayoutTransition {
+                src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+                dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                src_access: vk::AccessFlags::empty(),
+                dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            })
+        }
+        (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) => {
+            if !usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) {
+                return Err(VulkanError::UnsupportedOperation("image transfer source usage"));
+            }
+            if !usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+                return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
+            }
+
+            Ok(VulkanLayoutTransition {
+                src_stage: vk::PipelineStageFlags::TRANSFER,
+                dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                src_access: vk::AccessFlags::TRANSFER_READ,
+                dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            })
+        }
+        (vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) => {
+            if !usage.contains(vk::ImageUsageFlags::TRANSFER_DST) {
+                return Err(VulkanError::UnsupportedOperation(
+                    "image transfer destination usage",
+                ));
+            }
+            if !usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+                return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
+            }
+
+            Ok(VulkanLayoutTransition {
+                src_stage: vk::PipelineStageFlags::TRANSFER,
+                dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                src_access: vk::AccessFlags::TRANSFER_WRITE,
+                dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            })
+        }
+        (vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL) => {
+            if !usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+                return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
+            }
+            if !usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) {
+                return Err(VulkanError::UnsupportedOperation("image transfer source usage"));
+            }
+
+            Ok(VulkanLayoutTransition {
+                src_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                dst_stage: vk::PipelineStageFlags::TRANSFER,
+                src_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                dst_access: vk::AccessFlags::TRANSFER_READ,
+            })
+        }
         _ => Err(VulkanError::UnsupportedOperation("image layout transition")),
     }
 }
@@ -1304,6 +1448,18 @@ fn create_image_view(image: &VulkanOwnedImage) -> Result<VulkanImageView, Vulkan
         return Err(VulkanError::UnsupportedOperation("image sampled usage"));
     }
 
+    create_image_view_for_color_aspect(image)
+}
+
+fn create_color_attachment_image_view(image: &VulkanOwnedImage) -> Result<VulkanImageView, VulkanError> {
+    if !image.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+        return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
+    }
+
+    create_image_view_for_color_aspect(image)
+}
+
+fn create_image_view_for_color_aspect(image: &VulkanOwnedImage) -> Result<VulkanImageView, VulkanError> {
     let view_info = vk::ImageViewCreateInfo::default()
         .image(image.image())
         .view_type(vk::ImageViewType::TYPE_2D)
@@ -1785,6 +1941,99 @@ impl Drop for VulkanImageView {
                 .destroy_image_view(self.view, None)
         };
     }
+}
+
+#[derive(Debug)]
+struct VulkanRenderPass {
+    logical_device: VulkanLogicalDevice,
+    handle: vk::RenderPass,
+}
+
+impl Drop for VulkanRenderPass {
+    fn drop(&mut self) {
+        unsafe {
+            self.logical_device
+                .handle()
+                .destroy_render_pass(self.handle, None)
+        };
+    }
+}
+
+#[derive(Debug)]
+struct VulkanFramebuffer {
+    logical_device: VulkanLogicalDevice,
+    handle: vk::Framebuffer,
+}
+
+impl Drop for VulkanFramebuffer {
+    fn drop(&mut self) {
+        unsafe {
+            self.logical_device
+                .handle()
+                .destroy_framebuffer(self.handle, None)
+        };
+    }
+}
+
+fn create_single_color_render_pass(
+    logical_device: &VulkanLogicalDevice,
+    format: vk::Format,
+) -> Result<VulkanRenderPass, VulkanError> {
+    let attachments = [vk::AttachmentDescription::default()
+        .format(format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+    let color_attachments = [vk::AttachmentReference::default()
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+    let subpasses = [vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(&color_attachments)];
+    let render_pass_info = vk::RenderPassCreateInfo::default()
+        .attachments(&attachments)
+        .subpasses(&subpasses);
+    let handle = unsafe {
+        logical_device
+            .handle()
+            .create_render_pass(&render_pass_info, None)
+    }
+    .map_err(VulkanError::from)?;
+
+    Ok(VulkanRenderPass {
+        logical_device: logical_device.clone(),
+        handle,
+    })
+}
+
+fn create_single_color_framebuffer(
+    render_pass: &VulkanRenderPass,
+    view: &VulkanImageView,
+    extent: vk::Extent3D,
+) -> Result<VulkanFramebuffer, VulkanError> {
+    let attachments = [view.handle()];
+    let framebuffer_info = vk::FramebufferCreateInfo::default()
+        .render_pass(render_pass.handle)
+        .attachments(&attachments)
+        .width(extent.width)
+        .height(extent.height)
+        .layers(1);
+    let handle = unsafe {
+        render_pass
+            .logical_device
+            .handle()
+            .create_framebuffer(&framebuffer_info, None)
+    }
+    .map_err(VulkanError::from)?;
+
+    Ok(VulkanFramebuffer {
+        logical_device: render_pass.logical_device.clone(),
+        handle,
+    })
 }
 
 /// Vulkan sampler for uploaded textures.
