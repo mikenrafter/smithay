@@ -2650,6 +2650,12 @@ fn runtime_builtin_graphics_pipelines_are_cached() {
         .unwrap();
     assert!(Arc::ptr_eq(&solid_blend_a, &solid_blend_b));
     assert!(!Arc::ptr_eq(&solid_blend_a, &solid_opaque));
+
+    let clear_render_pass_a = device.single_color_clear_render_pass(pipeline_format).unwrap();
+    let clear_render_pass_b = device.single_color_clear_render_pass(pipeline_format).unwrap();
+    let load_render_pass = device.single_color_load_render_pass(pipeline_format).unwrap();
+    assert!(Arc::ptr_eq(&clear_render_pass_a, &clear_render_pass_b));
+    assert!(!Arc::ptr_eq(&clear_render_pass_a, &load_render_pass));
 }
 
 #[test]

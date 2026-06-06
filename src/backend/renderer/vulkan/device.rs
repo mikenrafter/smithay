@@ -17,6 +17,21 @@ use super::{VulkanError, VulkanRendererCapabilities};
 const SAMPLED_TEXTURE_DRAW_CONSTANT_SIZE: u32 = 32;
 const SOLID_COLOR_DRAW_CONSTANT_SIZE: u32 = 16;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum VulkanSingleColorRenderPassLoadOp {
+    Clear,
+    Load,
+}
+
+impl VulkanSingleColorRenderPassLoadOp {
+    fn to_vk(self) -> vk::AttachmentLoadOp {
+        match self {
+            VulkanSingleColorRenderPassLoadOp::Clear => vk::AttachmentLoadOp::CLEAR,
+            VulkanSingleColorRenderPassLoadOp::Load => vk::AttachmentLoadOp::LOAD,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct VulkanSampledTextureDrawConstants {
     pub(super) draw_area: vk::Rect2D,
@@ -52,6 +67,8 @@ pub(crate) struct VulkanDeviceState {
     builtin_sampled_texture_pipelines:
         Mutex<HashMap<(vk::Format, bool), Arc<VulkanSampledTextureGraphicsPipeline>>>,
     builtin_solid_color_pipelines: Mutex<HashMap<(vk::Format, bool), Arc<VulkanSolidColorGraphicsPipeline>>>,
+    single_color_render_passes:
+        Mutex<HashMap<(vk::Format, VulkanSingleColorRenderPassLoadOp), Arc<VulkanRenderPass>>>,
 }
 
 impl VulkanDeviceState {
@@ -133,6 +150,7 @@ impl VulkanDeviceState {
             enabled_extensions: Vec::new(),
             builtin_sampled_texture_pipelines: Mutex::new(HashMap::new()),
             builtin_solid_color_pipelines: Mutex::new(HashMap::new()),
+            single_color_render_passes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -151,6 +169,7 @@ impl VulkanDeviceState {
             enabled_extensions: Vec::new(),
             builtin_sampled_texture_pipelines: Mutex::new(HashMap::new()),
             builtin_solid_color_pipelines: Mutex::new(HashMap::new()),
+            single_color_render_passes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -652,7 +671,7 @@ impl VulkanDeviceState {
         color: vk::ClearColorValue,
     ) -> Result<(), VulkanError> {
         let view = self.create_color_attachment_image_view(image)?;
-        let render_pass = create_single_color_render_pass(&image.inner.logical_device, image.format())?;
+        let render_pass = self.single_color_clear_render_pass(image.format())?;
         let framebuffer = create_single_color_framebuffer(&render_pass, &view, image.extent())?;
         let mut command_buffer = self.allocate_graphics_command_buffer()?;
 
@@ -679,7 +698,7 @@ impl VulkanDeviceState {
         }
 
         let view = self.create_color_attachment_image_view(image)?;
-        let render_pass = create_single_color_load_render_pass(&image.inner.logical_device, image.format())?;
+        let render_pass = self.single_color_load_render_pass(image.format())?;
         let framebuffer = create_single_color_framebuffer(&render_pass, &view, image.extent())?;
         let mut command_buffer = self.allocate_graphics_command_buffer()?;
 
@@ -700,6 +719,49 @@ impl VulkanDeviceState {
         )?;
         self.end_command_buffer(&mut command_buffer)?;
         self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn single_color_clear_render_pass(
+        &self,
+        format: vk::Format,
+    ) -> Result<Arc<VulkanRenderPass>, VulkanError> {
+        self.single_color_render_pass(format, VulkanSingleColorRenderPassLoadOp::Clear)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn single_color_load_render_pass(
+        &self,
+        format: vk::Format,
+    ) -> Result<Arc<VulkanRenderPass>, VulkanError> {
+        self.single_color_render_pass(format, VulkanSingleColorRenderPassLoadOp::Load)
+    }
+
+    fn single_color_render_pass(
+        &self,
+        format: vk::Format,
+        load_op: VulkanSingleColorRenderPassLoadOp,
+    ) -> Result<Arc<VulkanRenderPass>, VulkanError> {
+        let key = (format, load_op);
+        let mut render_passes = self
+            .single_color_render_passes
+            .lock()
+            .map_err(|_| host_synchronization_failed())?;
+        if let Some(render_pass) = render_passes.get(&key) {
+            return Ok(Arc::clone(render_pass));
+        }
+
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        let render_pass = Arc::new(create_single_color_render_pass_with_load_op(
+            logical_device,
+            format,
+            load_op.to_vk(),
+        )?);
+        render_passes.insert(key, Arc::clone(&render_pass));
+        Ok(render_pass)
     }
 
     #[allow(dead_code)]
@@ -3709,13 +3771,6 @@ fn create_sampled_texture_descriptor_set(
         sampled_image,
         handle,
     })
-}
-
-fn create_single_color_render_pass(
-    logical_device: &VulkanLogicalDevice,
-    format: vk::Format,
-) -> Result<VulkanRenderPass, VulkanError> {
-    create_single_color_render_pass_with_load_op(logical_device, format, vk::AttachmentLoadOp::CLEAR)
 }
 
 fn create_single_color_load_render_pass(
