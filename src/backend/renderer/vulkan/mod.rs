@@ -46,10 +46,10 @@
 use crate::{
     backend::vulkan::PhysicalDevice,
     backend::{
-        allocator::{Format, Fourcc, Modifier, format::FormatSet},
+        allocator::{Format, Fourcc, Modifier, dmabuf::Dmabuf, format::FormatSet},
         renderer::{
-            Bind, Color32F, ContextId, DebugFlags, ExportMem, ImportMem, Offscreen, Renderer, RendererSuper,
-            Texture, TextureFilter, sync::SyncPoint,
+            Bind, Color32F, ContextId, DebugFlags, ExportMem, ImportDma, ImportMem, Offscreen, Renderer,
+            RendererSuper, Texture, TextureFilter, sync::SyncPoint,
         },
     },
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
@@ -369,6 +369,16 @@ impl<'target> Bind<VulkanRenderTarget<'target>> for VulkanRenderer {
     }
 }
 
+impl Bind<Dmabuf> for VulkanRenderer {
+    fn bind<'a>(&mut self, _target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        Err(VulkanError::UnsupportedOperation("dmabuf render target"))
+    }
+
+    fn supported_formats(&self) -> Option<FormatSet> {
+        Some(FormatSet::default())
+    }
+}
+
 impl Offscreen<VulkanRenderTarget<'static>> for VulkanRenderer {
     fn create_buffer(
         &mut self,
@@ -380,6 +390,20 @@ impl Offscreen<VulkanRenderTarget<'static>> for VulkanRenderer {
         }
 
         self.create_offscreen_render_target(format, size)
+    }
+}
+
+impl ImportDma for VulkanRenderer {
+    fn dmabuf_formats(&self) -> FormatSet {
+        self.capabilities.formats.dmabuf_import.clone()
+    }
+
+    fn import_dmabuf(
+        &mut self,
+        _dmabuf: &Dmabuf,
+        _damage: Option<&[Rectangle<i32, BufferCoord>]>,
+    ) -> Result<Self::TextureId, Self::Error> {
+        Err(VulkanError::UnsupportedOperation("dmabuf import"))
     }
 }
 

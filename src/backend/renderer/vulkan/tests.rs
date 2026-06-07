@@ -1,12 +1,15 @@
-use std::{marker::PhantomData, os::unix::io::OwnedFd, sync::Arc};
+use std::{fs::File, marker::PhantomData, os::unix::io::OwnedFd, sync::Arc};
 
 use ash::vk;
 
-use crate::backend::allocator::{Format, Fourcc, Modifier};
+use crate::backend::allocator::{
+    Format, Fourcc, Modifier,
+    dmabuf::{Dmabuf, DmabufFlags},
+};
 use crate::backend::renderer::sync::Interrupted;
 use crate::backend::renderer::{
-    Bind, Color32F, DebugFlags, ExportMem, Frame, ImportMem, Offscreen, Renderer, Texture, TextureMapping,
-    sync::Fence,
+    Bind, Color32F, DebugFlags, ExportMem, Frame, ImportDma, ImportMem, Offscreen, Renderer, Texture,
+    TextureMapping, sync::Fence,
 };
 use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
 use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
@@ -86,6 +89,17 @@ fn render_target_for_tests(
         color_image: None,
         _target: PhantomData,
     }
+}
+
+fn dmabuf_for_tests() -> Dmabuf {
+    let mut builder = Dmabuf::builder(
+        Size::<i32, BufferCoord>::from((1, 1)),
+        Fourcc::Abgr8888,
+        Modifier::Invalid,
+        DmabufFlags::empty(),
+    );
+    builder.add_plane(File::open("/dev/null").unwrap().into(), 0, 0, 4);
+    builder.build().unwrap()
 }
 
 fn render_target_format_record_for_tests(
@@ -830,6 +844,37 @@ fn public_bind_rejects_invalid_vulkan_targets_before_device_lookup() {
     assert!(matches!(
         Bind::bind(&mut renderer, &mut missing_image_target),
         Err(VulkanError::UnsupportedOperation("render target image"))
+    ));
+}
+
+#[test]
+fn public_dmabuf_bind_is_explicitly_unsupported() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut dmabuf = dmabuf_for_tests();
+
+    let formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
+        .expect("Vulkan dmabuf render targets have an explicit format set");
+    assert!(formats.iter().next().is_none());
+    assert!(matches!(
+        <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut dmabuf),
+        Err(VulkanError::UnsupportedOperation("dmabuf render target"))
+    ));
+}
+
+#[test]
+fn public_dmabuf_import_is_explicitly_unsupported() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let dmabuf = dmabuf_for_tests();
+    let format = Format {
+        code: Fourcc::Abgr8888,
+        modifier: Modifier::Invalid,
+    };
+
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+    assert!(!renderer.has_dmabuf_format(format));
+    assert!(matches!(
+        renderer.import_dmabuf(&dmabuf, None),
+        Err(VulkanError::UnsupportedOperation("dmabuf import"))
     ));
 }
 
