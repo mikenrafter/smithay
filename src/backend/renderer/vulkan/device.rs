@@ -68,6 +68,27 @@ pub(crate) struct VulkanDmabufExternalImageFormatProperties {
     pub(super) dedicated_only: bool,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct VulkanDmabufImportCandidate {
+    pub(super) properties: VulkanDmabufExternalImageFormatProperties,
+    pub(super) dedicated_only: bool,
+}
+
+impl VulkanDmabufExternalImageFormatProperties {
+    pub(super) fn supports_sampled_import(&self, import: &VulkanDmabufImportState) -> bool {
+        self.importable
+            && self
+                .image_format_properties
+                .sample_counts
+                .contains(vk::SampleCountFlags::TYPE_1)
+            && self.image_format_properties.max_array_layers >= 1
+            && self.image_format_properties.max_extent.width >= import.size.w.try_into().unwrap_or_default()
+            && self.image_format_properties.max_extent.height >= import.size.h.try_into().unwrap_or_default()
+            && self.image_format_properties.max_extent.depth >= 1
+    }
+}
+
 impl VulkanExternalMemoryDeviceFunctions {
     fn new(instance: &ash::Instance, device: &ash::Device) -> Self {
         Self {
@@ -336,6 +357,25 @@ impl VulkanDeviceState {
             Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => Ok(None),
             Err(error) => Err(VulkanError::from(error)),
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn dmabuf_import_candidate(
+        &self,
+        import: &VulkanDmabufImportState,
+    ) -> Result<Option<VulkanDmabufImportCandidate>, VulkanError> {
+        let Some(properties) = self.dmabuf_external_image_format_properties(import)? else {
+            return Ok(None);
+        };
+
+        if !properties.supports_sampled_import(import) {
+            return Ok(None);
+        }
+
+        Ok(Some(VulkanDmabufImportCandidate {
+            dedicated_only: properties.dedicated_only,
+            properties,
+        }))
     }
 
     #[allow(dead_code)]

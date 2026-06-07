@@ -19,9 +19,9 @@ use super::capabilities::{
     should_query_modifier_properties,
 };
 use super::device::{
-    VulkanDeviceState, VulkanSampledTexturePipelineShaders, VulkanShaderSpirv, find_memory_type_index,
-    image_copy_buffer_offset, image_copy_required_size, image_layout_transition, select_queue_families,
-    tightly_packed_image_size, vulkan_filter,
+    VulkanDeviceState, VulkanDmabufExternalImageFormatProperties, VulkanSampledTexturePipelineShaders,
+    VulkanShaderSpirv, find_memory_type_index, image_copy_buffer_offset, image_copy_required_size,
+    image_layout_transition, select_queue_families, tightly_packed_image_size, vulkan_filter,
 };
 use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
@@ -123,6 +123,40 @@ fn extension_names_for_tests(extensions: Vec<&'static CStr>) -> Vec<String> {
         .into_iter()
         .map(|extension| extension.to_string_lossy().into_owned())
         .collect()
+}
+
+fn dmabuf_external_image_properties_for_tests(
+    importable: bool,
+    max_extent: vk::Extent3D,
+    sample_counts: vk::SampleCountFlags,
+) -> VulkanDmabufExternalImageFormatProperties {
+    let external_memory_features = if importable {
+        vk::ExternalMemoryFeatureFlags::IMPORTABLE
+    } else {
+        vk::ExternalMemoryFeatureFlags::empty()
+    };
+    let compatible_handle_types = if importable {
+        vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT
+    } else {
+        vk::ExternalMemoryHandleTypeFlags::empty()
+    };
+
+    VulkanDmabufExternalImageFormatProperties {
+        image_format_properties: vk::ImageFormatProperties {
+            max_extent,
+            max_mip_levels: 1,
+            max_array_layers: 1,
+            sample_counts,
+            max_resource_size: 1,
+        },
+        external_memory_properties: vk::ExternalMemoryProperties {
+            external_memory_features,
+            export_from_imported_handle_types: vk::ExternalMemoryHandleTypeFlags::empty(),
+            compatible_handle_types,
+        },
+        importable,
+        dedicated_only: false,
+    }
 }
 
 fn render_target_format_record_for_tests(
@@ -503,6 +537,104 @@ fn dmabuf_external_image_format_query_is_disabled_without_prerequisites() {
             .unwrap()
             .is_none()
     );
+    assert!(device.dmabuf_import_candidate(&import).unwrap().is_none());
+}
+
+#[test]
+fn dmabuf_import_candidate_requires_importable_single_sample_extent() {
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let import = VulkanDmabufImportState::from_dmabuf(&dmabuf).unwrap();
+
+    let supported = dmabuf_external_image_properties_for_tests(
+        true,
+        vk::Extent3D {
+            width: 4,
+            height: 3,
+            depth: 1,
+        },
+        vk::SampleCountFlags::TYPE_1,
+    );
+    assert!(supported.supports_sampled_import(&import));
+
+    let non_importable = dmabuf_external_image_properties_for_tests(
+        false,
+        vk::Extent3D {
+            width: 4,
+            height: 3,
+            depth: 1,
+        },
+        vk::SampleCountFlags::TYPE_1,
+    );
+    assert!(!non_importable.supports_sampled_import(&import));
+
+    let too_small = dmabuf_external_image_properties_for_tests(
+        true,
+        vk::Extent3D {
+            width: 3,
+            height: 3,
+            depth: 1,
+        },
+        vk::SampleCountFlags::TYPE_1,
+    );
+    assert!(!too_small.supports_sampled_import(&import));
+
+    let too_short = dmabuf_external_image_properties_for_tests(
+        true,
+        vk::Extent3D {
+            width: 4,
+            height: 2,
+            depth: 1,
+        },
+        vk::SampleCountFlags::TYPE_1,
+    );
+    assert!(!too_short.supports_sampled_import(&import));
+
+    let zero_depth = dmabuf_external_image_properties_for_tests(
+        true,
+        vk::Extent3D {
+            width: 4,
+            height: 3,
+            depth: 0,
+        },
+        vk::SampleCountFlags::TYPE_1,
+    );
+    assert!(!zero_depth.supports_sampled_import(&import));
+
+    let mut zero_layers = dmabuf_external_image_properties_for_tests(
+        true,
+        vk::Extent3D {
+            width: 4,
+            height: 3,
+            depth: 1,
+        },
+        vk::SampleCountFlags::TYPE_1,
+    );
+    zero_layers.image_format_properties.max_array_layers = 0;
+    assert!(!zero_layers.supports_sampled_import(&import));
+
+    let no_single_sample = dmabuf_external_image_properties_for_tests(
+        true,
+        vk::Extent3D {
+            width: 4,
+            height: 3,
+            depth: 1,
+        },
+        vk::SampleCountFlags::TYPE_2,
+    );
+    assert!(!no_single_sample.supports_sampled_import(&import));
+
+    let mut dedicated_only = supported;
+    dedicated_only.dedicated_only = true;
+    dedicated_only.external_memory_properties.external_memory_features |=
+        vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY;
+    assert!(dedicated_only.supports_sampled_import(&import));
+    assert!(dedicated_only.dedicated_only);
 }
 
 #[test]
@@ -2970,6 +3102,12 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
                     .compatible_handle_types
                     .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
             );
+        }
+        let candidate = device.dmabuf_import_candidate(&import).unwrap();
+        if let Some(candidate) = candidate {
+            assert!(candidate.properties.importable);
+            assert!(candidate.properties.supports_sampled_import(&import));
+            assert_eq!(candidate.dedicated_only, candidate.properties.dedicated_only);
         }
         assert!(!caps.import.dmabuf);
         assert!(caps.formats.dmabuf_import.iter().next().is_none());
