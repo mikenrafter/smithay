@@ -4,7 +4,7 @@ use ash::vk;
 
 use crate::{
     backend::{
-        allocator::{Fourcc, Modifier},
+        allocator::{Buffer, Fourcc, Modifier, dmabuf::Dmabuf},
         renderer::{Color32F, ContextId, Frame, Texture, TextureMapping, sync::SyncPoint},
     },
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
@@ -212,6 +212,51 @@ pub(crate) struct VulkanDmabufPlane {
 pub(crate) struct VulkanDmabufImportState {
     pub(super) size: Size<i32, BufferCoord>,
     pub(super) memory: VulkanExternalMemoryState,
+    pub(super) y_inverted: bool,
+}
+
+impl VulkanDmabufImportState {
+    #[allow(dead_code)]
+    pub(crate) fn from_dmabuf(dmabuf: &Dmabuf) -> Result<Self, VulkanError> {
+        let size = dmabuf.size();
+        if size.w <= 0 || size.h <= 0 {
+            return Err(VulkanError::UnsupportedOperation("dmabuf size"));
+        }
+
+        if dmabuf.num_planes() == 0 {
+            return Err(VulkanError::UnsupportedOperation("dmabuf planes"));
+        }
+
+        let mut planes = Vec::with_capacity(dmabuf.num_planes());
+        for (expected_idx, plane) in dmabuf.0.planes.iter().enumerate() {
+            if plane.plane_idx != expected_idx as u32 {
+                return Err(VulkanError::UnsupportedOperation("dmabuf plane index"));
+            }
+            if plane.stride == 0 {
+                return Err(VulkanError::UnsupportedOperation("dmabuf stride"));
+            }
+
+            planes.push(VulkanDmabufPlane {
+                plane_idx: plane.plane_idx,
+                offset: plane.offset,
+                stride: plane.stride,
+            });
+        }
+
+        let format = dmabuf.format();
+
+        Ok(Self {
+            size,
+            memory: VulkanExternalMemoryState {
+                handle_type: VulkanExternalMemoryHandleType::Dmabuf,
+                format: format.code,
+                modifier: format.modifier,
+                disjoint: planes.len() > 1,
+                planes,
+            },
+            y_inverted: dmabuf.y_inverted(),
+        })
+    }
 }
 
 impl VulkanRenderTarget<'_> {

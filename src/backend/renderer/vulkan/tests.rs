@@ -95,13 +95,26 @@ fn render_target_for_tests(
 }
 
 fn dmabuf_for_tests() -> Dmabuf {
-    let mut builder = Dmabuf::builder(
-        Size::<i32, BufferCoord>::from((1, 1)),
+    dmabuf_with_planes_for_tests(
+        (1, 1).into(),
         Fourcc::Abgr8888,
         Modifier::Invalid,
         DmabufFlags::empty(),
-    );
-    builder.add_plane(File::open("/dev/null").unwrap().into(), 0, 0, 4);
+        &[(0, 0, 4)],
+    )
+}
+
+fn dmabuf_with_planes_for_tests(
+    size: Size<i32, BufferCoord>,
+    format: Fourcc,
+    modifier: Modifier,
+    flags: DmabufFlags,
+    planes: &[(u32, u32, u32)],
+) -> Dmabuf {
+    let mut builder = Dmabuf::builder(size, format, modifier, flags);
+    for &(idx, offset, stride) in planes {
+        builder.add_plane(File::open("/dev/null").unwrap().into(), idx, offset, stride);
+    }
     builder.build().unwrap()
 }
 
@@ -1452,6 +1465,7 @@ fn external_memory_metadata_tracks_planes() {
     let import = VulkanDmabufImportState {
         size: (1, 1).into(),
         memory,
+        y_inverted: false,
     };
 
     assert_eq!(import.memory.handle_type, VulkanExternalMemoryHandleType::Dmabuf);
@@ -1462,6 +1476,106 @@ fn external_memory_metadata_tracks_planes() {
     );
     assert_eq!(import.memory.planes.len(), 1);
     assert!(!import.memory.disjoint);
+    assert!(!import.y_inverted);
+}
+
+#[test]
+fn dmabuf_import_state_extracts_metadata() {
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Nv12,
+        Modifier::Linear,
+        DmabufFlags::Y_INVERT,
+        &[(0, 16, 32), (1, 48, 16)],
+    );
+
+    let import = VulkanDmabufImportState::from_dmabuf(&dmabuf).unwrap();
+
+    assert_eq!(import.size, Size::from((4, 3)));
+    assert_eq!(import.memory.handle_type, VulkanExternalMemoryHandleType::Dmabuf);
+    assert_eq!(import.memory.format, Fourcc::Nv12);
+    assert_eq!(import.memory.modifier, Modifier::Linear);
+    assert_eq!(import.memory.planes.len(), 2);
+    assert_eq!(
+        import.memory.planes,
+        vec![
+            VulkanDmabufPlane {
+                plane_idx: 0,
+                offset: 16,
+                stride: 32,
+            },
+            VulkanDmabufPlane {
+                plane_idx: 1,
+                offset: 48,
+                stride: 16,
+            },
+        ]
+    );
+    assert!(import.memory.disjoint);
+    assert!(import.y_inverted);
+}
+
+#[test]
+fn dmabuf_import_state_rejects_invalid_metadata() {
+    let zero_width = dmabuf_with_planes_for_tests(
+        (0, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    assert!(matches!(
+        VulkanDmabufImportState::from_dmabuf(&zero_width),
+        Err(VulkanError::UnsupportedOperation("dmabuf size"))
+    ));
+
+    let missing_plane_zero = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(1, 0, 4)],
+    );
+    assert!(matches!(
+        VulkanDmabufImportState::from_dmabuf(&missing_plane_zero),
+        Err(VulkanError::UnsupportedOperation("dmabuf plane index"))
+    ));
+
+    let duplicate_plane_zero = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Nv12,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4), (0, 4, 4)],
+    );
+    assert!(matches!(
+        VulkanDmabufImportState::from_dmabuf(&duplicate_plane_zero),
+        Err(VulkanError::UnsupportedOperation("dmabuf plane index"))
+    ));
+
+    let plane_gap = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Nv12,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4), (2, 4, 4)],
+    );
+    assert!(matches!(
+        VulkanDmabufImportState::from_dmabuf(&plane_gap),
+        Err(VulkanError::UnsupportedOperation("dmabuf plane index"))
+    ));
+
+    let zero_stride = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 0)],
+    );
+    assert!(matches!(
+        VulkanDmabufImportState::from_dmabuf(&zero_stride),
+        Err(VulkanError::UnsupportedOperation("dmabuf stride"))
+    ));
 }
 
 #[test]
