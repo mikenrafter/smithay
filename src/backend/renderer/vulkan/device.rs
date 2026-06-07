@@ -2703,6 +2703,27 @@ pub(super) struct VulkanExternalImageBarrier {
 }
 
 #[allow(dead_code)]
+impl VulkanExternalImageBarrier {
+    pub(super) fn to_color_image_memory_barrier(self, image: vk::Image) -> vk::ImageMemoryBarrier<'static> {
+        vk::ImageMemoryBarrier::default()
+            .src_access_mask(self.src_access)
+            .dst_access_mask(self.dst_access)
+            .old_layout(self.old_layout)
+            .new_layout(self.new_layout)
+            .src_queue_family_index(self.src_queue_family_index)
+            .dst_queue_family_index(self.dst_queue_family_index)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+    }
+}
+
+#[allow(dead_code)]
 pub(super) fn sampled_dmabuf_foreign_acquire_barrier(
     external_layout: vk::ImageLayout,
     graphics_queue_family: u32,

@@ -982,6 +982,40 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
     assert_eq!(release.new_layout, vk::ImageLayout::GENERAL);
     assert_eq!(release.src_queue_family_index, 2);
     assert_eq!(release.dst_queue_family_index, vk::QUEUE_FAMILY_FOREIGN_EXT);
+
+    let image = vk::Image::null();
+    let vk_barrier = acquire.to_color_image_memory_barrier(image);
+    assert_eq!(vk_barrier.s_type, vk::StructureType::IMAGE_MEMORY_BARRIER);
+    assert!(vk_barrier.p_next.is_null());
+    assert_eq!(vk_barrier.src_access_mask, acquire.src_access);
+    assert_eq!(vk_barrier.dst_access_mask, acquire.dst_access);
+    assert_eq!(vk_barrier.old_layout, acquire.old_layout);
+    assert_eq!(vk_barrier.new_layout, acquire.new_layout);
+    assert_eq!(vk_barrier.src_queue_family_index, acquire.src_queue_family_index);
+    assert_eq!(vk_barrier.dst_queue_family_index, acquire.dst_queue_family_index);
+    assert_eq!(vk_barrier.image, image);
+    assert_eq!(
+        vk_barrier.subresource_range.aspect_mask,
+        vk::ImageAspectFlags::COLOR
+    );
+    assert_eq!(vk_barrier.subresource_range.base_mip_level, 0);
+    assert_eq!(vk_barrier.subresource_range.level_count, 1);
+    assert_eq!(vk_barrier.subresource_range.base_array_layer, 0);
+    assert_eq!(vk_barrier.subresource_range.layer_count, 1);
+
+    let release_vk_barrier = release.to_color_image_memory_barrier(image);
+    assert_eq!(release_vk_barrier.src_access_mask, release.src_access);
+    assert_eq!(release_vk_barrier.dst_access_mask, release.dst_access);
+    assert_eq!(release_vk_barrier.old_layout, release.old_layout);
+    assert_eq!(release_vk_barrier.new_layout, release.new_layout);
+    assert_eq!(
+        release_vk_barrier.src_queue_family_index,
+        release.src_queue_family_index
+    );
+    assert_eq!(
+        release_vk_barrier.dst_queue_family_index,
+        release.dst_queue_family_index
+    );
 }
 
 #[test]
