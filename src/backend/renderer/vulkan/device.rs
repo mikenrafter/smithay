@@ -88,8 +88,19 @@ impl VulkanDeviceState {
                 .get_physical_device_memory_properties(physical_device.handle())
         };
         let queue_families = select_queue_families(&queue_properties)?;
-        let mut capabilities = VulkanRendererCapabilities::for_initialized_device(&[]);
-        capabilities.external_memory = super::VulkanExternalMemoryCapabilities::discover(&physical_device);
+        let external_memory = super::VulkanExternalMemoryCapabilities::discover(&physical_device);
+        let enabled_device_extensions = if external_memory.prerequisites_available {
+            super::VulkanExternalMemoryCapabilities::required_device_extensions(physical_device.api_version())
+        } else {
+            Vec::new()
+        };
+        let enabled_extension_pointers = enabled_device_extensions
+            .iter()
+            .copied()
+            .map(std::ffi::CStr::as_ptr)
+            .collect::<Vec<_>>();
+        let mut capabilities = VulkanRendererCapabilities::for_initialized_device(&enabled_device_extensions);
+        capabilities.external_memory = external_memory;
         capabilities.formats =
             super::VulkanFormatCapabilities::discover(&physical_device, &capabilities.external_memory)?;
         capabilities.import.memory = capabilities.formats.memory_import.iter().next().is_some();
@@ -111,8 +122,15 @@ impl VulkanDeviceState {
                     .queue_priorities(&queue_priorities)
             })
             .collect::<Vec<_>>();
-        let create_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_create_infos);
+        let create_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queue_create_infos)
+            .enabled_extension_names(&enabled_extension_pointers);
 
+        // SAFETY: `physical_device` was enumerated from `instance`, every queue family index comes
+        // from the same physical device query, and `queue_priorities`/extension-name pointers live
+        // through the call. External-memory extension names are only included after device-extension
+        // discovery reports the full prerequisite set for this API version; no allocation callbacks
+        // are used.
         let logical_device = unsafe {
             instance
                 .handle()
@@ -154,7 +172,10 @@ impl VulkanDeviceState {
             instance: Some(instance),
             memory_properties: Some(memory_properties),
             capabilities,
-            enabled_extensions: Vec::new(),
+            enabled_extensions: enabled_device_extensions
+                .iter()
+                .map(|extension| extension.to_string_lossy().into_owned())
+                .collect(),
             builtin_sampled_texture_pipelines: Mutex::new(HashMap::new()),
             builtin_solid_color_pipelines: Mutex::new(HashMap::new()),
             single_color_render_passes: Mutex::new(HashMap::new()),

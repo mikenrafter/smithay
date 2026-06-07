@@ -1,4 +1,4 @@
-use std::{fs::File, marker::PhantomData, os::unix::io::OwnedFd, sync::Arc};
+use std::{ffi::CStr, fs::File, marker::PhantomData, os::unix::io::OwnedFd, sync::Arc};
 
 use ash::{ext, khr, vk};
 
@@ -116,6 +116,13 @@ fn dmabuf_with_planes_for_tests(
         builder.add_plane(File::open("/dev/null").unwrap().into(), idx, offset, stride);
     }
     builder.build().unwrap()
+}
+
+fn extension_names_for_tests(extensions: Vec<&'static CStr>) -> Vec<String> {
+    extensions
+        .into_iter()
+        .map(|extension| extension.to_string_lossy().into_owned())
+        .collect()
 }
 
 fn render_target_format_record_for_tests(
@@ -2580,6 +2587,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         .unwrap()
         .next()
         .expect("No physical devices");
+    let api_version = physical_device.api_version();
 
     let mut renderer = VulkanRenderer::builder()
         .with_physical_device(physical_device)
@@ -2895,7 +2903,15 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert!(texture.has_sampled_image_for_tests());
     assert!(texture.is_y_inverted_for_tests());
     assert!(caps.device.available);
-    assert!(caps.device.extensions.is_empty());
+    let expected_enabled_extensions = if caps.external_memory.prerequisites_available {
+        extension_names_for_tests(VulkanExternalMemoryCapabilities::required_device_extensions(
+            api_version,
+        ))
+    } else {
+        Vec::new()
+    };
+    assert_eq!(caps.device.extensions, expected_enabled_extensions);
+    assert_eq!(device.enabled_extensions, expected_enabled_extensions);
     assert_eq!(
         caps.import.memory,
         caps.formats.memory_import.iter().next().is_some()
