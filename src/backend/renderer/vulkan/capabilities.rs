@@ -320,6 +320,21 @@ pub struct VulkanExternalMemoryCapabilities {
 }
 
 impl VulkanExternalMemoryCapabilities {
+    #[allow(dead_code)]
+    pub(super) fn required_device_extensions(api_version: Version) -> Vec<&'static CStr> {
+        let mut extensions = vec![
+            ext::external_memory_dma_buf::NAME,
+            khr::external_memory_fd::NAME,
+            ext::image_drm_format_modifier::NAME,
+        ];
+
+        if api_version < Version::VERSION_1_2 {
+            extensions.push(khr::image_format_list::NAME);
+        }
+
+        extensions
+    }
+
     pub(super) fn discover(physical_device: &PhysicalDevice) -> Self {
         Self::from_device_extension_support(physical_device.api_version(), |extension| {
             physical_device.has_device_extension(extension)

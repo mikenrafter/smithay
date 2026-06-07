@@ -303,6 +303,27 @@ fn external_memory_capability_discovery_requires_modifier_dependency() {
 }
 
 #[test]
+fn external_memory_required_device_extensions_track_api_version_dependencies() {
+    assert_eq!(
+        VulkanExternalMemoryCapabilities::required_device_extensions(Version::VERSION_1_1),
+        vec![
+            ext::external_memory_dma_buf::NAME,
+            khr::external_memory_fd::NAME,
+            ext::image_drm_format_modifier::NAME,
+            khr::image_format_list::NAME,
+        ]
+    );
+    assert_eq!(
+        VulkanExternalMemoryCapabilities::required_device_extensions(Version::VERSION_1_2),
+        vec![
+            ext::external_memory_dma_buf::NAME,
+            khr::external_memory_fd::NAME,
+            ext::image_drm_format_modifier::NAME,
+        ]
+    );
+}
+
+#[test]
 fn drm_modifier_queries_require_full_external_memory_prerequisites() {
     let partial = VulkanExternalMemoryCapabilities {
         drm_format_modifiers: true,
