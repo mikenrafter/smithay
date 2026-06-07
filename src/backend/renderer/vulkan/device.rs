@@ -12,7 +12,9 @@ use crate::backend::{
     vulkan::{Instance, PhysicalDevice},
 };
 
-use super::{VulkanError, VulkanRendererCapabilities};
+use super::{
+    VulkanError, VulkanRendererCapabilities, format::get_render_vk_format, image::VulkanDmabufImportState,
+};
 
 const SAMPLED_TEXTURE_DRAW_CONSTANT_SIZE: u32 = 32;
 const SOLID_COLOR_DRAW_CONSTANT_SIZE: u32 = 16;
@@ -55,6 +57,15 @@ pub(super) struct VulkanExternalMemoryDeviceFunctions {
     pub(super) image_drm_format_modifier: ext::image_drm_format_modifier::Device,
     #[allow(dead_code)]
     pub(super) external_memory_fd: khr::external_memory_fd::Device,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct VulkanDmabufExternalImageFormatProperties {
+    pub(super) image_format_properties: vk::ImageFormatProperties,
+    pub(super) external_memory_properties: vk::ExternalMemoryProperties,
+    pub(super) importable: bool,
+    pub(super) dedicated_only: bool,
 }
 
 impl VulkanExternalMemoryDeviceFunctions {
@@ -251,6 +262,80 @@ impl VulkanDeviceState {
         })?;
 
         allocate_command_buffer(command_pool)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn dmabuf_external_image_format_properties(
+        &self,
+        import: &VulkanDmabufImportState,
+    ) -> Result<Option<VulkanDmabufExternalImageFormatProperties>, VulkanError> {
+        if !self.capabilities.external_memory.prerequisites_available || self.external_memory_fns.is_none() {
+            return Ok(None);
+        }
+
+        if self.capabilities.formats.dmabuf_import_record(import).is_none() {
+            return Ok(None);
+        }
+
+        let physical_device = self
+            .physical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing physical device".to_owned()))?;
+        let vk_format = get_render_vk_format(import.format())?;
+        let mut external_image_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut drm_format_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+            .drm_format_modifier(import.modifier().into())
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
+            .format(vk_format)
+            .ty(vk::ImageType::TYPE_2D)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .flags(vk::ImageCreateFlags::empty())
+            .push_next(&mut external_image_info)
+            .push_next(&mut drm_format_info);
+        let mut external_properties = vk::ExternalImageFormatProperties::default();
+        let mut image_properties = vk::ImageFormatProperties2::default().push_next(&mut external_properties);
+
+        // SAFETY: `physical_device` belongs to the retained instance. The pNext chains are built
+        // from stack values that outlive the call, use Vulkan-defined structs, and request only a
+        // 2D sampled DRM-modifier image with DMA_BUF external memory after the corresponding device
+        // extensions and modifier record have been discovered.
+        let result = unsafe {
+            physical_device
+                .instance()
+                .handle()
+                .get_physical_device_image_format_properties2(
+                    physical_device.handle(),
+                    &format_info,
+                    &mut image_properties,
+                )
+        };
+
+        match result {
+            Ok(()) => {
+                let image_format_properties = image_properties.image_format_properties;
+                let _ = image_properties;
+                let external_memory_properties = external_properties.external_memory_properties;
+                let importable = external_memory_properties
+                    .external_memory_features
+                    .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+                    && external_memory_properties
+                        .compatible_handle_types
+                        .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+                Ok(Some(VulkanDmabufExternalImageFormatProperties {
+                    image_format_properties,
+                    external_memory_properties,
+                    importable,
+                    dedicated_only: external_memory_properties
+                        .external_memory_features
+                        .contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY),
+                }))
+            }
+            Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => Ok(None),
+            Err(error) => Err(VulkanError::from(error)),
+        }
     }
 
     #[allow(dead_code)]

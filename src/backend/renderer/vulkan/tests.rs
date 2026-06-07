@@ -486,6 +486,26 @@ fn vulkan_device_state_uninitialized_starts_empty() {
 }
 
 #[test]
+fn dmabuf_external_image_format_query_is_disabled_without_prerequisites() {
+    let device = VulkanDeviceState::empty_for_tests();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let import = VulkanDmabufImportState::from_dmabuf(&dmabuf).unwrap();
+
+    assert!(
+        device
+            .dmabuf_external_image_format_properties(&import)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn memory_type_lookup_selects_supported_required_properties() {
     let properties = memory_properties_for_tests(&[
         vk::MemoryPropertyFlags::HOST_VISIBLE,
@@ -2924,6 +2944,36 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert!(!caps.import.dmabuf);
     assert_eq!(caps.export.memory, caps.rendering.offscreen);
     assert!(!caps.export.dmabuf);
+    if let Some(record) = caps
+        .formats
+        .modifier_records
+        .iter()
+        .find(|record| record.usages.sampled && record.plane_count > 0)
+    {
+        let planes = (0..record.plane_count)
+            .map(|idx| (idx, idx * 16, 16))
+            .collect::<Vec<_>>();
+        let dmabuf = dmabuf_with_planes_for_tests(
+            (4, 3).into(),
+            record.format,
+            record.modifier,
+            DmabufFlags::empty(),
+            &planes,
+        );
+        let import = VulkanDmabufImportState::from_dmabuf(&dmabuf).unwrap();
+        let properties = device.dmabuf_external_image_format_properties(&import).unwrap();
+        if let Some(properties) = properties {
+            assert_eq!(properties.image_format_properties.max_extent.depth, 1);
+            assert!(
+                properties
+                    .external_memory_properties
+                    .compatible_handle_types
+                    .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            );
+        }
+        assert!(!caps.import.dmabuf);
+        assert!(caps.formats.dmabuf_import.iter().next().is_none());
+    }
     assert!(caps.rendering.offscreen);
     assert!(!caps.rendering.blit);
     assert!(!caps.sync.explicit);
