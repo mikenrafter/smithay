@@ -22,6 +22,7 @@ use super::device::{
     VulkanDeviceState, VulkanDmabufExternalImageFormatProperties, VulkanSampledTexturePipelineShaders,
     VulkanShaderSpirv, dmabuf_import_memory_type_bits, dmabuf_plane_layouts, find_memory_type_index,
     image_copy_buffer_offset, image_copy_required_size, image_layout_transition,
+    plan_sampled_dmabuf_foreign_acquire_barrier, plan_sampled_dmabuf_foreign_release_barrier,
     sampled_dmabuf_foreign_acquire_barrier, sampled_dmabuf_foreign_release_barrier, select_queue_families,
     tightly_packed_image_size, vulkan_filter,
 };
@@ -934,6 +935,19 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
         ..VulkanImageSyncState::default()
     };
     let released_sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+    let local_sync = VulkanImageSyncState {
+        external_ownership: VulkanExternalImageOwnership::Local,
+        ..VulkanImageSyncState::default()
+    };
+    let pending_local_sync = VulkanImageSyncState {
+        external_acquire_pending: true,
+        external_ownership: VulkanExternalImageOwnership::Local,
+        ..VulkanImageSyncState::default()
+    };
+    let no_pending_sync = VulkanImageSyncState {
+        external_ownership: VulkanExternalImageOwnership::ForeignKnownGeneral,
+        ..VulkanImageSyncState::default()
+    };
 
     assert!(fresh_import_sync.external_acquire_pending);
     assert_eq!(
@@ -950,6 +964,22 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
         released_sync.known_foreign_layout(),
         Some(vk::ImageLayout::GENERAL)
     );
+    assert!(matches!(
+        plan_sampled_dmabuf_foreign_acquire_barrier(&no_pending_sync, 2, usage),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    assert_eq!(
+        plan_sampled_dmabuf_foreign_acquire_barrier(&local_sync, 2, usage).unwrap(),
+        None
+    );
+    assert!(matches!(
+        plan_sampled_dmabuf_foreign_acquire_barrier(&fresh_import_sync, 2, usage),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    assert!(matches!(
+        plan_sampled_dmabuf_foreign_acquire_barrier(&released_sync, vk::QUEUE_FAMILY_FOREIGN_EXT, usage,),
+        Err(VulkanError::UnsupportedOperation("dmabuf queue family"))
+    ));
 
     assert!(matches!(
         sampled_dmabuf_foreign_acquire_barrier(vk::ImageLayout::UNDEFINED, 0, usage),
@@ -999,6 +1029,10 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
     assert_eq!(acquire.new_layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     assert_eq!(acquire.src_queue_family_index, vk::QUEUE_FAMILY_FOREIGN_EXT);
     assert_eq!(acquire.dst_queue_family_index, 2);
+    assert_eq!(
+        plan_sampled_dmabuf_foreign_acquire_barrier(&released_sync, 2, usage).unwrap(),
+        Some(acquire)
+    );
 
     let release = sampled_dmabuf_foreign_release_barrier(2, usage).unwrap();
     assert_eq!(release.src_stage, vk::PipelineStageFlags::FRAGMENT_SHADER);
@@ -1009,6 +1043,48 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
     assert_eq!(release.new_layout, vk::ImageLayout::GENERAL);
     assert_eq!(release.src_queue_family_index, 2);
     assert_eq!(release.dst_queue_family_index, vk::QUEUE_FAMILY_FOREIGN_EXT);
+    assert_eq!(
+        plan_sampled_dmabuf_foreign_release_barrier(
+            &VulkanImageSyncState::default(),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            2,
+            usage,
+        )
+        .unwrap(),
+        None
+    );
+    assert!(matches!(
+        plan_sampled_dmabuf_foreign_release_barrier(
+            &released_sync,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            2,
+            usage,
+        ),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    assert!(matches!(
+        plan_sampled_dmabuf_foreign_release_barrier(
+            &pending_local_sync,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            2,
+            usage,
+        ),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    assert!(matches!(
+        plan_sampled_dmabuf_foreign_release_barrier(&local_sync, vk::ImageLayout::GENERAL, 2, usage,),
+        Err(VulkanError::UnsupportedOperation("dmabuf local layout"))
+    ));
+    assert_eq!(
+        plan_sampled_dmabuf_foreign_release_barrier(
+            &local_sync,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            2,
+            usage,
+        )
+        .unwrap(),
+        Some(release)
+    );
 
     let image = vk::Image::null();
     let vk_barrier = acquire.to_color_image_memory_barrier(image);

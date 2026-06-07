@@ -226,7 +226,17 @@ impl VulkanImageSyncState {
     }
 
     #[allow(dead_code)]
-    pub(super) fn known_foreign_layout(&self) -> Option<vk::ImageLayout> {
+    pub(crate) fn external_acquire_pending(&self) -> bool {
+        self.external_acquire_pending
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn external_ownership(&self) -> VulkanExternalImageOwnership {
+        self.external_ownership
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn known_foreign_layout(&self) -> Option<vk::ImageLayout> {
         match self.external_ownership {
             VulkanExternalImageOwnership::ForeignKnownGeneral => Some(vk::ImageLayout::GENERAL),
             VulkanExternalImageOwnership::None

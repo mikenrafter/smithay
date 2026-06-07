@@ -17,7 +17,9 @@ use crate::backend::{
 };
 
 use super::{
-    VulkanError, VulkanRendererCapabilities, format::get_render_vk_format, image::VulkanDmabufImportState,
+    VulkanError, VulkanRendererCapabilities,
+    format::get_render_vk_format,
+    image::{VulkanDmabufImportState, VulkanExternalImageOwnership, VulkanImageSyncState},
 };
 
 const SAMPLED_TEXTURE_DRAW_CONSTANT_SIZE: u32 = 32;
@@ -2784,6 +2786,58 @@ pub(super) fn sampled_dmabuf_foreign_release_barrier(
 }
 
 #[allow(dead_code)]
+pub(super) fn plan_sampled_dmabuf_foreign_acquire_barrier(
+    sync: &VulkanImageSyncState,
+    graphics_queue_family: u32,
+    usage: vk::ImageUsageFlags,
+) -> Result<Option<VulkanExternalImageBarrier>, VulkanError> {
+    match (sync.external_ownership(), sync.external_acquire_pending()) {
+        (VulkanExternalImageOwnership::ForeignKnownGeneral, true) => {
+            let external_layout = sync
+                .known_foreign_layout()
+                .ok_or(VulkanError::UnsupportedOperation("dmabuf external layout"))?;
+            sampled_dmabuf_foreign_acquire_barrier(external_layout, graphics_queue_family, usage).map(Some)
+        }
+        (VulkanExternalImageOwnership::None, false) | (VulkanExternalImageOwnership::Local, false) => {
+            Ok(None)
+        }
+        (VulkanExternalImageOwnership::ForeignUnknown, _)
+        | (VulkanExternalImageOwnership::ForeignKnownGeneral, false)
+        | (VulkanExternalImageOwnership::None, true)
+        | (VulkanExternalImageOwnership::Local, true) => {
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(super) fn plan_sampled_dmabuf_foreign_release_barrier(
+    sync: &VulkanImageSyncState,
+    local_layout: vk::ImageLayout,
+    graphics_queue_family: u32,
+    usage: vk::ImageUsageFlags,
+) -> Result<Option<VulkanExternalImageBarrier>, VulkanError> {
+    match (sync.external_ownership(), sync.external_acquire_pending()) {
+        (VulkanExternalImageOwnership::Local, true) => {
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        }
+        (VulkanExternalImageOwnership::Local, false) => {
+            if local_layout != vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+                return Err(VulkanError::UnsupportedOperation("dmabuf local layout"));
+            }
+
+            sampled_dmabuf_foreign_release_barrier(graphics_queue_family, usage).map(Some)
+        }
+        (VulkanExternalImageOwnership::None, false) => Ok(None),
+        (VulkanExternalImageOwnership::None, true)
+        | (VulkanExternalImageOwnership::ForeignUnknown, _)
+        | (VulkanExternalImageOwnership::ForeignKnownGeneral, _) => {
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn is_local_queue_family_index(queue_family: u32) -> bool {
     queue_family != vk::QUEUE_FAMILY_IGNORED
         && queue_family != vk::QUEUE_FAMILY_EXTERNAL
@@ -3485,6 +3539,25 @@ impl VulkanCommandBuffer {
 
     pub(super) fn queue_family_index(&self) -> u32 {
         self.command_pool.queue_family_index()
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn plan_sampled_dmabuf_foreign_acquire_barrier(
+        &self,
+        sync: &VulkanImageSyncState,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Option<VulkanExternalImageBarrier>, VulkanError> {
+        plan_sampled_dmabuf_foreign_acquire_barrier(sync, self.queue_family_index(), usage)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn plan_sampled_dmabuf_foreign_release_barrier(
+        &self,
+        sync: &VulkanImageSyncState,
+        local_layout: vk::ImageLayout,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Option<VulkanExternalImageBarrier>, VulkanError> {
+        plan_sampled_dmabuf_foreign_release_barrier(sync, local_layout, self.queue_family_index(), usage)
     }
 
     fn pending_layout_for(&self, image: &VulkanOwnedImage) -> Result<Option<vk::ImageLayout>, VulkanError> {
