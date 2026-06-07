@@ -20,8 +20,9 @@ use super::capabilities::{
 };
 use super::device::{
     VulkanDeviceState, VulkanDmabufExternalImageFormatProperties, VulkanSampledTexturePipelineShaders,
-    VulkanShaderSpirv, find_memory_type_index, image_copy_buffer_offset, image_copy_required_size,
-    image_layout_transition, select_queue_families, tightly_packed_image_size, vulkan_filter,
+    VulkanShaderSpirv, dmabuf_plane_layouts, find_memory_type_index, image_copy_buffer_offset,
+    image_copy_required_size, image_layout_transition, select_queue_families, tightly_packed_image_size,
+    vulkan_filter,
 };
 use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
@@ -538,6 +539,29 @@ fn dmabuf_external_image_format_query_is_disabled_without_prerequisites() {
             .is_none()
     );
     assert!(device.dmabuf_import_candidate(&import).unwrap().is_none());
+    assert!(device.create_dmabuf_import_image(&import).unwrap().is_none());
+}
+
+#[test]
+fn dmabuf_import_image_plane_layouts_track_metadata() {
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Nv12,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4), (1, 16, 4)],
+    );
+    let import = VulkanDmabufImportState::from_dmabuf(&dmabuf).unwrap();
+    let layouts = dmabuf_plane_layouts(&import);
+
+    assert_eq!(layouts.len(), 2);
+    assert_eq!(layouts[0].offset, 0);
+    assert_eq!(layouts[0].row_pitch, 4);
+    assert_eq!(layouts[0].size, 0);
+    assert_eq!(layouts[0].array_pitch, 0);
+    assert_eq!(layouts[0].depth_pitch, 0);
+    assert_eq!(layouts[1].offset, 16);
+    assert_eq!(layouts[1].row_pitch, 4);
 }
 
 #[test]

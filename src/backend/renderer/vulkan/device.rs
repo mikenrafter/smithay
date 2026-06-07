@@ -75,6 +75,14 @@ pub(crate) struct VulkanDmabufImportCandidate {
     pub(super) dedicated_only: bool,
 }
 
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanDmabufImportImage {
+    pub(super) image: VulkanUnboundImage,
+    pub(super) memory_requirements: vk::MemoryRequirements,
+    pub(super) candidate: VulkanDmabufImportCandidate,
+}
+
 impl VulkanDmabufExternalImageFormatProperties {
     pub(super) fn supports_sampled_import(&self, import: &VulkanDmabufImportState) -> bool {
         self.importable
@@ -375,6 +383,79 @@ impl VulkanDeviceState {
         Ok(Some(VulkanDmabufImportCandidate {
             dedicated_only: properties.dedicated_only,
             properties,
+        }))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn create_dmabuf_import_image(
+        &self,
+        import: &VulkanDmabufImportState,
+    ) -> Result<Option<VulkanDmabufImportImage>, VulkanError> {
+        let Some(candidate) = self.dmabuf_import_candidate(import)? else {
+            return Ok(None);
+        };
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+        let vk_format = get_render_vk_format(import.format())?;
+        let extent = vk::Extent3D {
+            width: import.size.w.try_into().unwrap_or_default(),
+            height: import.size.h.try_into().unwrap_or_default(),
+            depth: 1,
+        };
+        let plane_layouts = dmabuf_plane_layouts(import);
+        let mut external_memory_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(import.modifier().into())
+            .plane_layouts(&plane_layouts);
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk_format)
+            .extent(extent)
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut external_memory_info)
+            .push_next(&mut modifier_info);
+
+        // SAFETY: `logical_device` is live. The pNext chain contains Vulkan-defined image-create
+        // extension structs whose stack storage outlives the call. The image shape matches the
+        // earlier external-image-format query/candidate: 2D, one mip level, one array layer,
+        // TYPE_1 samples, SAMPLED usage, DRM_FORMAT_MODIFIER tiling, and DMA_BUF_EXT external
+        // memory. Plane-layout pointers are derived from validated plane count/order and nonzero
+        // stride metadata, and remain alive through the call; modifier-specific layout validity is
+        // still checked by the driver and may make image creation fail. No allocation callbacks are
+        // used.
+        let image =
+            unsafe { logical_device.handle().create_image(&image_info, None) }.map_err(VulkanError::from)?;
+        let unbound = VulkanUnboundImage {
+            logical_device,
+            image,
+            extent,
+            format: vk_format,
+            usage: vk::ImageUsageFlags::SAMPLED,
+        };
+        // SAFETY: `unbound.image` was just created from `unbound.logical_device`, has not been
+        // destroyed, and the call only queries requirements for that image. No memory has been bound
+        // yet, and the image owner remains alive for the duration of the query.
+        let memory_requirements = unsafe {
+            unbound
+                .logical_device
+                .handle()
+                .get_image_memory_requirements(unbound.image)
+        };
+
+        Ok(Some(VulkanDmabufImportImage {
+            image: unbound,
+            memory_requirements,
+            candidate,
         }))
     }
 
@@ -2997,6 +3078,21 @@ fn create_bound_image(
     })
 }
 
+pub(super) fn dmabuf_plane_layouts(import: &VulkanDmabufImportState) -> Vec<vk::SubresourceLayout> {
+    import
+        .memory
+        .planes
+        .iter()
+        .map(|plane| vk::SubresourceLayout {
+            offset: plane.offset.into(),
+            size: 0,
+            row_pitch: plane.stride.into(),
+            array_pitch: 0,
+            depth_pitch: 0,
+        })
+        .collect()
+}
+
 /// Logical device owner retained by Vulkan resource wrappers.
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -3162,6 +3258,17 @@ pub(crate) struct VulkanOwnedImage {
     inner: Arc<VulkanOwnedImageInner>,
 }
 
+/// Vulkan image created for an external-memory import before memory is bound.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanUnboundImage {
+    logical_device: VulkanLogicalDevice,
+    image: vk::Image,
+    extent: vk::Extent3D,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+}
+
 /// Shared owned image resource kept alive by command buffers that reference it.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -3203,6 +3310,35 @@ impl VulkanOwnedImage {
             .lock()
             .map(|layout| *layout)
             .map_err(|_| host_synchronization_failed())
+    }
+}
+
+#[allow(dead_code)]
+impl VulkanUnboundImage {
+    pub(super) fn image(&self) -> vk::Image {
+        self.image
+    }
+
+    pub(super) fn extent(&self) -> vk::Extent3D {
+        self.extent
+    }
+
+    pub(super) fn format(&self) -> vk::Format {
+        self.format
+    }
+
+    pub(super) fn usage(&self) -> vk::ImageUsageFlags {
+        self.usage
+    }
+}
+
+impl Drop for VulkanUnboundImage {
+    fn drop(&mut self) {
+        // SAFETY: `self.image` was created from `self.logical_device` and is destroyed exactly
+        // once by this owner. No memory has been bound through this scaffold type yet, so there is
+        // no corresponding device memory to free. `VulkanLogicalDevice` is retained by value, so the
+        // device outlives the image. No allocation callbacks are used.
+        unsafe { self.logical_device.handle().destroy_image(self.image, None) };
     }
 }
 
