@@ -14,7 +14,10 @@ use crate::backend::renderer::{
 use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
 use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 
-use super::capabilities::{format_usage_from_features, linear_tiling_supported};
+use super::capabilities::{
+    format_usage_from_features, linear_tiling_supported, modifier_record_from_properties,
+    should_query_modifier_properties,
+};
 use super::device::{
     VulkanDeviceState, VulkanSampledTexturePipelineShaders, VulkanShaderSpirv, find_memory_type_index,
     image_copy_buffer_offset, image_copy_required_size, image_layout_transition, select_queue_families,
@@ -190,6 +193,7 @@ fn vulkan_renderer_default_capabilities_are_false() {
 fn vulkan_format_capability_matrix_defaults_empty() {
     let caps = VulkanRendererCapabilities::default();
     assert!(caps.formats.records.is_empty());
+    assert!(caps.formats.modifier_records.is_empty());
     assert!(caps.formats.memory_import.iter().next().is_none());
     assert!(caps.formats.dmabuf_import.iter().next().is_none());
     assert!(caps.formats.dmabuf_export.iter().next().is_none());
@@ -283,6 +287,66 @@ fn external_memory_capability_discovery_requires_modifier_dependency() {
         });
     assert!(core_image_format_list_caps.image_format_list);
     assert!(core_image_format_list_caps.prerequisites_available);
+}
+
+#[test]
+fn drm_modifier_queries_require_full_external_memory_prerequisites() {
+    let partial = VulkanExternalMemoryCapabilities {
+        drm_format_modifiers: true,
+        image_format_list: true,
+        ..VulkanExternalMemoryCapabilities::default()
+    };
+    assert!(!should_query_modifier_properties(&partial));
+
+    let inconsistent = VulkanExternalMemoryCapabilities {
+        prerequisites_available: true,
+        ..partial
+    };
+    assert!(!should_query_modifier_properties(&inconsistent));
+
+    let complete = VulkanExternalMemoryCapabilities {
+        dmabuf_external_memory: true,
+        external_memory_fd: true,
+        drm_format_modifiers: true,
+        image_format_list: true,
+        prerequisites_available: true,
+    };
+    assert!(should_query_modifier_properties(&complete));
+}
+
+#[test]
+fn drm_modifier_capability_records_map_vulkan_properties_without_advertising_dmabuf() {
+    let record = modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::TRANSFER_DST,
+        },
+    );
+
+    assert_eq!(record.format, Fourcc::Abgr8888);
+    assert_eq!(record.modifier, Modifier::Linear);
+    assert_eq!(record.plane_count, 1);
+    assert!(record.usages.sampled);
+    assert!(record.usages.color_attachment);
+    assert!(record.usages.transfer_dst);
+    assert!(!record.usages.dmabuf_import);
+    assert!(!record.usages.dmabuf_export);
+
+    let renderer_caps = VulkanRendererCapabilities {
+        formats: VulkanFormatCapabilities {
+            modifier_records: vec![record],
+            ..VulkanFormatCapabilities::default()
+        },
+        ..VulkanRendererCapabilities::default()
+    };
+    assert!(!renderer_caps.import.dmabuf);
+    assert!(!renderer_caps.export.dmabuf);
+    assert!(renderer_caps.formats.dmabuf_import.iter().next().is_none());
+    assert!(renderer_caps.formats.dmabuf_export.iter().next().is_none());
 }
 
 #[test]
@@ -4172,7 +4236,8 @@ fn runtime_format_discovery_finds_device_backed_formats_without_import_export() 
         .next()
         .expect("No physical devices");
 
-    let caps = VulkanFormatCapabilities::discover(&physical_device).unwrap();
+    let external_memory = VulkanExternalMemoryCapabilities::discover(&physical_device);
+    let caps = VulkanFormatCapabilities::discover(&physical_device, &external_memory).unwrap();
 
     assert!(
         has_probed_format_support(&caps),

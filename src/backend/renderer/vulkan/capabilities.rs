@@ -43,6 +43,9 @@ pub struct VulkanRendererCapabilities {
 pub struct VulkanFormatCapabilities {
     /// Detailed records keyed by DRM format and Vulkan image tiling.
     pub records: Vec<VulkanFormatCapabilityRecord>,
+    /// Detailed records keyed by DRM format and DRM format modifier.
+    #[allow(dead_code)]
+    pub(crate) modifier_records: Vec<VulkanDrmFormatModifierCapabilityRecord>,
     /// Formats usable for shared-memory uploads.
     pub memory_import: FormatSet,
     /// Formats usable for dmabuf imports.
@@ -60,6 +63,19 @@ pub struct VulkanFormatCapabilityRecord {
     /// Vulkan image tiling queried for this format.
     pub tiling: VulkanFormatTiling,
     /// Per-usage capability bits for this format and tiling marker.
+    pub usages: VulkanFormatUsage,
+}
+
+/// Capability record for a DRM format modifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VulkanDrmFormatModifierCapabilityRecord {
+    /// DRM format code.
+    pub format: Fourcc,
+    /// DRM format modifier.
+    pub modifier: Modifier,
+    /// Number of memory planes used by this format/modifier pair.
+    pub plane_count: u32,
+    /// Per-usage capability bits for this format/modifier pair.
     pub usages: VulkanFormatUsage,
 }
 
@@ -106,8 +122,12 @@ impl VulkanFormatCapabilities {
     /// This probes sampled, color-attachment, blit, transfer, and linear tiling support for the
     /// renderer's static format table. Import and export format sets remain empty until those
     /// traits are implemented and can import or export the advertised pairs.
-    pub fn discover(physical_device: &PhysicalDevice) -> Result<Self, VulkanError> {
+    pub fn discover(
+        physical_device: &PhysicalDevice,
+        external_memory: &VulkanExternalMemoryCapabilities,
+    ) -> Result<Self, VulkanError> {
         let mut records = Vec::new();
+        let mut modifier_records = Vec::new();
         let mut memory_import = Vec::new();
 
         for info in renderer_format_infos() {
@@ -140,10 +160,23 @@ impl VulkanFormatCapabilities {
                     usages: linear_usage,
                 });
             }
+
+            if should_query_modifier_properties(external_memory) {
+                for modifier_properties in physical_device
+                    .get_format_modifier_properties(info.vk_format)
+                    .unwrap_or_default()
+                {
+                    let record = modifier_record_from_properties(info.fourcc, modifier_properties);
+                    if record.usages.any_supported() {
+                        modifier_records.push(record);
+                    }
+                }
+            }
         }
 
         Ok(Self {
             records,
+            modifier_records,
             memory_import: memory_import.into_iter().collect(),
             dmabuf_import: FormatSet::default(),
             dmabuf_export: FormatSet::default(),
@@ -168,6 +201,26 @@ impl VulkanFormatCapabilities {
                 modifier: Modifier::Invalid,
             })
             .collect()
+    }
+}
+
+pub(super) fn should_query_modifier_properties(external_memory: &VulkanExternalMemoryCapabilities) -> bool {
+    external_memory.prerequisites_available
+        && external_memory.dmabuf_external_memory
+        && external_memory.external_memory_fd
+        && external_memory.drm_format_modifiers
+        && external_memory.image_format_list
+}
+
+pub(super) fn modifier_record_from_properties(
+    format: Fourcc,
+    properties: vk::DrmFormatModifierPropertiesEXT,
+) -> VulkanDrmFormatModifierCapabilityRecord {
+    VulkanDrmFormatModifierCapabilityRecord {
+        format,
+        modifier: Modifier::from(properties.drm_format_modifier),
+        plane_count: properties.drm_format_modifier_plane_count,
+        usages: format_usage_from_features(properties.drm_format_modifier_tiling_features),
     }
 }
 
