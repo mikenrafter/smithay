@@ -165,6 +165,7 @@ pub(super) fn dmabuf_import_image_state(import: &VulkanDmabufImportState) -> Vul
         layout: VulkanImageLayoutState::Undefined,
         sync: VulkanImageSyncState {
             external_acquire_pending: true,
+            external_ownership: VulkanExternalImageOwnership::ForeignUnknown,
             ..VulkanImageSyncState::default()
         },
     }
@@ -211,6 +212,38 @@ pub(crate) struct VulkanImageSyncState {
     pub(super) pending_write: bool,
     pub(super) exportable_sync: bool,
     pub(super) external_acquire_pending: bool,
+    pub(super) external_ownership: VulkanExternalImageOwnership,
+}
+
+impl VulkanImageSyncState {
+    #[allow(dead_code)]
+    pub(super) fn foreign_known_general_for_dmabuf_import() -> Self {
+        Self {
+            external_acquire_pending: true,
+            external_ownership: VulkanExternalImageOwnership::ForeignKnownGeneral,
+            ..Self::default()
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn known_foreign_layout(&self) -> Option<vk::ImageLayout> {
+        match self.external_ownership {
+            VulkanExternalImageOwnership::ForeignKnownGeneral => Some(vk::ImageLayout::GENERAL),
+            VulkanExternalImageOwnership::None
+            | VulkanExternalImageOwnership::ForeignUnknown
+            | VulkanExternalImageOwnership::Local => None,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VulkanExternalImageOwnership {
+    #[default]
+    None,
+    ForeignUnknown,
+    ForeignKnownGeneral,
+    Local,
 }
 
 /// External-memory metadata reserved for future dmabuf import/export support.

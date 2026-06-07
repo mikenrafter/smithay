@@ -27,10 +27,11 @@ use super::device::{
 };
 use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
-    VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalMemoryHandleType, VulkanExternalMemoryState,
-    VulkanImageLayoutState, VulkanImageSource, VulkanImageState, VulkanImageSyncState, VulkanImageUsage,
-    clear_damage_to_clear_areas, damage_to_scissor_areas, dmabuf_import_image_state,
-    draw_solid_damage_to_clear_areas, render_texture_damage_to_scissor_areas, source_to_uv_rect,
+    VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalImageOwnership, VulkanExternalMemoryHandleType,
+    VulkanExternalMemoryState, VulkanImageLayoutState, VulkanImageSource, VulkanImageState,
+    VulkanImageSyncState, VulkanImageUsage, clear_damage_to_clear_areas, damage_to_scissor_areas,
+    dmabuf_import_image_state, draw_solid_damage_to_clear_areas, render_texture_damage_to_scissor_areas,
+    source_to_uv_rect,
 };
 use super::*;
 
@@ -599,6 +600,10 @@ fn dmabuf_import_image_state_tracks_sampled_dmabuf_without_advertising_renderabi
     assert!(!image.usage.color_attachment);
     assert_eq!(image.layout, VulkanImageLayoutState::Undefined);
     assert!(image.sync.external_acquire_pending);
+    assert_eq!(
+        image.sync.external_ownership,
+        VulkanExternalImageOwnership::ForeignUnknown
+    );
     assert!(!image.sync.pending_write);
     assert!(!image.sync.exportable_sync);
     assert!(import.y_inverted);
@@ -923,6 +928,28 @@ fn image_layout_transition_requires_matching_image_usage() {
 #[test]
 fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
     let usage = vk::ImageUsageFlags::SAMPLED;
+    let fresh_import_sync = VulkanImageSyncState {
+        external_acquire_pending: true,
+        external_ownership: VulkanExternalImageOwnership::ForeignUnknown,
+        ..VulkanImageSyncState::default()
+    };
+    let released_sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+
+    assert!(fresh_import_sync.external_acquire_pending);
+    assert_eq!(
+        fresh_import_sync.external_ownership,
+        VulkanExternalImageOwnership::ForeignUnknown
+    );
+    assert_eq!(fresh_import_sync.known_foreign_layout(), None);
+    assert!(released_sync.external_acquire_pending);
+    assert_eq!(
+        released_sync.external_ownership,
+        VulkanExternalImageOwnership::ForeignKnownGeneral
+    );
+    assert_eq!(
+        released_sync.known_foreign_layout(),
+        Some(vk::ImageLayout::GENERAL)
+    );
 
     assert!(matches!(
         sampled_dmabuf_foreign_acquire_barrier(vk::ImageLayout::UNDEFINED, 0, usage),
