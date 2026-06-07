@@ -1,6 +1,6 @@
 use std::{fs::File, marker::PhantomData, os::unix::io::OwnedFd, sync::Arc};
 
-use ash::vk;
+use ash::{ext, khr, vk};
 
 use crate::backend::allocator::{
     Format, Fourcc, Modifier,
@@ -179,6 +179,11 @@ fn vulkan_renderer_default_capabilities_are_false() {
     assert!(!caps.sync.explicit);
     assert!(!caps.color.color_transform_hooks);
     assert!(!caps.color.hdr_ready_targets);
+    assert!(!caps.external_memory.dmabuf_external_memory);
+    assert!(!caps.external_memory.external_memory_fd);
+    assert!(!caps.external_memory.drm_format_modifiers);
+    assert!(!caps.external_memory.image_format_list);
+    assert!(!caps.external_memory.prerequisites_available);
 }
 
 #[test]
@@ -225,6 +230,59 @@ fn vulkan_format_capability_record_is_per_tiling_marker() {
     assert!(record.usages.memory_import);
     assert!(!record.usages.dmabuf_import);
     assert!(record.usages.transfer_src);
+}
+
+#[test]
+fn external_memory_capability_discovery_tracks_prerequisites_without_advertising_dmabuf() {
+    let supported = [
+        ext::external_memory_dma_buf::NAME,
+        khr::external_memory_fd::NAME,
+        ext::image_drm_format_modifier::NAME,
+        khr::image_format_list::NAME,
+    ];
+    let caps =
+        VulkanExternalMemoryCapabilities::from_device_extension_support(Version::VERSION_1_1, |name| {
+            supported.iter().any(|supported| *supported == name)
+        });
+
+    assert!(caps.dmabuf_external_memory);
+    assert!(caps.external_memory_fd);
+    assert!(caps.drm_format_modifiers);
+    assert!(caps.image_format_list);
+    assert!(caps.prerequisites_available);
+
+    let renderer_caps = VulkanRendererCapabilities {
+        external_memory: caps,
+        ..VulkanRendererCapabilities::default()
+    };
+    assert!(!renderer_caps.import.dmabuf);
+    assert!(!renderer_caps.import.modifiers);
+    assert!(!renderer_caps.export.dmabuf);
+    assert!(!renderer_caps.export.modifiers);
+    assert!(renderer_caps.formats.dmabuf_import.iter().next().is_none());
+    assert!(renderer_caps.formats.dmabuf_export.iter().next().is_none());
+}
+
+#[test]
+fn external_memory_capability_discovery_requires_modifier_dependency() {
+    let supported = [
+        ext::external_memory_dma_buf::NAME,
+        khr::external_memory_fd::NAME,
+        ext::image_drm_format_modifier::NAME,
+    ];
+    let caps =
+        VulkanExternalMemoryCapabilities::from_device_extension_support(Version::VERSION_1_1, |name| {
+            supported.iter().any(|supported| *supported == name)
+        });
+    assert!(!caps.image_format_list);
+    assert!(!caps.prerequisites_available);
+
+    let core_image_format_list_caps =
+        VulkanExternalMemoryCapabilities::from_device_extension_support(Version::VERSION_1_2, |name| {
+            supported.iter().any(|supported| *supported == name)
+        });
+    assert!(core_image_format_list_caps.image_format_list);
+    assert!(core_image_format_list_caps.prerequisites_available);
 }
 
 #[test]

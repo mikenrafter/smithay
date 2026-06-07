@@ -89,6 +89,7 @@ impl VulkanDeviceState {
         };
         let queue_families = select_queue_families(&queue_properties)?;
         let mut capabilities = VulkanRendererCapabilities::for_initialized_device(&[]);
+        capabilities.external_memory = super::VulkanExternalMemoryCapabilities::discover(&physical_device);
         capabilities.formats = super::VulkanFormatCapabilities::discover(&physical_device)?;
         capabilities.import.memory = capabilities.formats.memory_import.iter().next().is_some();
         let has_public_render_target_formats = capabilities

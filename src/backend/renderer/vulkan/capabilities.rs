@@ -1,10 +1,10 @@
 use std::ffi::CStr;
 
-use ash::vk;
+use ash::{ext, khr, vk};
 
 use crate::backend::{
     allocator::{Format, Fourcc, Modifier, format::FormatSet},
-    vulkan::PhysicalDevice,
+    vulkan::{PhysicalDevice, version::Version},
 };
 
 use super::{
@@ -30,6 +30,8 @@ pub struct VulkanRendererCapabilities {
     pub color: VulkanColorCapabilities,
     /// Raw per-format Vulkan image feature capabilities.
     pub formats: VulkanFormatCapabilities,
+    /// External-memory prerequisite discovery.
+    pub external_memory: VulkanExternalMemoryCapabilities,
 }
 
 /// Raw per-format Vulkan image feature capabilities.
@@ -221,6 +223,55 @@ impl VulkanRendererCapabilities {
                     .collect(),
             },
             ..Self::default()
+        }
+    }
+}
+
+/// Vulkan external-memory prerequisite discovery.
+///
+/// These fields only describe physical-device support for renderer-side dmabuf plumbing. They do
+/// not mean that the renderer enabled the device extensions, can import/export dmabufs, or should
+/// advertise any Smithay-facing dmabuf format set.
+#[non_exhaustive]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct VulkanExternalMemoryCapabilities {
+    /// Whether `VK_EXT_external_memory_dma_buf` is supported.
+    pub dmabuf_external_memory: bool,
+    /// Whether `VK_KHR_external_memory_fd` is supported.
+    pub external_memory_fd: bool,
+    /// Whether `VK_EXT_image_drm_format_modifier` is supported.
+    pub drm_format_modifiers: bool,
+    /// Whether `VK_KHR_image_format_list` is available, either as Vulkan 1.2 core or as an extension.
+    pub image_format_list: bool,
+    /// Whether the known renderer dmabuf external-memory prerequisites are all available.
+    pub prerequisites_available: bool,
+}
+
+impl VulkanExternalMemoryCapabilities {
+    pub(super) fn discover(physical_device: &PhysicalDevice) -> Self {
+        Self::from_device_extension_support(physical_device.api_version(), |extension| {
+            physical_device.has_device_extension(extension)
+        })
+    }
+
+    pub(super) fn from_device_extension_support(
+        api_version: Version,
+        mut has_device_extension: impl FnMut(&CStr) -> bool,
+    ) -> Self {
+        let dmabuf_external_memory = has_device_extension(ext::external_memory_dma_buf::NAME);
+        let external_memory_fd = has_device_extension(khr::external_memory_fd::NAME);
+        let drm_format_modifiers = has_device_extension(ext::image_drm_format_modifier::NAME);
+        let image_format_list =
+            api_version >= Version::VERSION_1_2 || has_device_extension(khr::image_format_list::NAME);
+        let prerequisites_available =
+            dmabuf_external_memory && external_memory_fd && drm_format_modifiers && image_format_list;
+
+        Self {
+            dmabuf_external_memory,
+            external_memory_fd,
+            drm_format_modifiers,
+            image_format_list,
+            prerequisites_available,
         }
     }
 }
