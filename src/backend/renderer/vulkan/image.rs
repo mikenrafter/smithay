@@ -163,7 +163,10 @@ pub(super) fn dmabuf_import_image_state(import: &VulkanDmabufImportState) -> Vul
             ..VulkanImageUsage::default()
         },
         layout: VulkanImageLayoutState::Undefined,
-        sync: VulkanImageSyncState::default(),
+        sync: VulkanImageSyncState {
+            external_acquire_pending: true,
+            ..VulkanImageSyncState::default()
+        },
     }
 }
 
@@ -207,6 +210,7 @@ pub(crate) enum VulkanImageLayoutState {
 pub(crate) struct VulkanImageSyncState {
     pub(super) pending_write: bool,
     pub(super) exportable_sync: bool,
+    pub(super) external_acquire_pending: bool,
 }
 
 /// External-memory metadata reserved for future dmabuf import/export support.
@@ -547,6 +551,9 @@ impl Frame for VulkanFrame<'_, '_> {
 
         if texture.context_id != self.context_id {
             return Err(VulkanError::UnsupportedOperation("foreign render texture"));
+        }
+        if texture.image.sync.external_acquire_pending {
+            return Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"));
         }
         if self.transform != Transform::Normal {
             return Err(VulkanError::UnsupportedOperation("render texture transform"));

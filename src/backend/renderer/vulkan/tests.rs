@@ -597,7 +597,9 @@ fn dmabuf_import_image_state_tracks_sampled_dmabuf_without_advertising_renderabi
     assert!(!image.usage.transfer_dst);
     assert!(!image.usage.color_attachment);
     assert_eq!(image.layout, VulkanImageLayoutState::Undefined);
-    assert_eq!(image.sync, VulkanImageSyncState::default());
+    assert!(image.sync.external_acquire_pending);
+    assert!(!image.sync.pending_write);
+    assert!(!image.sync.exportable_sync);
     assert!(import.y_inverted);
 }
 
@@ -2301,6 +2303,21 @@ fn frame_render_texture_rejects_narrow_path_preconditions_before_device_lookup()
     );
 
     texture.context_id = frame_context_id.clone();
+
+    let mut acquire_pending_texture = texture.clone();
+    acquire_pending_texture.image.sync.external_acquire_pending = true;
+    assert_render_texture_error(
+        &acquire_pending_texture,
+        frame_context_id.clone(),
+        Transform::Normal,
+        full_src,
+        full_dst,
+        &full_damage,
+        &[],
+        Transform::Normal,
+        1.0,
+        "dmabuf import synchronization",
+    );
 
     assert_render_texture_error(
         &texture,
