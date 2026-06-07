@@ -5,7 +5,7 @@ use ash::vk;
 use crate::{
     backend::{
         allocator::{Fourcc, Modifier},
-        renderer::{Color32F, ContextId, Frame, Texture, sync::SyncPoint},
+        renderer::{Color32F, ContextId, Frame, Texture, TextureMapping, sync::SyncPoint},
     },
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
 };
@@ -48,6 +48,15 @@ pub struct VulkanRenderTarget<'buffer> {
     pub(super) image: VulkanImageState,
     pub(super) color_image: Option<VulkanOwnedImage>,
     pub(super) _target: PhantomData<&'buffer mut ()>,
+}
+
+/// CPU-memory readback mapping produced by the Vulkan renderer.
+#[derive(Debug, Clone)]
+pub struct VulkanMemoryMapping {
+    pub(super) data: Vec<u8>,
+    pub(super) size: Size<i32, BufferCoord>,
+    pub(super) format: Fourcc,
+    pub(super) flipped: bool,
 }
 
 /// Vulkan image state shared by textures and render targets.
@@ -287,6 +296,30 @@ impl Texture for VulkanRenderTarget<'_> {
 
     fn format(&self) -> Option<Fourcc> {
         self.image.format()
+    }
+}
+
+impl Texture for VulkanMemoryMapping {
+    fn width(&self) -> u32 {
+        self.size.w.try_into().unwrap_or_default()
+    }
+
+    fn height(&self) -> u32 {
+        self.size.h.try_into().unwrap_or_default()
+    }
+
+    fn size(&self) -> Size<i32, BufferCoord> {
+        self.size
+    }
+
+    fn format(&self) -> Option<Fourcc> {
+        Some(self.format)
+    }
+}
+
+impl TextureMapping for VulkanMemoryMapping {
+    fn flipped(&self) -> bool {
+        self.flipped
     }
 }
 

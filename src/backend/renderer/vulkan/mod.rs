@@ -1,10 +1,11 @@
 //! Native Vulkan renderer.
 //!
 //! This module provides a provisional, opt-in Vulkan renderer for an explicit [`PhysicalDevice`]. It
-//! can upload sampled textures from CPU memory and render to in-memory/offscreen targets through
-//! Smithay's public [`ImportMem`], [`Bind`], [`Offscreen`], and [`Renderer`] traits. It remains
-//! intentionally incomplete and does not expose general Vulkan compositor support, present to KMS,
-//! implement HDR, or perform colour-management policy.
+//! can upload sampled textures from CPU memory, render to in-memory/offscreen targets, and read back
+//! those offscreen targets through Smithay's public [`ImportMem`], [`Bind`], [`Offscreen`],
+//! [`Renderer`], and [`ExportMem`] traits. It remains intentionally incomplete and does not expose
+//! general Vulkan compositor support, present to KMS, implement HDR, or perform colour-management
+//! policy.
 //!
 //! Downstream compositors must not treat the presence of this module or the `renderer_vulkan`
 //! feature as broad Vulkan rendering support. Real enablement must be added incrementally behind
@@ -12,9 +13,9 @@
 //! functionality.
 //!
 //! Smithay's optional renderer traits are capability surfaces. This module currently supports the
-//! tested CPU-memory/offscreen path only. `ImportDma`, `ExportMem`, `ExportDma`, explicit sync,
-//! blit/copy, and presentation remain unsupported until the corresponding capability bit can become
-//! true with coverage.
+//! tested CPU-memory/offscreen path only. `ImportDma`, texture `ExportMem`, `ExportDma`, explicit
+//! sync, blit/copy, and presentation remain unsupported until the corresponding capability bit can
+//! become true with coverage.
 //!
 //! Intended implementation order:
 //!
@@ -47,8 +48,8 @@ use crate::{
     backend::{
         allocator::{Format, Fourcc, Modifier, format::FormatSet},
         renderer::{
-            Bind, Color32F, ContextId, DebugFlags, ImportMem, Offscreen, Renderer, RendererSuper,
-            TextureFilter, sync::SyncPoint,
+            Bind, Color32F, ContextId, DebugFlags, ExportMem, ImportMem, Offscreen, Renderer, RendererSuper,
+            Texture, TextureFilter, sync::SyncPoint,
         },
     },
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
@@ -69,7 +70,7 @@ pub use self::{
         VulkanSyncCapabilities,
     },
     error::VulkanError,
-    image::{VulkanFrame, VulkanRenderTarget, VulkanTexture},
+    image::{VulkanFrame, VulkanMemoryMapping, VulkanRenderTarget, VulkanTexture},
 };
 
 use self::{
@@ -486,6 +487,73 @@ impl ImportMem for VulkanRenderer {
     }
 }
 
+impl ExportMem for VulkanRenderer {
+    type TextureMapping = VulkanMemoryMapping;
+
+    fn copy_framebuffer(
+        &mut self,
+        target: &Self::Framebuffer<'_>,
+        region: Rectangle<i32, BufferCoord>,
+        format: Fourcc,
+    ) -> Result<Self::TextureMapping, Self::Error> {
+        if target.context_id != self.context_id {
+            return Err(VulkanError::UnsupportedOperation("foreign render target"));
+        }
+        if target.image.source != image::VulkanImageSource::Offscreen {
+            return Err(VulkanError::UnsupportedOperation("render target"));
+        }
+        let target_format = target
+            .format()
+            .ok_or(VulkanError::UnsupportedOperation("render target format"))?;
+        if format != target_format {
+            return Err(VulkanError::UnsupportedFormat(format));
+        }
+
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+        let color_image = target
+            .color_image
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("render target image"))?;
+        let (image_offset, extent) = image_region_to_vk(target.size(), region, "framebuffer copy region")?;
+        let data = device.read_image_region_to_tightly_packed_buffer(color_image, image_offset, extent)?;
+
+        Ok(VulkanMemoryMapping {
+            data,
+            size: region.size,
+            format,
+            flipped: false,
+        })
+    }
+
+    fn copy_texture(
+        &mut self,
+        texture: &Self::TextureId,
+        _region: Rectangle<i32, BufferCoord>,
+        _format: Fourcc,
+    ) -> Result<Self::TextureMapping, Self::Error> {
+        if texture.context_id != self.context_id {
+            return Err(VulkanError::UnsupportedOperation("foreign memory texture"));
+        }
+
+        Err(VulkanError::UnsupportedOperation("texture memory export"))
+    }
+
+    fn can_read_texture(&mut self, texture: &Self::TextureId) -> Result<bool, Self::Error> {
+        if texture.context_id != self.context_id {
+            return Err(VulkanError::UnsupportedOperation("foreign memory texture"));
+        }
+
+        Ok(false)
+    }
+
+    fn map_texture<'a>(
+        &mut self,
+        texture_mapping: &'a Self::TextureMapping,
+    ) -> Result<&'a [u8], Self::Error> {
+        Ok(&texture_mapping.data)
+    }
+}
+
 fn extent_from_size(size: Size<i32, BufferCoord>, error: &'static str) -> Result<vk::Extent3D, VulkanError> {
     if size.w <= 0 || size.h <= 0 {
         return Err(VulkanError::UnsupportedOperation(error));
@@ -502,6 +570,50 @@ fn extent_from_size(size: Size<i32, BufferCoord>, error: &'static str) -> Result
             .map_err(|_| VulkanError::UnsupportedOperation(error))?,
         depth: 1,
     })
+}
+
+fn image_region_to_vk(
+    image_size: Size<i32, BufferCoord>,
+    region: Rectangle<i32, BufferCoord>,
+    error: &'static str,
+) -> Result<(vk::Offset3D, vk::Extent3D), VulkanError> {
+    if region.loc.x < 0 || region.loc.y < 0 || region.size.w <= 0 || region.size.h <= 0 {
+        return Err(VulkanError::UnsupportedOperation(error));
+    }
+    if region
+        .loc
+        .x
+        .checked_add(region.size.w)
+        .is_none_or(|right| right > image_size.w)
+        || region
+            .loc
+            .y
+            .checked_add(region.size.h)
+            .is_none_or(|bottom| bottom > image_size.h)
+    {
+        return Err(VulkanError::UnsupportedOperation(error));
+    }
+
+    Ok((
+        vk::Offset3D {
+            x: region.loc.x,
+            y: region.loc.y,
+            z: 0,
+        },
+        vk::Extent3D {
+            width: region
+                .size
+                .w
+                .try_into()
+                .map_err(|_| VulkanError::UnsupportedOperation(error))?,
+            height: region
+                .size
+                .h
+                .try_into()
+                .map_err(|_| VulkanError::UnsupportedOperation(error))?,
+            depth: 1,
+        },
+    ))
 }
 
 fn update_region_to_vk(

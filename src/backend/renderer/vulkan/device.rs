@@ -91,12 +91,14 @@ impl VulkanDeviceState {
         let mut capabilities = VulkanRendererCapabilities::for_initialized_device(&[]);
         capabilities.formats = super::VulkanFormatCapabilities::discover(&physical_device)?;
         capabilities.import.memory = capabilities.formats.memory_import.iter().next().is_some();
-        capabilities.rendering.offscreen = capabilities
+        let has_public_render_target_formats = capabilities
             .formats
             .render_target_formats()
             .iter()
             .next()
             .is_some();
+        capabilities.rendering.offscreen = has_public_render_target_formats;
+        capabilities.export.memory = has_public_render_target_formats;
 
         let queue_priorities = [1.0];
         let queue_create_infos = queue_families
@@ -1256,14 +1258,28 @@ impl VulkanDeviceState {
         &self,
         image: &VulkanOwnedImage,
     ) -> Result<Vec<u8>, VulkanError> {
-        let readback_size = tightly_packed_image_size(image.format(), image.extent())?;
+        self.read_image_region_to_tightly_packed_buffer(
+            image,
+            vk::Offset3D { x: 0, y: 0, z: 0 },
+            image.extent(),
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn read_image_region_to_tightly_packed_buffer(
+        &self,
+        image: &VulkanOwnedImage,
+        image_offset: vk::Offset3D,
+        extent: vk::Extent3D,
+    ) -> Result<Vec<u8>, VulkanError> {
+        let readback_size = tightly_packed_image_size(image.format(), extent)?;
         let readback_buffer =
             self.create_host_visible_buffer(readback_size, vk::BufferUsageFlags::TRANSFER_DST)?;
         let mut command_buffer = self.allocate_graphics_command_buffer()?;
 
         self.begin_command_buffer(&mut command_buffer)?;
         self.transition_image_layout(&mut command_buffer, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)?;
-        self.copy_image_to_buffer(&mut command_buffer, image, &readback_buffer, image.extent())?;
+        self.copy_image_region_to_buffer(&mut command_buffer, image, &readback_buffer, image_offset, extent)?;
         self.end_command_buffer(&mut command_buffer)?;
         self.submit_graphics_command_buffer_and_wait(&mut command_buffer)?;
 
@@ -1278,7 +1294,25 @@ impl VulkanDeviceState {
         buffer: &VulkanHostVisibleBuffer,
         extent: vk::Extent3D,
     ) -> Result<(), VulkanError> {
-        copy_image_to_buffer(command_buffer, image, buffer, extent)
+        self.copy_image_region_to_buffer(
+            command_buffer,
+            image,
+            buffer,
+            vk::Offset3D { x: 0, y: 0, z: 0 },
+            extent,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn copy_image_region_to_buffer(
+        &self,
+        command_buffer: &mut VulkanCommandBuffer,
+        image: &VulkanOwnedImage,
+        buffer: &VulkanHostVisibleBuffer,
+        image_offset: vk::Offset3D,
+        extent: vk::Extent3D,
+    ) -> Result<(), VulkanError> {
+        copy_image_region_to_buffer(command_buffer, image, buffer, image_offset, extent)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2205,10 +2239,11 @@ fn synchronize_color_attachment_load(
     Ok(())
 }
 
-fn copy_image_to_buffer(
+fn copy_image_region_to_buffer(
     command_buffer: &mut VulkanCommandBuffer,
     image: &VulkanOwnedImage,
     buffer: &VulkanHostVisibleBuffer,
+    image_offset: vk::Offset3D,
     extent: vk::Extent3D,
 ) -> Result<(), VulkanError> {
     if !image.usage().contains(vk::ImageUsageFlags::TRANSFER_SRC) {
@@ -2222,10 +2257,22 @@ fn copy_image_to_buffer(
     if extent.width == 0 || extent.height == 0 || extent.depth == 0 {
         return Err(VulkanError::UnsupportedOperation("zero-sized image copy"));
     }
+    if image_offset.x < 0 || image_offset.y < 0 || image_offset.z < 0 {
+        return Err(VulkanError::UnsupportedOperation("image copy offset"));
+    }
     let image_extent = image.extent();
-    if extent.width > image_extent.width
-        || extent.height > image_extent.height
-        || extent.depth > image_extent.depth
+    let copy_width = image_offset.x as u32;
+    let copy_height = image_offset.y as u32;
+    let copy_depth = image_offset.z as u32;
+    if copy_width
+        .checked_add(extent.width)
+        .is_none_or(|right| right > image_extent.width)
+        || copy_height
+            .checked_add(extent.height)
+            .is_none_or(|bottom| bottom > image_extent.height)
+        || copy_depth
+            .checked_add(extent.depth)
+            .is_none_or(|back| back > image_extent.depth)
     {
         return Err(VulkanError::UnsupportedOperation("image copy extent"));
     }
@@ -2251,7 +2298,7 @@ fn copy_image_to_buffer(
             base_array_layer: 0,
             layer_count: 1,
         })
-        .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+        .image_offset(image_offset)
         .image_extent(extent);
     let _pool_guard = command_buffer.command_pool.lock_host_access()?;
 

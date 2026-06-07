@@ -253,6 +253,8 @@ pub struct VulkanImportCapabilities {
 #[non_exhaustive]
 #[derive(Debug, Default, Clone)]
 pub struct VulkanExportCapabilities {
+    /// Whether same-format CPU-memory readback from offscreen framebuffers is supported.
+    pub memory: bool,
     /// Whether dmabuf export is supported.
     pub dmabuf: bool,
     /// Whether modifier-aware export is supported.

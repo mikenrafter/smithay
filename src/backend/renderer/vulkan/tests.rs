@@ -5,7 +5,8 @@ use ash::vk;
 use crate::backend::allocator::{Format, Fourcc, Modifier};
 use crate::backend::renderer::sync::Interrupted;
 use crate::backend::renderer::{
-    Bind, Color32F, DebugFlags, Frame, ImportMem, Offscreen, Renderer, Texture, sync::Fence,
+    Bind, Color32F, DebugFlags, ExportMem, Frame, ImportMem, Offscreen, Renderer, Texture, TextureMapping,
+    sync::Fence,
 };
 use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
 use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
@@ -154,6 +155,7 @@ fn vulkan_renderer_default_capabilities_are_false() {
     assert!(!caps.import.memory);
     assert!(!caps.import.dmabuf);
     assert!(!caps.import.modifiers);
+    assert!(!caps.export.memory);
     assert!(!caps.export.dmabuf);
     assert!(!caps.export.modifiers);
     assert!(!caps.rendering.offscreen);
@@ -181,6 +183,7 @@ fn wayland_protocol_capabilities_are_not_advertised_by_default() {
     assert!(!caps.import.memory);
     assert!(!caps.import.dmabuf);
     assert!(!caps.import.modifiers);
+    assert!(!caps.export.memory);
     assert!(!caps.export.dmabuf);
     assert!(!caps.export.modifiers);
     assert!(!caps.sync.explicit);
@@ -757,6 +760,7 @@ fn initialized_device_capabilities_do_not_enable_format_backed_rendering_before_
     assert!(caps.device.extensions.is_empty());
     assert!(!caps.import.memory);
     assert!(!caps.import.dmabuf);
+    assert!(!caps.export.memory);
     assert!(!caps.export.dmabuf);
     assert!(!caps.rendering.offscreen);
     assert!(!caps.rendering.blit);
@@ -826,6 +830,72 @@ fn public_bind_rejects_invalid_vulkan_targets_before_device_lookup() {
     assert!(matches!(
         Bind::bind(&mut renderer, &mut missing_image_target),
         Err(VulkanError::UnsupportedOperation("render target image"))
+    ));
+}
+
+#[test]
+fn public_export_mem_rejects_invalid_vulkan_targets_before_device_lookup() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let foreign_target = render_target_for_tests(
+        ContextId::new(),
+        VulkanImageSource::Offscreen,
+        (1, 1).into(),
+        Some(Fourcc::Abgr8888),
+    );
+    let non_offscreen_target = render_target_for_tests(
+        renderer.context_id(),
+        VulkanImageSource::Uninitialized,
+        (1, 1).into(),
+        Some(Fourcc::Abgr8888),
+    );
+    let missing_image_target = render_target_for_tests(
+        renderer.context_id(),
+        VulkanImageSource::Offscreen,
+        (1, 1).into(),
+        Some(Fourcc::Abgr8888),
+    );
+    let region = Rectangle::new((0, 0).into(), (1, 1).into());
+
+    assert!(matches!(
+        renderer.copy_framebuffer(&foreign_target, region, Fourcc::Abgr8888),
+        Err(VulkanError::UnsupportedOperation("foreign render target"))
+    ));
+    assert!(matches!(
+        renderer.copy_framebuffer(&non_offscreen_target, region, Fourcc::Abgr8888),
+        Err(VulkanError::UnsupportedOperation("render target"))
+    ));
+    assert!(matches!(
+        renderer.copy_framebuffer(&missing_image_target, region, Fourcc::Argb8888),
+        Err(VulkanError::UnsupportedFormat(Fourcc::Argb8888))
+    ));
+    assert!(matches!(
+        renderer.copy_framebuffer(&missing_image_target, region, Fourcc::Abgr8888),
+        Err(VulkanError::VulkanUnavailable)
+    ));
+}
+
+#[test]
+fn public_export_mem_rejects_texture_readback_before_device_lookup() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let foreign_texture = texture_for_tests((1, 1).into(), Some(Fourcc::Abgr8888));
+    let texture = VulkanTexture {
+        context_id: renderer.context_id(),
+        ..texture_for_tests((1, 1).into(), Some(Fourcc::Abgr8888))
+    };
+    let region = Rectangle::new((0, 0).into(), (1, 1).into());
+
+    assert!(matches!(
+        renderer.can_read_texture(&foreign_texture),
+        Err(VulkanError::UnsupportedOperation("foreign memory texture"))
+    ));
+    assert!(matches!(renderer.can_read_texture(&texture), Ok(false)));
+    assert!(matches!(
+        renderer.copy_texture(&foreign_texture, region, Fourcc::Abgr8888),
+        Err(VulkanError::UnsupportedOperation("foreign memory texture"))
+    ));
+    assert!(matches!(
+        renderer.copy_texture(&texture, region, Fourcc::Abgr8888),
+        Err(VulkanError::UnsupportedOperation("texture memory export"))
     ));
 }
 
@@ -916,6 +986,64 @@ fn memory_update_region_validation_rejects_out_of_bounds_regions() {
         super::update_region_to_vk((4, 4).into(), Rectangle::new((3, 3).into(), (2, 1).into())),
         Err(VulkanError::UnsupportedOperation("memory update region"))
     ));
+}
+
+#[test]
+fn image_region_to_vk_rejects_invalid_readback_regions() {
+    let image_size = Size::<i32, BufferCoord>::from((4, 3));
+
+    assert!(matches!(
+        super::image_region_to_vk(
+            image_size,
+            Rectangle::new((-1, 0).into(), (1, 1).into()),
+            "test region"
+        ),
+        Err(VulkanError::UnsupportedOperation("test region"))
+    ));
+    assert!(matches!(
+        super::image_region_to_vk(
+            image_size,
+            Rectangle::new((0, 0).into(), (0, 1).into()),
+            "test region"
+        ),
+        Err(VulkanError::UnsupportedOperation("test region"))
+    ));
+    assert!(matches!(
+        super::image_region_to_vk(
+            image_size,
+            Rectangle::new((3, 0).into(), (2, 1).into()),
+            "test region"
+        ),
+        Err(VulkanError::UnsupportedOperation("test region"))
+    ));
+    assert!(matches!(
+        super::image_region_to_vk(
+            image_size,
+            Rectangle::new((0, 2).into(), (1, 2).into()),
+            "test region"
+        ),
+        Err(VulkanError::UnsupportedOperation("test region"))
+    ));
+}
+
+#[test]
+fn image_region_to_vk_converts_valid_readback_regions() {
+    let (offset, extent) = super::image_region_to_vk(
+        Size::<i32, BufferCoord>::from((4, 3)),
+        Rectangle::new((1, 1).into(), (2, 1).into()),
+        "test region",
+    )
+    .unwrap();
+
+    assert_eq!(offset, vk::Offset3D { x: 1, y: 1, z: 0 });
+    assert_eq!(
+        extent,
+        vk::Extent3D {
+            width: 2,
+            height: 1,
+            depth: 1,
+        }
+    );
 }
 
 #[test]
@@ -2358,6 +2486,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         caps.formats.memory_import.iter().next().is_some()
     );
     assert!(!caps.import.dmabuf);
+    assert_eq!(caps.export.memory, caps.rendering.offscreen);
     assert!(!caps.export.dmabuf);
     assert!(caps.rendering.offscreen);
     assert!(!caps.rendering.blit);
@@ -2449,6 +2578,19 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL
         );
         assert_eq!(readback, [51, 102, 153, 255].repeat(4));
+        let public_readback = renderer
+            .copy_framebuffer(
+                &target,
+                Rectangle::new((1, 0).into(), (1, 2).into()),
+                offscreen_format,
+            )
+            .unwrap();
+        assert_eq!(public_readback.width(), 1);
+        assert_eq!(public_readback.height(), 2);
+        assert_eq!(Texture::format(&public_readback), Some(offscreen_format));
+        assert!(!public_readback.flipped());
+        let public_readback_data = renderer.map_texture(&public_readback).unwrap();
+        assert_eq!(public_readback_data, [51, 102, 153, 255].repeat(2));
         {
             let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((2, 2)))];
             let renderer_context = renderer.context_id();
@@ -2466,6 +2608,17 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         assert_eq!(target.image.layout, VulkanImageLayoutState::ColorAttachment);
         let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
         assert_eq!(readback, [255, 0, 0, 255].repeat(4));
+        let public_readback = renderer
+            .copy_framebuffer(
+                &target,
+                Rectangle::new((0, 0).into(), (2, 1).into()),
+                offscreen_format,
+            )
+            .unwrap();
+        assert_eq!(
+            renderer.map_texture(&public_readback).unwrap(),
+            [255, 0, 0, 255].repeat(2)
+        );
         Some(target)
     } else {
         None
