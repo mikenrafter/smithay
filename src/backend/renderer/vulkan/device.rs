@@ -538,6 +538,22 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn create_dmabuf_sampled_image_resources(
+        &self,
+        dmabuf: &Dmabuf,
+        min_filter: TextureFilter,
+        mag_filter: TextureFilter,
+    ) -> Result<Option<VulkanSampledImage>, VulkanError> {
+        let Some(image) = self.create_bound_dmabuf_import_image(dmabuf)? else {
+            return Ok(None);
+        };
+        let view = self.create_image_view(&image)?;
+        let sampler = self.create_sampler(min_filter, mag_filter)?;
+
+        Ok(Some(VulkanSampledImage { sampler, view, image }))
+    }
+
+    #[allow(dead_code)]
     pub(super) fn allocate_transfer_command_buffer(&self) -> Result<VulkanCommandBuffer, VulkanError> {
         self.logical_device
             .as_ref()

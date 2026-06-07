@@ -213,6 +213,29 @@ impl VulkanRenderer {
     }
 
     #[allow(dead_code)]
+    fn create_imported_dmabuf_texture(
+        &mut self,
+        dmabuf: &Dmabuf,
+    ) -> Result<Option<VulkanTexture>, VulkanError> {
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+        let import = image::VulkanDmabufImportState::from_dmabuf(dmabuf)?;
+        let Some(sampled_image) = device.create_dmabuf_sampled_image_resources(
+            dmabuf,
+            self.downscale_filter,
+            self.upscale_filter,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(VulkanTexture::from_dmabuf_sampled_image(
+            self.context_id.clone(),
+            &import,
+            sampled_image,
+        )))
+    }
+
+    #[allow(dead_code)]
     fn clear_offscreen_render_target(
         &mut self,
         target: &mut VulkanRenderTarget<'_>,

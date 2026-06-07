@@ -28,8 +28,8 @@ use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
     VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalMemoryHandleType, VulkanExternalMemoryState,
     VulkanImageLayoutState, VulkanImageSource, VulkanImageState, VulkanImageSyncState, VulkanImageUsage,
-    clear_damage_to_clear_areas, damage_to_scissor_areas, draw_solid_damage_to_clear_areas,
-    render_texture_damage_to_scissor_areas, source_to_uv_rect,
+    clear_damage_to_clear_areas, damage_to_scissor_areas, dmabuf_import_image_state,
+    draw_solid_damage_to_clear_areas, render_texture_damage_to_scissor_areas, source_to_uv_rect,
 };
 use super::*;
 
@@ -546,6 +546,35 @@ fn dmabuf_external_image_format_query_is_disabled_without_prerequisites() {
             .unwrap()
             .is_none()
     );
+    assert!(
+        device
+            .create_dmabuf_sampled_image_resources(&dmabuf, TextureFilter::Linear, TextureFilter::Nearest)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn dmabuf_import_image_state_tracks_sampled_dmabuf_without_advertising_renderability() {
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::Y_INVERT,
+        &[(0, 0, 16)],
+    );
+    let import = VulkanDmabufImportState::from_dmabuf(&dmabuf).unwrap();
+    let image = dmabuf_import_image_state(&import);
+
+    assert_eq!(image.size, (4, 3).into());
+    assert_eq!(image.format, Some(Fourcc::Abgr8888));
+    assert_eq!(image.source, VulkanImageSource::DmabufImport);
+    assert!(image.usage.sampled);
+    assert!(!image.usage.transfer_dst);
+    assert!(!image.usage.color_attachment);
+    assert_eq!(image.layout, VulkanImageLayoutState::Undefined);
+    assert_eq!(image.sync, VulkanImageSyncState::default());
+    assert!(import.y_inverted);
 }
 
 #[test]
