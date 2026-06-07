@@ -240,6 +240,7 @@ fn vulkan_renderer_default_capabilities_are_false() {
     assert!(!caps.external_memory.dmabuf_external_memory);
     assert!(!caps.external_memory.external_memory_fd);
     assert!(!caps.external_memory.drm_format_modifiers);
+    assert!(!caps.external_memory.foreign_queue_family);
     assert!(!caps.external_memory.image_format_list);
     assert!(!caps.external_memory.prerequisites_available);
 }
@@ -297,6 +298,7 @@ fn external_memory_capability_discovery_tracks_prerequisites_without_advertising
         ext::external_memory_dma_buf::NAME,
         khr::external_memory_fd::NAME,
         ext::image_drm_format_modifier::NAME,
+        ext::queue_family_foreign::NAME,
         khr::image_format_list::NAME,
     ];
     let caps =
@@ -307,6 +309,7 @@ fn external_memory_capability_discovery_tracks_prerequisites_without_advertising
     assert!(caps.dmabuf_external_memory);
     assert!(caps.external_memory_fd);
     assert!(caps.drm_format_modifiers);
+    assert!(caps.foreign_queue_family);
     assert!(caps.image_format_list);
     assert!(caps.prerequisites_available);
 
@@ -328,6 +331,7 @@ fn external_memory_capability_discovery_requires_modifier_dependency() {
         ext::external_memory_dma_buf::NAME,
         khr::external_memory_fd::NAME,
         ext::image_drm_format_modifier::NAME,
+        ext::queue_family_foreign::NAME,
     ];
     let caps =
         VulkanExternalMemoryCapabilities::from_device_extension_support(Version::VERSION_1_1, |name| {
@@ -345,6 +349,23 @@ fn external_memory_capability_discovery_requires_modifier_dependency() {
 }
 
 #[test]
+fn external_memory_capability_discovery_requires_foreign_queue_family() {
+    let supported = [
+        ext::external_memory_dma_buf::NAME,
+        khr::external_memory_fd::NAME,
+        ext::image_drm_format_modifier::NAME,
+        khr::image_format_list::NAME,
+    ];
+    let caps =
+        VulkanExternalMemoryCapabilities::from_device_extension_support(Version::VERSION_1_1, |name| {
+            supported.iter().any(|supported| *supported == name)
+        });
+
+    assert!(!caps.foreign_queue_family);
+    assert!(!caps.prerequisites_available);
+}
+
+#[test]
 fn external_memory_required_device_extensions_track_api_version_dependencies() {
     assert_eq!(
         VulkanExternalMemoryCapabilities::required_device_extensions(Version::VERSION_1_1),
@@ -352,6 +373,7 @@ fn external_memory_required_device_extensions_track_api_version_dependencies() {
             ext::external_memory_dma_buf::NAME,
             khr::external_memory_fd::NAME,
             ext::image_drm_format_modifier::NAME,
+            ext::queue_family_foreign::NAME,
             khr::image_format_list::NAME,
         ]
     );
@@ -361,6 +383,7 @@ fn external_memory_required_device_extensions_track_api_version_dependencies() {
             ext::external_memory_dma_buf::NAME,
             khr::external_memory_fd::NAME,
             ext::image_drm_format_modifier::NAME,
+            ext::queue_family_foreign::NAME,
         ]
     );
 }
@@ -384,6 +407,7 @@ fn drm_modifier_queries_require_full_external_memory_prerequisites() {
         dmabuf_external_memory: true,
         external_memory_fd: true,
         drm_format_modifiers: true,
+        foreign_queue_family: true,
         image_format_list: true,
         prerequisites_available: true,
     };

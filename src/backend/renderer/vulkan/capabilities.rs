@@ -228,6 +228,7 @@ pub(super) fn should_query_modifier_properties(external_memory: &VulkanExternalM
         && external_memory.dmabuf_external_memory
         && external_memory.external_memory_fd
         && external_memory.drm_format_modifiers
+        && external_memory.foreign_queue_family
         && external_memory.image_format_list
 }
 
@@ -313,6 +314,8 @@ pub struct VulkanExternalMemoryCapabilities {
     pub external_memory_fd: bool,
     /// Whether `VK_EXT_image_drm_format_modifier` is supported.
     pub drm_format_modifiers: bool,
+    /// Whether `VK_EXT_queue_family_foreign` is supported for foreign producer ownership transfer.
+    pub foreign_queue_family: bool,
     /// Whether `VK_KHR_image_format_list` is available, either as Vulkan 1.2 core or as an extension.
     pub image_format_list: bool,
     /// Whether the known renderer dmabuf external-memory prerequisites are all available.
@@ -326,6 +329,7 @@ impl VulkanExternalMemoryCapabilities {
             ext::external_memory_dma_buf::NAME,
             khr::external_memory_fd::NAME,
             ext::image_drm_format_modifier::NAME,
+            ext::queue_family_foreign::NAME,
         ];
 
         if api_version < Version::VERSION_1_2 {
@@ -348,15 +352,20 @@ impl VulkanExternalMemoryCapabilities {
         let dmabuf_external_memory = has_device_extension(ext::external_memory_dma_buf::NAME);
         let external_memory_fd = has_device_extension(khr::external_memory_fd::NAME);
         let drm_format_modifiers = has_device_extension(ext::image_drm_format_modifier::NAME);
+        let foreign_queue_family = has_device_extension(ext::queue_family_foreign::NAME);
         let image_format_list =
             api_version >= Version::VERSION_1_2 || has_device_extension(khr::image_format_list::NAME);
-        let prerequisites_available =
-            dmabuf_external_memory && external_memory_fd && drm_format_modifiers && image_format_list;
+        let prerequisites_available = dmabuf_external_memory
+            && external_memory_fd
+            && drm_format_modifiers
+            && foreign_queue_family
+            && image_format_list;
 
         Self {
             dmabuf_external_memory,
             external_memory_fd,
             drm_format_modifiers,
+            foreign_queue_family,
             image_format_list,
             prerequisites_available,
         }
