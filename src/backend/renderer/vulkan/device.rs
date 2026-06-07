@@ -19,7 +19,10 @@ use crate::backend::{
 use super::{
     VulkanError, VulkanRendererCapabilities,
     format::get_render_vk_format,
-    image::{VulkanDmabufImportState, VulkanExternalImageOwnership, VulkanImageSyncState},
+    image::{
+        VulkanDmabufImportState, VulkanExternalImageOwnership, VulkanExternalMemoryHandleType,
+        VulkanImageSyncState,
+    },
 };
 
 const SAMPLED_TEXTURE_DRAW_CONSTANT_SIZE: u32 = 32;
@@ -452,6 +455,7 @@ impl VulkanDeviceState {
             extent,
             format: vk_format,
             usage: vk::ImageUsageFlags::SAMPLED,
+            external_memory_handle_type: Some(VulkanExternalMemoryHandleType::Dmabuf),
         };
         // SAFETY: `unbound.image` was just created from `unbound.logical_device`, has not been
         // destroyed, and the call only queries requirements for that image. No memory has been bound
@@ -585,6 +589,7 @@ impl VulkanDeviceState {
         &self,
         command_buffer: &mut VulkanCommandBuffer,
     ) -> Result<(), VulkanError> {
+        ensure_command_buffer_recording(command_buffer)?;
         let _pool_guard = command_buffer.command_pool.lock_host_access()?;
 
         unsafe {
@@ -594,7 +599,10 @@ impl VulkanDeviceState {
                 .handle()
                 .end_command_buffer(command_buffer.handle)
         }
-        .map_err(VulkanError::from)
+        .map_err(VulkanError::from)?;
+
+        command_buffer.state = VulkanCommandBufferState::Executable;
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -1816,6 +1824,7 @@ fn allocate_command_buffer(
     Ok(VulkanCommandBuffer {
         command_pool: Arc::clone(command_pool),
         handle,
+        state: VulkanCommandBufferState::Initial,
         pending_image_layouts: Vec::new(),
         referenced_buffers: Vec::new(),
         referenced_images: Vec::new(),
@@ -1823,6 +1832,10 @@ fn allocate_command_buffer(
 }
 
 fn begin_command_buffer(command_buffer: &mut VulkanCommandBuffer) -> Result<(), VulkanError> {
+    if command_buffer.state != VulkanCommandBufferState::Initial {
+        return Err(VulkanError::UnsupportedOperation("command buffer recording"));
+    }
+
     let _pool_guard = command_buffer.command_pool.lock_host_access()?;
     command_buffer.pending_image_layouts.clear();
     command_buffer.referenced_buffers.clear();
@@ -1837,7 +1850,26 @@ fn begin_command_buffer(command_buffer: &mut VulkanCommandBuffer) -> Result<(), 
             .handle()
             .begin_command_buffer(command_buffer.handle, &begin_info)
     }
-    .map_err(VulkanError::from)
+    .map_err(VulkanError::from)?;
+
+    command_buffer.state = VulkanCommandBufferState::Recording;
+    Ok(())
+}
+
+fn ensure_command_buffer_recording(command_buffer: &VulkanCommandBuffer) -> Result<(), VulkanError> {
+    if command_buffer.is_recording() {
+        Ok(())
+    } else {
+        Err(VulkanError::UnsupportedOperation("command buffer recording"))
+    }
+}
+
+fn ensure_command_buffer_executable(command_buffer: &VulkanCommandBuffer) -> Result<(), VulkanError> {
+    if command_buffer.state == VulkanCommandBufferState::Executable {
+        Ok(())
+    } else {
+        Err(VulkanError::UnsupportedOperation("command buffer executable"))
+    }
 }
 
 fn submit_command_buffer_and_wait(
@@ -1845,6 +1877,7 @@ fn submit_command_buffer_and_wait(
     queue: &VulkanQueue,
     command_buffer: &mut VulkanCommandBuffer,
 ) -> Result<(), VulkanError> {
+    ensure_command_buffer_executable(command_buffer)?;
     if command_buffer.queue_family_index() != queue.queue_family_index() {
         return Err(VulkanError::UnsupportedOperation("command buffer queue family"));
     }
@@ -1855,7 +1888,7 @@ fn submit_command_buffer_and_wait(
     let command_buffers = [command_buffer.handle];
     let submit_infos = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
 
-    let result = command_buffer
+    let submit_result = command_buffer
         .command_pool
         .lock_host_access()
         .and_then(|_pool_guard| {
@@ -1867,15 +1900,21 @@ fn submit_command_buffer_and_wait(
                 }
                 .map_err(VulkanError::from)
             })
-        })
-        .and_then(|_| {
-            unsafe { logical_device.handle().wait_for_fences(&[fence], true, u64::MAX) }
-                .map_err(VulkanError::from)
         });
+
+    if let Err(err) = submit_result {
+        unsafe { logical_device.handle().destroy_fence(fence, None) };
+        return Err(err);
+    }
+
+    command_buffer.state = VulkanCommandBufferState::Submitted;
+    let wait_result = unsafe { logical_device.handle().wait_for_fences(&[fence], true, u64::MAX) }
+        .map_err(VulkanError::from);
 
     unsafe { logical_device.handle().destroy_fence(fence, None) };
 
-    result.and_then(|_| command_buffer.commit_pending_image_layouts())
+    wait_result?;
+    command_buffer.commit_pending_image_layouts()
 }
 
 fn transition_image_layout(
@@ -1883,6 +1922,7 @@ fn transition_image_layout(
     image: &VulkanOwnedImage,
     new_layout: vk::ImageLayout,
 ) -> Result<(), VulkanError> {
+    ensure_command_buffer_recording(command_buffer)?;
     let old_layout = command_buffer
         .pending_layout_for(image)?
         .unwrap_or(image.layout()?);
@@ -1964,6 +2004,7 @@ fn copy_buffer_region_to_image(
     image_offset: vk::Offset3D,
     extent: vk::Extent3D,
 ) -> Result<(), VulkanError> {
+    ensure_command_buffer_recording(command_buffer)?;
     if !buffer.usage().contains(vk::BufferUsageFlags::TRANSFER_SRC) {
         return Err(VulkanError::UnsupportedOperation("buffer transfer source usage"));
     }
@@ -2054,6 +2095,7 @@ fn clear_color_image(
     image: &VulkanOwnedImage,
     color: vk::ClearColorValue,
 ) -> Result<(), VulkanError> {
+    ensure_command_buffer_recording(command_buffer)?;
     if !image.usage().contains(vk::ImageUsageFlags::TRANSFER_DST) {
         return Err(VulkanError::UnsupportedOperation(
             "image transfer destination usage",
@@ -2102,6 +2144,7 @@ fn record_color_attachment_clear(
     framebuffer: &VulkanFramebuffer,
     color: vk::ClearColorValue,
 ) -> Result<(), VulkanError> {
+    ensure_command_buffer_recording(command_buffer)?;
     if !image.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
         return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
     }
@@ -2154,6 +2197,7 @@ fn record_color_attachment_clear_rects(
     color: vk::ClearColorValue,
     clear_areas: &[vk::Rect2D],
 ) -> Result<(), VulkanError> {
+    ensure_command_buffer_recording(command_buffer)?;
     if clear_areas.is_empty() {
         return Ok(());
     }
@@ -2220,6 +2264,7 @@ fn record_sampled_texture_draw(
     framebuffer: &VulkanFramebuffer,
     draw_constants: VulkanSampledTextureDrawConstants,
 ) -> Result<(), VulkanError> {
+    ensure_command_buffer_recording(command_buffer)?;
     if !target.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
         return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
     }
@@ -2320,6 +2365,7 @@ fn record_solid_color_draw(
     framebuffer: &VulkanFramebuffer,
     draw_constants: VulkanSolidColorDrawConstants,
 ) -> Result<(), VulkanError> {
+    ensure_command_buffer_recording(command_buffer)?;
     if !target.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
         return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
     }
@@ -2556,6 +2602,7 @@ fn synchronize_color_attachment_load(
     command_buffer: &mut VulkanCommandBuffer,
     image: &VulkanOwnedImage,
 ) -> Result<(), VulkanError> {
+    ensure_command_buffer_recording(command_buffer)?;
     if !image.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
         return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
     }
@@ -2615,6 +2662,7 @@ fn copy_image_region_to_buffer(
     image_offset: vk::Offset3D,
     extent: vk::Extent3D,
 ) -> Result<(), VulkanError> {
+    ensure_command_buffer_recording(command_buffer)?;
     if !image.usage().contains(vk::ImageUsageFlags::TRANSFER_SRC) {
         return Err(VulkanError::UnsupportedOperation("image transfer source usage"));
     }
@@ -3324,6 +3372,7 @@ fn create_bound_image(
             extent,
             format,
             usage,
+            external_memory_handle_type: None,
             layout: Mutex::new(vk::ImageLayout::UNDEFINED),
         }),
     })
@@ -3526,9 +3575,18 @@ impl Drop for VulkanCommandPool {
 pub(crate) struct VulkanCommandBuffer {
     command_pool: Arc<VulkanCommandPool>,
     handle: vk::CommandBuffer,
+    state: VulkanCommandBufferState,
     pending_image_layouts: Vec<VulkanPendingImageLayout>,
     referenced_buffers: Vec<Arc<VulkanHostVisibleBufferInner>>,
     referenced_images: Vec<Arc<VulkanOwnedImageInner>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VulkanCommandBufferState {
+    Initial,
+    Recording,
+    Executable,
+    Submitted,
 }
 
 #[allow(dead_code)]
@@ -3539,6 +3597,20 @@ impl VulkanCommandBuffer {
 
     pub(super) fn queue_family_index(&self) -> u32 {
         self.command_pool.queue_family_index()
+    }
+
+    pub(super) fn is_recording(&self) -> bool {
+        self.state == VulkanCommandBufferState::Recording
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_executable_for_tests(&self) -> bool {
+        self.state == VulkanCommandBufferState::Executable
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_submitted_for_tests(&self) -> bool {
+        self.state == VulkanCommandBufferState::Submitted
     }
 
     #[allow(dead_code)]
@@ -3624,6 +3696,7 @@ pub(crate) struct VulkanUnboundImage {
     extent: vk::Extent3D,
     format: vk::Format,
     usage: vk::ImageUsageFlags,
+    external_memory_handle_type: Option<VulkanExternalMemoryHandleType>,
 }
 
 /// Shared owned image resource kept alive by command buffers that reference it.
@@ -3636,6 +3709,7 @@ struct VulkanOwnedImageInner {
     extent: vk::Extent3D,
     format: vk::Format,
     usage: vk::ImageUsageFlags,
+    external_memory_handle_type: Option<VulkanExternalMemoryHandleType>,
     layout: Mutex<vk::ImageLayout>,
 }
 
@@ -3659,6 +3733,10 @@ impl VulkanOwnedImage {
 
     pub(super) fn usage(&self) -> vk::ImageUsageFlags {
         self.inner.usage
+    }
+
+    pub(super) fn external_memory_handle_type(&self) -> Option<VulkanExternalMemoryHandleType> {
+        self.inner.external_memory_handle_type
     }
 
     pub(super) fn layout(&self) -> Result<vk::ImageLayout, VulkanError> {
@@ -3704,6 +3782,7 @@ impl VulkanUnboundImage {
                 extent: this.extent,
                 format: this.format,
                 usage: this.usage,
+                external_memory_handle_type: this.external_memory_handle_type,
                 layout: Mutex::new(vk::ImageLayout::UNDEFINED),
             }),
         }

@@ -3158,6 +3158,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert!(owned_image.usage().contains(vk::ImageUsageFlags::TRANSFER_DST));
     assert!(owned_image.usage().contains(vk::ImageUsageFlags::SAMPLED));
     assert_eq!(owned_image.layout().unwrap(), vk::ImageLayout::UNDEFINED);
+    assert_eq!(owned_image.external_memory_handle_type(), None);
     assert!(matches!(
         device.create_bound_image(
             vk::Extent3D {
@@ -3196,6 +3197,33 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert_ne!(transfer_command_buffer.handle(), vk::CommandBuffer::null());
     assert_eq!(graphics_command_buffer.queue_family_index(), graphics_family);
     assert_eq!(transfer_command_buffer.queue_family_index(), transfer_family);
+    assert!(matches!(
+        device.transition_image_layout(
+            &mut graphics_command_buffer,
+            &owned_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        ),
+        Err(VulkanError::UnsupportedOperation("command buffer recording"))
+    ));
+    assert!(matches!(
+        device.end_command_buffer(&mut transfer_command_buffer),
+        Err(VulkanError::UnsupportedOperation("command buffer recording"))
+    ));
+    assert!(!graphics_command_buffer.is_recording());
+    assert!(matches!(
+        device.submit_transfer_command_buffer_and_wait(&mut transfer_command_buffer),
+        Err(VulkanError::UnsupportedOperation("command buffer executable"))
+    ));
+    device.begin_command_buffer(&mut graphics_command_buffer).unwrap();
+    assert!(graphics_command_buffer.is_recording());
+    assert!(matches!(
+        device.begin_command_buffer(&mut graphics_command_buffer),
+        Err(VulkanError::UnsupportedOperation("command buffer recording"))
+    ));
+    assert!(matches!(
+        device.submit_graphics_command_buffer_and_wait(&mut graphics_command_buffer),
+        Err(VulkanError::UnsupportedOperation("command buffer executable"))
+    ));
     if graphics_family != transfer_family {
         let mut wrong_family_command_buffer = device.allocate_transfer_command_buffer().unwrap();
         device
@@ -3209,7 +3237,6 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
             Err(VulkanError::UnsupportedOperation("command buffer queue family"))
         ));
     }
-    device.begin_command_buffer(&mut graphics_command_buffer).unwrap();
     assert!(matches!(
         device.copy_buffer_to_image(
             &mut graphics_command_buffer,
@@ -3252,9 +3279,20 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         .unwrap();
     assert_eq!(owned_image.layout().unwrap(), vk::ImageLayout::UNDEFINED);
     device.end_command_buffer(&mut graphics_command_buffer).unwrap();
+    assert!(!graphics_command_buffer.is_recording());
+    assert!(graphics_command_buffer.is_executable_for_tests());
+    assert!(matches!(
+        device.end_command_buffer(&mut graphics_command_buffer),
+        Err(VulkanError::UnsupportedOperation("command buffer recording"))
+    ));
     device
         .submit_graphics_command_buffer_and_wait(&mut graphics_command_buffer)
         .unwrap();
+    assert!(graphics_command_buffer.is_submitted_for_tests());
+    assert!(matches!(
+        device.submit_graphics_command_buffer_and_wait(&mut graphics_command_buffer),
+        Err(VulkanError::UnsupportedOperation("command buffer executable"))
+    ));
     assert_eq!(
         owned_image.layout().unwrap(),
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
