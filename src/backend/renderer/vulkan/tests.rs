@@ -900,6 +900,26 @@ fn public_export_mem_rejects_texture_readback_before_device_lookup() {
 }
 
 #[test]
+fn vulkan_memory_mapping_reports_readback_metadata() {
+    let mapping = VulkanMemoryMapping {
+        data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        size: Size::from((2, 1)),
+        format: Fourcc::Abgr8888,
+        flipped: false,
+    };
+
+    assert_eq!(mapping.width(), 2);
+    assert_eq!(mapping.height(), 1);
+    assert_eq!(mapping.size(), Size::from((2, 1)));
+    assert_eq!(Texture::format(&mapping), Some(Fourcc::Abgr8888));
+    assert_eq!(TextureMapping::format(&mapping), Fourcc::Abgr8888);
+    assert!(!mapping.flipped());
+
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    assert_eq!(renderer.map_texture(&mapping).unwrap(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+}
+
+#[test]
 fn public_bind_supported_formats_match_probed_render_targets() {
     let renderer = VulkanRenderer::new_scaffold_for_tests();
     let formats = <VulkanRenderer as Bind<VulkanRenderTarget<'static>>>::supported_formats(&renderer)
@@ -1020,6 +1040,22 @@ fn image_region_to_vk_rejects_invalid_readback_regions() {
         super::image_region_to_vk(
             image_size,
             Rectangle::new((0, 2).into(), (1, 2).into()),
+            "test region"
+        ),
+        Err(VulkanError::UnsupportedOperation("test region"))
+    ));
+    assert!(matches!(
+        super::image_region_to_vk(
+            Size::<i32, BufferCoord>::from((i32::MAX, 1)),
+            Rectangle::new((i32::MAX, 0).into(), (1, 1).into()),
+            "test region"
+        ),
+        Err(VulkanError::UnsupportedOperation("test region"))
+    ));
+    assert!(matches!(
+        super::image_region_to_vk(
+            Size::<i32, BufferCoord>::from((1, i32::MAX)),
+            Rectangle::new((0, i32::MAX).into(), (1, 1).into()),
             "test region"
         ),
         Err(VulkanError::UnsupportedOperation("test region"))
