@@ -21,7 +21,8 @@ use super::capabilities::{
 use super::device::{
     VulkanDeviceState, VulkanDmabufExternalImageFormatProperties, VulkanSampledTexturePipelineShaders,
     VulkanShaderSpirv, dmabuf_import_memory_type_bits, dmabuf_plane_layouts, find_memory_type_index,
-    image_copy_buffer_offset, image_copy_required_size, image_layout_transition, select_queue_families,
+    image_copy_buffer_offset, image_copy_required_size, image_layout_transition,
+    sampled_dmabuf_foreign_acquire_barrier, sampled_dmabuf_foreign_release_barrier, select_queue_families,
     tightly_packed_image_size, vulkan_filter,
 };
 use super::error::vulkan_api_result_invalidates_context;
@@ -917,6 +918,70 @@ fn image_layout_transition_requires_matching_image_usage() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
+    let usage = vk::ImageUsageFlags::SAMPLED;
+
+    assert!(matches!(
+        sampled_dmabuf_foreign_acquire_barrier(vk::ImageLayout::UNDEFINED, 0, usage),
+        Err(VulkanError::UnsupportedOperation("dmabuf external layout"))
+    ));
+    assert!(matches!(
+        sampled_dmabuf_foreign_acquire_barrier(vk::ImageLayout::PREINITIALIZED, 0, usage),
+        Err(VulkanError::UnsupportedOperation("dmabuf external layout"))
+    ));
+    assert!(matches!(
+        sampled_dmabuf_foreign_acquire_barrier(
+            vk::ImageLayout::GENERAL,
+            0,
+            vk::ImageUsageFlags::TRANSFER_DST,
+        ),
+        Err(VulkanError::UnsupportedOperation("image sampled usage"))
+    ));
+    assert!(matches!(
+        sampled_dmabuf_foreign_release_barrier(vk::QUEUE_FAMILY_FOREIGN_EXT, usage),
+        Err(VulkanError::UnsupportedOperation("dmabuf queue family"))
+    ));
+    assert!(matches!(
+        sampled_dmabuf_foreign_release_barrier(0, vk::ImageUsageFlags::TRANSFER_DST),
+        Err(VulkanError::UnsupportedOperation("image sampled usage"))
+    ));
+    for special_queue_family in [
+        vk::QUEUE_FAMILY_IGNORED,
+        vk::QUEUE_FAMILY_EXTERNAL,
+        vk::QUEUE_FAMILY_FOREIGN_EXT,
+    ] {
+        assert!(matches!(
+            sampled_dmabuf_foreign_acquire_barrier(vk::ImageLayout::GENERAL, special_queue_family, usage),
+            Err(VulkanError::UnsupportedOperation("dmabuf queue family"))
+        ));
+        assert!(matches!(
+            sampled_dmabuf_foreign_release_barrier(special_queue_family, usage),
+            Err(VulkanError::UnsupportedOperation("dmabuf queue family"))
+        ));
+    }
+
+    let acquire = sampled_dmabuf_foreign_acquire_barrier(vk::ImageLayout::GENERAL, 2, usage).unwrap();
+    assert_eq!(acquire.src_stage, vk::PipelineStageFlags::TOP_OF_PIPE);
+    assert_eq!(acquire.dst_stage, vk::PipelineStageFlags::FRAGMENT_SHADER);
+    assert_eq!(acquire.src_access, vk::AccessFlags::empty());
+    assert_eq!(acquire.dst_access, vk::AccessFlags::SHADER_READ);
+    assert_eq!(acquire.old_layout, vk::ImageLayout::GENERAL);
+    assert_eq!(acquire.new_layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    assert_eq!(acquire.src_queue_family_index, vk::QUEUE_FAMILY_FOREIGN_EXT);
+    assert_eq!(acquire.dst_queue_family_index, 2);
+
+    let release = sampled_dmabuf_foreign_release_barrier(2, usage).unwrap();
+    assert_eq!(release.src_stage, vk::PipelineStageFlags::FRAGMENT_SHADER);
+    assert_eq!(release.dst_stage, vk::PipelineStageFlags::BOTTOM_OF_PIPE);
+    assert_eq!(release.src_access, vk::AccessFlags::SHADER_READ);
+    assert_eq!(release.dst_access, vk::AccessFlags::empty());
+    assert_eq!(release.old_layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    assert_eq!(release.new_layout, vk::ImageLayout::GENERAL);
+    assert_eq!(release.src_queue_family_index, 2);
+    assert_eq!(release.dst_queue_family_index, vk::QUEUE_FAMILY_FOREIGN_EXT);
 }
 
 #[test]

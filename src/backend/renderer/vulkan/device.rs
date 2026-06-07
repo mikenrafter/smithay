@@ -2689,6 +2689,78 @@ pub(super) struct VulkanLayoutTransition {
     dst_access: vk::AccessFlags,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct VulkanExternalImageBarrier {
+    pub(super) src_stage: vk::PipelineStageFlags,
+    pub(super) dst_stage: vk::PipelineStageFlags,
+    pub(super) src_access: vk::AccessFlags,
+    pub(super) dst_access: vk::AccessFlags,
+    pub(super) old_layout: vk::ImageLayout,
+    pub(super) new_layout: vk::ImageLayout,
+    pub(super) src_queue_family_index: u32,
+    pub(super) dst_queue_family_index: u32,
+}
+
+#[allow(dead_code)]
+pub(super) fn sampled_dmabuf_foreign_acquire_barrier(
+    external_layout: vk::ImageLayout,
+    graphics_queue_family: u32,
+    usage: vk::ImageUsageFlags,
+) -> Result<VulkanExternalImageBarrier, VulkanError> {
+    if !usage.contains(vk::ImageUsageFlags::SAMPLED) {
+        return Err(VulkanError::UnsupportedOperation("image sampled usage"));
+    }
+    if !is_local_queue_family_index(graphics_queue_family) {
+        return Err(VulkanError::UnsupportedOperation("dmabuf queue family"));
+    }
+    if external_layout != vk::ImageLayout::GENERAL {
+        return Err(VulkanError::UnsupportedOperation("dmabuf external layout"));
+    }
+
+    Ok(VulkanExternalImageBarrier {
+        src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+        dst_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
+        src_access: vk::AccessFlags::empty(),
+        dst_access: vk::AccessFlags::SHADER_READ,
+        old_layout: vk::ImageLayout::GENERAL,
+        new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        src_queue_family_index: vk::QUEUE_FAMILY_FOREIGN_EXT,
+        dst_queue_family_index: graphics_queue_family,
+    })
+}
+
+#[allow(dead_code)]
+pub(super) fn sampled_dmabuf_foreign_release_barrier(
+    graphics_queue_family: u32,
+    usage: vk::ImageUsageFlags,
+) -> Result<VulkanExternalImageBarrier, VulkanError> {
+    if !usage.contains(vk::ImageUsageFlags::SAMPLED) {
+        return Err(VulkanError::UnsupportedOperation("image sampled usage"));
+    }
+    if !is_local_queue_family_index(graphics_queue_family) {
+        return Err(VulkanError::UnsupportedOperation("dmabuf queue family"));
+    }
+
+    Ok(VulkanExternalImageBarrier {
+        src_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
+        dst_stage: vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+        src_access: vk::AccessFlags::SHADER_READ,
+        dst_access: vk::AccessFlags::empty(),
+        old_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        new_layout: vk::ImageLayout::GENERAL,
+        src_queue_family_index: graphics_queue_family,
+        dst_queue_family_index: vk::QUEUE_FAMILY_FOREIGN_EXT,
+    })
+}
+
+#[allow(dead_code)]
+fn is_local_queue_family_index(queue_family: u32) -> bool {
+    queue_family != vk::QUEUE_FAMILY_IGNORED
+        && queue_family != vk::QUEUE_FAMILY_EXTERNAL
+        && queue_family != vk::QUEUE_FAMILY_FOREIGN_EXT
+}
+
 pub(super) fn image_layout_transition(
     old_layout: vk::ImageLayout,
     new_layout: vk::ImageLayout,
