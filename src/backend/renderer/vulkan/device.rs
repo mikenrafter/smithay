@@ -1,13 +1,17 @@
 use std::{
     collections::HashMap,
     ffi::c_void,
-    fmt, ptr,
+    fmt,
+    mem::ManuallyDrop,
+    os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+    ptr,
     sync::{Arc, Mutex, MutexGuard},
 };
 
 use ash::{ext, khr, vk};
 
 use crate::backend::{
+    allocator::dmabuf::Dmabuf,
     renderer::TextureFilter,
     vulkan::{Instance, PhysicalDevice},
 };
@@ -457,6 +461,80 @@ impl VulkanDeviceState {
             memory_requirements,
             candidate,
         }))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn create_bound_dmabuf_import_image(
+        &self,
+        dmabuf: &Dmabuf,
+    ) -> Result<Option<VulkanOwnedImage>, VulkanError> {
+        let import = VulkanDmabufImportState::from_dmabuf(dmabuf)?;
+        let Some(fd) = single_plane_dmabuf_fd(dmabuf)? else {
+            return Ok(None);
+        };
+        let Some(import_image) = self.create_dmabuf_import_image(&import)? else {
+            return Ok(None);
+        };
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+        let memory_properties = self
+            .memory_properties
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing memory properties".to_owned()))?;
+        let external_memory_fns = self
+            .external_memory_fns
+            .as_ref()
+            .ok_or(VulkanError::ExternalMemoryUnsupported)?;
+
+        let mut fd_properties = vk::MemoryFdPropertiesKHR::default();
+        // SAFETY: `external_memory_fns` was loaded only when VK_KHR_external_memory_fd was enabled
+        // on this live device. `fd` is a live duplicated dmabuf file descriptor for the duration of
+        // the call, and the output pointer refers to stack storage.
+        unsafe {
+            external_memory_fns.external_memory_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                fd.as_raw_fd(),
+                &mut fd_properties,
+            )
+        }
+        .map_err(VulkanError::from)?;
+
+        let memory_type_bits = dmabuf_import_memory_type_bits(
+            import_image.memory_requirements.memory_type_bits,
+            fd_properties.memory_type_bits,
+        );
+        let memory_type_index = find_memory_type_index(
+            memory_properties,
+            memory_type_bits,
+            vk::MemoryPropertyFlags::empty(),
+        )?;
+        let memory = allocate_imported_dmabuf_memory(
+            &logical_device,
+            import_image.image.image(),
+            import_image.memory_requirements.size,
+            memory_type_index,
+            fd,
+            import_image.candidate.dedicated_only,
+        )?;
+
+        if let Err(err) = unsafe {
+            logical_device
+                .handle()
+                .bind_image_memory(import_image.image.image(), memory, 0)
+        }
+        .map_err(VulkanError::from)
+        {
+            // SAFETY: `memory` was allocated from `logical_device` above and has not been bound
+            // successfully or transferred into an owner. Freeing it here prevents a leak; the
+            // unbound image is destroyed when `import_image` is dropped.
+            unsafe { logical_device.handle().free_memory(memory, None) };
+            return Err(err);
+        }
+
+        Ok(Some(import_image.image.into_bound_image(memory)))
     }
 
     #[allow(dead_code)]
@@ -3093,6 +3171,78 @@ pub(super) fn dmabuf_plane_layouts(import: &VulkanDmabufImportState) -> Vec<vk::
         .collect()
 }
 
+fn single_plane_dmabuf_fd(dmabuf: &Dmabuf) -> Result<Option<OwnedFd>, VulkanError> {
+    if dmabuf.num_planes() != 1 {
+        return Ok(None);
+    }
+
+    dmabuf
+        .0
+        .planes
+        .first()
+        .ok_or(VulkanError::UnsupportedOperation("dmabuf planes"))?
+        .fd
+        .as_fd()
+        .try_clone_to_owned()
+        .map(Some)
+        .map_err(|_| VulkanError::UnsupportedOperation("dmabuf fd"))
+}
+
+pub(super) fn dmabuf_import_memory_type_bits(image_memory_type_bits: u32, fd_memory_type_bits: u32) -> u32 {
+    image_memory_type_bits & fd_memory_type_bits
+}
+
+fn allocate_imported_dmabuf_memory(
+    logical_device: &VulkanLogicalDevice,
+    image: vk::Image,
+    allocation_size: vk::DeviceSize,
+    memory_type_index: u32,
+    fd: OwnedFd,
+    dedicated_only: bool,
+) -> Result<vk::DeviceMemory, VulkanError> {
+    let raw_fd = fd.into_raw_fd();
+    let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+        .fd(raw_fd);
+
+    let result = if dedicated_only {
+        let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(allocation_size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut import_info)
+            .push_next(&mut dedicated_info);
+
+        // SAFETY: `logical_device` is live. `allocation_size`/`memory_type_index` were derived from
+        // the image memory requirements and intersected fd memory type bits. The imported raw fd is
+        // a duplicated dmabuf fd and remains open for the call. On success Vulkan consumes the fd;
+        // on failure ownership remains with us and is reconstructed below for closing. The dedicated
+        // allocation pNext references the image whose requirements were queried.
+        unsafe { logical_device.handle().allocate_memory(&allocate_info, None) }
+    } else {
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(allocation_size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut import_info);
+
+        // SAFETY: `logical_device` is live. `allocation_size`/`memory_type_index` were derived from
+        // the image memory requirements and intersected fd memory type bits. The imported raw fd is
+        // a duplicated dmabuf fd and remains open for the call. On success Vulkan consumes the fd;
+        // on failure ownership remains with us and is reconstructed below for closing.
+        unsafe { logical_device.handle().allocate_memory(&allocate_info, None) }
+    };
+
+    match result {
+        Ok(memory) => Ok(memory),
+        Err(err) => {
+            // SAFETY: `raw_fd` came from `OwnedFd::into_raw_fd` above. Failed Vulkan allocation does
+            // not take ownership of the fd, so reconstructing an `OwnedFd` closes it exactly once.
+            unsafe { drop(OwnedFd::from_raw_fd(raw_fd)) };
+            Err(VulkanError::from(err))
+        }
+    }
+}
+
 /// Logical device owner retained by Vulkan resource wrappers.
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -3329,6 +3479,27 @@ impl VulkanUnboundImage {
 
     pub(super) fn usage(&self) -> vk::ImageUsageFlags {
         self.usage
+    }
+
+    fn into_bound_image(self, memory: vk::DeviceMemory) -> VulkanOwnedImage {
+        let this = ManuallyDrop::new(self);
+        // SAFETY: `this` is `ManuallyDrop`, so its fields will not be dropped automatically. Moving
+        // the logical device out with `ptr::read` transfers the single owning reference into the
+        // bound image owner without incrementing/leaking the device `Arc`. The image handle is also
+        // transferred and must no longer be destroyed by `VulkanUnboundImage`.
+        let logical_device = unsafe { ptr::read(&this.logical_device) };
+
+        VulkanOwnedImage {
+            inner: Arc::new(VulkanOwnedImageInner {
+                logical_device,
+                image: this.image,
+                memory,
+                extent: this.extent,
+                format: this.format,
+                usage: this.usage,
+                layout: Mutex::new(vk::ImageLayout::UNDEFINED),
+            }),
+        }
     }
 }
 

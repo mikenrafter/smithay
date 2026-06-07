@@ -20,9 +20,9 @@ use super::capabilities::{
 };
 use super::device::{
     VulkanDeviceState, VulkanDmabufExternalImageFormatProperties, VulkanSampledTexturePipelineShaders,
-    VulkanShaderSpirv, dmabuf_plane_layouts, find_memory_type_index, image_copy_buffer_offset,
-    image_copy_required_size, image_layout_transition, select_queue_families, tightly_packed_image_size,
-    vulkan_filter,
+    VulkanShaderSpirv, dmabuf_import_memory_type_bits, dmabuf_plane_layouts, find_memory_type_index,
+    image_copy_buffer_offset, image_copy_required_size, image_layout_transition, select_queue_families,
+    tightly_packed_image_size, vulkan_filter,
 };
 use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
@@ -540,6 +540,12 @@ fn dmabuf_external_image_format_query_is_disabled_without_prerequisites() {
     );
     assert!(device.dmabuf_import_candidate(&import).unwrap().is_none());
     assert!(device.create_dmabuf_import_image(&import).unwrap().is_none());
+    assert!(
+        device
+            .create_bound_dmabuf_import_image(&dmabuf)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -562,6 +568,12 @@ fn dmabuf_import_image_plane_layouts_track_metadata() {
     assert_eq!(layouts[0].depth_pitch, 0);
     assert_eq!(layouts[1].offset, 16);
     assert_eq!(layouts[1].row_pitch, 4);
+}
+
+#[test]
+fn dmabuf_import_memory_type_bits_intersect_image_and_fd_requirements() {
+    assert_eq!(dmabuf_import_memory_type_bits(0b1110, 0b1010), 0b1010);
+    assert_eq!(dmabuf_import_memory_type_bits(0b0100, 0b0010), 0);
 }
 
 #[test]
