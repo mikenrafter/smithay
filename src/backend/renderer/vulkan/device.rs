@@ -1,11 +1,11 @@
 use std::{
     collections::HashMap,
     ffi::c_void,
-    ptr,
+    fmt, ptr,
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use ash::vk;
+use ash::{ext, khr, vk};
 
 use crate::backend::{
     renderer::TextureFilter,
@@ -50,6 +50,29 @@ pub(super) struct VulkanSolidColorDrawConstants {
     pub(super) color: [f32; 4],
 }
 
+pub(super) struct VulkanExternalMemoryDeviceFunctions {
+    #[allow(dead_code)]
+    pub(super) image_drm_format_modifier: ext::image_drm_format_modifier::Device,
+    #[allow(dead_code)]
+    pub(super) external_memory_fd: khr::external_memory_fd::Device,
+}
+
+impl VulkanExternalMemoryDeviceFunctions {
+    fn new(instance: &ash::Instance, device: &ash::Device) -> Self {
+        Self {
+            image_drm_format_modifier: ext::image_drm_format_modifier::Device::new(instance, device),
+            external_memory_fd: khr::external_memory_fd::Device::new(instance, device),
+        }
+    }
+}
+
+impl fmt::Debug for VulkanExternalMemoryDeviceFunctions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VulkanExternalMemoryDeviceFunctions")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Device state for the provisional Vulkan in-memory/offscreen renderer.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -64,6 +87,7 @@ pub(crate) struct VulkanDeviceState {
     pub(super) memory_properties: Option<vk::PhysicalDeviceMemoryProperties>,
     pub(super) capabilities: VulkanRendererCapabilities,
     pub(super) enabled_extensions: Vec<String>,
+    pub(super) external_memory_fns: Option<VulkanExternalMemoryDeviceFunctions>,
     builtin_sampled_texture_pipelines:
         Mutex<HashMap<(vk::Format, bool), Arc<VulkanSampledTextureGraphicsPipeline>>>,
     builtin_solid_color_pipelines: Mutex<HashMap<(vk::Format, bool), Arc<VulkanSolidColorGraphicsPipeline>>>,
@@ -138,6 +162,14 @@ impl VulkanDeviceState {
         }
         .map_err(VulkanError::from)?;
         let logical_device = VulkanLogicalDevice::new(logical_device, instance.clone());
+        let external_memory_fns = if capabilities.external_memory.prerequisites_available {
+            Some(VulkanExternalMemoryDeviceFunctions::new(
+                instance.handle(),
+                logical_device.handle(),
+            ))
+        } else {
+            None
+        };
 
         let graphics_family = queue_families
             .graphics
@@ -176,6 +208,7 @@ impl VulkanDeviceState {
                 .iter()
                 .map(|extension| extension.to_string_lossy().into_owned())
                 .collect(),
+            external_memory_fns,
             builtin_sampled_texture_pipelines: Mutex::new(HashMap::new()),
             builtin_solid_color_pipelines: Mutex::new(HashMap::new()),
             single_color_render_passes: Mutex::new(HashMap::new()),
@@ -198,6 +231,7 @@ impl VulkanDeviceState {
             memory_properties: None,
             capabilities: VulkanRendererCapabilities::default(),
             enabled_extensions: Vec::new(),
+            external_memory_fns: None,
             builtin_sampled_texture_pipelines: Mutex::new(HashMap::new()),
             builtin_solid_color_pipelines: Mutex::new(HashMap::new()),
             single_color_render_passes: Mutex::new(HashMap::new()),

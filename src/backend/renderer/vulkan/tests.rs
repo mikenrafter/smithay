@@ -476,6 +476,7 @@ fn vulkan_device_state_uninitialized_starts_empty() {
     assert!(device.memory_properties.is_none());
     assert!(!device.capabilities.device.available);
     assert!(device.enabled_extensions.is_empty());
+    assert!(device.external_memory_fns.is_none());
     assert_eq!(device.queue_families.graphics, None);
     assert_eq!(device.queue_families.transfer, None);
     assert!(device.queues.graphics.is_none());
@@ -2912,6 +2913,10 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     };
     assert_eq!(caps.device.extensions, expected_enabled_extensions);
     assert_eq!(device.enabled_extensions, expected_enabled_extensions);
+    assert_eq!(
+        device.external_memory_fns.is_some(),
+        caps.external_memory.prerequisites_available
+    );
     assert_eq!(
         caps.import.memory,
         caps.formats.memory_import.iter().next().is_some()
