@@ -2988,8 +2988,16 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
             .find_memory_type_index(u32::MAX, vk::MemoryPropertyFlags::empty())
             .is_ok()
     );
-    assert!(device.graphics_command_pool.is_some());
-    assert!(device.transfer_command_pool.is_some());
+    let graphics_family = device.queue_families.graphics.unwrap();
+    let transfer_family = device.queue_families.transfer.unwrap();
+    let graphics_queue = device.queues.graphics.as_ref().unwrap();
+    let transfer_queue = device.queues.transfer.as_ref().unwrap();
+    let graphics_command_pool = device.graphics_command_pool.as_ref().unwrap();
+    let transfer_command_pool = device.transfer_command_pool.as_ref().unwrap();
+    assert_eq!(graphics_queue.queue_family_index(), graphics_family);
+    assert_eq!(transfer_queue.queue_family_index(), transfer_family);
+    assert_eq!(graphics_command_pool.queue_family_index(), graphics_family);
+    assert_eq!(transfer_command_pool.queue_family_index(), transfer_family);
     let buffer = device
         .create_buffer(
             4096,
@@ -3110,6 +3118,21 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     let mut transfer_command_buffer = device.allocate_transfer_command_buffer().unwrap();
     assert_ne!(graphics_command_buffer.handle(), vk::CommandBuffer::null());
     assert_ne!(transfer_command_buffer.handle(), vk::CommandBuffer::null());
+    assert_eq!(graphics_command_buffer.queue_family_index(), graphics_family);
+    assert_eq!(transfer_command_buffer.queue_family_index(), transfer_family);
+    if graphics_family != transfer_family {
+        let mut wrong_family_command_buffer = device.allocate_transfer_command_buffer().unwrap();
+        device
+            .begin_command_buffer(&mut wrong_family_command_buffer)
+            .unwrap();
+        device
+            .end_command_buffer(&mut wrong_family_command_buffer)
+            .unwrap();
+        assert!(matches!(
+            device.submit_graphics_command_buffer_and_wait(&mut wrong_family_command_buffer),
+            Err(VulkanError::UnsupportedOperation("command buffer queue family"))
+        ));
+    }
     device.begin_command_buffer(&mut graphics_command_buffer).unwrap();
     assert!(matches!(
         device.copy_buffer_to_image(

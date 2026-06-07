@@ -218,13 +218,16 @@ impl VulkanDeviceState {
         let graphics_family = queue_families
             .graphics
             .ok_or(VulkanError::QueueFamilyUnsupported)?;
-        let graphics_queue =
-            VulkanQueue::new(unsafe { logical_device.handle().get_device_queue(graphics_family, 0) });
+        let graphics_queue = VulkanQueue::new(
+            unsafe { logical_device.handle().get_device_queue(graphics_family, 0) },
+            graphics_family,
+        );
         let transfer_queue = match queue_families.transfer {
             Some(transfer_family) if transfer_family == graphics_family => Some(graphics_queue.clone()),
-            Some(transfer_family) => Some(VulkanQueue::new(unsafe {
-                logical_device.handle().get_device_queue(transfer_family, 0)
-            })),
+            Some(transfer_family) => Some(VulkanQueue::new(
+                unsafe { logical_device.handle().get_device_queue(transfer_family, 0) },
+                transfer_family,
+            )),
             None => None,
         };
         let queues = VulkanQueues {
@@ -1781,6 +1784,7 @@ fn create_command_pool(
     Ok(Arc::new(VulkanCommandPool {
         logical_device: logical_device.clone(),
         handle,
+        queue_family_index,
         host_access: Mutex::new(()),
     }))
 }
@@ -1839,6 +1843,10 @@ fn submit_command_buffer_and_wait(
     queue: &VulkanQueue,
     command_buffer: &mut VulkanCommandBuffer,
 ) -> Result<(), VulkanError> {
+    if command_buffer.queue_family_index() != queue.queue_family_index() {
+        return Err(VulkanError::UnsupportedOperation("command buffer queue family"));
+    }
+
     let fence_info = vk::FenceCreateInfo::default();
     let fence =
         unsafe { logical_device.handle().create_fence(&fence_info, None) }.map_err(VulkanError::from)?;
@@ -3402,15 +3410,21 @@ fn host_synchronization_failed() -> VulkanError {
 #[derive(Debug, Clone)]
 pub(crate) struct VulkanQueue {
     handle: vk::Queue,
+    queue_family_index: u32,
     host_access: Arc<Mutex<()>>,
 }
 
 impl VulkanQueue {
-    fn new(handle: vk::Queue) -> Self {
+    fn new(handle: vk::Queue, queue_family_index: u32) -> Self {
         Self {
             handle,
+            queue_family_index,
             host_access: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub(super) fn queue_family_index(&self) -> u32 {
+        self.queue_family_index
     }
 
     fn lock_host_access(&self) -> Result<MutexGuard<'_, ()>, VulkanError> {
@@ -3424,10 +3438,15 @@ impl VulkanQueue {
 pub(crate) struct VulkanCommandPool {
     logical_device: VulkanLogicalDevice,
     handle: vk::CommandPool,
+    queue_family_index: u32,
     host_access: Mutex<()>,
 }
 
 impl VulkanCommandPool {
+    pub(super) fn queue_family_index(&self) -> u32 {
+        self.queue_family_index
+    }
+
     fn lock_host_access(&self) -> Result<MutexGuard<'_, ()>, VulkanError> {
         self.host_access.lock().map_err(|_| host_synchronization_failed())
     }
@@ -3462,6 +3481,10 @@ pub(crate) struct VulkanCommandBuffer {
 impl VulkanCommandBuffer {
     pub(super) fn handle(&self) -> vk::CommandBuffer {
         self.handle
+    }
+
+    pub(super) fn queue_family_index(&self) -> u32 {
+        self.command_pool.queue_family_index()
     }
 
     fn pending_layout_for(&self, image: &VulkanOwnedImage) -> Result<Option<vk::ImageLayout>, VulkanError> {
