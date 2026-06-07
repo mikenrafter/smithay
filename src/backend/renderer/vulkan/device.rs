@@ -432,11 +432,13 @@ impl VulkanDeviceState {
         // SAFETY: `logical_device` is live. The pNext chain contains Vulkan-defined image-create
         // extension structs whose stack storage outlives the call. The image shape matches the
         // earlier external-image-format query/candidate: 2D, one mip level, one array layer,
-        // TYPE_1 samples, SAMPLED usage, DRM_FORMAT_MODIFIER tiling, and DMA_BUF_EXT external
-        // memory. Plane-layout pointers are derived from validated plane count/order and nonzero
-        // stride metadata, and remain alive through the call; modifier-specific layout validity is
-        // still checked by the driver and may make image creation fail. No allocation callbacks are
-        // used.
+        // TYPE_1 samples, SAMPLED usage, DRM_FORMAT_MODIFIER tiling, UNDEFINED initial layout, and
+        // DMA_BUF_EXT external memory. External-memory images with nonzero handle types must be
+        // created with UNDEFINED initial layout; preserving producer contents must be handled by a
+        // later external acquire/synchronization path, not by PREINITIALIZED image creation.
+        // Plane-layout pointers are derived from validated plane count/order and nonzero stride
+        // metadata, and remain alive through the call; modifier-specific layout validity is still
+        // checked by the driver and may make image creation fail. No allocation callbacks are used.
         let image =
             unsafe { logical_device.handle().create_image(&image_info, None) }.map_err(VulkanError::from)?;
         let unbound = VulkanUnboundImage {
