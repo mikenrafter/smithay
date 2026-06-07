@@ -10,6 +10,7 @@ use crate::backend::{
 use super::{
     VulkanError,
     format::{get_format_info, renderer_format_infos},
+    image::VulkanDmabufImportState,
 };
 
 /// Top-level Vulkan renderer capabilities.
@@ -201,6 +202,24 @@ impl VulkanFormatCapabilities {
                 modifier: Modifier::Invalid,
             })
             .collect()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn dmabuf_import_record(
+        &self,
+        import: &VulkanDmabufImportState,
+    ) -> Option<&VulkanDrmFormatModifierCapabilityRecord> {
+        self.modifier_records.iter().find(|record| {
+            record.format == import.format()
+                && record.modifier == import.modifier()
+                && record.plane_count as usize == import.plane_count()
+                && record.usages.sampled
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn has_sampled_dmabuf_modifier_record(&self, import: &VulkanDmabufImportState) -> bool {
+        self.dmabuf_import_record(import).is_some()
     }
 }
 

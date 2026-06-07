@@ -363,6 +363,83 @@ fn drm_modifier_capability_records_map_vulkan_properties_without_advertising_dma
 }
 
 #[test]
+fn drm_modifier_capability_lookup_requires_sampled_exact_match() {
+    let sampled_record = modifier_record_from_properties(
+        Fourcc::Nv12,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 2,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    );
+    let non_sampled_record = modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT,
+        },
+    );
+    let caps = VulkanFormatCapabilities {
+        modifier_records: vec![sampled_record, non_sampled_record],
+        ..VulkanFormatCapabilities::default()
+    };
+
+    let importable_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Nv12,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4), (1, 4, 4)],
+    );
+    let importable = VulkanDmabufImportState::from_dmabuf(&importable_dmabuf).unwrap();
+    assert!(caps.has_sampled_dmabuf_modifier_record(&importable));
+    assert!(caps.dmabuf_import_record(&importable).is_some());
+
+    let wrong_modifier_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Nv12,
+        Modifier::Invalid,
+        DmabufFlags::empty(),
+        &[(0, 0, 4), (1, 4, 4)],
+    );
+    let wrong_modifier = VulkanDmabufImportState::from_dmabuf(&wrong_modifier_dmabuf).unwrap();
+    assert!(!caps.has_sampled_dmabuf_modifier_record(&wrong_modifier));
+
+    let wrong_plane_count_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Nv12,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let wrong_plane_count = VulkanDmabufImportState::from_dmabuf(&wrong_plane_count_dmabuf).unwrap();
+    assert!(!caps.has_sampled_dmabuf_modifier_record(&wrong_plane_count));
+
+    let unsupported_format_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Xrgb8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let unsupported_format = VulkanDmabufImportState::from_dmabuf(&unsupported_format_dmabuf).unwrap();
+    assert!(!caps.has_sampled_dmabuf_modifier_record(&unsupported_format));
+
+    let non_sampled_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let non_sampled = VulkanDmabufImportState::from_dmabuf(&non_sampled_dmabuf).unwrap();
+    assert!(!caps.has_sampled_dmabuf_modifier_record(&non_sampled));
+    assert!(caps.dmabuf_import.iter().next().is_none());
+    assert!(caps.dmabuf_export.iter().next().is_none());
+}
+
+#[test]
 fn vulkan_device_state_uninitialized_starts_empty() {
     let device = VulkanDeviceState::empty_for_tests();
     assert!(device.instance.is_none());

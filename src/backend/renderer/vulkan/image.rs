@@ -257,6 +257,18 @@ impl VulkanDmabufImportState {
             y_inverted: dmabuf.y_inverted(),
         })
     }
+
+    pub(crate) fn format(&self) -> Fourcc {
+        self.memory.format
+    }
+
+    pub(crate) fn modifier(&self) -> Modifier {
+        self.memory.modifier
+    }
+
+    pub(crate) fn plane_count(&self) -> usize {
+        self.memory.planes.len()
+    }
 }
 
 impl VulkanRenderTarget<'_> {
