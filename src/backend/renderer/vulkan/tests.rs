@@ -20,11 +20,12 @@ use super::capabilities::{
 };
 use super::device::{
     VulkanDeviceState, VulkanDmabufExternalImageFormatProperties, VulkanSampledTexturePipelineShaders,
-    VulkanShaderSpirv, VulkanSyncFileImport, dmabuf_import_memory_type_bits, dmabuf_plane_layouts,
-    find_memory_type_index, image_copy_buffer_offset, image_copy_required_size, image_layout_transition,
-    plan_sampled_dmabuf_foreign_acquire_barrier, plan_sampled_dmabuf_foreign_release_barrier,
-    sampled_dmabuf_foreign_acquire_barrier, sampled_dmabuf_foreign_release_barrier, select_queue_families,
-    tightly_packed_image_size, vulkan_filter,
+    VulkanShaderSpirv, VulkanSubmitSynchronization, VulkanSyncFileImport, dmabuf_import_memory_type_bits,
+    dmabuf_plane_layouts, find_memory_type_index, image_copy_buffer_offset, image_copy_required_size,
+    image_layout_transition, plan_sampled_dmabuf_foreign_acquire_barrier,
+    plan_sampled_dmabuf_foreign_release_barrier, sampled_dmabuf_foreign_acquire_barrier,
+    sampled_dmabuf_foreign_release_barrier, select_queue_families, tightly_packed_image_size,
+    validate_submit_wait_stage, vulkan_filter,
 };
 use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
@@ -482,6 +483,16 @@ fn sync_file_semaphore_helpers_require_capabilities_before_device_lookup() {
         device.create_exportable_sync_file_semaphore(),
         Err(VulkanError::UnsupportedOperation("sync-file semaphore export"))
     ));
+}
+
+#[test]
+fn submit_wait_stage_validation_rejects_empty_masks() {
+    assert!(matches!(
+        validate_submit_wait_stage(vk::PipelineStageFlags::empty()),
+        Err(VulkanError::UnsupportedOperation("semaphore wait stage"))
+    ));
+    assert!(validate_submit_wait_stage(vk::PipelineStageFlags::TOP_OF_PIPE).is_ok());
+    assert!(validate_submit_wait_stage(vk::PipelineStageFlags::FRAGMENT_SHADER).is_ok());
 }
 
 #[test]
@@ -3432,6 +3443,70 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     device
         .submit_transfer_command_buffer_and_wait(&mut transfer_command_buffer)
         .unwrap();
+    if caps.external_sync.sync_file_importable && caps.external_sync.sync_file_exportable {
+        // SAFETY: `AlreadySignaled` uses Vulkan's special `-1` sync-file import value, not an
+        // application-owned fd.
+        let acquire_semaphore = unsafe {
+            device
+                .import_sync_file_semaphore(VulkanSyncFileImport::AlreadySignaled)
+                .unwrap()
+        };
+        let release_semaphore = device.create_exportable_sync_file_semaphore().unwrap();
+        let mut synchronized_command_buffer = device.allocate_graphics_command_buffer().unwrap();
+        device
+            .begin_command_buffer(&mut synchronized_command_buffer)
+            .unwrap();
+        device
+            .end_command_buffer(&mut synchronized_command_buffer)
+            .unwrap();
+
+        let empty_wait_stage = VulkanSubmitSynchronization::default()
+            .wait_sync_file(&acquire_semaphore, vk::PipelineStageFlags::empty());
+        assert!(matches!(
+            // SAFETY: This intentionally exercises pre-submit validation and returns before any
+            // Vulkan queue operation because the wait stage is invalid.
+            unsafe {
+                device.submit_graphics_command_buffer_and_wait_with_synchronization(
+                    &mut synchronized_command_buffer,
+                    &empty_wait_stage,
+                )
+            },
+            Err(VulkanError::UnsupportedOperation("semaphore wait stage"))
+        ));
+        let duplicate_semaphore = VulkanSubmitSynchronization::default()
+            .wait_sync_file(&acquire_semaphore, vk::PipelineStageFlags::TOP_OF_PIPE)
+            .signal_sync_file(&acquire_semaphore);
+        assert!(matches!(
+            // SAFETY: This intentionally exercises pre-submit validation and returns before any
+            // Vulkan queue operation because the same binary semaphore appears twice.
+            unsafe {
+                device.submit_graphics_command_buffer_and_wait_with_synchronization(
+                    &mut synchronized_command_buffer,
+                    &duplicate_semaphore,
+                )
+            },
+            Err(VulkanError::UnsupportedOperation("semaphore submit duplicate"))
+        ));
+
+        let synchronization = VulkanSubmitSynchronization::default()
+            .wait_sync_file(&acquire_semaphore, vk::PipelineStageFlags::TOP_OF_PIPE)
+            .signal_sync_file(&release_semaphore);
+        // SAFETY: `acquire_semaphore` was imported with Vulkan's already-signaled `-1` sync-file
+        // payload and has not been waited on yet. `release_semaphore` was freshly created for
+        // export and has not been signaled yet. `TOP_OF_PIPE` is valid for the graphics queue.
+        unsafe {
+            device
+                .submit_graphics_command_buffer_and_wait_with_synchronization(
+                    &mut synchronized_command_buffer,
+                    &synchronization,
+                )
+                .unwrap()
+        };
+        assert!(synchronized_command_buffer.is_submitted_for_tests());
+        // SAFETY: The synchronized submit above completed before this export, and the release
+        // semaphore was created for sync-file export on this device.
+        let _release_sync_file = unsafe { device.export_sync_file_semaphore(&release_semaphore).unwrap() };
+    }
     let uploaded_image = device
         .create_uploaded_image(
             vk::Extent3D {

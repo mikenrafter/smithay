@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use ash::{ext, khr, vk};
+use ash::{ext, khr, vk, vk::Handle};
 
 use crate::backend::{
     allocator::dmabuf::Dmabuf,
@@ -92,6 +92,21 @@ pub(crate) enum VulkanSyncFileImport {
     AlreadySignaled,
 }
 
+/// A sync-file semaphore wait attached to a single Vulkan queue submit.
+#[allow(dead_code)]
+pub(super) struct VulkanSubmitSemaphoreWait<'a> {
+    pub(super) semaphore: &'a VulkanSyncFileSemaphore,
+    pub(super) dst_stage: vk::PipelineStageFlags,
+}
+
+/// Binary semaphore synchronization attached to a single Vulkan queue submit.
+#[allow(dead_code)]
+#[derive(Default)]
+pub(super) struct VulkanSubmitSynchronization<'a> {
+    pub(super) wait_semaphores: Vec<VulkanSubmitSemaphoreWait<'a>>,
+    pub(super) signal_semaphores: Vec<&'a VulkanSyncFileSemaphore>,
+}
+
 impl VulkanSyncFileImport {
     fn into_raw_fd(self) -> i32 {
         match self {
@@ -99,6 +114,99 @@ impl VulkanSyncFileImport {
             VulkanSyncFileImport::AlreadySignaled => -1,
         }
     }
+}
+
+#[allow(dead_code)]
+impl<'a> VulkanSubmitSynchronization<'a> {
+    pub(super) fn wait_sync_file(
+        mut self,
+        semaphore: &'a VulkanSyncFileSemaphore,
+        dst_stage: vk::PipelineStageFlags,
+    ) -> Self {
+        self.wait_semaphores
+            .push(VulkanSubmitSemaphoreWait { semaphore, dst_stage });
+        self
+    }
+
+    pub(super) fn signal_sync_file(mut self, semaphore: &'a VulkanSyncFileSemaphore) -> Self {
+        self.signal_semaphores.push(semaphore);
+        self
+    }
+
+    fn validate(&self, logical_device: &VulkanLogicalDevice) -> Result<(), VulkanError> {
+        let mut seen_handles = Vec::with_capacity(self.wait_semaphores.len() + self.signal_semaphores.len());
+
+        for wait in &self.wait_semaphores {
+            validate_submit_wait_stage(wait.dst_stage)?;
+            validate_submit_semaphore(logical_device, wait.semaphore, &mut seen_handles)?;
+        }
+        for semaphore in &self.signal_semaphores {
+            validate_submit_semaphore(logical_device, semaphore, &mut seen_handles)?;
+        }
+
+        Ok(())
+    }
+
+    fn wait_handles(&self) -> Vec<vk::Semaphore> {
+        self.wait_semaphores
+            .iter()
+            .map(|wait| wait.semaphore.handle())
+            .collect()
+    }
+
+    fn wait_stage_masks(&self) -> Vec<vk::PipelineStageFlags> {
+        self.wait_semaphores.iter().map(|wait| wait.dst_stage).collect()
+    }
+
+    fn signal_handles(&self) -> Vec<vk::Semaphore> {
+        self.signal_semaphores
+            .iter()
+            .map(|semaphore| semaphore.handle())
+            .collect()
+    }
+
+    fn lock_host_access(&self) -> Result<Vec<MutexGuard<'_, ()>>, VulkanError> {
+        let mut semaphores = Vec::with_capacity(self.wait_semaphores.len() + self.signal_semaphores.len());
+        for wait in &self.wait_semaphores {
+            semaphores.push(wait.semaphore);
+        }
+        for semaphore in &self.signal_semaphores {
+            semaphores.push(*semaphore);
+        }
+        semaphores.sort_by_key(|semaphore| semaphore.handle().as_raw());
+
+        let mut guards = Vec::with_capacity(semaphores.len());
+        for semaphore in semaphores {
+            guards.push(semaphore.lock_host_access()?);
+        }
+
+        Ok(guards)
+    }
+}
+
+#[allow(dead_code)]
+pub(super) fn validate_submit_wait_stage(dst_stage: vk::PipelineStageFlags) -> Result<(), VulkanError> {
+    if dst_stage.is_empty() {
+        return Err(VulkanError::UnsupportedOperation("semaphore wait stage"));
+    }
+
+    Ok(())
+}
+
+fn validate_submit_semaphore(
+    logical_device: &VulkanLogicalDevice,
+    semaphore: &VulkanSyncFileSemaphore,
+    seen_handles: &mut Vec<vk::Semaphore>,
+) -> Result<(), VulkanError> {
+    if !logical_device.is_same_device(&semaphore.logical_device) {
+        return Err(VulkanError::UnsupportedOperation("semaphore device"));
+    }
+    if seen_handles.contains(&semaphore.handle()) {
+        return Err(VulkanError::UnsupportedOperation("semaphore submit duplicate"));
+    }
+
+    seen_handles.push(semaphore.handle());
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -874,7 +982,38 @@ impl VulkanDeviceState {
                 VulkanError::DeviceInitializationFailed("missing graphics queue".to_owned())
             })?;
 
-        submit_command_buffer_and_wait(logical_device, queue, command_buffer)
+        submit_command_buffer_and_wait_without_synchronization(logical_device, queue, command_buffer)
+    }
+
+    /// Submit a graphics command buffer with binary semaphore waits/signals and wait for completion.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure all binary semaphore payload-state and stage-mask valid usage for
+    /// `vkQueueSubmit`: wait semaphores must be signaled or have pending signal operations whose
+    /// dependencies have been submitted, signal semaphores must be unsignaled with no conflicting
+    /// pending operation, and every wait stage mask must contain only stages supported by the
+    /// graphics queue and enabled device features/extensions. Semaphores must not be reused in a way
+    /// that violates binary semaphore payload consumption/production rules.
+    #[allow(dead_code)]
+    pub(super) unsafe fn submit_graphics_command_buffer_and_wait_with_synchronization(
+        &self,
+        command_buffer: &mut VulkanCommandBuffer,
+        synchronization: &VulkanSubmitSynchronization<'_>,
+    ) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        let queue =
+            self.queues.graphics.as_ref().ok_or_else(|| {
+                VulkanError::DeviceInitializationFailed("missing graphics queue".to_owned())
+            })?;
+
+        // SAFETY: The caller upholds the semaphore payload-state and stage-mask valid-usage
+        // requirements for the supplied synchronization description. This method selected the
+        // graphics queue matching the command buffer's queue-family check below.
+        unsafe { submit_command_buffer_and_wait(logical_device, queue, command_buffer, synchronization) }
     }
 
     #[allow(dead_code)]
@@ -891,7 +1030,7 @@ impl VulkanDeviceState {
                 VulkanError::DeviceInitializationFailed("missing transfer queue".to_owned())
             })?;
 
-        submit_command_buffer_and_wait(logical_device, queue, command_buffer)
+        submit_command_buffer_and_wait_without_synchronization(logical_device, queue, command_buffer)
     }
 
     #[allow(dead_code)]
@@ -2127,27 +2266,71 @@ fn ensure_command_buffer_executable(command_buffer: &VulkanCommandBuffer) -> Res
     }
 }
 
-fn submit_command_buffer_and_wait(
+fn submit_command_buffer_and_wait_without_synchronization(
     logical_device: &VulkanLogicalDevice,
     queue: &VulkanQueue,
     command_buffer: &mut VulkanCommandBuffer,
 ) -> Result<(), VulkanError> {
+    // SAFETY: An empty synchronization description does not include any semaphore wait/signal
+    // payload-state or stage-mask requirements beyond the command-buffer/queue/fence checks in the
+    // submit helper.
+    unsafe {
+        submit_command_buffer_and_wait(
+            logical_device,
+            queue,
+            command_buffer,
+            &VulkanSubmitSynchronization::default(),
+        )
+    }
+}
+
+unsafe fn submit_command_buffer_and_wait(
+    logical_device: &VulkanLogicalDevice,
+    queue: &VulkanQueue,
+    command_buffer: &mut VulkanCommandBuffer,
+    synchronization: &VulkanSubmitSynchronization<'_>,
+) -> Result<(), VulkanError> {
     ensure_command_buffer_executable(command_buffer)?;
+    if !logical_device.is_same_device(&command_buffer.command_pool.logical_device) {
+        return Err(VulkanError::UnsupportedOperation("command buffer device"));
+    }
     if command_buffer.queue_family_index() != queue.queue_family_index() {
         return Err(VulkanError::UnsupportedOperation("command buffer queue family"));
     }
+    synchronization.validate(logical_device)?;
 
     let fence_info = vk::FenceCreateInfo::default();
     let fence =
         unsafe { logical_device.handle().create_fence(&fence_info, None) }.map_err(VulkanError::from)?;
     let command_buffers = [command_buffer.handle];
-    let submit_infos = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+    let wait_semaphores = synchronization.wait_handles();
+    let wait_stage_masks = synchronization.wait_stage_masks();
+    let signal_semaphores = synchronization.signal_handles();
+    let submit_infos = [vk::SubmitInfo::default()
+        .wait_semaphores(&wait_semaphores)
+        .wait_dst_stage_mask(&wait_stage_masks)
+        .command_buffers(&command_buffers)
+        .signal_semaphores(&signal_semaphores)];
+    let semaphore_guards = match synchronization.lock_host_access() {
+        Ok(guards) => guards,
+        Err(err) => {
+            unsafe { logical_device.handle().destroy_fence(fence, None) };
+            return Err(err);
+        }
+    };
 
     let submit_result = command_buffer
         .command_pool
         .lock_host_access()
         .and_then(|_pool_guard| {
             queue.lock_host_access().and_then(|_queue_guard| {
+                // SAFETY: `logical_device`, `queue.handle`, `command_buffer.handle`, `fence`, and
+                // all semaphores in `submit_infos` belong to the same live device and are kept alive
+                // through the fence wait below. The queue host-access mutex externally synchronizes
+                // host access to the queue. Semaphore host-access mutexes prevent concurrent
+                // import/export/destroy while the submit is pending. Slice storage used by
+                // `submit_infos` lives until `queue_submit` returns. The caller of this unsafe
+                // helper upholds binary semaphore payload-state and wait-stage valid usage.
                 unsafe {
                     logical_device
                         .handle()
@@ -2165,6 +2348,7 @@ fn submit_command_buffer_and_wait(
     command_buffer.state = VulkanCommandBufferState::Submitted;
     let wait_result = unsafe { logical_device.handle().wait_for_fences(&[fence], true, u64::MAX) }
         .map_err(VulkanError::from);
+    drop(semaphore_guards);
 
     unsafe { logical_device.handle().destroy_fence(fence, None) };
 
