@@ -68,6 +68,11 @@ pub(super) struct VulkanExternalMemoryDeviceFunctions {
     pub(super) external_memory_fd: khr::external_memory_fd::Device,
 }
 
+pub(super) struct VulkanExternalSyncDeviceFunctions {
+    #[allow(dead_code)]
+    pub(super) external_semaphore_fd: khr::external_semaphore_fd::Device,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct VulkanDmabufExternalImageFormatProperties {
@@ -115,9 +120,24 @@ impl VulkanExternalMemoryDeviceFunctions {
     }
 }
 
+impl VulkanExternalSyncDeviceFunctions {
+    fn new(instance: &ash::Instance, device: &ash::Device) -> Self {
+        Self {
+            external_semaphore_fd: khr::external_semaphore_fd::Device::new(instance, device),
+        }
+    }
+}
+
 impl fmt::Debug for VulkanExternalMemoryDeviceFunctions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VulkanExternalMemoryDeviceFunctions")
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for VulkanExternalSyncDeviceFunctions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VulkanExternalSyncDeviceFunctions")
             .finish_non_exhaustive()
     }
 }
@@ -137,6 +157,7 @@ pub(crate) struct VulkanDeviceState {
     pub(super) capabilities: VulkanRendererCapabilities,
     pub(super) enabled_extensions: Vec<String>,
     pub(super) external_memory_fns: Option<VulkanExternalMemoryDeviceFunctions>,
+    pub(super) external_sync_fns: Option<VulkanExternalSyncDeviceFunctions>,
     builtin_sampled_texture_pipelines:
         Mutex<HashMap<(vk::Format, bool), Arc<VulkanSampledTextureGraphicsPipeline>>>,
     builtin_solid_color_pipelines: Mutex<HashMap<(vk::Format, bool), Arc<VulkanSolidColorGraphicsPipeline>>>,
@@ -162,11 +183,22 @@ impl VulkanDeviceState {
         };
         let queue_families = select_queue_families(&queue_properties)?;
         let external_memory = super::VulkanExternalMemoryCapabilities::discover(&physical_device);
-        let enabled_device_extensions = if external_memory.prerequisites_available {
-            super::VulkanExternalMemoryCapabilities::required_device_extensions(physical_device.api_version())
-        } else {
-            Vec::new()
-        };
+        let external_sync = super::VulkanExternalSyncCapabilities::discover(&physical_device);
+        let mut enabled_device_extensions = Vec::new();
+        if external_memory.prerequisites_available {
+            enabled_device_extensions.extend(
+                super::VulkanExternalMemoryCapabilities::required_device_extensions(
+                    physical_device.api_version(),
+                ),
+            );
+        }
+        if external_sync.prerequisites_available {
+            enabled_device_extensions.extend(
+                super::VulkanExternalSyncCapabilities::required_device_extensions(
+                    physical_device.api_version(),
+                ),
+            );
+        }
         let enabled_extension_pointers = enabled_device_extensions
             .iter()
             .copied()
@@ -174,6 +206,7 @@ impl VulkanDeviceState {
             .collect::<Vec<_>>();
         let mut capabilities = VulkanRendererCapabilities::for_initialized_device(&enabled_device_extensions);
         capabilities.external_memory = external_memory;
+        capabilities.external_sync = external_sync;
         capabilities.formats =
             super::VulkanFormatCapabilities::discover(&physical_device, &capabilities.external_memory)?;
         capabilities.import.memory = capabilities.formats.memory_import.iter().next().is_some();
@@ -201,9 +234,10 @@ impl VulkanDeviceState {
 
         // SAFETY: `physical_device` was enumerated from `instance`, every queue family index comes
         // from the same physical device query, and `queue_priorities`/extension-name pointers live
-        // through the call. External-memory extension names are only included after device-extension
-        // discovery reports the full prerequisite set for this API version; no allocation callbacks
-        // are used.
+        // through the call. External-memory and external-sync extension names are only included
+        // after device-extension discovery reports the full prerequisite set for this API version;
+        // promoted core functionality is not redundantly enabled as an extension. No allocation
+        // callbacks are used.
         let logical_device = unsafe {
             instance
                 .handle()
@@ -213,6 +247,14 @@ impl VulkanDeviceState {
         let logical_device = VulkanLogicalDevice::new(logical_device, instance.clone());
         let external_memory_fns = if capabilities.external_memory.prerequisites_available {
             Some(VulkanExternalMemoryDeviceFunctions::new(
+                instance.handle(),
+                logical_device.handle(),
+            ))
+        } else {
+            None
+        };
+        let external_sync_fns = if capabilities.external_sync.prerequisites_available {
+            Some(VulkanExternalSyncDeviceFunctions::new(
                 instance.handle(),
                 logical_device.handle(),
             ))
@@ -261,6 +303,7 @@ impl VulkanDeviceState {
                 .map(|extension| extension.to_string_lossy().into_owned())
                 .collect(),
             external_memory_fns,
+            external_sync_fns,
             builtin_sampled_texture_pipelines: Mutex::new(HashMap::new()),
             builtin_solid_color_pipelines: Mutex::new(HashMap::new()),
             single_color_render_passes: Mutex::new(HashMap::new()),
@@ -284,6 +327,7 @@ impl VulkanDeviceState {
             capabilities: VulkanRendererCapabilities::default(),
             enabled_extensions: Vec::new(),
             external_memory_fns: None,
+            external_sync_fns: None,
             builtin_sampled_texture_pipelines: Mutex::new(HashMap::new()),
             builtin_solid_color_pipelines: Mutex::new(HashMap::new()),
             single_color_render_passes: Mutex::new(HashMap::new()),

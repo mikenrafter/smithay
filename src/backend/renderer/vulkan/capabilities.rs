@@ -33,6 +33,8 @@ pub struct VulkanRendererCapabilities {
     pub formats: VulkanFormatCapabilities,
     /// External-memory prerequisite discovery.
     pub external_memory: VulkanExternalMemoryCapabilities,
+    /// External synchronization prerequisite discovery.
+    pub external_sync: VulkanExternalSyncCapabilities,
 }
 
 /// Raw per-format Vulkan image feature capabilities.
@@ -367,6 +369,56 @@ impl VulkanExternalMemoryCapabilities {
             drm_format_modifiers,
             foreign_queue_family,
             image_format_list,
+            prerequisites_available,
+        }
+    }
+}
+
+/// Vulkan external synchronization prerequisite discovery.
+///
+/// These fields only describe physical-device support for future Vulkan sync-file semaphore
+/// plumbing. They do not mean that the renderer can already import/export sync files or advertise
+/// Smithay explicit synchronization support.
+#[non_exhaustive]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct VulkanExternalSyncCapabilities {
+    /// Whether external semaphore support is available via Vulkan 1.1 core or `VK_KHR_external_semaphore`.
+    pub external_semaphore: bool,
+    /// Whether `VK_KHR_external_semaphore_fd` is supported.
+    pub external_semaphore_fd: bool,
+    /// Whether the known renderer sync-file semaphore prerequisites are all available.
+    pub prerequisites_available: bool,
+}
+
+impl VulkanExternalSyncCapabilities {
+    #[allow(dead_code)]
+    pub(super) fn required_device_extensions(api_version: Version) -> Vec<&'static CStr> {
+        let mut extensions = Vec::new();
+        if api_version < Version::VERSION_1_1 {
+            extensions.push(khr::external_semaphore::NAME);
+        }
+        extensions.push(khr::external_semaphore_fd::NAME);
+        extensions
+    }
+
+    pub(super) fn discover(physical_device: &PhysicalDevice) -> Self {
+        Self::from_device_extension_support(physical_device.api_version(), |extension| {
+            physical_device.has_device_extension(extension)
+        })
+    }
+
+    pub(super) fn from_device_extension_support(
+        api_version: Version,
+        mut has_device_extension: impl FnMut(&CStr) -> bool,
+    ) -> Self {
+        let external_semaphore =
+            api_version >= Version::VERSION_1_1 || has_device_extension(khr::external_semaphore::NAME);
+        let external_semaphore_fd = has_device_extension(khr::external_semaphore_fd::NAME);
+        let prerequisites_available = external_semaphore && external_semaphore_fd;
+
+        Self {
+            external_semaphore,
+            external_semaphore_fd,
             prerequisites_available,
         }
     }

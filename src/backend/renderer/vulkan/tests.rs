@@ -246,6 +246,9 @@ fn vulkan_renderer_default_capabilities_are_false() {
     assert!(!caps.external_memory.foreign_queue_family);
     assert!(!caps.external_memory.image_format_list);
     assert!(!caps.external_memory.prerequisites_available);
+    assert!(!caps.external_sync.external_semaphore);
+    assert!(!caps.external_sync.external_semaphore_fd);
+    assert!(!caps.external_sync.prerequisites_available);
 }
 
 #[test]
@@ -269,6 +272,7 @@ fn wayland_protocol_capabilities_are_not_advertised_by_default() {
     assert!(!caps.export.dmabuf);
     assert!(!caps.export.modifiers);
     assert!(!caps.sync.explicit);
+    assert!(!caps.external_sync.prerequisites_available);
     assert!(caps.formats.memory_import.iter().next().is_none());
     assert!(caps.formats.dmabuf_import.iter().next().is_none());
     assert!(caps.formats.dmabuf_export.iter().next().is_none());
@@ -366,6 +370,60 @@ fn external_memory_capability_discovery_requires_foreign_queue_family() {
 
     assert!(!caps.foreign_queue_family);
     assert!(!caps.prerequisites_available);
+}
+
+#[test]
+fn external_sync_capability_discovery_tracks_sync_file_prerequisites_without_advertising() {
+    let supported = [khr::external_semaphore::NAME, khr::external_semaphore_fd::NAME];
+    let caps = VulkanExternalSyncCapabilities::from_device_extension_support(Version::VERSION_1_0, |name| {
+        supported.iter().any(|supported| *supported == name)
+    });
+
+    assert!(caps.external_semaphore);
+    assert!(caps.external_semaphore_fd);
+    assert!(caps.prerequisites_available);
+
+    let renderer_caps = VulkanRendererCapabilities {
+        external_sync: caps,
+        ..VulkanRendererCapabilities::default()
+    };
+    assert!(!renderer_caps.sync.explicit);
+    assert!(!renderer_caps.import.dmabuf);
+    assert!(!renderer_caps.export.dmabuf);
+}
+
+#[test]
+fn external_sync_capability_discovery_requires_fd_extension() {
+    let caps = VulkanExternalSyncCapabilities::from_device_extension_support(Version::VERSION_1_0, |name| {
+        name == khr::external_semaphore::NAME
+    });
+
+    assert!(caps.external_semaphore);
+    assert!(!caps.external_semaphore_fd);
+    assert!(!caps.prerequisites_available);
+}
+
+#[test]
+fn external_sync_capability_discovery_uses_core_external_semaphore() {
+    let caps = VulkanExternalSyncCapabilities::from_device_extension_support(Version::VERSION_1_1, |name| {
+        name == khr::external_semaphore_fd::NAME
+    });
+
+    assert!(caps.external_semaphore);
+    assert!(caps.external_semaphore_fd);
+    assert!(caps.prerequisites_available);
+}
+
+#[test]
+fn external_sync_required_device_extensions_track_api_version_dependencies() {
+    assert_eq!(
+        VulkanExternalSyncCapabilities::required_device_extensions(Version::VERSION_1_0),
+        vec![khr::external_semaphore::NAME, khr::external_semaphore_fd::NAME]
+    );
+    assert_eq!(
+        VulkanExternalSyncCapabilities::required_device_extensions(Version::VERSION_1_1),
+        vec![khr::external_semaphore_fd::NAME]
+    );
 }
 
 #[test]
@@ -539,6 +597,7 @@ fn vulkan_device_state_uninitialized_starts_empty() {
     assert!(!device.capabilities.device.available);
     assert!(device.enabled_extensions.is_empty());
     assert!(device.external_memory_fns.is_none());
+    assert!(device.external_sync_fns.is_none());
     assert_eq!(device.queue_families.graphics, None);
     assert_eq!(device.queue_families.transfer, None);
     assert!(device.queues.graphics.is_none());
@@ -3425,18 +3484,27 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert!(texture.has_sampled_image_for_tests());
     assert!(texture.is_y_inverted_for_tests());
     assert!(caps.device.available);
-    let expected_enabled_extensions = if caps.external_memory.prerequisites_available {
-        extension_names_for_tests(VulkanExternalMemoryCapabilities::required_device_extensions(
+    let mut expected_required_extensions = Vec::new();
+    if caps.external_memory.prerequisites_available {
+        expected_required_extensions.extend(VulkanExternalMemoryCapabilities::required_device_extensions(
             api_version,
-        ))
-    } else {
-        Vec::new()
-    };
+        ));
+    }
+    if caps.external_sync.prerequisites_available {
+        expected_required_extensions.extend(VulkanExternalSyncCapabilities::required_device_extensions(
+            api_version,
+        ));
+    }
+    let expected_enabled_extensions = extension_names_for_tests(expected_required_extensions);
     assert_eq!(caps.device.extensions, expected_enabled_extensions);
     assert_eq!(device.enabled_extensions, expected_enabled_extensions);
     assert_eq!(
         device.external_memory_fns.is_some(),
         caps.external_memory.prerequisites_available
+    );
+    assert_eq!(
+        device.external_sync_fns.is_some(),
+        caps.external_sync.prerequisites_available
     );
     assert_eq!(
         caps.import.memory,
@@ -3445,6 +3513,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert!(!caps.import.dmabuf);
     assert_eq!(caps.export.memory, caps.rendering.offscreen);
     assert!(!caps.export.dmabuf);
+    assert!(!caps.sync.explicit);
     if let Some(record) = caps
         .formats
         .modifier_records

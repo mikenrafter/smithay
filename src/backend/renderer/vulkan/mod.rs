@@ -65,9 +65,9 @@ mod image;
 pub use self::{
     capabilities::{
         VulkanColorCapabilities, VulkanDeviceCapabilities, VulkanExportCapabilities,
-        VulkanExternalMemoryCapabilities, VulkanFormatCapabilities, VulkanFormatCapabilityRecord,
-        VulkanFormatTiling, VulkanFormatUsage, VulkanImportCapabilities, VulkanRendererCapabilities,
-        VulkanRenderingCapabilities, VulkanSyncCapabilities,
+        VulkanExternalMemoryCapabilities, VulkanExternalSyncCapabilities, VulkanFormatCapabilities,
+        VulkanFormatCapabilityRecord, VulkanFormatTiling, VulkanFormatUsage, VulkanImportCapabilities,
+        VulkanRendererCapabilities, VulkanRenderingCapabilities, VulkanSyncCapabilities,
     },
     error::VulkanError,
     image::{VulkanFrame, VulkanMemoryMapping, VulkanRenderTarget, VulkanTexture},
