@@ -73,6 +73,62 @@ pub(super) struct VulkanExternalSyncDeviceFunctions {
     pub(super) external_semaphore_fd: khr::external_semaphore_fd::Device,
 }
 
+/// Binary Vulkan semaphore used for future sync-file interop.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanSyncFileSemaphore {
+    logical_device: VulkanLogicalDevice,
+    handle: vk::Semaphore,
+    created_for_sync_file_export: bool,
+    imported_from_sync_file: bool,
+    host_access: Mutex<()>,
+}
+
+/// Sync-file payload to import into a Vulkan semaphore.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum VulkanSyncFileImport {
+    Fd(OwnedFd),
+    AlreadySignaled,
+}
+
+impl VulkanSyncFileImport {
+    fn into_raw_fd(self) -> i32 {
+        match self {
+            VulkanSyncFileImport::Fd(fd) => fd.into_raw_fd(),
+            VulkanSyncFileImport::AlreadySignaled => -1,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl VulkanSyncFileSemaphore {
+    pub(super) fn handle(&self) -> vk::Semaphore {
+        self.handle
+    }
+
+    fn lock_host_access(&self) -> Result<MutexGuard<'_, ()>, VulkanError> {
+        self.host_access.lock().map_err(|_| host_synchronization_failed())
+    }
+
+    fn can_export_sync_file(&self, export_from_imported: bool) -> bool {
+        self.created_for_sync_file_export && (!self.imported_from_sync_file || export_from_imported)
+    }
+}
+
+impl Drop for VulkanSyncFileSemaphore {
+    fn drop(&mut self) {
+        let _guard = self
+            .host_access
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: `self.handle` was created from `self.logical_device`, has not been destroyed yet,
+        // and the host-access mutex prevents concurrent host operations on this semaphore while it
+        // is being destroyed. No allocation callbacks are used.
+        unsafe { self.logical_device.handle().destroy_semaphore(self.handle, None) };
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct VulkanDmabufExternalImageFormatProperties {
@@ -347,6 +403,161 @@ impl VulkanDeviceState {
         })?;
 
         allocate_command_buffer(command_pool)
+    }
+
+    #[allow(dead_code)]
+    fn create_sync_file_semaphore(
+        &self,
+        created_for_sync_file_export: bool,
+        imported_from_sync_file: bool,
+    ) -> Result<VulkanSyncFileSemaphore, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+        let sync_fd = vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD;
+        let mut export_info = vk::ExportSemaphoreCreateInfo::default().handle_types(sync_fd);
+        let mut semaphore_info = vk::SemaphoreCreateInfo::default();
+        if created_for_sync_file_export {
+            semaphore_info = semaphore_info.push_next(&mut export_info);
+        }
+
+        // SAFETY: `logical_device` is live. The optional pNext chain contains a Vulkan-defined
+        // export-create struct whose stack storage outlives the call, and `SYNC_FD` export creation
+        // is only requested by callers after the physical-device property query reports export
+        // support. This creates a binary semaphore with no queue use yet. No allocation callbacks
+        // are used.
+        let handle = unsafe { logical_device.handle().create_semaphore(&semaphore_info, None) }
+            .map_err(VulkanError::from)?;
+
+        Ok(VulkanSyncFileSemaphore {
+            logical_device,
+            handle,
+            created_for_sync_file_export,
+            imported_from_sync_file,
+            host_access: Mutex::new(()),
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn create_exportable_sync_file_semaphore(
+        &self,
+    ) -> Result<VulkanSyncFileSemaphore, VulkanError> {
+        if !self.capabilities.external_sync.sync_file_exportable || self.external_sync_fns.is_none() {
+            return Err(VulkanError::UnsupportedOperation("sync-file semaphore export"));
+        }
+
+        self.create_sync_file_semaphore(true, false)
+    }
+
+    /// Import a Linux sync-file fd into a temporary Vulkan binary semaphore payload.
+    ///
+    /// # Safety
+    ///
+    /// If `sync_file` is [`VulkanSyncFileImport::Fd`], the fd must be a valid Linux sync-file fd
+    /// suitable for `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT`. Use
+    /// [`VulkanSyncFileImport::AlreadySignaled`] for Vulkan's special `-1` already-signaled import.
+    #[allow(dead_code)]
+    pub(crate) unsafe fn import_sync_file_semaphore(
+        &self,
+        sync_file: VulkanSyncFileImport,
+    ) -> Result<VulkanSyncFileSemaphore, VulkanError> {
+        if !self.capabilities.external_sync.sync_file_importable || self.external_sync_fns.is_none() {
+            return Err(VulkanError::UnsupportedOperation("sync-file semaphore import"));
+        }
+        let external_sync_fns = self
+            .external_sync_fns
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("sync-file semaphore import"))?;
+        let export_from_imported = self.capabilities.external_sync.sync_file_export_from_imported;
+        let semaphore = self.create_sync_file_semaphore(export_from_imported, true)?;
+        let raw_fd = sync_file.into_raw_fd();
+        let import_info = vk::ImportSemaphoreFdInfoKHR::default()
+            .semaphore(semaphore.handle())
+            .flags(vk::SemaphoreImportFlags::TEMPORARY)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+            .fd(raw_fd);
+
+        // SAFETY: `external_sync_fns` was loaded only when VK_KHR_external_semaphore_fd was enabled
+        // on this live device. `semaphore` was freshly created from the same logical device and has
+        // no pending queue use. `SYNC_FD` has copy transference and therefore uses TEMPORARY import.
+        // `raw_fd` either comes from `OwnedFd::into_raw_fd` or is Vulkan's special `-1` already
+        // signaled value. On success Vulkan owns a non-`-1` fd, and on failure a non-`-1` fd is
+        // reconstructed and closed below.
+        let result = unsafe {
+            external_sync_fns
+                .external_semaphore_fd
+                .import_semaphore_fd(&import_info)
+        };
+        match result {
+            Ok(()) => Ok(semaphore),
+            Err(err) => {
+                if raw_fd != -1 {
+                    // SAFETY: A failed import does not take ownership of `raw_fd`; reconstructing
+                    // the `OwnedFd` closes it exactly once. The semaphore wrapper is dropped
+                    // afterwards and destroys the Vulkan semaphore. `-1` is not an owned fd and was
+                    // handled above.
+                    unsafe { drop(OwnedFd::from_raw_fd(raw_fd)) };
+                }
+                Err(VulkanError::from(err))
+            }
+        }
+    }
+
+    /// Export a signaled or pending-signaled Vulkan semaphore payload as a Linux sync-file fd.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the semaphore satisfies the `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT`
+    /// export valid-usage rules: there must be no queue currently waiting on it, it must be binary,
+    /// and it must be signaled or have a submitted pending signal operation whose dependencies have
+    /// also been submitted.
+    #[allow(dead_code)]
+    pub(crate) unsafe fn export_sync_file_semaphore(
+        &self,
+        semaphore: &VulkanSyncFileSemaphore,
+    ) -> Result<Option<OwnedFd>, VulkanError> {
+        if !self.capabilities.external_sync.sync_file_exportable || self.external_sync_fns.is_none() {
+            return Err(VulkanError::UnsupportedOperation("sync-file semaphore export"));
+        }
+        if !semaphore.can_export_sync_file(self.capabilities.external_sync.sync_file_export_from_imported) {
+            return Err(VulkanError::UnsupportedOperation("sync-file semaphore export"));
+        }
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        if !logical_device.is_same_device(&semaphore.logical_device) {
+            return Err(VulkanError::UnsupportedOperation("sync-file semaphore export"));
+        }
+        let external_sync_fns = self
+            .external_sync_fns
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("sync-file semaphore export"))?;
+        let _semaphore_guard = semaphore.lock_host_access()?;
+        let get_info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(semaphore.handle())
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+
+        // SAFETY: The caller upholds the sync-file semaphore export valid-usage requirements above.
+        // `external_sync_fns` was loaded from the same logical device, `semaphore` belongs to that
+        // device, and the host-access mutex prevents concurrent host operations on the semaphore.
+        // The returned fd is newly owned by the application, except `-1` is a valid sync-file result
+        // meaning the payload is already signaled and no fd needs to be closed.
+        let raw_fd = unsafe {
+            external_sync_fns
+                .external_semaphore_fd
+                .get_semaphore_fd(&get_info)
+        }
+        .map_err(VulkanError::from)?;
+        if raw_fd == -1 {
+            Ok(None)
+        } else {
+            // SAFETY: `vkGetSemaphoreFdKHR` returned a newly owned POSIX file descriptor for the
+            // application to close or transfer. `-1` was handled above.
+            Ok(Some(unsafe { OwnedFd::from_raw_fd(raw_fd) }))
+        }
     }
 
     #[allow(dead_code)]

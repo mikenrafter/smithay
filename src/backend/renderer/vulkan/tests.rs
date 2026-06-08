@@ -20,8 +20,8 @@ use super::capabilities::{
 };
 use super::device::{
     VulkanDeviceState, VulkanDmabufExternalImageFormatProperties, VulkanSampledTexturePipelineShaders,
-    VulkanShaderSpirv, dmabuf_import_memory_type_bits, dmabuf_plane_layouts, find_memory_type_index,
-    image_copy_buffer_offset, image_copy_required_size, image_layout_transition,
+    VulkanShaderSpirv, VulkanSyncFileImport, dmabuf_import_memory_type_bits, dmabuf_plane_layouts,
+    find_memory_type_index, image_copy_buffer_offset, image_copy_required_size, image_layout_transition,
     plan_sampled_dmabuf_foreign_acquire_barrier, plan_sampled_dmabuf_foreign_release_barrier,
     sampled_dmabuf_foreign_acquire_barrier, sampled_dmabuf_foreign_release_barrier, select_queue_families,
     tightly_packed_image_size, vulkan_filter,
@@ -466,6 +466,22 @@ fn external_sync_file_properties_map_import_export_features() {
     assert!(!caps.sync_file_importable);
     assert!(caps.sync_file_exportable);
     assert!(!caps.sync_file_export_from_imported);
+}
+
+#[test]
+fn sync_file_semaphore_helpers_require_capabilities_before_device_lookup() {
+    let device = VulkanDeviceState::empty_for_tests();
+
+    assert!(matches!(
+        // SAFETY: The helper returns before using the import payload because sync-file import
+        // capabilities are disabled on an empty test device.
+        unsafe { device.import_sync_file_semaphore(VulkanSyncFileImport::AlreadySignaled) },
+        Err(VulkanError::UnsupportedOperation("sync-file semaphore import"))
+    ));
+    assert!(matches!(
+        device.create_exportable_sync_file_semaphore(),
+        Err(VulkanError::UnsupportedOperation("sync-file semaphore export"))
+    ));
 }
 
 #[test]
