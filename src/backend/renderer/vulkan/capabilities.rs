@@ -386,6 +386,12 @@ pub struct VulkanExternalSyncCapabilities {
     pub external_semaphore: bool,
     /// Whether `VK_KHR_external_semaphore_fd` is supported.
     pub external_semaphore_fd: bool,
+    /// Whether `SYNC_FD` external semaphores report import support.
+    pub sync_file_importable: bool,
+    /// Whether `SYNC_FD` external semaphores report export support.
+    pub sync_file_exportable: bool,
+    /// Whether semaphores imported from `SYNC_FD` can be exported again as `SYNC_FD`.
+    pub sync_file_export_from_imported: bool,
     /// Whether the known renderer sync-file semaphore prerequisites are all available.
     pub prerequisites_available: bool,
 }
@@ -402,9 +408,33 @@ impl VulkanExternalSyncCapabilities {
     }
 
     pub(super) fn discover(physical_device: &PhysicalDevice) -> Self {
-        Self::from_device_extension_support(physical_device.api_version(), |extension| {
-            physical_device.has_device_extension(extension)
-        })
+        let mut capabilities =
+            Self::from_device_extension_support(physical_device.api_version(), |extension| {
+                physical_device.has_device_extension(extension)
+            });
+
+        if capabilities.prerequisites_available {
+            let external_semaphore_info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+                .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+            let mut external_semaphore_properties = vk::ExternalSemaphoreProperties::default();
+            // SAFETY: `physical_device` was enumerated from this live instance. Vulkan 1.1 core or
+            // VK_KHR_external_semaphore provides this query, and `prerequisites_available` also
+            // requires VK_KHR_external_semaphore_fd. Input/output pointers refer to stack storage
+            // valid for the duration of the call.
+            unsafe {
+                physical_device
+                    .instance()
+                    .handle()
+                    .get_physical_device_external_semaphore_properties(
+                        physical_device.handle(),
+                        &external_semaphore_info,
+                        &mut external_semaphore_properties,
+                    )
+            };
+            capabilities.apply_sync_file_properties(external_semaphore_properties);
+        }
+
+        capabilities
     }
 
     pub(super) fn from_device_extension_support(
@@ -419,8 +449,21 @@ impl VulkanExternalSyncCapabilities {
         Self {
             external_semaphore,
             external_semaphore_fd,
+            sync_file_importable: false,
+            sync_file_exportable: false,
+            sync_file_export_from_imported: false,
             prerequisites_available,
         }
+    }
+
+    pub(super) fn apply_sync_file_properties(&mut self, properties: vk::ExternalSemaphoreProperties<'_>) {
+        let sync_fd = vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD;
+        let features = properties.external_semaphore_features;
+        self.sync_file_importable = features.contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE);
+        self.sync_file_exportable = features.contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE);
+        self.sync_file_export_from_imported = self.sync_file_importable
+            && self.sync_file_exportable
+            && properties.export_from_imported_handle_types.contains(sync_fd);
     }
 }
 

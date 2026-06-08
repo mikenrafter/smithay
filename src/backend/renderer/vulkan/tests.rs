@@ -248,6 +248,9 @@ fn vulkan_renderer_default_capabilities_are_false() {
     assert!(!caps.external_memory.prerequisites_available);
     assert!(!caps.external_sync.external_semaphore);
     assert!(!caps.external_sync.external_semaphore_fd);
+    assert!(!caps.external_sync.sync_file_importable);
+    assert!(!caps.external_sync.sync_file_exportable);
+    assert!(!caps.external_sync.sync_file_export_from_imported);
     assert!(!caps.external_sync.prerequisites_available);
 }
 
@@ -382,6 +385,9 @@ fn external_sync_capability_discovery_tracks_sync_file_prerequisites_without_adv
     assert!(caps.external_semaphore);
     assert!(caps.external_semaphore_fd);
     assert!(caps.prerequisites_available);
+    assert!(!caps.sync_file_importable);
+    assert!(!caps.sync_file_exportable);
+    assert!(!caps.sync_file_export_from_imported);
 
     let renderer_caps = VulkanRendererCapabilities {
         external_sync: caps,
@@ -412,6 +418,54 @@ fn external_sync_capability_discovery_uses_core_external_semaphore() {
     assert!(caps.external_semaphore);
     assert!(caps.external_semaphore_fd);
     assert!(caps.prerequisites_available);
+    assert!(!caps.sync_file_importable);
+    assert!(!caps.sync_file_exportable);
+    assert!(!caps.sync_file_export_from_imported);
+}
+
+#[test]
+fn external_sync_file_properties_map_import_export_features() {
+    let mut caps =
+        VulkanExternalSyncCapabilities::from_device_extension_support(Version::VERSION_1_1, |name| {
+            name == khr::external_semaphore_fd::NAME
+        });
+    let unsupported_properties = vk::ExternalSemaphoreProperties::default()
+        .export_from_imported_handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+
+    caps.apply_sync_file_properties(unsupported_properties);
+    assert!(!caps.sync_file_importable);
+    assert!(!caps.sync_file_exportable);
+    assert!(!caps.sync_file_export_from_imported);
+
+    let sync_file_properties = vk::ExternalSemaphoreProperties::default()
+        .compatible_handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+        .external_semaphore_features(
+            vk::ExternalSemaphoreFeatureFlags::IMPORTABLE | vk::ExternalSemaphoreFeatureFlags::EXPORTABLE,
+        )
+        .export_from_imported_handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+
+    caps.apply_sync_file_properties(sync_file_properties);
+    assert!(caps.sync_file_importable);
+    assert!(caps.sync_file_exportable);
+    assert!(caps.sync_file_export_from_imported);
+
+    let import_only_properties = vk::ExternalSemaphoreProperties::default()
+        .compatible_handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+        .external_semaphore_features(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE);
+
+    caps.apply_sync_file_properties(import_only_properties);
+    assert!(caps.sync_file_importable);
+    assert!(!caps.sync_file_exportable);
+    assert!(!caps.sync_file_export_from_imported);
+
+    let export_only_properties = vk::ExternalSemaphoreProperties::default()
+        .external_semaphore_features(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE)
+        .export_from_imported_handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+
+    caps.apply_sync_file_properties(export_only_properties);
+    assert!(!caps.sync_file_importable);
+    assert!(caps.sync_file_exportable);
+    assert!(!caps.sync_file_export_from_imported);
 }
 
 #[test]
