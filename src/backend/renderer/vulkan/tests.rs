@@ -2762,35 +2762,47 @@ fn frame_render_texture_rejects_narrow_path_preconditions_before_device_lookup()
 
     texture.context_id = frame_context_id.clone();
 
-    let mut acquire_pending_texture = texture.clone();
-    acquire_pending_texture.image.sync.external_acquire_pending = true;
-    assert_render_texture_error(
-        &acquire_pending_texture,
-        frame_context_id.clone(),
-        Transform::Normal,
-        full_src,
-        full_dst,
-        &full_damage,
-        &[],
-        Transform::Normal,
-        1.0,
-        "dmabuf import synchronization",
-    );
-
-    let mut release_pending_texture = texture.clone();
-    release_pending_texture.image.sync.external_ownership = VulkanExternalImageOwnership::ReleasePending;
-    assert_render_texture_error(
-        &release_pending_texture,
-        frame_context_id.clone(),
-        Transform::Normal,
-        full_src,
-        full_dst,
-        &full_damage,
-        &[],
-        Transform::Normal,
-        1.0,
-        "dmabuf import synchronization",
-    );
+    for sync in [
+        VulkanImageSyncState {
+            external_acquire_pending: true,
+            ..VulkanImageSyncState::default()
+        },
+        VulkanImageSyncState {
+            external_acquire_pending: true,
+            external_ownership: VulkanExternalImageOwnership::ForeignUnknown,
+            ..VulkanImageSyncState::default()
+        },
+        VulkanImageSyncState::foreign_known_general_for_dmabuf_import(),
+        VulkanImageSyncState {
+            external_acquire_pending: true,
+            external_ownership: VulkanExternalImageOwnership::AcquirePending,
+            ..VulkanImageSyncState::default()
+        },
+        VulkanImageSyncState {
+            external_acquire_pending: true,
+            external_ownership: VulkanExternalImageOwnership::Local,
+            ..VulkanImageSyncState::default()
+        },
+        VulkanImageSyncState {
+            external_ownership: VulkanExternalImageOwnership::ReleasePending,
+            ..VulkanImageSyncState::default()
+        },
+    ] {
+        let mut externally_owned_texture = texture.clone();
+        externally_owned_texture.image.sync = sync;
+        assert_render_texture_error(
+            &externally_owned_texture,
+            frame_context_id.clone(),
+            Transform::Normal,
+            full_src,
+            full_dst,
+            &full_damage,
+            &[],
+            Transform::Normal,
+            1.0,
+            "dmabuf import synchronization",
+        );
+    }
 
     assert_render_texture_error(
         &texture,
