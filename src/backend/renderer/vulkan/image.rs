@@ -150,6 +150,30 @@ impl VulkanTexture {
     pub(super) fn is_y_inverted_for_tests(&self) -> bool {
         self.y_inverted
     }
+
+    fn sync_state(&self) -> Result<VulkanImageSyncState, VulkanError> {
+        self.sampled_image
+            .as_ref()
+            .map(|sampled_image| sampled_image.image().sync_state())
+            .unwrap_or(Ok(self.image.sync))
+    }
+
+    #[cfg(test)]
+    pub(super) fn sync_state_for_tests(&self) -> Result<VulkanImageSyncState, VulkanError> {
+        self.sync_state()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_sampled_image_sync_state_for_tests(
+        &self,
+        sync: VulkanImageSyncState,
+    ) -> Result<(), VulkanError> {
+        self.sampled_image
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("sampled image sync"))?
+            .image()
+            .set_sync_state(sync)
+    }
 }
 
 #[allow(dead_code)]
@@ -163,11 +187,16 @@ pub(super) fn dmabuf_import_image_state(import: &VulkanDmabufImportState) -> Vul
             ..VulkanImageUsage::default()
         },
         layout: VulkanImageLayoutState::Undefined,
-        sync: VulkanImageSyncState {
-            external_acquire_pending: true,
-            external_ownership: VulkanExternalImageOwnership::ForeignUnknown,
-            ..VulkanImageSyncState::default()
-        },
+        sync: dmabuf_import_sync_state(),
+    }
+}
+
+#[allow(dead_code)]
+pub(super) fn dmabuf_import_sync_state() -> VulkanImageSyncState {
+    VulkanImageSyncState {
+        external_acquire_pending: true,
+        external_ownership: VulkanExternalImageOwnership::ForeignUnknown,
+        ..VulkanImageSyncState::default()
     }
 }
 
@@ -735,7 +764,7 @@ impl Frame for VulkanFrame<'_, '_> {
         if texture.context_id != self.context_id {
             return Err(VulkanError::UnsupportedOperation("foreign render texture"));
         }
-        if !texture.image.sync.is_locally_usable() {
+        if !texture.sync_state()?.is_locally_usable() {
             return Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"));
         }
         if self.transform != Transform::Normal {

@@ -21,7 +21,7 @@ use super::{
     format::get_render_vk_format,
     image::{
         VulkanDmabufImportState, VulkanExternalImageOwnership, VulkanExternalMemoryHandleType,
-        VulkanImageSyncState,
+        VulkanImageSyncState, dmabuf_import_sync_state,
     },
 };
 
@@ -1066,7 +1066,11 @@ impl VulkanDeviceState {
             return Err(err);
         }
 
-        Ok(Some(import_image.image.into_bound_image(memory)))
+        Ok(Some(
+            import_image
+                .image
+                .into_bound_image_with_sync(memory, dmabuf_import_sync_state()),
+        ))
     }
 
     #[allow(dead_code)]
@@ -3991,6 +3995,7 @@ fn create_bound_image(
             usage,
             external_memory_handle_type: None,
             layout: Mutex::new(vk::ImageLayout::UNDEFINED),
+            sync: Mutex::new(VulkanImageSyncState::default()),
         }),
     })
 }
@@ -4328,6 +4333,7 @@ struct VulkanOwnedImageInner {
     usage: vk::ImageUsageFlags,
     external_memory_handle_type: Option<VulkanExternalMemoryHandleType>,
     layout: Mutex<vk::ImageLayout>,
+    sync: Mutex<VulkanImageSyncState>,
 }
 
 #[allow(dead_code)]
@@ -4363,6 +4369,24 @@ impl VulkanOwnedImage {
             .map(|layout| *layout)
             .map_err(|_| host_synchronization_failed())
     }
+
+    pub(super) fn sync_state(&self) -> Result<VulkanImageSyncState, VulkanError> {
+        self.inner
+            .sync
+            .lock()
+            .map(|sync| *sync)
+            .map_err(|_| host_synchronization_failed())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_sync_state(&self, sync: VulkanImageSyncState) -> Result<(), VulkanError> {
+        *self
+            .inner
+            .sync
+            .lock()
+            .map_err(|_| host_synchronization_failed())? = sync;
+        Ok(())
+    }
 }
 
 #[allow(dead_code)]
@@ -4384,6 +4408,14 @@ impl VulkanUnboundImage {
     }
 
     fn into_bound_image(self, memory: vk::DeviceMemory) -> VulkanOwnedImage {
+        self.into_bound_image_with_sync(memory, VulkanImageSyncState::default())
+    }
+
+    fn into_bound_image_with_sync(
+        self,
+        memory: vk::DeviceMemory,
+        sync: VulkanImageSyncState,
+    ) -> VulkanOwnedImage {
         let this = ManuallyDrop::new(self);
         // SAFETY: `this` is `ManuallyDrop`, so its fields will not be dropped automatically. Moving
         // the logical device out with `ptr::read` transfers the single owning reference into the
@@ -4401,6 +4433,7 @@ impl VulkanUnboundImage {
                 usage: this.usage,
                 external_memory_handle_type: this.external_memory_handle_type,
                 layout: Mutex::new(vk::ImageLayout::UNDEFINED),
+                sync: Mutex::new(sync),
             }),
         }
     }

@@ -4238,6 +4238,77 @@ fn runtime_builtin_graphics_pipelines_are_cached() {
 
 #[test]
 #[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_vulkan_texture_clones_share_sampled_image_sync_state() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let Some(format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.sampled
+                && record.usages.transfer_dst
+        })
+        .map(|record| record.format)
+    else {
+        return;
+    };
+
+    let sampled_image = renderer
+        .device
+        .as_ref()
+        .unwrap()
+        .create_uploaded_sampled_image(
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            super::get_render_vk_format(format).unwrap(),
+            &[0, 0, 0, 255],
+            TextureFilter::Nearest,
+            TextureFilter::Nearest,
+        )
+        .unwrap();
+    let texture =
+        VulkanTexture::from_sampled_image(renderer.context_id(), (1, 1).into(), format, sampled_image, false);
+    let cloned_texture = texture.clone();
+    let foreign_sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+
+    assert_eq!(
+        texture.sync_state_for_tests().unwrap(),
+        VulkanImageSyncState::default()
+    );
+    cloned_texture
+        .set_sampled_image_sync_state_for_tests(foreign_sync)
+        .unwrap();
+    assert_eq!(texture.sync_state_for_tests().unwrap(), foreign_sync);
+    assert_eq!(cloned_texture.sync_state_for_tests().unwrap(), foreign_sync);
+
+    let local_sync = VulkanImageSyncState {
+        external_ownership: VulkanExternalImageOwnership::Local,
+        ..VulkanImageSyncState::default()
+    };
+    texture
+        .set_sampled_image_sync_state_for_tests(local_sync)
+        .unwrap();
+    assert_eq!(texture.sync_state_for_tests().unwrap(), local_sync);
+    assert_eq!(cloned_texture.sync_state_for_tests().unwrap(), local_sync);
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
 fn runtime_frame_render_texture_draws_uploaded_sampled_image() {
     let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
     let physical_device = PhysicalDevice::enumerate(&instance)
