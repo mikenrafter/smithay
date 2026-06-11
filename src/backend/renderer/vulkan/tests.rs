@@ -1106,7 +1106,9 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
     );
     let mut acquire_transition_sync = released_sync;
     assert!(matches!(
-        acquire_transition_sync.complete_sampled_dmabuf_foreign_acquire(),
+        // SAFETY: This intentionally checks precondition validation and returns before mutating
+        // because no acquire transfer is pending.
+        unsafe { acquire_transition_sync.complete_sampled_dmabuf_foreign_acquire() },
         Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
     ));
     acquire_transition_sync
@@ -1123,9 +1125,13 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
         plan_sampled_dmabuf_foreign_acquire_barrier(&acquire_transition_sync, 2, usage),
         Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
     ));
-    acquire_transition_sync
-        .complete_sampled_dmabuf_foreign_acquire()
-        .unwrap();
+    // SAFETY: This unit test exercises only the host-side state transition; production callers may
+    // complete a pending transfer only after the corresponding Vulkan barrier has completed.
+    unsafe {
+        acquire_transition_sync
+            .complete_sampled_dmabuf_foreign_acquire()
+            .unwrap()
+    };
     assert!(!acquire_transition_sync.external_acquire_pending);
     assert_eq!(
         acquire_transition_sync.external_ownership,
@@ -1158,7 +1164,9 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
         VulkanExternalImageOwnership::Local
     );
     assert!(matches!(
-        acquire_transition_sync.complete_sampled_dmabuf_foreign_release(),
+        // SAFETY: This intentionally checks precondition validation and returns before mutating
+        // because no release transfer is pending.
+        unsafe { acquire_transition_sync.complete_sampled_dmabuf_foreign_release() },
         Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
     ));
     acquire_transition_sync
@@ -1168,9 +1176,13 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
         acquire_transition_sync.external_ownership,
         VulkanExternalImageOwnership::ReleasePending
     );
-    acquire_transition_sync
-        .complete_sampled_dmabuf_foreign_release()
-        .unwrap();
+    // SAFETY: This unit test exercises only the host-side state transition; production callers may
+    // complete a pending transfer only after the corresponding Vulkan barrier has completed.
+    unsafe {
+        acquire_transition_sync
+            .complete_sampled_dmabuf_foreign_release()
+            .unwrap()
+    };
     assert!(acquire_transition_sync.external_acquire_pending);
     assert_eq!(
         acquire_transition_sync.external_ownership,
@@ -1194,7 +1206,8 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
             Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
         ));
         assert!(matches!(
-            invalid_acquire.complete_sampled_dmabuf_foreign_acquire(),
+            // SAFETY: This intentionally checks precondition validation and returns before mutating.
+            unsafe { invalid_acquire.complete_sampled_dmabuf_foreign_acquire() },
             Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
         ));
     }
@@ -1204,7 +1217,8 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
             Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
         ));
         assert!(matches!(
-            invalid_release.complete_sampled_dmabuf_foreign_release(),
+            // SAFETY: This intentionally checks precondition validation and returns before mutating.
+            unsafe { invalid_release.complete_sampled_dmabuf_foreign_release() },
             Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
         ));
     }
@@ -1277,7 +1291,6 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
         plan_sampled_dmabuf_foreign_acquire_barrier(&released_sync, 2, usage).unwrap(),
         Some(acquire)
     );
-
     let release = sampled_dmabuf_foreign_release_barrier(2, usage).unwrap();
     assert_eq!(release.src_stage, vk::PipelineStageFlags::FRAGMENT_SHADER);
     assert_eq!(release.dst_stage, vk::PipelineStageFlags::BOTTOM_OF_PIPE);
@@ -1329,7 +1342,6 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
         .unwrap(),
         Some(release)
     );
-
     let image = vk::Image::null();
     let vk_barrier = acquire.to_color_image_memory_barrier(image);
     assert_eq!(vk_barrier.s_type, vk::StructureType::IMAGE_MEMORY_BARRIER);

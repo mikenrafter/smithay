@@ -273,8 +273,16 @@ impl VulkanImageSyncState {
         }
     }
 
+    /// Complete a pending sampled-dmabuf foreign acquire after the Vulkan barrier has executed.
+    ///
+    /// # Safety
+    ///
+    /// If this method can complete successfully, the caller must ensure the corresponding
+    /// queue-family ownership and layout transition from foreign ownership to this renderer's queue
+    /// has been submitted and completed before calling it. Calling this early makes the host-side
+    /// sync state more permissive than Vulkan's actual image ownership/layout state.
     #[allow(dead_code)]
-    pub(super) fn complete_sampled_dmabuf_foreign_acquire(&mut self) -> Result<(), VulkanError> {
+    pub(super) unsafe fn complete_sampled_dmabuf_foreign_acquire(&mut self) -> Result<(), VulkanError> {
         match (self.external_ownership, self.external_acquire_pending) {
             (VulkanExternalImageOwnership::AcquirePending, true) => {
                 self.external_ownership = VulkanExternalImageOwnership::Local;
@@ -328,8 +336,16 @@ impl VulkanImageSyncState {
         }
     }
 
+    /// Complete a pending sampled-dmabuf foreign release after the Vulkan barrier has executed.
+    ///
+    /// # Safety
+    ///
+    /// If this method can complete successfully, the caller must ensure the corresponding
+    /// queue-family ownership and layout transition from this renderer's queue to foreign ownership
+    /// has been submitted and completed before calling it. Calling this early can expose the image to
+    /// foreign users while Vulkan still considers it locally owned or in the local sampled layout.
     #[allow(dead_code)]
-    pub(super) fn complete_sampled_dmabuf_foreign_release(&mut self) -> Result<(), VulkanError> {
+    pub(super) unsafe fn complete_sampled_dmabuf_foreign_release(&mut self) -> Result<(), VulkanError> {
         match (self.external_ownership, self.external_acquire_pending) {
             (VulkanExternalImageOwnership::ReleasePending, false) => {
                 self.external_ownership = VulkanExternalImageOwnership::ForeignKnownGeneral;
