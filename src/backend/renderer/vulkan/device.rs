@@ -607,10 +607,10 @@ impl VulkanDeviceState {
             transfer: transfer_queue,
         };
 
-        let graphics_command_pool = create_command_pool(&logical_device, graphics_family)?;
+        let graphics_command_pool = create_command_pool(&logical_device, graphics_family, true)?;
         let transfer_command_pool = queue_families
             .transfer
-            .map(|family| create_command_pool(&logical_device, family))
+            .map(|family| create_command_pool(&logical_device, family, family == graphics_family))
             .transpose()?;
 
         Ok(Self {
@@ -1462,6 +1462,24 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(super) fn record_sampled_dmabuf_foreign_acquire_barrier(
+        &self,
+        command_buffer: &mut VulkanCommandBuffer,
+        image: &VulkanOwnedImage,
+    ) -> Result<bool, VulkanError> {
+        record_sampled_dmabuf_foreign_acquire_barrier(command_buffer, image)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn record_sampled_dmabuf_foreign_release_barrier(
+        &self,
+        command_buffer: &mut VulkanCommandBuffer,
+        image: &VulkanOwnedImage,
+    ) -> Result<bool, VulkanError> {
+        record_sampled_dmabuf_foreign_release_barrier(command_buffer, image)
+    }
+
+    #[allow(dead_code)]
     pub(super) fn copy_buffer_to_image(
         &self,
         command_buffer: &mut VulkanCommandBuffer,
@@ -1537,9 +1555,11 @@ impl VulkanDeviceState {
 
     #[allow(dead_code)]
     pub(super) fn create_image_view(&self, image: &VulkanOwnedImage) -> Result<VulkanImageView, VulkanError> {
-        self.logical_device
+        let logical_device = self
+            .logical_device
             .as_ref()
             .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        ensure_logical_device_image_device(logical_device, image, "image view device")?;
 
         create_image_view(image)
     }
@@ -1622,6 +1642,13 @@ impl VulkanDeviceState {
         image: &VulkanOwnedImage,
         color: vk::ClearColorValue,
     ) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        ensure_logical_device_image_device(logical_device, image, "image device")?;
+        ensure_image_locally_usable(image)?;
+
         let view = self.create_color_attachment_image_view(image)?;
         let render_pass = self.single_color_clear_render_pass(image.format())?;
         let framebuffer = create_single_color_framebuffer(&render_pass, &view, image.extent())?;
@@ -1648,6 +1675,12 @@ impl VulkanDeviceState {
         if clear_areas.is_empty() {
             return Ok(());
         }
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        ensure_logical_device_image_device(logical_device, image, "image device")?;
+        ensure_image_locally_usable(image)?;
 
         let view = self.create_color_attachment_image_view(image)?;
         let render_pass = self.single_color_load_render_pass(image.format())?;
@@ -1721,9 +1754,11 @@ impl VulkanDeviceState {
         &self,
         image: &VulkanOwnedImage,
     ) -> Result<VulkanImageView, VulkanError> {
-        self.logical_device
+        let logical_device = self
+            .logical_device
             .as_ref()
             .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        ensure_logical_device_image_device(logical_device, image, "image view device")?;
 
         create_color_attachment_image_view(image)
     }
@@ -2348,6 +2383,7 @@ impl VulkanDeviceState {
 fn create_command_pool(
     logical_device: &VulkanLogicalDevice,
     queue_family_index: u32,
+    supports_graphics: bool,
 ) -> Result<Arc<VulkanCommandPool>, VulkanError> {
     let command_pool_info = vk::CommandPoolCreateInfo::default()
         .queue_family_index(queue_family_index)
@@ -2364,6 +2400,7 @@ fn create_command_pool(
         logical_device: logical_device.clone(),
         handle,
         queue_family_index,
+        supports_graphics,
         host_access: Mutex::new(()),
     }))
 }
@@ -2440,6 +2477,60 @@ fn ensure_command_buffer_executable(command_buffer: &VulkanCommandBuffer) -> Res
         Ok(())
     } else {
         Err(VulkanError::UnsupportedOperation("command buffer executable"))
+    }
+}
+
+fn ensure_graphics_command_buffer(command_buffer: &VulkanCommandBuffer) -> Result<(), VulkanError> {
+    if command_buffer.command_pool.supports_graphics() {
+        Ok(())
+    } else {
+        Err(VulkanError::UnsupportedOperation("command buffer graphics queue"))
+    }
+}
+
+fn ensure_command_buffer_image_device(
+    command_buffer: &VulkanCommandBuffer,
+    image: &VulkanOwnedImage,
+) -> Result<(), VulkanError> {
+    ensure_logical_device_image_device(
+        &command_buffer.command_pool.logical_device,
+        image,
+        "command buffer image device",
+    )
+}
+
+fn ensure_logical_device_image_device(
+    logical_device: &VulkanLogicalDevice,
+    image: &VulkanOwnedImage,
+    reason: &'static str,
+) -> Result<(), VulkanError> {
+    if logical_device.is_same_device(&image.inner.logical_device) {
+        Ok(())
+    } else {
+        Err(VulkanError::UnsupportedOperation(reason))
+    }
+}
+
+fn ensure_command_buffer_buffer_device(
+    command_buffer: &VulkanCommandBuffer,
+    buffer: &VulkanHostVisibleBuffer,
+) -> Result<(), VulkanError> {
+    if command_buffer
+        .command_pool
+        .logical_device
+        .is_same_device(&buffer.inner.logical_device)
+    {
+        Ok(())
+    } else {
+        Err(VulkanError::UnsupportedOperation("command buffer buffer device"))
+    }
+}
+
+fn ensure_image_locally_usable(image: &VulkanOwnedImage) -> Result<(), VulkanError> {
+    if image.sync_state()?.is_locally_usable() {
+        Ok(())
+    } else {
+        Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"))
     }
 }
 
@@ -2619,6 +2710,8 @@ fn transition_image_layout(
     new_layout: vk::ImageLayout,
 ) -> Result<(), VulkanError> {
     ensure_command_buffer_recording(command_buffer)?;
+    ensure_command_buffer_image_device(command_buffer, image)?;
+    ensure_image_locally_usable(image)?;
     let old_layout = command_buffer
         .pending_layout_for(image)?
         .unwrap_or(image.layout()?);
@@ -2671,6 +2764,126 @@ fn transition_image_layout(
     Ok(())
 }
 
+fn record_sampled_dmabuf_foreign_acquire_barrier(
+    command_buffer: &mut VulkanCommandBuffer,
+    image: &VulkanOwnedImage,
+) -> Result<bool, VulkanError> {
+    ensure_command_buffer_recording(command_buffer)?;
+    ensure_graphics_command_buffer(command_buffer)?;
+    ensure_command_buffer_image_device(command_buffer, image)?;
+    ensure_dmabuf_external_image(image)?;
+    let Some(barrier) =
+        command_buffer.plan_sampled_dmabuf_foreign_acquire_barrier(&image.sync_state()?, image.usage())?
+    else {
+        return Ok(false);
+    };
+    let vk_barrier = barrier.to_color_image_memory_barrier(image.image());
+    let _pool_guard = command_buffer.command_pool.lock_host_access()?;
+
+    image.inner.sync.begin_sampled_dmabuf_foreign_acquire()?;
+    // SAFETY: `command_buffer` is in recording state and belongs to a live command pool/device.
+    // `image` is a bound external-memory image retained below until command completion. The barrier
+    // is produced by the sampled-dmabuf foreign acquire planner, which validates sampled usage, a
+    // local destination queue family, and the known foreign GENERAL layout before selecting the
+    // FOREIGN -> local queue-family transfer and GENERAL -> SHADER_READ_ONLY layout transition.
+    unsafe {
+        command_buffer
+            .command_pool
+            .logical_device
+            .handle()
+            .cmd_pipeline_barrier(
+                command_buffer.handle,
+                barrier.src_stage,
+                barrier.dst_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vk_barrier],
+            )
+    };
+    command_buffer
+        .pending_image_layouts
+        .push(VulkanPendingImageLayout {
+            image: image.image(),
+            resource: Arc::clone(&image.inner),
+            new_layout: barrier.new_layout,
+        });
+    command_buffer.pending_image_syncs.push(VulkanPendingImageSync {
+        resource: Arc::clone(&image.inner),
+        operation: VulkanPendingImageSyncOperation::SampledDmabufForeignAcquire,
+    });
+    command_buffer.referenced_images.push(Arc::clone(&image.inner));
+
+    Ok(true)
+}
+
+fn record_sampled_dmabuf_foreign_release_barrier(
+    command_buffer: &mut VulkanCommandBuffer,
+    image: &VulkanOwnedImage,
+) -> Result<bool, VulkanError> {
+    ensure_command_buffer_recording(command_buffer)?;
+    ensure_graphics_command_buffer(command_buffer)?;
+    ensure_command_buffer_image_device(command_buffer, image)?;
+    ensure_dmabuf_external_image(image)?;
+    let local_layout = command_buffer
+        .pending_layout_for(image)?
+        .unwrap_or(image.layout()?);
+    let Some(barrier) = command_buffer.plan_sampled_dmabuf_foreign_release_barrier(
+        &image.sync_state()?,
+        local_layout,
+        image.usage(),
+    )?
+    else {
+        return Ok(false);
+    };
+    let vk_barrier = barrier.to_color_image_memory_barrier(image.image());
+    let _pool_guard = command_buffer.command_pool.lock_host_access()?;
+
+    image.inner.sync.begin_sampled_dmabuf_foreign_release()?;
+    // SAFETY: `command_buffer` is in recording state and belongs to a live command pool/device.
+    // `image` is a bound external-memory image retained below until command completion. The barrier
+    // is produced by the sampled-dmabuf foreign release planner, which validates sampled usage,
+    // current local SHADER_READ_ONLY layout, and a local source queue family before selecting the
+    // local -> FOREIGN queue-family transfer and SHADER_READ_ONLY -> GENERAL layout transition.
+    unsafe {
+        command_buffer
+            .command_pool
+            .logical_device
+            .handle()
+            .cmd_pipeline_barrier(
+                command_buffer.handle,
+                barrier.src_stage,
+                barrier.dst_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vk_barrier],
+            )
+    };
+    command_buffer
+        .pending_image_layouts
+        .push(VulkanPendingImageLayout {
+            image: image.image(),
+            resource: Arc::clone(&image.inner),
+            new_layout: barrier.new_layout,
+        });
+    command_buffer.pending_image_syncs.push(VulkanPendingImageSync {
+        resource: Arc::clone(&image.inner),
+        operation: VulkanPendingImageSyncOperation::SampledDmabufForeignRelease,
+    });
+    command_buffer.referenced_images.push(Arc::clone(&image.inner));
+
+    Ok(true)
+}
+
+fn ensure_dmabuf_external_image(image: &VulkanOwnedImage) -> Result<(), VulkanError> {
+    if image.external_memory_handle_type() == Some(VulkanExternalMemoryHandleType::Dmabuf) {
+        Ok(())
+    } else {
+        Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+    }
+}
+
 fn copy_buffer_to_image(
     command_buffer: &mut VulkanCommandBuffer,
     buffer: &VulkanHostVisibleBuffer,
@@ -2701,6 +2914,9 @@ fn copy_buffer_region_to_image(
     extent: vk::Extent3D,
 ) -> Result<(), VulkanError> {
     ensure_command_buffer_recording(command_buffer)?;
+    ensure_command_buffer_image_device(command_buffer, image)?;
+    ensure_image_locally_usable(image)?;
+    ensure_command_buffer_buffer_device(command_buffer, buffer)?;
     if !buffer.usage().contains(vk::BufferUsageFlags::TRANSFER_SRC) {
         return Err(VulkanError::UnsupportedOperation("buffer transfer source usage"));
     }
@@ -2792,6 +3008,8 @@ fn clear_color_image(
     color: vk::ClearColorValue,
 ) -> Result<(), VulkanError> {
     ensure_command_buffer_recording(command_buffer)?;
+    ensure_command_buffer_image_device(command_buffer, image)?;
+    ensure_image_locally_usable(image)?;
     if !image.usage().contains(vk::ImageUsageFlags::TRANSFER_DST) {
         return Err(VulkanError::UnsupportedOperation(
             "image transfer destination usage",
@@ -2841,6 +3059,8 @@ fn record_color_attachment_clear(
     color: vk::ClearColorValue,
 ) -> Result<(), VulkanError> {
     ensure_command_buffer_recording(command_buffer)?;
+    ensure_command_buffer_image_device(command_buffer, image)?;
+    ensure_image_locally_usable(image)?;
     if !image.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
         return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
     }
@@ -2894,6 +3114,8 @@ fn record_color_attachment_clear_rects(
     clear_areas: &[vk::Rect2D],
 ) -> Result<(), VulkanError> {
     ensure_command_buffer_recording(command_buffer)?;
+    ensure_command_buffer_image_device(command_buffer, image)?;
+    ensure_image_locally_usable(image)?;
     if clear_areas.is_empty() {
         return Ok(());
     }
@@ -2961,6 +3183,9 @@ fn record_sampled_texture_draw(
     draw_constants: VulkanSampledTextureDrawConstants,
 ) -> Result<(), VulkanError> {
     ensure_command_buffer_recording(command_buffer)?;
+    ensure_command_buffer_image_device(command_buffer, target)?;
+    ensure_image_locally_usable(target)?;
+    ensure_image_locally_usable(descriptor_set.sampled_image().image())?;
     if !target.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
         return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
     }
@@ -3062,6 +3287,8 @@ fn record_solid_color_draw(
     draw_constants: VulkanSolidColorDrawConstants,
 ) -> Result<(), VulkanError> {
     ensure_command_buffer_recording(command_buffer)?;
+    ensure_command_buffer_image_device(command_buffer, target)?;
+    ensure_image_locally_usable(target)?;
     if !target.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
         return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
     }
@@ -3299,6 +3526,8 @@ fn synchronize_color_attachment_load(
     image: &VulkanOwnedImage,
 ) -> Result<(), VulkanError> {
     ensure_command_buffer_recording(command_buffer)?;
+    ensure_command_buffer_image_device(command_buffer, image)?;
+    ensure_image_locally_usable(image)?;
     if !image.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
         return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
     }
@@ -3359,6 +3588,9 @@ fn copy_image_region_to_buffer(
     extent: vk::Extent3D,
 ) -> Result<(), VulkanError> {
     ensure_command_buffer_recording(command_buffer)?;
+    ensure_command_buffer_image_device(command_buffer, image)?;
+    ensure_image_locally_usable(image)?;
+    ensure_command_buffer_buffer_device(command_buffer, buffer)?;
     if !image.usage().contains(vk::ImageUsageFlags::TRANSFER_SRC) {
         return Err(VulkanError::UnsupportedOperation("image transfer source usage"));
     }
@@ -4243,12 +4475,17 @@ pub(crate) struct VulkanCommandPool {
     logical_device: VulkanLogicalDevice,
     handle: vk::CommandPool,
     queue_family_index: u32,
+    supports_graphics: bool,
     host_access: Mutex<()>,
 }
 
 impl VulkanCommandPool {
     pub(super) fn queue_family_index(&self) -> u32 {
         self.queue_family_index
+    }
+
+    fn supports_graphics(&self) -> bool {
+        self.supports_graphics
     }
 
     fn lock_host_access(&self) -> Result<MutexGuard<'_, ()>, VulkanError> {
@@ -4730,6 +4967,10 @@ impl VulkanImageView {
 
     pub(super) fn image(&self) -> vk::Image {
         self.image.image
+    }
+
+    fn logical_device(&self) -> &VulkanLogicalDevice {
+        &self.image.logical_device
     }
 }
 
@@ -5623,6 +5864,10 @@ fn create_single_color_framebuffer(
     view: &VulkanImageView,
     extent: vk::Extent3D,
 ) -> Result<VulkanFramebuffer, VulkanError> {
+    if !render_pass.logical_device().is_same_device(view.logical_device()) {
+        return Err(VulkanError::UnsupportedOperation("framebuffer device"));
+    }
+
     let attachments = [view.handle()];
     let framebuffer_info = vk::FramebufferCreateInfo::default()
         .render_pass(render_pass.handle)

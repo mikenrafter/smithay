@@ -3411,6 +3411,10 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     let api_version = physical_device.api_version();
 
     let mut renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device.clone())
+        .build()
+        .unwrap();
+    let other_renderer = VulkanRenderer::builder()
         .with_physical_device(physical_device)
         .build()
         .unwrap();
@@ -3418,6 +3422,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
 
     assert!(renderer.is_device_initialized());
     let device = renderer.device.as_ref().unwrap();
+    let other_device = other_renderer.device.as_ref().unwrap();
     assert!(device.memory_properties.is_some());
     assert!(
         device
@@ -3548,9 +3553,50 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     let copy_buffer = device
         .create_host_visible_buffer(4, vk::BufferUsageFlags::TRANSFER_SRC)
         .unwrap();
+    let foreign_copy_buffer = other_device
+        .create_host_visible_buffer(4, vk::BufferUsageFlags::TRANSFER_SRC)
+        .unwrap();
     assert_eq!(copy_buffer.size(), 4);
     assert!(copy_buffer.usage().contains(vk::BufferUsageFlags::TRANSFER_SRC));
     copy_buffer.write(&[0xff, 0x00, 0x00, 0xff]).unwrap();
+    let foreign_color_image = other_device
+        .create_bound_image(
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .unwrap();
+    assert!(matches!(
+        device.create_color_attachment_image_view(&foreign_color_image),
+        Err(VulkanError::UnsupportedOperation("image view device"))
+    ));
+    assert!(matches!(
+        device.clear_color_attachment_image(
+            &foreign_color_image,
+            vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0]
+            },
+        ),
+        Err(VulkanError::UnsupportedOperation("image device"))
+    ));
+    assert!(matches!(
+        device.clear_color_attachment_image_in(
+            &foreign_color_image,
+            vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0]
+            },
+            &[vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D { width: 1, height: 1 },
+            }],
+        ),
+        Err(VulkanError::UnsupportedOperation("image device"))
+    ));
     let mut graphics_command_buffer = device.allocate_graphics_command_buffer().unwrap();
     let mut transfer_command_buffer = device.allocate_transfer_command_buffer().unwrap();
     assert_ne!(graphics_command_buffer.handle(), vk::CommandBuffer::null());
@@ -3563,6 +3609,14 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
             &owned_image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         ),
+        Err(VulkanError::UnsupportedOperation("command buffer recording"))
+    ));
+    assert!(matches!(
+        device.record_sampled_dmabuf_foreign_acquire_barrier(&mut graphics_command_buffer, &owned_image),
+        Err(VulkanError::UnsupportedOperation("command buffer recording"))
+    ));
+    assert!(matches!(
+        device.record_sampled_dmabuf_foreign_release_barrier(&mut graphics_command_buffer, &owned_image),
         Err(VulkanError::UnsupportedOperation("command buffer recording"))
     ));
     assert!(matches!(
@@ -3584,6 +3638,57 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         device.submit_graphics_command_buffer_and_wait(&mut graphics_command_buffer),
         Err(VulkanError::UnsupportedOperation("command buffer executable"))
     ));
+    assert!(matches!(
+        device.record_sampled_dmabuf_foreign_acquire_barrier(&mut graphics_command_buffer, &owned_image),
+        Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+    ));
+    assert!(matches!(
+        device.record_sampled_dmabuf_foreign_release_barrier(&mut graphics_command_buffer, &owned_image),
+        Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+    ));
+    assert!(matches!(
+        device.copy_buffer_to_image(
+            &mut graphics_command_buffer,
+            &foreign_copy_buffer,
+            &owned_image,
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        ),
+        Err(VulkanError::UnsupportedOperation("command buffer buffer device"))
+    ));
+    assert!(matches!(
+        device.copy_image_to_buffer(
+            &mut graphics_command_buffer,
+            &owned_image,
+            &foreign_copy_buffer,
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        ),
+        Err(VulkanError::UnsupportedOperation("command buffer buffer device"))
+    ));
+    owned_image
+        .set_sync_state(VulkanImageSyncState {
+            external_ownership: VulkanExternalImageOwnership::ReleasePending,
+            ..VulkanImageSyncState::default()
+        })
+        .unwrap();
+    assert!(matches!(
+        device.transition_image_layout(
+            &mut graphics_command_buffer,
+            &owned_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        ),
+        Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"))
+    ));
+    owned_image
+        .set_sync_state(VulkanImageSyncState::default())
+        .unwrap();
     if graphics_family != transfer_family {
         let mut wrong_family_command_buffer = device.allocate_transfer_command_buffer().unwrap();
         device
@@ -3595,6 +3700,25 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         assert!(matches!(
             device.submit_graphics_command_buffer_and_wait(&mut wrong_family_command_buffer),
             Err(VulkanError::UnsupportedOperation("command buffer queue family"))
+        ));
+
+        let mut transfer_barrier_command_buffer = device.allocate_transfer_command_buffer().unwrap();
+        device
+            .begin_command_buffer(&mut transfer_barrier_command_buffer)
+            .unwrap();
+        assert!(matches!(
+            device.record_sampled_dmabuf_foreign_acquire_barrier(
+                &mut transfer_barrier_command_buffer,
+                &owned_image,
+            ),
+            Err(VulkanError::UnsupportedOperation("command buffer graphics queue"))
+        ));
+        assert!(matches!(
+            device.record_sampled_dmabuf_foreign_release_barrier(
+                &mut transfer_barrier_command_buffer,
+                &owned_image,
+            ),
+            Err(VulkanError::UnsupportedOperation("command buffer graphics queue"))
         ));
     }
     assert!(matches!(
