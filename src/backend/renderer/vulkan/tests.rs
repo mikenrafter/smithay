@@ -1105,6 +1105,24 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
         Some(vk::ImageLayout::GENERAL)
     );
     let mut acquire_transition_sync = released_sync;
+    assert!(matches!(
+        acquire_transition_sync.complete_sampled_dmabuf_foreign_acquire(),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    acquire_transition_sync
+        .begin_sampled_dmabuf_foreign_acquire()
+        .unwrap();
+    assert!(acquire_transition_sync.external_acquire_pending);
+    assert_eq!(
+        acquire_transition_sync.external_ownership,
+        VulkanExternalImageOwnership::AcquirePending
+    );
+    assert_eq!(acquire_transition_sync.known_foreign_layout(), None);
+    assert!(!acquire_transition_sync.is_locally_usable());
+    assert!(matches!(
+        plan_sampled_dmabuf_foreign_acquire_barrier(&acquire_transition_sync, 2, usage),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
     acquire_transition_sync
         .complete_sampled_dmabuf_foreign_acquire()
         .unwrap();
@@ -1112,6 +1130,43 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
     assert_eq!(
         acquire_transition_sync.external_ownership,
         VulkanExternalImageOwnership::Local
+    );
+    assert!(acquire_transition_sync.is_locally_usable());
+    let mut aborted_release_sync = acquire_transition_sync;
+    aborted_release_sync
+        .begin_sampled_dmabuf_foreign_release()
+        .unwrap();
+    assert_eq!(
+        aborted_release_sync.external_ownership,
+        VulkanExternalImageOwnership::ReleasePending
+    );
+    assert!(!aborted_release_sync.is_locally_usable());
+    assert!(matches!(
+        plan_sampled_dmabuf_foreign_release_barrier(
+            &aborted_release_sync,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            2,
+            usage,
+        ),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    aborted_release_sync
+        .abort_sampled_dmabuf_foreign_release()
+        .unwrap();
+    assert_eq!(
+        aborted_release_sync.external_ownership,
+        VulkanExternalImageOwnership::Local
+    );
+    assert!(matches!(
+        acquire_transition_sync.complete_sampled_dmabuf_foreign_release(),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    acquire_transition_sync
+        .begin_sampled_dmabuf_foreign_release()
+        .unwrap();
+    assert_eq!(
+        acquire_transition_sync.external_ownership,
+        VulkanExternalImageOwnership::ReleasePending
     );
     acquire_transition_sync
         .complete_sampled_dmabuf_foreign_release()
@@ -1125,13 +1180,29 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
         acquire_transition_sync.known_foreign_layout(),
         Some(vk::ImageLayout::GENERAL)
     );
+    let mut aborted_acquire_sync = released_sync;
+    aborted_acquire_sync
+        .begin_sampled_dmabuf_foreign_acquire()
+        .unwrap();
+    aborted_acquire_sync
+        .abort_sampled_dmabuf_foreign_acquire()
+        .unwrap();
+    assert_eq!(aborted_acquire_sync, released_sync);
     for mut invalid_acquire in [fresh_import_sync, local_sync, no_pending_sync] {
+        assert!(matches!(
+            invalid_acquire.begin_sampled_dmabuf_foreign_acquire(),
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        ));
         assert!(matches!(
             invalid_acquire.complete_sampled_dmabuf_foreign_acquire(),
             Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
         ));
     }
     for mut invalid_release in [fresh_import_sync, released_sync, pending_local_sync] {
+        assert!(matches!(
+            invalid_release.begin_sampled_dmabuf_foreign_release(),
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        ));
         assert!(matches!(
             invalid_release.complete_sampled_dmabuf_foreign_release(),
             Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
@@ -2683,6 +2754,21 @@ fn frame_render_texture_rejects_narrow_path_preconditions_before_device_lookup()
     acquire_pending_texture.image.sync.external_acquire_pending = true;
     assert_render_texture_error(
         &acquire_pending_texture,
+        frame_context_id.clone(),
+        Transform::Normal,
+        full_src,
+        full_dst,
+        &full_damage,
+        &[],
+        Transform::Normal,
+        1.0,
+        "dmabuf import synchronization",
+    );
+
+    let mut release_pending_texture = texture.clone();
+    release_pending_texture.image.sync.external_ownership = VulkanExternalImageOwnership::ReleasePending;
+    assert_render_texture_error(
+        &release_pending_texture,
         frame_context_id.clone(),
         Transform::Normal,
         full_src,

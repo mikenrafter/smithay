@@ -236,27 +236,93 @@ impl VulkanImageSyncState {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn is_locally_usable(&self) -> bool {
+        matches!(
+            (self.external_ownership, self.external_acquire_pending),
+            (VulkanExternalImageOwnership::None, false) | (VulkanExternalImageOwnership::Local, false)
+        )
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn known_foreign_layout(&self) -> Option<vk::ImageLayout> {
         match self.external_ownership {
             VulkanExternalImageOwnership::ForeignKnownGeneral => Some(vk::ImageLayout::GENERAL),
             VulkanExternalImageOwnership::None
             | VulkanExternalImageOwnership::ForeignUnknown
-            | VulkanExternalImageOwnership::Local => None,
+            | VulkanExternalImageOwnership::AcquirePending
+            | VulkanExternalImageOwnership::Local
+            | VulkanExternalImageOwnership::ReleasePending => None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn begin_sampled_dmabuf_foreign_acquire(&mut self) -> Result<(), VulkanError> {
+        match (self.external_ownership, self.external_acquire_pending) {
+            (VulkanExternalImageOwnership::ForeignKnownGeneral, true) => {
+                self.external_ownership = VulkanExternalImageOwnership::AcquirePending;
+                Ok(())
+            }
+            (VulkanExternalImageOwnership::ForeignUnknown, _)
+            | (VulkanExternalImageOwnership::ForeignKnownGeneral, false)
+            | (VulkanExternalImageOwnership::AcquirePending, _)
+            | (VulkanExternalImageOwnership::None, _)
+            | (VulkanExternalImageOwnership::Local, _)
+            | (VulkanExternalImageOwnership::ReleasePending, _) => {
+                Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+            }
         }
     }
 
     #[allow(dead_code)]
     pub(super) fn complete_sampled_dmabuf_foreign_acquire(&mut self) -> Result<(), VulkanError> {
         match (self.external_ownership, self.external_acquire_pending) {
-            (VulkanExternalImageOwnership::ForeignKnownGeneral, true) => {
+            (VulkanExternalImageOwnership::AcquirePending, true) => {
                 self.external_ownership = VulkanExternalImageOwnership::Local;
                 self.external_acquire_pending = false;
                 Ok(())
             }
             (VulkanExternalImageOwnership::ForeignUnknown, _)
-            | (VulkanExternalImageOwnership::ForeignKnownGeneral, false)
+            | (VulkanExternalImageOwnership::ForeignKnownGeneral, _)
+            | (VulkanExternalImageOwnership::AcquirePending, false)
             | (VulkanExternalImageOwnership::None, _)
-            | (VulkanExternalImageOwnership::Local, _) => {
+            | (VulkanExternalImageOwnership::Local, _)
+            | (VulkanExternalImageOwnership::ReleasePending, _) => {
+                Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn abort_sampled_dmabuf_foreign_acquire(&mut self) -> Result<(), VulkanError> {
+        match (self.external_ownership, self.external_acquire_pending) {
+            (VulkanExternalImageOwnership::AcquirePending, true) => {
+                self.external_ownership = VulkanExternalImageOwnership::ForeignKnownGeneral;
+                Ok(())
+            }
+            (VulkanExternalImageOwnership::ForeignUnknown, _)
+            | (VulkanExternalImageOwnership::ForeignKnownGeneral, _)
+            | (VulkanExternalImageOwnership::AcquirePending, false)
+            | (VulkanExternalImageOwnership::None, _)
+            | (VulkanExternalImageOwnership::Local, _)
+            | (VulkanExternalImageOwnership::ReleasePending, _) => {
+                Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn begin_sampled_dmabuf_foreign_release(&mut self) -> Result<(), VulkanError> {
+        match (self.external_ownership, self.external_acquire_pending) {
+            (VulkanExternalImageOwnership::Local, false) => {
+                self.external_ownership = VulkanExternalImageOwnership::ReleasePending;
+                Ok(())
+            }
+            (VulkanExternalImageOwnership::None, _)
+            | (VulkanExternalImageOwnership::ForeignUnknown, _)
+            | (VulkanExternalImageOwnership::ForeignKnownGeneral, _)
+            | (VulkanExternalImageOwnership::AcquirePending, _)
+            | (VulkanExternalImageOwnership::Local, true)
+            | (VulkanExternalImageOwnership::ReleasePending, _) => {
                 Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
             }
         }
@@ -265,7 +331,7 @@ impl VulkanImageSyncState {
     #[allow(dead_code)]
     pub(super) fn complete_sampled_dmabuf_foreign_release(&mut self) -> Result<(), VulkanError> {
         match (self.external_ownership, self.external_acquire_pending) {
-            (VulkanExternalImageOwnership::Local, false) => {
+            (VulkanExternalImageOwnership::ReleasePending, false) => {
                 self.external_ownership = VulkanExternalImageOwnership::ForeignKnownGeneral;
                 self.external_acquire_pending = true;
                 Ok(())
@@ -274,7 +340,28 @@ impl VulkanImageSyncState {
             | (VulkanExternalImageOwnership::None, true)
             | (VulkanExternalImageOwnership::ForeignUnknown, _)
             | (VulkanExternalImageOwnership::ForeignKnownGeneral, _)
-            | (VulkanExternalImageOwnership::Local, true) => {
+            | (VulkanExternalImageOwnership::AcquirePending, _)
+            | (VulkanExternalImageOwnership::Local, _)
+            | (VulkanExternalImageOwnership::ReleasePending, true) => {
+                Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn abort_sampled_dmabuf_foreign_release(&mut self) -> Result<(), VulkanError> {
+        match (self.external_ownership, self.external_acquire_pending) {
+            (VulkanExternalImageOwnership::ReleasePending, false) => {
+                self.external_ownership = VulkanExternalImageOwnership::Local;
+                Ok(())
+            }
+            (VulkanExternalImageOwnership::None, _)
+            | (VulkanExternalImageOwnership::ForeignUnknown, _)
+            | (VulkanExternalImageOwnership::ForeignKnownGeneral, _)
+            | (VulkanExternalImageOwnership::AcquirePending, _)
+            | (VulkanExternalImageOwnership::Local, false)
+            | (VulkanExternalImageOwnership::Local, true)
+            | (VulkanExternalImageOwnership::ReleasePending, true) => {
                 Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
             }
         }
@@ -288,7 +375,9 @@ pub(crate) enum VulkanExternalImageOwnership {
     None,
     ForeignUnknown,
     ForeignKnownGeneral,
+    AcquirePending,
     Local,
+    ReleasePending,
 }
 
 /// External-memory metadata reserved for future dmabuf import/export support.
@@ -630,7 +719,7 @@ impl Frame for VulkanFrame<'_, '_> {
         if texture.context_id != self.context_id {
             return Err(VulkanError::UnsupportedOperation("foreign render texture"));
         }
-        if texture.image.sync.external_acquire_pending {
+        if !texture.image.sync.is_locally_usable() {
             return Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"));
         }
         if self.transform != Transform::Normal {

@@ -3464,8 +3464,10 @@ pub(super) fn plan_sampled_dmabuf_foreign_acquire_barrier(
         }
         (VulkanExternalImageOwnership::ForeignUnknown, _)
         | (VulkanExternalImageOwnership::ForeignKnownGeneral, false)
+        | (VulkanExternalImageOwnership::AcquirePending, _)
         | (VulkanExternalImageOwnership::None, true)
-        | (VulkanExternalImageOwnership::Local, true) => {
+        | (VulkanExternalImageOwnership::Local, true)
+        | (VulkanExternalImageOwnership::ReleasePending, _) => {
             Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
         }
     }
@@ -3492,7 +3494,9 @@ pub(super) fn plan_sampled_dmabuf_foreign_release_barrier(
         (VulkanExternalImageOwnership::None, false) => Ok(None),
         (VulkanExternalImageOwnership::None, true)
         | (VulkanExternalImageOwnership::ForeignUnknown, _)
-        | (VulkanExternalImageOwnership::ForeignKnownGeneral, _) => {
+        | (VulkanExternalImageOwnership::ForeignKnownGeneral, _)
+        | (VulkanExternalImageOwnership::AcquirePending, _)
+        | (VulkanExternalImageOwnership::ReleasePending, _) => {
             Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
         }
     }
