@@ -75,8 +75,13 @@ pub(super) struct VulkanExternalSyncDeviceFunctions {
 
 /// Binary Vulkan semaphore used for future sync-file interop.
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct VulkanSyncFileSemaphore {
+    inner: Arc<VulkanSyncFileSemaphoreInner>,
+}
+
+#[derive(Debug)]
+struct VulkanSyncFileSemaphoreInner {
     logical_device: VulkanLogicalDevice,
     handle: vk::Semaphore,
     created_for_sync_file_export: bool,
@@ -104,9 +109,9 @@ pub(super) enum VulkanSyncFileSemaphorePayloadState {
     Signaled,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct VulkanPendingSemaphorePayload<'a> {
-    semaphore: &'a VulkanSyncFileSemaphore,
+#[derive(Debug, Clone)]
+struct VulkanPendingSemaphorePayload {
+    semaphore: VulkanSyncFileSemaphore,
     previous_state: VulkanSyncFileSemaphorePayloadState,
 }
 
@@ -201,12 +206,13 @@ impl<'a> VulkanSubmitSynchronization<'a> {
         Ok(guards)
     }
 
-    fn mark_payloads_pending_submit(&self) -> Result<Vec<VulkanPendingSemaphorePayload<'a>>, VulkanError> {
+    fn mark_payloads_pending_submit(&self) -> Result<Vec<VulkanPendingSemaphorePayload>, VulkanError> {
         let mut pending = Vec::with_capacity(self.wait_semaphores.len() + self.signal_semaphores.len());
 
         for wait in &self.wait_semaphores {
             let mut state = wait
                 .semaphore
+                .inner
                 .payload_state
                 .lock()
                 .map_err(|_| host_synchronization_failed())?;
@@ -214,7 +220,7 @@ impl<'a> VulkanSubmitSynchronization<'a> {
                 VulkanSyncFileSemaphorePayloadState::AwaitableSyncFileImport
                 | VulkanSyncFileSemaphorePayloadState::Signaled => {
                     pending.push(VulkanPendingSemaphorePayload {
-                        semaphore: wait.semaphore,
+                        semaphore: wait.semaphore.clone(),
                         previous_state: *state,
                     });
                     *state = VulkanSyncFileSemaphorePayloadState::PendingWait;
@@ -230,13 +236,14 @@ impl<'a> VulkanSubmitSynchronization<'a> {
         }
         for semaphore in &self.signal_semaphores {
             let mut state = semaphore
+                .inner
                 .payload_state
                 .lock()
                 .map_err(|_| host_synchronization_failed())?;
             match *state {
                 VulkanSyncFileSemaphorePayloadState::Unsignaled => {
                     pending.push(VulkanPendingSemaphorePayload {
-                        semaphore,
+                        semaphore: (*semaphore).clone(),
                         previous_state: *state,
                     });
                     *state = VulkanSyncFileSemaphorePayloadState::PendingSignal;
@@ -256,21 +263,18 @@ impl<'a> VulkanSubmitSynchronization<'a> {
     }
 }
 
-fn restore_pending_semaphore_payloads(
-    pending: &[VulkanPendingSemaphorePayload<'_>],
-) -> Result<(), VulkanError> {
+fn restore_pending_semaphore_payloads(pending: &[VulkanPendingSemaphorePayload]) -> Result<(), VulkanError> {
     for pending in pending.iter().rev() {
         pending.semaphore.set_payload_state(pending.previous_state)?;
     }
     Ok(())
 }
 
-fn complete_pending_semaphore_payloads(
-    pending: &[VulkanPendingSemaphorePayload<'_>],
-) -> Result<(), VulkanError> {
+fn complete_pending_semaphore_payloads(pending: &[VulkanPendingSemaphorePayload]) -> Result<(), VulkanError> {
     for pending in pending {
         let state = *pending
             .semaphore
+            .inner
             .payload_state
             .lock()
             .map_err(|_| host_synchronization_failed())?;
@@ -307,7 +311,7 @@ fn validate_submit_semaphore(
     semaphore: &VulkanSyncFileSemaphore,
     seen_handles: &mut Vec<vk::Semaphore>,
 ) -> Result<(), VulkanError> {
-    if !logical_device.is_same_device(&semaphore.logical_device) {
+    if !logical_device.is_same_device(&semaphore.inner.logical_device) {
         return Err(VulkanError::UnsupportedOperation("semaphore device"));
     }
     if seen_handles.contains(&semaphore.handle()) {
@@ -321,23 +325,28 @@ fn validate_submit_semaphore(
 #[allow(dead_code)]
 impl VulkanSyncFileSemaphore {
     pub(super) fn handle(&self) -> vk::Semaphore {
-        self.handle
+        self.inner.handle
     }
 
     #[cfg(test)]
     pub(super) fn payload_state_for_tests(&self) -> Result<VulkanSyncFileSemaphorePayloadState, VulkanError> {
-        self.payload_state
+        self.inner
+            .payload_state
             .lock()
             .map(|state| *state)
             .map_err(|_| host_synchronization_failed())
     }
 
     fn lock_host_access(&self) -> Result<MutexGuard<'_, ()>, VulkanError> {
-        self.host_access.lock().map_err(|_| host_synchronization_failed())
+        self.inner
+            .host_access
+            .lock()
+            .map_err(|_| host_synchronization_failed())
     }
 
     fn set_payload_state(&self, new_state: VulkanSyncFileSemaphorePayloadState) -> Result<(), VulkanError> {
         *self
+            .inner
             .payload_state
             .lock()
             .map_err(|_| host_synchronization_failed())? = new_state;
@@ -354,6 +363,7 @@ impl VulkanSyncFileSemaphore {
 
     fn exportable_payload_state(&self) -> Result<VulkanSyncFileSemaphorePayloadState, VulkanError> {
         let state = *self
+            .inner
             .payload_state
             .lock()
             .map_err(|_| host_synchronization_failed())?;
@@ -370,11 +380,12 @@ impl VulkanSyncFileSemaphore {
     }
 
     fn can_export_sync_file(&self, export_from_imported: bool) -> bool {
-        self.created_for_sync_file_export && (!self.imported_from_sync_file || export_from_imported)
+        self.inner.created_for_sync_file_export
+            && (!self.inner.imported_from_sync_file || export_from_imported)
     }
 }
 
-impl Drop for VulkanSyncFileSemaphore {
+impl Drop for VulkanSyncFileSemaphoreInner {
     fn drop(&mut self) {
         let _guard = self
             .host_access
@@ -690,12 +701,14 @@ impl VulkanDeviceState {
             .map_err(VulkanError::from)?;
 
         Ok(VulkanSyncFileSemaphore {
-            logical_device,
-            handle,
-            created_for_sync_file_export,
-            imported_from_sync_file,
-            host_access: Mutex::new(()),
-            payload_state: Mutex::new(VulkanSyncFileSemaphorePayloadState::Unsignaled),
+            inner: Arc::new(VulkanSyncFileSemaphoreInner {
+                logical_device,
+                handle,
+                created_for_sync_file_export,
+                imported_from_sync_file,
+                host_access: Mutex::new(()),
+                payload_state: Mutex::new(VulkanSyncFileSemaphorePayloadState::Unsignaled),
+            }),
         })
     }
 
@@ -791,7 +804,7 @@ impl VulkanDeviceState {
             .logical_device
             .as_ref()
             .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
-        if !logical_device.is_same_device(&semaphore.logical_device) {
+        if !logical_device.is_same_device(&semaphore.inner.logical_device) {
             return Err(VulkanError::UnsupportedOperation("sync-file semaphore export"));
         }
         let external_sync_fns = self
@@ -2382,6 +2395,7 @@ fn allocate_command_buffer(
         handle,
         state: VulkanCommandBufferState::Initial,
         pending_image_layouts: Vec::new(),
+        pending_image_syncs: Vec::new(),
         referenced_buffers: Vec::new(),
         referenced_images: Vec::new(),
     })
@@ -2394,6 +2408,7 @@ fn begin_command_buffer(command_buffer: &mut VulkanCommandBuffer) -> Result<(), 
 
     let _pool_guard = command_buffer.command_pool.lock_host_access()?;
     command_buffer.pending_image_layouts.clear();
+    command_buffer.pending_image_syncs.clear();
     command_buffer.referenced_buffers.clear();
     command_buffer.referenced_images.clear();
     let begin_info =
@@ -2426,6 +2441,13 @@ fn ensure_command_buffer_executable(command_buffer: &VulkanCommandBuffer) -> Res
     } else {
         Err(VulkanError::UnsupportedOperation("command buffer executable"))
     }
+}
+
+fn vulkan_error_is_device_lost(err: &VulkanError) -> bool {
+    matches!(
+        err,
+        VulkanError::DeviceLost | VulkanError::VulkanApi(vk::Result::ERROR_DEVICE_LOST)
+    )
 }
 
 fn submit_command_buffer_and_wait_without_synchronization(
@@ -2512,26 +2534,83 @@ unsafe fn submit_command_buffer_and_wait(
 
     if let Err(err) = submit_result {
         let _ = restore_pending_semaphore_payloads(&pending_semaphore_payloads);
+        let abort_result = command_buffer.abort_pending_image_syncs();
+        command_buffer.state = VulkanCommandBufferState::Invalid;
         drop(semaphore_guards);
         unsafe { logical_device.handle().destroy_fence(fence, None) };
+        abort_result?;
         return Err(err);
     }
 
     command_buffer.state = VulkanCommandBufferState::Submitted;
     let wait_result = unsafe { logical_device.handle().wait_for_fences(&[fence], true, u64::MAX) }
         .map_err(VulkanError::from);
-    let complete_result = if wait_result.is_ok() {
+    let mut queue_completed = wait_result.is_ok();
+    let mut can_destroy_submitted_objects = wait_result.is_ok();
+    let wait_error = match wait_result {
+        Ok(()) => None,
+        Err(wait_err) => {
+            let wait_reported_device_lost = vulkan_error_is_device_lost(&wait_err);
+            let queue_idle_result = queue.lock_host_access().and_then(|_queue_guard| {
+                // SAFETY: `queue.handle` belongs to `logical_device`, and queue host access is
+                // externally synchronized by the queue mutex. Waiting the queue after a fence wait
+                // error either proves the submitted command buffer completed or reports device loss,
+                // which makes the context unusable and prevents later false ownership completion.
+                unsafe { logical_device.handle().queue_wait_idle(queue.handle) }.map_err(VulkanError::from)
+            });
+            match queue_idle_result {
+                Ok(()) => {
+                    queue_completed = true;
+                    can_destroy_submitted_objects = true;
+                    Some(wait_err)
+                }
+                Err(idle_err) => {
+                    can_destroy_submitted_objects =
+                        wait_reported_device_lost || vulkan_error_is_device_lost(&idle_err);
+                    Some(if wait_reported_device_lost {
+                        wait_err
+                    } else {
+                        idle_err
+                    })
+                }
+            }
+        }
+    };
+    let image_result = if queue_completed {
+        Some(command_buffer.commit_pending_image_layouts_and_syncs())
+    } else {
+        // The queue accepted this command buffer, but neither the fence wait nor queue-idle fallback
+        // proved completion. This is expected only for context-invalidating failures such as device
+        // loss. Leave image ownership reservations in their non-locally-usable pending state rather
+        // than falsely restoring or completing ownership that may have transferred on the GPU.
+        None
+    };
+    let complete_result = if queue_completed {
         complete_pending_semaphore_payloads(&pending_semaphore_payloads)
     } else {
         Ok(())
     };
     drop(semaphore_guards);
 
-    unsafe { logical_device.handle().destroy_fence(fence, None) };
+    if can_destroy_submitted_objects {
+        unsafe { logical_device.handle().destroy_fence(fence, None) };
+    } else {
+        command_buffer.state = VulkanCommandBufferState::SubmitCompletionUnknown;
+        // `VulkanPendingSemaphorePayload` owns semaphore clones specifically for this path: the
+        // submitted queue may still reference them, and the caller's borrowed semaphore handles may
+        // be dropped after this function returns.
+        std::mem::forget(pending_semaphore_payloads);
+    }
 
-    wait_result?;
-    complete_result?;
-    command_buffer.commit_pending_image_layouts()
+    if let Some(err) = wait_error {
+        if let Some(image_result) = image_result {
+            image_result?;
+        }
+        complete_result?;
+        return Err(err);
+    }
+    image_result.expect("queue completion proven without wait error")?;
+    complete_result
 }
 
 fn transition_image_layout(
@@ -3995,7 +4074,7 @@ fn create_bound_image(
             usage,
             external_memory_handle_type: None,
             layout: Mutex::new(vk::ImageLayout::UNDEFINED),
-            sync: Mutex::new(VulkanImageSyncState::default()),
+            sync: VulkanSharedImageSyncState::new(VulkanImageSyncState::default()),
         }),
     })
 }
@@ -4199,6 +4278,7 @@ pub(crate) struct VulkanCommandBuffer {
     handle: vk::CommandBuffer,
     state: VulkanCommandBufferState,
     pending_image_layouts: Vec<VulkanPendingImageLayout>,
+    pending_image_syncs: Vec<VulkanPendingImageSync>,
     referenced_buffers: Vec<Arc<VulkanHostVisibleBufferInner>>,
     referenced_images: Vec<Arc<VulkanOwnedImageInner>>,
 }
@@ -4209,6 +4289,10 @@ enum VulkanCommandBufferState {
     Recording,
     Executable,
     Submitted,
+    /// Queue submission was accepted, but neither fence wait nor queue-idle fallback proved
+    /// completion and device loss was not reported. The command buffer handle must not be freed.
+    SubmitCompletionUnknown,
+    Invalid,
 }
 
 #[allow(dead_code)]
@@ -4263,7 +4347,7 @@ impl VulkanCommandBuffer {
             .map(|pending| pending.new_layout))
     }
 
-    fn commit_pending_image_layouts(&mut self) -> Result<(), VulkanError> {
+    fn commit_pending_image_layouts_and_syncs(&mut self) -> Result<(), VulkanError> {
         for pending in &self.pending_image_layouts {
             *pending
                 .resource
@@ -4271,10 +4355,27 @@ impl VulkanCommandBuffer {
                 .lock()
                 .map_err(|_| host_synchronization_failed())? = pending.new_layout;
         }
+        for pending in &self.pending_image_syncs {
+            // SAFETY: Pending image sync entries are added only for ownership transfers whose
+            // matching Vulkan barrier has been recorded into this command buffer. This method is
+            // called only after the command buffer was successfully submitted and its fence waited,
+            // so the recorded ownership transfer has completed before host-side sync is advanced.
+            unsafe { pending.complete()? };
+        }
 
         self.pending_image_layouts.clear();
+        self.pending_image_syncs.clear();
         self.referenced_buffers.clear();
         self.referenced_images.clear();
+        Ok(())
+    }
+
+    fn abort_pending_image_syncs(&mut self) -> Result<(), VulkanError> {
+        for pending in self.pending_image_syncs.iter().rev() {
+            pending.abort()?;
+        }
+
+        self.pending_image_syncs.clear();
         Ok(())
     }
 }
@@ -4286,8 +4387,71 @@ struct VulkanPendingImageLayout {
     new_layout: vk::ImageLayout,
 }
 
+#[derive(Debug)]
+#[allow(dead_code)]
+struct VulkanPendingImageSync {
+    resource: Arc<VulkanOwnedImageInner>,
+    operation: VulkanPendingImageSyncOperation,
+}
+
+impl VulkanPendingImageSync {
+    fn abort(&self) -> Result<(), VulkanError> {
+        match self.operation {
+            VulkanPendingImageSyncOperation::SampledDmabufForeignAcquire => {
+                self.resource.sync.abort_sampled_dmabuf_foreign_acquire()
+            }
+            VulkanPendingImageSyncOperation::SampledDmabufForeignRelease => {
+                self.resource.sync.abort_sampled_dmabuf_foreign_release()
+            }
+        }
+    }
+
+    /// Complete a pending image sync transition after the matching Vulkan operation completed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the Vulkan queue-family ownership transfer and layout transition that
+    /// caused this pending sync operation has been submitted and completed before calling this.
+    unsafe fn complete(&self) -> Result<(), VulkanError> {
+        match self.operation {
+            VulkanPendingImageSyncOperation::SampledDmabufForeignAcquire => {
+                // SAFETY: Upheld by this method's caller.
+                unsafe { self.resource.sync.complete_sampled_dmabuf_foreign_acquire() }
+            }
+            VulkanPendingImageSyncOperation::SampledDmabufForeignRelease => {
+                // SAFETY: Upheld by this method's caller.
+                unsafe { self.resource.sync.complete_sampled_dmabuf_foreign_release() }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum VulkanPendingImageSyncOperation {
+    SampledDmabufForeignAcquire,
+    SampledDmabufForeignRelease,
+}
+
 impl Drop for VulkanCommandBuffer {
     fn drop(&mut self) {
+        if self.state == VulkanCommandBufferState::SubmitCompletionUnknown {
+            // The queue may still reference this command buffer and Vulkan did not report device
+            // loss. Leaking the command buffer handle is safer than freeing a pending command
+            // buffer. Keep the command pool and referenced resources alive as well, because the
+            // pending submission may still access them.
+            std::mem::forget(Arc::clone(&self.command_pool));
+            std::mem::forget(std::mem::take(&mut self.pending_image_layouts));
+            std::mem::forget(std::mem::take(&mut self.pending_image_syncs));
+            std::mem::forget(std::mem::take(&mut self.referenced_buffers));
+            std::mem::forget(std::mem::take(&mut self.referenced_images));
+            return;
+        }
+
+        if self.state != VulkanCommandBufferState::Submitted {
+            let _ = self.abort_pending_image_syncs();
+        }
+
         let _pool_guard = self
             .command_pool
             .host_access
@@ -4333,7 +4497,7 @@ struct VulkanOwnedImageInner {
     usage: vk::ImageUsageFlags,
     external_memory_handle_type: Option<VulkanExternalMemoryHandleType>,
     layout: Mutex<vk::ImageLayout>,
-    sync: Mutex<VulkanImageSyncState>,
+    sync: VulkanSharedImageSyncState,
 }
 
 #[allow(dead_code)]
@@ -4371,20 +4535,112 @@ impl VulkanOwnedImage {
     }
 
     pub(super) fn sync_state(&self) -> Result<VulkanImageSyncState, VulkanError> {
-        self.inner
-            .sync
+        self.inner.sync.get()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_sync_state(&self, sync: VulkanImageSyncState) -> Result<(), VulkanError> {
+        self.inner.sync.set_for_tests(sync)
+    }
+}
+
+/// Shared image synchronization state used by all handles for one Vulkan image.
+#[derive(Debug)]
+pub(super) struct VulkanSharedImageSyncState {
+    state: Mutex<VulkanImageSyncState>,
+}
+
+impl VulkanSharedImageSyncState {
+    pub(super) fn new(state: VulkanImageSyncState) -> Self {
+        Self {
+            state: Mutex::new(state),
+        }
+    }
+
+    pub(super) fn get(&self) -> Result<VulkanImageSyncState, VulkanError> {
+        self.state
             .lock()
             .map(|sync| *sync)
             .map_err(|_| host_synchronization_failed())
     }
 
-    #[cfg(test)]
-    pub(super) fn set_sync_state(&self, sync: VulkanImageSyncState) -> Result<(), VulkanError> {
-        *self
-            .inner
-            .sync
+    #[allow(dead_code)]
+    pub(super) fn begin_sampled_dmabuf_foreign_acquire(&self) -> Result<(), VulkanError> {
+        self.state
             .lock()
-            .map_err(|_| host_synchronization_failed())? = sync;
+            .map_err(|_| host_synchronization_failed())?
+            .begin_sampled_dmabuf_foreign_acquire()
+    }
+
+    pub(super) fn abort_sampled_dmabuf_foreign_acquire(&self) -> Result<(), VulkanError> {
+        self.state
+            .lock()
+            .map_err(|_| host_synchronization_failed())?
+            .abort_sampled_dmabuf_foreign_acquire()
+    }
+
+    /// Complete a pending sampled-dmabuf foreign acquire after the Vulkan barrier has executed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the matching queue-family ownership transfer and layout transition
+    /// from foreign ownership to this renderer's queue has completed before calling this.
+    unsafe fn complete_sampled_dmabuf_foreign_acquire(&self) -> Result<(), VulkanError> {
+        // SAFETY: Forwarded from this method's caller.
+        unsafe {
+            self.state
+                .lock()
+                .map_err(|_| host_synchronization_failed())?
+                .complete_sampled_dmabuf_foreign_acquire()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) unsafe fn complete_sampled_dmabuf_foreign_acquire_for_tests(&self) -> Result<(), VulkanError> {
+        // SAFETY: Forwarded from this test-only method's caller.
+        unsafe { self.complete_sampled_dmabuf_foreign_acquire() }
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn begin_sampled_dmabuf_foreign_release(&self) -> Result<(), VulkanError> {
+        self.state
+            .lock()
+            .map_err(|_| host_synchronization_failed())?
+            .begin_sampled_dmabuf_foreign_release()
+    }
+
+    pub(super) fn abort_sampled_dmabuf_foreign_release(&self) -> Result<(), VulkanError> {
+        self.state
+            .lock()
+            .map_err(|_| host_synchronization_failed())?
+            .abort_sampled_dmabuf_foreign_release()
+    }
+
+    /// Complete a pending sampled-dmabuf foreign release after the Vulkan barrier has executed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the matching queue-family ownership transfer and layout transition
+    /// from this renderer's queue to foreign ownership has completed before calling this.
+    unsafe fn complete_sampled_dmabuf_foreign_release(&self) -> Result<(), VulkanError> {
+        // SAFETY: Forwarded from this method's caller.
+        unsafe {
+            self.state
+                .lock()
+                .map_err(|_| host_synchronization_failed())?
+                .complete_sampled_dmabuf_foreign_release()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) unsafe fn complete_sampled_dmabuf_foreign_release_for_tests(&self) -> Result<(), VulkanError> {
+        // SAFETY: Forwarded from this test-only method's caller.
+        unsafe { self.complete_sampled_dmabuf_foreign_release() }
+    }
+
+    #[cfg(test)]
+    fn set_for_tests(&self, sync: VulkanImageSyncState) -> Result<(), VulkanError> {
+        *self.state.lock().map_err(|_| host_synchronization_failed())? = sync;
         Ok(())
     }
 }
@@ -4433,7 +4689,7 @@ impl VulkanUnboundImage {
                 usage: this.usage,
                 external_memory_handle_type: this.external_memory_handle_type,
                 layout: Mutex::new(vk::ImageLayout::UNDEFINED),
-                sync: Mutex::new(sync),
+                sync: VulkanSharedImageSyncState::new(sync),
             }),
         }
     }
