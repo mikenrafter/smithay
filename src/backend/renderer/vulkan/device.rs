@@ -1103,6 +1103,70 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn submit_sampled_dmabuf_foreign_acquire(
+        &self,
+        image: &VulkanOwnedImage,
+        acquire_semaphore: Option<&VulkanSyncFileSemaphore>,
+    ) -> Result<bool, VulkanError> {
+        let mut command_buffer = self.allocate_graphics_command_buffer()?;
+        self.begin_command_buffer(&mut command_buffer)?;
+        if !self.record_sampled_dmabuf_foreign_acquire_barrier(&mut command_buffer, image)? {
+            return Ok(false);
+        }
+        self.end_command_buffer(&mut command_buffer)?;
+
+        if let Some(acquire_semaphore) = acquire_semaphore {
+            let synchronization = VulkanSubmitSynchronization::default()
+                .wait_sync_file(acquire_semaphore, vk::PipelineStageFlags::TOP_OF_PIPE);
+            // SAFETY: This helper fixes the wait stage to TOP_OF_PIPE, which is supported by every
+            // graphics queue. `submit_command_buffer_and_wait` validates that the semaphore belongs
+            // to this device, is not duplicated in the submit, and has a waitable tracked payload
+            // before the queue operation is attempted.
+            unsafe {
+                self.submit_graphics_command_buffer_and_wait_with_synchronization(
+                    &mut command_buffer,
+                    &synchronization,
+                )?
+            };
+        } else {
+            self.submit_graphics_command_buffer_and_wait(&mut command_buffer)?;
+        }
+
+        Ok(true)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn submit_sampled_dmabuf_foreign_release(
+        &self,
+        image: &VulkanOwnedImage,
+        release_semaphore: Option<&VulkanSyncFileSemaphore>,
+    ) -> Result<bool, VulkanError> {
+        let mut command_buffer = self.allocate_graphics_command_buffer()?;
+        self.begin_command_buffer(&mut command_buffer)?;
+        if !self.record_sampled_dmabuf_foreign_release_barrier(&mut command_buffer, image)? {
+            return Ok(false);
+        }
+        self.end_command_buffer(&mut command_buffer)?;
+
+        if let Some(release_semaphore) = release_semaphore {
+            let synchronization = VulkanSubmitSynchronization::default().signal_sync_file(release_semaphore);
+            // SAFETY: This submit has no semaphore waits, and `submit_command_buffer_and_wait`
+            // validates that the signal semaphore belongs to this device, is not duplicated in the
+            // submit, and has an unsignaled tracked payload before the queue operation is attempted.
+            unsafe {
+                self.submit_graphics_command_buffer_and_wait_with_synchronization(
+                    &mut command_buffer,
+                    &synchronization,
+                )?
+            };
+        } else {
+            self.submit_graphics_command_buffer_and_wait(&mut command_buffer)?;
+        }
+
+        Ok(true)
+    }
+
+    #[allow(dead_code)]
     pub(super) fn allocate_transfer_command_buffer(&self) -> Result<VulkanCommandBuffer, VulkanError> {
         self.logical_device
             .as_ref()

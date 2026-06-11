@@ -3647,6 +3647,14 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
     ));
     assert!(matches!(
+        device.submit_sampled_dmabuf_foreign_acquire(&owned_image, None),
+        Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+    ));
+    assert!(matches!(
+        device.submit_sampled_dmabuf_foreign_release(&owned_image, None),
+        Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+    ));
+    assert!(matches!(
         device.copy_buffer_to_image(
             &mut graphics_command_buffer,
             &foreign_copy_buffer,
@@ -3781,7 +3789,6 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         owned_image.layout().unwrap(),
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
     );
-    drop(owned_image);
     device.begin_command_buffer(&mut transfer_command_buffer).unwrap();
     device.end_command_buffer(&mut transfer_command_buffer).unwrap();
     device
@@ -3800,6 +3807,22 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
             acquire_semaphore.payload_state_for_tests().unwrap(),
             VulkanSyncFileSemaphorePayloadState::Signaled
         );
+        assert_eq!(
+            release_semaphore.payload_state_for_tests().unwrap(),
+            VulkanSyncFileSemaphorePayloadState::Unsignaled
+        );
+        assert!(matches!(
+            device.submit_sampled_dmabuf_foreign_acquire(&owned_image, Some(&acquire_semaphore)),
+            Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+        ));
+        assert_eq!(
+            acquire_semaphore.payload_state_for_tests().unwrap(),
+            VulkanSyncFileSemaphorePayloadState::Signaled
+        );
+        assert!(matches!(
+            device.submit_sampled_dmabuf_foreign_release(&owned_image, Some(&release_semaphore)),
+            Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+        ));
         assert_eq!(
             release_semaphore.payload_state_for_tests().unwrap(),
             VulkanSyncFileSemaphorePayloadState::Unsignaled
@@ -3911,6 +3934,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
             VulkanSyncFileSemaphorePayloadState::Signaled
         );
     }
+    drop(owned_image);
     let uploaded_image = device
         .create_uploaded_image(
             vk::Extent3D {
