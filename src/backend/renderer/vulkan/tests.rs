@@ -1104,6 +1104,39 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
         released_sync.known_foreign_layout(),
         Some(vk::ImageLayout::GENERAL)
     );
+    let mut acquire_transition_sync = released_sync;
+    acquire_transition_sync
+        .complete_sampled_dmabuf_foreign_acquire()
+        .unwrap();
+    assert!(!acquire_transition_sync.external_acquire_pending);
+    assert_eq!(
+        acquire_transition_sync.external_ownership,
+        VulkanExternalImageOwnership::Local
+    );
+    acquire_transition_sync
+        .complete_sampled_dmabuf_foreign_release()
+        .unwrap();
+    assert!(acquire_transition_sync.external_acquire_pending);
+    assert_eq!(
+        acquire_transition_sync.external_ownership,
+        VulkanExternalImageOwnership::ForeignKnownGeneral
+    );
+    assert_eq!(
+        acquire_transition_sync.known_foreign_layout(),
+        Some(vk::ImageLayout::GENERAL)
+    );
+    for mut invalid_acquire in [fresh_import_sync, local_sync, no_pending_sync] {
+        assert!(matches!(
+            invalid_acquire.complete_sampled_dmabuf_foreign_acquire(),
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        ));
+    }
+    for mut invalid_release in [fresh_import_sync, released_sync, pending_local_sync] {
+        assert!(matches!(
+            invalid_release.complete_sampled_dmabuf_foreign_release(),
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        ));
+    }
     assert!(matches!(
         plan_sampled_dmabuf_foreign_acquire_barrier(&no_pending_sync, 2, usage),
         Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
