@@ -20,12 +20,12 @@ use super::capabilities::{
 };
 use super::device::{
     VulkanDeviceState, VulkanDmabufExternalImageFormatProperties, VulkanSampledTexturePipelineShaders,
-    VulkanShaderSpirv, VulkanSubmitSynchronization, VulkanSyncFileImport, dmabuf_import_memory_type_bits,
-    dmabuf_plane_layouts, find_memory_type_index, image_copy_buffer_offset, image_copy_required_size,
-    image_layout_transition, plan_sampled_dmabuf_foreign_acquire_barrier,
-    plan_sampled_dmabuf_foreign_release_barrier, sampled_dmabuf_foreign_acquire_barrier,
-    sampled_dmabuf_foreign_release_barrier, select_queue_families, tightly_packed_image_size,
-    validate_submit_wait_stage, vulkan_filter,
+    VulkanShaderSpirv, VulkanSubmitSynchronization, VulkanSyncFileImport,
+    VulkanSyncFileSemaphorePayloadState, dmabuf_import_memory_type_bits, dmabuf_plane_layouts,
+    find_memory_type_index, image_copy_buffer_offset, image_copy_required_size, image_layout_transition,
+    plan_sampled_dmabuf_foreign_acquire_barrier, plan_sampled_dmabuf_foreign_release_barrier,
+    sampled_dmabuf_foreign_acquire_barrier, sampled_dmabuf_foreign_release_barrier, select_queue_families,
+    tightly_packed_image_size, validate_submit_wait_stage, vulkan_filter,
 };
 use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
@@ -3452,6 +3452,14 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
                 .unwrap()
         };
         let release_semaphore = device.create_exportable_sync_file_semaphore().unwrap();
+        assert_eq!(
+            acquire_semaphore.payload_state_for_tests().unwrap(),
+            VulkanSyncFileSemaphorePayloadState::Signaled
+        );
+        assert_eq!(
+            release_semaphore.payload_state_for_tests().unwrap(),
+            VulkanSyncFileSemaphorePayloadState::Unsignaled
+        );
         let mut synchronized_command_buffer = device.allocate_graphics_command_buffer().unwrap();
         device
             .begin_command_buffer(&mut synchronized_command_buffer)
@@ -3503,9 +3511,61 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
                 .unwrap()
         };
         assert!(synchronized_command_buffer.is_submitted_for_tests());
+        assert_eq!(
+            acquire_semaphore.payload_state_for_tests().unwrap(),
+            VulkanSyncFileSemaphorePayloadState::Unsignaled
+        );
+        assert_eq!(
+            release_semaphore.payload_state_for_tests().unwrap(),
+            VulkanSyncFileSemaphorePayloadState::Signaled
+        );
+        let mut repeated_signal_command_buffer = device.allocate_graphics_command_buffer().unwrap();
+        device
+            .begin_command_buffer(&mut repeated_signal_command_buffer)
+            .unwrap();
+        device
+            .end_command_buffer(&mut repeated_signal_command_buffer)
+            .unwrap();
+        let repeated_signal = VulkanSubmitSynchronization::default().signal_sync_file(&release_semaphore);
+        assert!(matches!(
+            // SAFETY: This intentionally exercises pre-submit payload-state validation and returns
+            // before any Vulkan queue operation because `release_semaphore` is already signaled.
+            unsafe {
+                device.submit_graphics_command_buffer_and_wait_with_synchronization(
+                    &mut repeated_signal_command_buffer,
+                    &repeated_signal,
+                )
+            },
+            Err(VulkanError::UnsupportedOperation("semaphore signal payload"))
+        ));
         // SAFETY: The synchronized submit above completed before this export, and the release
         // semaphore was created for sync-file export on this device.
         let _release_sync_file = unsafe { device.export_sync_file_semaphore(&release_semaphore).unwrap() };
+        assert_eq!(
+            release_semaphore.payload_state_for_tests().unwrap(),
+            VulkanSyncFileSemaphorePayloadState::Unsignaled
+        );
+        assert!(matches!(
+            // SAFETY: This intentionally exercises pre-export payload-state validation and returns
+            // before Vulkan because the previous export consumed the sync-file semaphore payload.
+            unsafe { device.export_sync_file_semaphore(&release_semaphore) },
+            Err(VulkanError::UnsupportedOperation("sync-file semaphore payload"))
+        ));
+        // SAFETY: The previous export consumed `release_semaphore` back to unsignaled, the command
+        // buffer is still executable because the earlier repeated-signal attempt failed before
+        // queue submission, and there are no wait semaphores.
+        unsafe {
+            device
+                .submit_graphics_command_buffer_and_wait_with_synchronization(
+                    &mut repeated_signal_command_buffer,
+                    &repeated_signal,
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            release_semaphore.payload_state_for_tests().unwrap(),
+            VulkanSyncFileSemaphorePayloadState::Signaled
+        );
     }
     let uploaded_image = device
         .create_uploaded_image(

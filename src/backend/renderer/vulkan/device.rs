@@ -82,6 +82,7 @@ pub(crate) struct VulkanSyncFileSemaphore {
     created_for_sync_file_export: bool,
     imported_from_sync_file: bool,
     host_access: Mutex<()>,
+    payload_state: Mutex<VulkanSyncFileSemaphorePayloadState>,
 }
 
 /// Sync-file payload to import into a Vulkan semaphore.
@@ -90,6 +91,23 @@ pub(crate) struct VulkanSyncFileSemaphore {
 pub(crate) enum VulkanSyncFileImport {
     Fd(OwnedFd),
     AlreadySignaled,
+}
+
+/// Coarse binary semaphore payload state for sync-file submit scaffolding.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VulkanSyncFileSemaphorePayloadState {
+    Unsignaled,
+    AwaitableSyncFileImport,
+    PendingWait,
+    PendingSignal,
+    Signaled,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VulkanPendingSemaphorePayload<'a> {
+    semaphore: &'a VulkanSyncFileSemaphore,
+    previous_state: VulkanSyncFileSemaphorePayloadState,
 }
 
 /// A sync-file semaphore wait attached to a single Vulkan queue submit.
@@ -182,6 +200,97 @@ impl<'a> VulkanSubmitSynchronization<'a> {
 
         Ok(guards)
     }
+
+    fn mark_payloads_pending_submit(&self) -> Result<Vec<VulkanPendingSemaphorePayload<'a>>, VulkanError> {
+        let mut pending = Vec::with_capacity(self.wait_semaphores.len() + self.signal_semaphores.len());
+
+        for wait in &self.wait_semaphores {
+            let mut state = wait
+                .semaphore
+                .payload_state
+                .lock()
+                .map_err(|_| host_synchronization_failed())?;
+            match *state {
+                VulkanSyncFileSemaphorePayloadState::AwaitableSyncFileImport
+                | VulkanSyncFileSemaphorePayloadState::Signaled => {
+                    pending.push(VulkanPendingSemaphorePayload {
+                        semaphore: wait.semaphore,
+                        previous_state: *state,
+                    });
+                    *state = VulkanSyncFileSemaphorePayloadState::PendingWait;
+                }
+                VulkanSyncFileSemaphorePayloadState::Unsignaled
+                | VulkanSyncFileSemaphorePayloadState::PendingWait
+                | VulkanSyncFileSemaphorePayloadState::PendingSignal => {
+                    drop(state);
+                    restore_pending_semaphore_payloads(&pending)?;
+                    return Err(VulkanError::UnsupportedOperation("semaphore wait payload"));
+                }
+            }
+        }
+        for semaphore in &self.signal_semaphores {
+            let mut state = semaphore
+                .payload_state
+                .lock()
+                .map_err(|_| host_synchronization_failed())?;
+            match *state {
+                VulkanSyncFileSemaphorePayloadState::Unsignaled => {
+                    pending.push(VulkanPendingSemaphorePayload {
+                        semaphore,
+                        previous_state: *state,
+                    });
+                    *state = VulkanSyncFileSemaphorePayloadState::PendingSignal;
+                }
+                VulkanSyncFileSemaphorePayloadState::AwaitableSyncFileImport
+                | VulkanSyncFileSemaphorePayloadState::PendingWait
+                | VulkanSyncFileSemaphorePayloadState::PendingSignal
+                | VulkanSyncFileSemaphorePayloadState::Signaled => {
+                    drop(state);
+                    restore_pending_semaphore_payloads(&pending)?;
+                    return Err(VulkanError::UnsupportedOperation("semaphore signal payload"));
+                }
+            }
+        }
+
+        Ok(pending)
+    }
+}
+
+fn restore_pending_semaphore_payloads(
+    pending: &[VulkanPendingSemaphorePayload<'_>],
+) -> Result<(), VulkanError> {
+    for pending in pending.iter().rev() {
+        pending.semaphore.set_payload_state(pending.previous_state)?;
+    }
+    Ok(())
+}
+
+fn complete_pending_semaphore_payloads(
+    pending: &[VulkanPendingSemaphorePayload<'_>],
+) -> Result<(), VulkanError> {
+    for pending in pending {
+        let state = *pending
+            .semaphore
+            .payload_state
+            .lock()
+            .map_err(|_| host_synchronization_failed())?;
+        let completed_state = match state {
+            VulkanSyncFileSemaphorePayloadState::PendingWait => {
+                VulkanSyncFileSemaphorePayloadState::Unsignaled
+            }
+            VulkanSyncFileSemaphorePayloadState::PendingSignal => {
+                VulkanSyncFileSemaphorePayloadState::Signaled
+            }
+            VulkanSyncFileSemaphorePayloadState::Unsignaled
+            | VulkanSyncFileSemaphorePayloadState::AwaitableSyncFileImport
+            | VulkanSyncFileSemaphorePayloadState::Signaled => {
+                return Err(VulkanError::UnsupportedOperation("semaphore submit payload"));
+            }
+        };
+        pending.semaphore.set_payload_state(completed_state)?;
+    }
+
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -215,8 +324,49 @@ impl VulkanSyncFileSemaphore {
         self.handle
     }
 
+    #[cfg(test)]
+    pub(super) fn payload_state_for_tests(&self) -> Result<VulkanSyncFileSemaphorePayloadState, VulkanError> {
+        self.payload_state
+            .lock()
+            .map(|state| *state)
+            .map_err(|_| host_synchronization_failed())
+    }
+
     fn lock_host_access(&self) -> Result<MutexGuard<'_, ()>, VulkanError> {
         self.host_access.lock().map_err(|_| host_synchronization_failed())
+    }
+
+    fn set_payload_state(&self, new_state: VulkanSyncFileSemaphorePayloadState) -> Result<(), VulkanError> {
+        *self
+            .payload_state
+            .lock()
+            .map_err(|_| host_synchronization_failed())? = new_state;
+        Ok(())
+    }
+
+    fn mark_sync_file_imported(&self, already_signaled: bool) -> Result<(), VulkanError> {
+        self.set_payload_state(if already_signaled {
+            VulkanSyncFileSemaphorePayloadState::Signaled
+        } else {
+            VulkanSyncFileSemaphorePayloadState::AwaitableSyncFileImport
+        })
+    }
+
+    fn exportable_payload_state(&self) -> Result<VulkanSyncFileSemaphorePayloadState, VulkanError> {
+        let state = *self
+            .payload_state
+            .lock()
+            .map_err(|_| host_synchronization_failed())?;
+
+        match state {
+            VulkanSyncFileSemaphorePayloadState::Signaled
+            | VulkanSyncFileSemaphorePayloadState::PendingSignal => Ok(state),
+            VulkanSyncFileSemaphorePayloadState::Unsignaled
+            | VulkanSyncFileSemaphorePayloadState::AwaitableSyncFileImport
+            | VulkanSyncFileSemaphorePayloadState::PendingWait => {
+                Err(VulkanError::UnsupportedOperation("sync-file semaphore payload"))
+            }
+        }
     }
 
     fn can_export_sync_file(&self, export_from_imported: bool) -> bool {
@@ -545,6 +695,7 @@ impl VulkanDeviceState {
             created_for_sync_file_export,
             imported_from_sync_file,
             host_access: Mutex::new(()),
+            payload_state: Mutex::new(VulkanSyncFileSemaphorePayloadState::Unsignaled),
         })
     }
 
@@ -581,6 +732,7 @@ impl VulkanDeviceState {
         let export_from_imported = self.capabilities.external_sync.sync_file_export_from_imported;
         let semaphore = self.create_sync_file_semaphore(export_from_imported, true)?;
         let raw_fd = sync_file.into_raw_fd();
+        let already_signaled = raw_fd == -1;
         let import_info = vk::ImportSemaphoreFdInfoKHR::default()
             .semaphore(semaphore.handle())
             .flags(vk::SemaphoreImportFlags::TEMPORARY)
@@ -599,7 +751,10 @@ impl VulkanDeviceState {
                 .import_semaphore_fd(&import_info)
         };
         match result {
-            Ok(()) => Ok(semaphore),
+            Ok(()) => {
+                semaphore.mark_sync_file_imported(already_signaled)?;
+                Ok(semaphore)
+            }
             Err(err) => {
                 if raw_fd != -1 {
                     // SAFETY: A failed import does not take ownership of `raw_fd`; reconstructing
@@ -644,6 +799,7 @@ impl VulkanDeviceState {
             .as_ref()
             .ok_or(VulkanError::UnsupportedOperation("sync-file semaphore export"))?;
         let _semaphore_guard = semaphore.lock_host_access()?;
+        semaphore.exportable_payload_state()?;
         let get_info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(semaphore.handle())
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
@@ -659,13 +815,15 @@ impl VulkanDeviceState {
                 .get_semaphore_fd(&get_info)
         }
         .map_err(VulkanError::from)?;
-        if raw_fd == -1 {
-            Ok(None)
+        let exported_fd = if raw_fd == -1 {
+            None
         } else {
             // SAFETY: `vkGetSemaphoreFdKHR` returned a newly owned POSIX file descriptor for the
             // application to close or transfer. `-1` was handled above.
-            Ok(Some(unsafe { OwnedFd::from_raw_fd(raw_fd) }))
-        }
+            Some(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+        };
+        semaphore.set_payload_state(VulkanSyncFileSemaphorePayloadState::Unsignaled)?;
+        Ok(exported_fd)
     }
 
     #[allow(dead_code)]
@@ -2318,6 +2476,14 @@ unsafe fn submit_command_buffer_and_wait(
             return Err(err);
         }
     };
+    let pending_semaphore_payloads = match synchronization.mark_payloads_pending_submit() {
+        Ok(pending) => pending,
+        Err(err) => {
+            drop(semaphore_guards);
+            unsafe { logical_device.handle().destroy_fence(fence, None) };
+            return Err(err);
+        }
+    };
 
     let submit_result = command_buffer
         .command_pool
@@ -2341,6 +2507,8 @@ unsafe fn submit_command_buffer_and_wait(
         });
 
     if let Err(err) = submit_result {
+        let _ = restore_pending_semaphore_payloads(&pending_semaphore_payloads);
+        drop(semaphore_guards);
         unsafe { logical_device.handle().destroy_fence(fence, None) };
         return Err(err);
     }
@@ -2348,11 +2516,17 @@ unsafe fn submit_command_buffer_and_wait(
     command_buffer.state = VulkanCommandBufferState::Submitted;
     let wait_result = unsafe { logical_device.handle().wait_for_fences(&[fence], true, u64::MAX) }
         .map_err(VulkanError::from);
+    let complete_result = if wait_result.is_ok() {
+        complete_pending_semaphore_payloads(&pending_semaphore_payloads)
+    } else {
+        Ok(())
+    };
     drop(semaphore_guards);
 
     unsafe { logical_device.handle().destroy_fence(fence, None) };
 
     wait_result?;
+    complete_result?;
     command_buffer.commit_pending_image_layouts()
 }
 
