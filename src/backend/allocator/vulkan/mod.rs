@@ -114,6 +114,10 @@ pub enum Error {
     #[error("format is not supported")]
     UnsupportedFormat,
 
+    /// The image memory requirements did not allow any usable memory type.
+    #[error("memory type is not supported")]
+    UnsupportedMemoryType,
+
     /// Some error from the Vulkan driver.
     #[error(transparent)]
     Vk(#[from] vk::Result),
@@ -339,7 +343,7 @@ impl VulkanAllocator {
             return Err(Error::UnsupportedFormat);
         }
 
-        Ok(unsafe { self.create_image(width, height, vk_format, vk_usage, fourcc, &modifiers[..]) }?)
+        unsafe { self.create_image(width, height, vk_format, vk_usage, fourcc, &modifiers[..]) }
     }
 
     /// Returns the [`PhysicalDevice`] this allocator was created with.
@@ -361,6 +365,29 @@ impl Allocator for VulkanAllocator {
     ) -> Result<VulkanImage, Self::Error> {
         self.create_buffer_with_usage(width, height, fourcc, modifiers, self.default_usage)
     }
+}
+
+fn find_memory_type_index(
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    memory_type_bits: u32,
+) -> Result<u32, Error> {
+    let mut fallback = None;
+
+    for index in 0..memory_properties.memory_type_count {
+        let memory_type_supported = (memory_type_bits & (1u32 << index)) != 0;
+        if !memory_type_supported {
+            continue;
+        }
+
+        let properties = memory_properties.memory_types[index as usize].property_flags;
+        if properties.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) {
+            return Ok(index);
+        }
+
+        fallback.get_or_insert(index);
+    }
+
+    fallback.ok_or(Error::UnsupportedMemoryType)
 }
 
 impl Drop for VulkanAllocator {
@@ -660,7 +687,7 @@ impl VulkanAllocator {
         vk_usage: vk::ImageUsageFlags,
         fourcc: DrmFourcc,
         modifiers: &[u64],
-    ) -> Result<VulkanImage, vk::Result> {
+    ) -> Result<VulkanImage, Error> {
         assert!(width > 0);
         assert!(height > 0);
 
@@ -710,7 +737,12 @@ impl VulkanAllocator {
                 image: unsafe { self.device.create_image(&image_create_info, None) }?,
                 memory: vk::DeviceMemory::null(),
             },
-            |inner| unsafe { self.device.destroy_image(inner.image, None) },
+            |inner| unsafe {
+                self.device.destroy_image(inner.image, None);
+                if inner.memory != vk::DeviceMemory::null() {
+                    self.device.free_memory(inner.memory, None);
+                }
+            },
         );
 
         // Get the modifier Vulkan created the image using.
@@ -740,11 +772,18 @@ impl VulkanAllocator {
 
         // Allocate image memory
         let memory_reqs = unsafe { self.device.get_image_memory_requirements(guard.image) };
-        // TODO: Memory type index
+        let memory_properties = unsafe {
+            self.phd
+                .instance()
+                .handle()
+                .get_physical_device_memory_properties(self.phd.handle())
+        };
+        let memory_type_index = find_memory_type_index(&memory_properties, memory_reqs.memory_type_bits)?;
         let mut export_memory_allocate_info = vk::ExportMemoryAllocateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
         let alloc_create_info = vk::MemoryAllocateInfo::default()
             .allocation_size(memory_reqs.size)
+            .memory_type_index(memory_type_index)
             .push_next(&mut export_memory_allocate_info);
 
         unsafe {
@@ -803,5 +842,56 @@ impl VulkanAllocator {
             // If the image was dropped, return false
             !drop
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, find_memory_type_index};
+    use ash::vk;
+
+    fn memory_properties_for_tests(flags: &[vk::MemoryPropertyFlags]) -> vk::PhysicalDeviceMemoryProperties {
+        let mut properties = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: flags.len() as u32,
+            ..vk::PhysicalDeviceMemoryProperties::default()
+        };
+        for (idx, flags) in flags.iter().copied().enumerate() {
+            properties.memory_types[idx].property_flags = flags;
+        }
+        properties
+    }
+
+    #[test]
+    fn memory_type_lookup_respects_supported_bits() {
+        let properties = memory_properties_for_tests(&[
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            vk::MemoryPropertyFlags::HOST_VISIBLE,
+        ]);
+
+        assert_eq!(find_memory_type_index(&properties, 0b10).unwrap(), 1);
+        assert!(matches!(
+            find_memory_type_index(&properties, 0b00),
+            Err(Error::UnsupportedMemoryType)
+        ));
+    }
+
+    #[test]
+    fn memory_type_lookup_prefers_device_local() {
+        let properties = memory_properties_for_tests(&[
+            vk::MemoryPropertyFlags::HOST_VISIBLE,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ]);
+
+        assert_eq!(find_memory_type_index(&properties, 0b11).unwrap(), 1);
+    }
+
+    #[test]
+    fn memory_type_lookup_falls_back_to_first_supported_type() {
+        let properties = memory_properties_for_tests(&[
+            vk::MemoryPropertyFlags::HOST_VISIBLE,
+            vk::MemoryPropertyFlags::HOST_COHERENT,
+        ]);
+
+        assert_eq!(find_memory_type_index(&properties, 0b11).unwrap(), 0);
     }
 }
