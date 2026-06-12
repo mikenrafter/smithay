@@ -45,6 +45,12 @@
 
 use std::os::fd::OwnedFd;
 
+#[cfg(all(
+    feature = "wayland_frontend",
+    feature = "backend_egl",
+    feature = "use_system_lib"
+))]
+use crate::backend::renderer::ImportAll;
 #[cfg(feature = "wayland_frontend")]
 use crate::backend::renderer::{ImportDmaWl, ImportMemWl};
 use crate::{
@@ -543,6 +549,22 @@ impl ImportDma for VulkanRenderer {
 
 #[cfg(feature = "wayland_frontend")]
 impl ImportDmaWl for VulkanRenderer {}
+
+#[cfg(all(
+    feature = "wayland_frontend",
+    feature = "backend_egl",
+    feature = "use_system_lib"
+))]
+impl ImportAll for VulkanRenderer {
+    fn import_buffer(
+        &mut self,
+        buffer: &wl_buffer::WlBuffer,
+        surface: Option<&crate::wayland::compositor::SurfaceData>,
+        damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Option<Result<Self::TextureId, Self::Error>> {
+        super::import_shm_dmabuf_buffer(self, buffer, surface, damage)
+    }
+}
 
 impl ImportMem for VulkanRenderer {
     fn import_memory(
