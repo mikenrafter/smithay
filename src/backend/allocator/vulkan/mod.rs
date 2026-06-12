@@ -888,7 +888,14 @@ impl VulkanAllocator {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, find_memory_type_index, requires_dedicated_allocation, supports_dma_buf_export};
+    use super::{
+        Error, ImageUsageFlags, VulkanAllocator, find_memory_type_index, requires_dedicated_allocation,
+        supports_dma_buf_export,
+    };
+    use crate::backend::{
+        allocator::{Allocator, Buffer, dmabuf::AsDmabuf},
+        vulkan::{Instance, PhysicalDevice, version::Version},
+    };
     use ash::vk;
 
     fn memory_properties_for_tests(flags: &[vk::MemoryPropertyFlags]) -> vk::PhysicalDeviceMemoryProperties {
@@ -965,5 +972,94 @@ mod tests {
         assert!(!requires_dedicated_allocation(
             vk::ExternalMemoryProperties::default()
         ));
+    }
+
+    #[test]
+    #[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable format"]
+    fn runtime_allocator_exports_dmabuf() {
+        let instance = match Instance::new(Version::VERSION_1_3, None) {
+            Ok(instance) => instance,
+            Err(err) => {
+                eprintln!("skipping Vulkan allocator export test: failed to create instance: {err:?}");
+                return;
+            }
+        };
+
+        let devices = match PhysicalDevice::enumerate(&instance) {
+            Ok(devices) => devices,
+            Err(err) => {
+                eprintln!("skipping Vulkan allocator export test: failed to enumerate devices: {err:?}");
+                return;
+            }
+        };
+        let mut found_extension_capable_device = false;
+        let mut created_allocator = false;
+        let mut allocator_setup_errors = Vec::new();
+
+        for physical_device in devices {
+            if !VulkanAllocator::required_extensions(&physical_device)
+                .into_iter()
+                .all(|extension| physical_device.has_device_extension(extension))
+            {
+                continue;
+            }
+
+            found_extension_capable_device = true;
+
+            let usage = ImageUsageFlags::COLOR_ATTACHMENT;
+            let mut allocator = match VulkanAllocator::new(&physical_device, usage) {
+                Ok(allocator) => allocator,
+                Err(err) => {
+                    allocator_setup_errors.push(format!("{}: {err:?}", physical_device.name()));
+                    continue;
+                }
+            };
+            created_allocator = true;
+
+            let format = allocator
+                .formats
+                .iter()
+                .map(|entry| entry.format)
+                .find(|format| allocator.is_format_supported(*format, usage));
+            let Some(format) = format else {
+                continue;
+            };
+
+            let image = allocator
+                .create_buffer(64, 64, format.code, &[format.modifier])
+                .expect("create exportable Vulkan image");
+            let dmabuf = image.export().expect("export Vulkan image as dmabuf");
+
+            assert_eq!(image.size(), dmabuf.size());
+            assert_eq!(image.format(), dmabuf.format());
+            assert_eq!(dmabuf.num_planes(), image.format_plane_count as usize);
+            assert!(dmabuf.num_planes() > 0);
+            assert_eq!(dmabuf.handles().count(), dmabuf.num_planes());
+            assert_eq!(dmabuf.offsets().count(), dmabuf.num_planes());
+            assert_eq!(dmabuf.strides().count(), dmabuf.num_planes());
+            assert!(dmabuf.strides().all(|stride| stride > 0));
+
+            return;
+        }
+
+        if !found_extension_capable_device {
+            eprintln!("skipping Vulkan allocator export test: no device supports required extensions");
+            return;
+        }
+
+        if !created_allocator {
+            panic!(
+                "failed to create Vulkan allocator for extension-capable devices: {allocator_setup_errors:?}"
+            );
+        }
+
+        if !allocator_setup_errors.is_empty() {
+            eprintln!(
+                "Vulkan allocator setup failed on some devices while looking for exportable formats: \
+                 {allocator_setup_errors:?}"
+            );
+        }
+
+        eprintln!("skipping Vulkan allocator export test: no dmabuf-exportable color format");
     }
 }
