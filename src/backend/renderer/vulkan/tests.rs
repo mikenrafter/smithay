@@ -9,7 +9,8 @@ use crate::backend::allocator::{
 use crate::backend::renderer::sync::Interrupted;
 use crate::backend::renderer::{
     Bind, Color32F, DebugFlags, ExportMem, Frame, ImportDma, ImportMem, Offscreen, Renderer, Texture,
-    TextureMapping, sync::Fence,
+    TextureMapping,
+    sync::{Fence, SyncPoint},
 };
 use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
 use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
@@ -55,6 +56,55 @@ impl Fence for InterruptedFence {
 
     fn export(&self) -> Option<OwnedFd> {
         None
+    }
+}
+
+#[derive(Debug)]
+struct SignaledExportableFence;
+
+impl Fence for SignaledExportableFence {
+    fn is_signaled(&self) -> bool {
+        true
+    }
+
+    fn wait(&self) -> Result<(), Interrupted> {
+        Ok(())
+    }
+
+    fn is_exportable(&self) -> bool {
+        true
+    }
+
+    fn export(&self) -> Option<OwnedFd> {
+        panic!("already-signaled sync points must not be exported")
+    }
+}
+
+#[derive(Debug)]
+struct CpuWaitFence {
+    exportable: bool,
+    exports_fd: bool,
+}
+
+impl Fence for CpuWaitFence {
+    fn is_signaled(&self) -> bool {
+        false
+    }
+
+    fn wait(&self) -> Result<(), Interrupted> {
+        Ok(())
+    }
+
+    fn is_exportable(&self) -> bool {
+        self.exportable
+    }
+
+    fn export(&self) -> Option<OwnedFd> {
+        if self.exports_fd {
+            Some(File::open("/dev/null").unwrap().into())
+        } else {
+            None
+        }
     }
 }
 
@@ -733,6 +783,69 @@ fn dmabuf_external_image_format_query_is_disabled_without_prerequisites() {
         .unwrap()
         .is_none()
     );
+}
+
+#[test]
+fn sync_point_wait_semaphore_falls_back_without_vulkan_sync_file_import() {
+    let device = VulkanDeviceState::empty_for_tests();
+
+    assert!(
+        unsafe {
+            // SAFETY: A signaled sync point does not export or import any fd.
+            device.import_sync_point_wait_semaphore(&SyncPoint::signaled())
+        }
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        unsafe {
+            // SAFETY: Already-signaled sync points are short-circuited before fd export/import.
+            device.import_sync_point_wait_semaphore(&SyncPoint::from(SignaledExportableFence))
+        }
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        unsafe {
+            // SAFETY: This fence is non-exportable, so the helper uses only CPU waiting.
+            device.import_sync_point_wait_semaphore(&SyncPoint::from(CpuWaitFence {
+                exportable: false,
+                exports_fd: false,
+            }))
+        }
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        unsafe {
+            // SAFETY: The empty test device cannot import sync-file fds, so this falls back to CPU wait.
+            device.import_sync_point_wait_semaphore(&SyncPoint::from(CpuWaitFence {
+                exportable: true,
+                exports_fd: false,
+            }))
+        }
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        unsafe {
+            // SAFETY: The empty test device cannot import sync-file fds, so this falls back to CPU wait
+            // without exporting the test fd.
+            device.import_sync_point_wait_semaphore(&SyncPoint::from(CpuWaitFence {
+                exportable: true,
+                exports_fd: true,
+            }))
+        }
+        .unwrap()
+        .is_none()
+    );
+    assert!(matches!(
+        unsafe {
+            // SAFETY: This non-exportable fence exercises CPU wait interruption only.
+            device.import_sync_point_wait_semaphore(&SyncPoint::from(InterruptedFence))
+        },
+        Err(VulkanError::SyncInterrupted)
+    ));
 }
 
 #[test]

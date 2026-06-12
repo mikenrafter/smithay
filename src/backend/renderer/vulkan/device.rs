@@ -12,7 +12,7 @@ use ash::{ext, khr, vk, vk::Handle};
 
 use crate::backend::{
     allocator::dmabuf::Dmabuf,
-    renderer::TextureFilter,
+    renderer::{TextureFilter, sync::SyncPoint},
     vulkan::{Instance, PhysicalDevice},
 };
 
@@ -779,6 +779,40 @@ impl VulkanDeviceState {
                 Err(VulkanError::from(err))
             }
         }
+    }
+
+    /// Convert a Smithay sync point into a Vulkan sync-file wait semaphore when possible.
+    ///
+    /// Already-signaled sync points need no Vulkan wait. Exportable sync points are imported as
+    /// `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT` binary semaphore payloads. Non-exportable
+    /// sync points, or exportable sync points whose export fails, are waited on by the CPU before
+    /// returning without a semaphore.
+    ///
+    /// # Safety
+    ///
+    /// If this device supports sync-file import and `sync` exports a fence fd, that fd must be a
+    /// valid Linux sync-file fd suitable for `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT`.
+    #[allow(dead_code)]
+    pub(crate) unsafe fn import_sync_point_wait_semaphore(
+        &self,
+        sync: &SyncPoint,
+    ) -> Result<Option<VulkanSyncFileSemaphore>, VulkanError> {
+        if !sync.contains_fence() || sync.is_reached() {
+            return Ok(None);
+        }
+
+        if sync.is_exportable()
+            && self.capabilities.external_sync.sync_file_importable
+            && self.external_sync_fns.is_some()
+        {
+            if let Some(fd) = sync.export() {
+                // SAFETY: Forwarded from this method's caller.
+                return unsafe { self.import_sync_file_semaphore(VulkanSyncFileImport::Fd(fd)) }.map(Some);
+            }
+        }
+
+        sync.wait().map_err(|_| VulkanError::SyncInterrupted)?;
+        Ok(None)
     }
 
     /// Export a signaled or pending-signaled Vulkan semaphore payload as a Linux sync-file fd.
