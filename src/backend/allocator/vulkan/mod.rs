@@ -291,9 +291,10 @@ impl VulkanAllocator {
         // TODO: Check if the extents are also valid?
         // Vulkan states a maximum extent size for images.
         // This may also be useful as a function on Allocator.
-        unsafe { self.get_format_info(format, vk::ImageUsageFlags::from_raw(usage.bits())) }
-            .ok()
-            .is_some()
+        matches!(
+            unsafe { self.get_format_info(format, vk::ImageUsageFlags::from_raw(usage.bits())) },
+            Ok(Some(_))
+        )
     }
 
     /// Try to create a buffer with the given dimensions, pixel format and usage flags.
@@ -340,7 +341,7 @@ impl VulkanAllocator {
         }
 
         // Filter out any format + modifier combinations that are not supported
-        let modifiers = self.filter_modifiers(width, height, vk_usage, fourcc, modifiers);
+        let modifiers = self.filter_modifiers(width, height, vk_usage, fourcc, modifiers)?;
 
         // VUID-VkImageDrmFormatModifierListCreateInfoEXT-drmFormatModifierCount-arraylength
         if modifiers.is_empty() {
@@ -566,6 +567,25 @@ fn dmabuf_plane_count(plane_count: u32) -> Option<u32> {
         .then_some(plane_count)
 }
 
+fn image_format_properties_support_extent(
+    properties: vk::ImageFormatProperties,
+    width: u32,
+    height: u32,
+) -> bool {
+    let max_extent = properties.max_extent;
+
+    // VUID-VkImageCreateInfo-extent-02252
+    max_extent.width >= width
+        // VUID-VkImageCreateInfo-extent-02253
+        && max_extent.height >= height
+        // VUID-VkImageCreateInfo-extent-02254
+        // VUID-VkImageCreateInfo-extent-00946
+        // VUID-VkImageCreateInfo-imageType-00957
+        && max_extent.depth >= 1
+        // VUID-VkImageCreateInfo-samples-02258
+        && properties.sample_counts.contains(vk::SampleCountFlags::TYPE_1)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ImageInner {
     // TODO: image usage?
@@ -687,47 +707,29 @@ impl VulkanAllocator {
         vk_usage: vk::ImageUsageFlags,
         fourcc: DrmFourcc,
         modifiers: &[DrmModifier],
-    ) -> Vec<u64> {
-        modifiers
-            .iter()
-            .copied()
-            .filter_map(move |modifier| {
-                let info = unsafe {
-                    self.get_format_info(
-                        DrmFormat {
-                            code: fourcc,
-                            modifier,
-                        },
-                        vk_usage,
-                    )
-                }
-                .ok()
-                .flatten()?;
+    ) -> Result<Vec<u64>, Error> {
+        let mut filtered = Vec::new();
 
-                Some((modifier, info))
-            })
-            // Filter modifiers where the required image creation limits are not met
-            .filter(move |(_, info)| {
-                let max_extent = info.image_format_properties.max_extent;
+        for modifier in modifiers.iter().copied() {
+            let info = unsafe {
+                self.get_format_info(
+                    DrmFormat {
+                        code: fourcc,
+                        modifier,
+                    },
+                    vk_usage,
+                )?
+            };
+            let Some(info) = info else {
+                continue;
+            };
 
-                // VUID-VkImageCreateInfo-extent-02252
-                max_extent.width >= width
-                // VUID-VkImageCreateInfo-extent-02253
-                && max_extent.height >= height
-                // VUID-VkImageCreateInfo-extent-02254
-                // VUID-VkImageCreateInfo-extent-00946
-                // VUID-VkImageCreateInfo-imageType-00957
-                && max_extent.depth >= 1
-                // VUID-VkImageCreateInfo-samples-02258
-                && info
-                    .image_format_properties
-                    .sample_counts
-                    .contains(vk::SampleCountFlags::TYPE_1)
-            })
-            .map(|(modifier, _)| modifier)
-            .map(Into::<u64>::into)
-            // TODO: Could use a smallvec or tinyvec to reduce number allocations
-            .collect::<Vec<_>>()
+            if image_format_properties_support_extent(info.image_format_properties, width, height) {
+                filtered.push(modifier.into());
+            }
+        }
+
+        Ok(filtered)
     }
 
     /// # Safety
@@ -913,7 +915,8 @@ impl VulkanAllocator {
 mod tests {
     use super::{
         Error, ImageUsageFlags, VulkanAllocator, dmabuf_plane_count, dmabuf_plane_layout,
-        find_memory_type_index, requires_dedicated_allocation, supports_dma_buf_export,
+        find_memory_type_index, image_format_properties_support_extent, requires_dedicated_allocation,
+        supports_dma_buf_export,
     };
     use crate::backend::{
         allocator::{Allocator, Buffer, dmabuf::AsDmabuf},
@@ -1040,6 +1043,62 @@ mod tests {
         assert_eq!(dmabuf_plane_count(1), Some(1));
         assert_eq!(dmabuf_plane_count(4), Some(4));
         assert_eq!(dmabuf_plane_count(5), None);
+    }
+
+    #[test]
+    fn image_format_properties_must_support_requested_extent() {
+        let properties = vk::ImageFormatProperties {
+            max_extent: vk::Extent3D {
+                width: 64,
+                height: 32,
+                depth: 1,
+            },
+            sample_counts: vk::SampleCountFlags::TYPE_1,
+            ..vk::ImageFormatProperties::default()
+        };
+
+        assert!(image_format_properties_support_extent(properties, 64, 32));
+        assert!(!image_format_properties_support_extent(
+            vk::ImageFormatProperties {
+                max_extent: vk::Extent3D {
+                    width: 63,
+                    ..properties.max_extent
+                },
+                ..properties
+            },
+            64,
+            32,
+        ));
+        assert!(!image_format_properties_support_extent(
+            vk::ImageFormatProperties {
+                max_extent: vk::Extent3D {
+                    height: 31,
+                    ..properties.max_extent
+                },
+                ..properties
+            },
+            64,
+            32,
+        ));
+        assert!(!image_format_properties_support_extent(
+            vk::ImageFormatProperties {
+                max_extent: vk::Extent3D {
+                    depth: 0,
+                    ..properties.max_extent
+                },
+                ..properties
+            },
+            64,
+            32,
+        ));
+        assert!(!image_format_properties_support_extent(
+            vk::ImageFormatProperties {
+                sample_counts: vk::SampleCountFlags::TYPE_2,
+                ..properties
+            },
+            64,
+            32,
+        ));
     }
 
     #[test]
