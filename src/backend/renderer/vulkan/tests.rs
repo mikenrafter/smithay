@@ -783,6 +783,35 @@ fn dmabuf_external_image_format_query_is_disabled_without_prerequisites() {
         .unwrap()
         .is_none()
     );
+    assert!(
+        // SAFETY: This uninitialized-device test returns before any Vulkan image import or acquire
+        // operation because external-memory prerequisites are unavailable. The signaled sync point
+        // does not export or import any fd.
+        unsafe {
+            device.create_acquired_dmabuf_sampled_image_resources_with_known_general_layout_and_sync_point(
+                &dmabuf,
+                TextureFilter::Linear,
+                TextureFilter::Nearest,
+                Some(&SyncPoint::signaled()),
+            )
+        }
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        // SAFETY: This uninitialized-device test returns before any Vulkan image import, sync wait,
+        // fd import, or acquire operation because external-memory prerequisites are unavailable.
+        unsafe {
+            device.create_acquired_dmabuf_sampled_image_resources_with_known_general_layout_and_sync_point(
+                &dmabuf,
+                TextureFilter::Linear,
+                TextureFilter::Nearest,
+                Some(&SyncPoint::from(InterruptedFence)),
+            )
+        }
+        .unwrap()
+        .is_none()
+    );
 }
 
 #[test]
@@ -2038,6 +2067,17 @@ fn public_dmabuf_import_is_explicitly_unsupported() {
         // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
         // Vulkan import or ownership-transfer operation can occur.
         unsafe { renderer.create_imported_dmabuf_texture_with_known_general_layout(&dmabuf, None) },
+        Err(VulkanError::VulkanUnavailable)
+    ));
+    assert!(matches!(
+        // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
+        // Vulkan import, fd import, or ownership-transfer operation can occur.
+        unsafe {
+            renderer.create_imported_dmabuf_texture_with_known_general_layout_and_sync_point(
+                &dmabuf,
+                Some(&SyncPoint::signaled()),
+            )
+        },
         Err(VulkanError::VulkanUnavailable)
     ));
 }

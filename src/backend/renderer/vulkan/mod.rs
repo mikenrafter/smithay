@@ -274,6 +274,46 @@ impl VulkanRenderer {
         )))
     }
 
+    /// Import a known-layout dmabuf using a Smithay sync point as the optional acquire dependency.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the dmabuf producer released the image to
+    /// `VK_QUEUE_FAMILY_FOREIGN_EXT` in `VK_IMAGE_LAYOUT_GENERAL`. If `acquire_sync` is `Some`, it
+    /// must represent the producer's completion dependency for that release and signal only after
+    /// the producer's writes and ownership release for this dmabuf are complete. If `acquire_sync`
+    /// is `None`, the caller must ensure those writes and ownership release are already complete and
+    /// visible to this renderer's Vulkan queue submission. If `acquire_sync` exports a fence fd and
+    /// this device supports sync-file import, that fd must be a valid Linux sync-file fd suitable for
+    /// `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT`.
+    #[allow(dead_code)]
+    unsafe fn create_imported_dmabuf_texture_with_known_general_layout_and_sync_point(
+        &mut self,
+        dmabuf: &Dmabuf,
+        acquire_sync: Option<&SyncPoint>,
+    ) -> Result<Option<VulkanTexture>, VulkanError> {
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+        let import = image::VulkanDmabufImportState::from_dmabuf(dmabuf)?;
+        let Some(sampled_image) = (unsafe {
+            // SAFETY: Forwarded from this method's caller.
+            device.create_acquired_dmabuf_sampled_image_resources_with_known_general_layout_and_sync_point(
+                dmabuf,
+                self.downscale_filter,
+                self.upscale_filter,
+                acquire_sync,
+            )
+        })?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(VulkanTexture::from_acquired_dmabuf_sampled_image(
+            self.context_id.clone(),
+            &import,
+            sampled_image,
+        )))
+    }
+
     #[allow(dead_code)]
     fn clear_offscreen_render_target(
         &mut self,

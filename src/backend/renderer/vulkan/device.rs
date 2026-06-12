@@ -1173,6 +1173,49 @@ impl VulkanDeviceState {
         Ok(Some(VulkanSampledImage { sampler, view, image }))
     }
 
+    /// Create sampled resources for a known-layout dmabuf, using a Smithay sync point as the
+    /// optional producer-completion dependency.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the dmabuf producer released the image to
+    /// `VK_QUEUE_FAMILY_FOREIGN_EXT` in `VK_IMAGE_LAYOUT_GENERAL`. If `acquire_sync` is `Some`, it
+    /// must represent the producer's completion dependency for that release and signal only after
+    /// the producer's writes and ownership release for this dmabuf are complete. If `acquire_sync`
+    /// is `None`, the caller must ensure those writes and ownership release are already complete and
+    /// visible to this Vulkan queue submission. If `acquire_sync` exports a fence fd and this device
+    /// supports sync-file import, that fd must be a valid Linux sync-file fd suitable for
+    /// `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT`.
+    #[allow(dead_code)]
+    pub(crate) unsafe fn create_acquired_dmabuf_sampled_image_resources_with_known_general_layout_and_sync_point(
+        &self,
+        dmabuf: &Dmabuf,
+        min_filter: TextureFilter,
+        mag_filter: TextureFilter,
+        acquire_sync: Option<&SyncPoint>,
+    ) -> Result<Option<VulkanSampledImage>, VulkanError> {
+        let Some(image) = self.create_bound_dmabuf_import_image_with_sync(
+            dmabuf,
+            VulkanImageSyncState::foreign_known_general_for_dmabuf_import(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let view = self.create_image_view(&image)?;
+        let sampler = self.create_sampler(min_filter, mag_filter)?;
+
+        let acquire_semaphore = if let Some(acquire_sync) = acquire_sync {
+            unsafe { self.import_sync_point_wait_semaphore(acquire_sync)? }
+        } else {
+            None
+        };
+        if !self.submit_sampled_dmabuf_foreign_acquire(&image, acquire_semaphore.as_ref())? {
+            return Err(VulkanError::UnsupportedOperation("dmabuf external ownership"));
+        }
+
+        Ok(Some(VulkanSampledImage { sampler, view, image }))
+    }
+
     #[allow(dead_code)]
     pub(crate) fn submit_sampled_dmabuf_foreign_acquire(
         &self,
