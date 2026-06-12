@@ -141,6 +141,20 @@ impl VulkanTexture {
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn from_acquired_dmabuf_sampled_image(
+        context_id: ContextId<VulkanTexture>,
+        import: &VulkanDmabufImportState,
+        sampled_image: VulkanSampledImage,
+    ) -> Self {
+        Self {
+            context_id,
+            image: dmabuf_acquired_image_state(import),
+            sampled_image: Some(Arc::new(sampled_image)),
+            y_inverted: import.y_inverted,
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn has_sampled_image_for_tests(&self) -> bool {
         self.sampled_image.is_some()
@@ -188,6 +202,24 @@ pub(super) fn dmabuf_import_image_state(import: &VulkanDmabufImportState) -> Vul
         },
         layout: VulkanImageLayoutState::Undefined,
         sync: dmabuf_import_sync_state(),
+    }
+}
+
+#[allow(dead_code)]
+pub(super) fn dmabuf_acquired_image_state(import: &VulkanDmabufImportState) -> VulkanImageState {
+    VulkanImageState {
+        size: import.size,
+        format: Some(import.format()),
+        source: VulkanImageSource::DmabufImport,
+        usage: VulkanImageUsage {
+            sampled: true,
+            ..VulkanImageUsage::default()
+        },
+        layout: VulkanImageLayoutState::ShaderReadOnly,
+        sync: VulkanImageSyncState {
+            external_ownership: VulkanExternalImageOwnership::Local,
+            ..VulkanImageSyncState::default()
+        },
     }
 }
 

@@ -74,7 +74,9 @@ pub use self::{
 };
 
 use self::{
-    device::{VulkanDeviceState, image_copy_buffer_offset, tightly_packed_image_size},
+    device::{
+        VulkanDeviceState, VulkanSyncFileSemaphore, image_copy_buffer_offset, tightly_packed_image_size,
+    },
     format::{get_format_info, get_render_vk_format},
 };
 
@@ -229,6 +231,43 @@ impl VulkanRenderer {
         };
 
         Ok(Some(VulkanTexture::from_dmabuf_sampled_image(
+            self.context_id.clone(),
+            &import,
+            sampled_image,
+        )))
+    }
+
+    /// Import a dmabuf as a sampled texture when the producer's Vulkan external state is known.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the dmabuf producer released the image to
+    /// `VK_QUEUE_FAMILY_FOREIGN_EXT` in `VK_IMAGE_LAYOUT_GENERAL`, and that `acquire_semaphore`, if
+    /// present, represents the producer's completion dependency for that release. If no semaphore is
+    /// supplied, the caller must ensure the producer's writes and ownership release are already
+    /// complete and visible to this renderer's Vulkan queue submission.
+    #[allow(dead_code)]
+    unsafe fn create_imported_dmabuf_texture_with_known_general_layout(
+        &mut self,
+        dmabuf: &Dmabuf,
+        acquire_semaphore: Option<&VulkanSyncFileSemaphore>,
+    ) -> Result<Option<VulkanTexture>, VulkanError> {
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+        let import = image::VulkanDmabufImportState::from_dmabuf(dmabuf)?;
+        let Some(sampled_image) = (unsafe {
+            // SAFETY: Forwarded from this method's caller.
+            device.create_acquired_dmabuf_sampled_image_resources_with_known_general_layout(
+                dmabuf,
+                self.downscale_filter,
+                self.upscale_filter,
+                acquire_semaphore,
+            )
+        })?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(VulkanTexture::from_acquired_dmabuf_sampled_image(
             self.context_id.clone(),
             &import,
             sampled_image,

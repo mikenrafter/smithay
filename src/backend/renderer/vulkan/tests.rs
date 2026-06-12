@@ -32,8 +32,8 @@ use super::image::{
     VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalImageOwnership, VulkanExternalMemoryHandleType,
     VulkanExternalMemoryState, VulkanImageLayoutState, VulkanImageSource, VulkanImageState,
     VulkanImageSyncState, VulkanImageUsage, clear_damage_to_clear_areas, damage_to_scissor_areas,
-    dmabuf_import_image_state, draw_solid_damage_to_clear_areas, render_texture_damage_to_scissor_areas,
-    source_to_uv_rect,
+    dmabuf_acquired_image_state, dmabuf_import_image_state, draw_solid_damage_to_clear_areas,
+    render_texture_damage_to_scissor_areas, source_to_uv_rect,
 };
 use super::*;
 
@@ -762,6 +762,18 @@ fn dmabuf_import_image_state_tracks_sampled_dmabuf_without_advertising_renderabi
     assert!(!image.sync.pending_write);
     assert!(!image.sync.exportable_sync);
     assert!(import.y_inverted);
+
+    let acquired = dmabuf_acquired_image_state(&import);
+    assert_eq!(acquired.size, (4, 3).into());
+    assert_eq!(acquired.format, Some(Fourcc::Abgr8888));
+    assert_eq!(acquired.source, VulkanImageSource::DmabufImport);
+    assert!(acquired.usage.sampled);
+    assert_eq!(acquired.layout, VulkanImageLayoutState::ShaderReadOnly);
+    assert!(!acquired.sync.external_acquire_pending);
+    assert_eq!(
+        acquired.sync.external_ownership,
+        VulkanExternalImageOwnership::Local
+    );
 }
 
 #[test]
@@ -1908,6 +1920,12 @@ fn public_dmabuf_import_is_explicitly_unsupported() {
     assert!(matches!(
         renderer.import_dmabuf(&dmabuf, None),
         Err(VulkanError::UnsupportedOperation("dmabuf import"))
+    ));
+    assert!(matches!(
+        // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
+        // Vulkan import or ownership-transfer operation can occur.
+        unsafe { renderer.create_imported_dmabuf_texture_with_known_general_layout(&dmabuf, None) },
+        Err(VulkanError::VulkanUnavailable)
     ));
 }
 
