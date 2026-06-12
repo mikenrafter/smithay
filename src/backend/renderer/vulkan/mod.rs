@@ -46,7 +46,7 @@
 use std::os::fd::OwnedFd;
 
 #[cfg(feature = "wayland_frontend")]
-use crate::backend::renderer::ImportMemWl;
+use crate::backend::renderer::{ImportDmaWl, ImportMemWl};
 use crate::{
     backend::vulkan::PhysicalDevice,
     backend::{
@@ -540,6 +540,9 @@ impl ImportDma for VulkanRenderer {
         Err(VulkanError::UnsupportedOperation("dmabuf import"))
     }
 }
+
+#[cfg(feature = "wayland_frontend")]
+impl ImportDmaWl for VulkanRenderer {}
 
 impl ImportMem for VulkanRenderer {
     fn import_memory(

@@ -332,6 +332,14 @@ fn wayland_protocol_capabilities_are_not_advertised_by_default() {
     assert!(caps.formats.dmabuf_export.iter().next().is_none());
 }
 
+#[cfg(feature = "wayland_frontend")]
+#[test]
+fn wayland_import_all_uses_shared_buffer_integration() {
+    fn assert_import_all<R: crate::backend::renderer::ImportAll>() {}
+
+    assert_import_all::<VulkanRenderer>();
+}
+
 #[test]
 fn vulkan_format_capability_record_is_per_tiling_marker() {
     let record = VulkanFormatCapabilityRecord {
