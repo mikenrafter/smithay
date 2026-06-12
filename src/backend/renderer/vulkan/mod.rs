@@ -851,14 +851,10 @@ fn copy_shm_buffer_to_tightly_packed(
         return Err(VulkanError::UnsupportedOperation("wl_shm buffer"));
     }
 
-    // SAFETY: `with_buffer_contents` provides a pointer valid for `len` bytes for the duration of
-    // the callback. This helper copies from that memory immediately and does not retain references
-    // into client-controlled shared memory.
-    let pool = unsafe { std::slice::from_raw_parts(ptr, len) };
     let packed_len = row_len
         .checked_mul(height)
         .ok_or(VulkanError::UnsupportedOperation("wl_shm buffer layout"))?;
-    let mut packed = Vec::with_capacity(packed_len);
+    let mut packed = vec![0; packed_len];
     for row in 0..height {
         let row_start = offset
             .checked_add(
@@ -866,7 +862,18 @@ fn copy_shm_buffer_to_tightly_packed(
                     .ok_or(VulkanError::UnsupportedOperation("wl_shm buffer layout"))?,
             )
             .ok_or(VulkanError::UnsupportedOperation("wl_shm buffer layout"))?;
-        packed.extend_from_slice(&pool[row_start..row_start + row_len]);
+        // SAFETY: `with_buffer_contents` provides a raw pointer valid for `len` bytes for the
+        // duration of the callback. Bounds above prove `row_start..row_start + row_len` is inside
+        // that range, and `packed` is an owned allocation large enough for this row. Use a raw
+        // pointer copy instead of creating a Rust slice/reference into client-controlled shared
+        // memory, which may be mutated by the client while this copy runs.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ptr.add(row_start),
+                packed.as_mut_ptr().add(row * row_len),
+                row_len,
+            );
+        }
     }
 
     Ok(packed)
