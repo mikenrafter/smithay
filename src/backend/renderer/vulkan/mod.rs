@@ -45,6 +45,8 @@
 
 use std::os::fd::OwnedFd;
 
+#[cfg(feature = "wayland_frontend")]
+use crate::backend::renderer::ImportMemWl;
 use crate::{
     backend::vulkan::PhysicalDevice,
     backend::{
@@ -57,6 +59,8 @@ use crate::{
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
 };
 use ash::vk;
+#[cfg(feature = "wayland_frontend")]
+use wayland_server::protocol::wl_buffer;
 
 mod capabilities;
 mod device;
@@ -641,6 +645,41 @@ impl ImportMem for VulkanRenderer {
     }
 }
 
+#[cfg(feature = "wayland_frontend")]
+impl ImportMemWl for VulkanRenderer {
+    fn import_shm_buffer(
+        &mut self,
+        buffer: &wl_buffer::WlBuffer,
+        _surface: Option<&crate::wayland::compositor::SurfaceData>,
+        _damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Result<Self::TextureId, Self::Error> {
+        let texture = crate::wayland::shm::with_buffer_contents(buffer, |ptr, len, data| {
+            let fourcc = crate::wayland::shm::shm_format_to_fourcc(data.format)
+                .ok_or(VulkanError::UnsupportedOperation("wl_shm format"))?;
+            let bits_per_pixel = crate::backend::allocator::format::get_bpp(fourcc)
+                .ok_or(VulkanError::UnsupportedFormat(fourcc))?;
+            if bits_per_pixel % 8 != 0 {
+                return Err(VulkanError::UnsupportedFormat(fourcc));
+            }
+            let bytes_per_pixel = bits_per_pixel / 8;
+            let packed = copy_shm_buffer_to_tightly_packed(
+                data.offset,
+                data.width,
+                data.height,
+                data.stride,
+                bytes_per_pixel,
+                ptr,
+                len,
+            )?;
+
+            self.import_memory(&packed, fourcc, (data.width, data.height).into(), false)
+        })
+        .map_err(|_| VulkanError::UnsupportedOperation("wl_shm buffer"))??;
+
+        Ok(texture)
+    }
+}
+
 impl ExportMem for VulkanRenderer {
     type TextureMapping = VulkanMemoryMapping;
 
@@ -768,6 +807,69 @@ fn image_region_to_vk(
             depth: 1,
         },
     ))
+}
+
+#[allow(dead_code)]
+fn copy_shm_buffer_to_tightly_packed(
+    offset: i32,
+    width: i32,
+    height: i32,
+    stride: i32,
+    bytes_per_pixel: usize,
+    ptr: *const u8,
+    len: usize,
+) -> Result<Vec<u8>, VulkanError> {
+    if offset < 0 || width <= 0 || height <= 0 || stride < 0 || bytes_per_pixel == 0 {
+        return Err(VulkanError::UnsupportedOperation("wl_shm buffer layout"));
+    }
+    let offset =
+        usize::try_from(offset).map_err(|_| VulkanError::UnsupportedOperation("wl_shm buffer layout"))?;
+    let width =
+        usize::try_from(width).map_err(|_| VulkanError::UnsupportedOperation("wl_shm buffer layout"))?;
+    let height =
+        usize::try_from(height).map_err(|_| VulkanError::UnsupportedOperation("wl_shm buffer layout"))?;
+    let stride =
+        usize::try_from(stride).map_err(|_| VulkanError::UnsupportedOperation("wl_shm buffer layout"))?;
+    let row_len = width
+        .checked_mul(bytes_per_pixel)
+        .ok_or(VulkanError::UnsupportedOperation("wl_shm buffer layout"))?;
+    if stride < row_len {
+        return Err(VulkanError::UnsupportedOperation("wl_shm buffer layout"));
+    }
+    let last_row = height
+        .checked_sub(1)
+        .and_then(|row| row.checked_mul(stride))
+        .ok_or(VulkanError::UnsupportedOperation("wl_shm buffer layout"))?;
+    let required_len = offset
+        .checked_add(last_row)
+        .and_then(|start| start.checked_add(row_len))
+        .ok_or(VulkanError::UnsupportedOperation("wl_shm buffer layout"))?;
+    if required_len > len {
+        return Err(VulkanError::UnsupportedOperation("wl_shm buffer length"));
+    }
+    if ptr.is_null() {
+        return Err(VulkanError::UnsupportedOperation("wl_shm buffer"));
+    }
+
+    // SAFETY: `with_buffer_contents` provides a pointer valid for `len` bytes for the duration of
+    // the callback. This helper copies from that memory immediately and does not retain references
+    // into client-controlled shared memory.
+    let pool = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let packed_len = row_len
+        .checked_mul(height)
+        .ok_or(VulkanError::UnsupportedOperation("wl_shm buffer layout"))?;
+    let mut packed = Vec::with_capacity(packed_len);
+    for row in 0..height {
+        let row_start = offset
+            .checked_add(
+                row.checked_mul(stride)
+                    .ok_or(VulkanError::UnsupportedOperation("wl_shm buffer layout"))?,
+            )
+            .ok_or(VulkanError::UnsupportedOperation("wl_shm buffer layout"))?;
+        packed.extend_from_slice(&pool[row_start..row_start + row_len]);
+    }
+
+    Ok(packed)
 }
 
 fn update_region_to_vk(

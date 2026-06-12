@@ -1660,6 +1660,33 @@ fn tightly_packed_image_size_matches_supported_renderer_formats() {
 }
 
 #[test]
+fn shm_buffer_copy_repacks_offset_and_stride() {
+    let data = [
+        0xaa, 0xbb, 0x00, 0x00, // padding before buffer offset
+        0x01, 0x02, 0x03, 0x04, // row 0 pixels
+        0xee, 0xff, // row 0 stride padding
+        0x05, 0x06, 0x07, 0x08, // row 1 pixels
+        0xcc, 0xdd, // row 1 stride padding
+    ];
+
+    let packed = super::copy_shm_buffer_to_tightly_packed(4, 2, 2, 6, 2, data.as_ptr(), data.len()).unwrap();
+    assert_eq!(packed, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+
+    assert!(matches!(
+        super::copy_shm_buffer_to_tightly_packed(4, 2, 2, 3, 2, data.as_ptr(), data.len()),
+        Err(VulkanError::UnsupportedOperation("wl_shm buffer layout"))
+    ));
+    assert!(matches!(
+        super::copy_shm_buffer_to_tightly_packed(4, 2, 2, 6, 2, data.as_ptr(), 13),
+        Err(VulkanError::UnsupportedOperation("wl_shm buffer length"))
+    ));
+    assert!(matches!(
+        super::copy_shm_buffer_to_tightly_packed(4, 2, 2, 6, 2, std::ptr::null(), data.len()),
+        Err(VulkanError::UnsupportedOperation("wl_shm buffer"))
+    ));
+}
+
+#[test]
 fn image_copy_required_size_accounts_for_regions_and_row_stride() {
     let extent = vk::Extent3D {
         width: 2,
