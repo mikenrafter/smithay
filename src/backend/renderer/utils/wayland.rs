@@ -140,6 +140,10 @@ impl PartialEq<WlBuffer> for &Buffer {
     }
 }
 
+fn should_replace_renderer_buffer(buffer_changed: bool, has_explicit_sync_points: bool) -> bool {
+    buffer_changed || has_explicit_sync_points
+}
+
 impl RendererSurfaceState {
     #[profiling::function]
     pub(crate) fn update_buffer(&mut self, states: &SurfaceData) {
@@ -165,7 +169,19 @@ impl RendererSurfaceState {
                 self.buffer_scale = attrs.buffer_scale;
                 self.buffer_transform = attrs.buffer_transform.into();
 
-                if !self.buffer.as_ref().is_some_and(|b| b == buffer) {
+                let buffer_changed = !self.buffer.as_ref().is_some_and(|b| b == buffer);
+                #[cfg(feature = "backend_drm")]
+                let has_explicit_sync_points =
+                    syncobj_state.acquire_point.is_some() || syncobj_state.release_point.is_some();
+                #[cfg(not(feature = "backend_drm"))]
+                let has_explicit_sync_points = false;
+
+                self.textures.clear();
+
+                // Explicit sync points are per commit, not per wl_buffer object. If the same
+                // wl_buffer is attached again with fresh sync points, refresh the renderer-managed
+                // wrapper so the commit-specific acquire/release points do not go stale.
+                if should_replace_renderer_buffer(buffer_changed, has_explicit_sync_points) {
                     self.buffer = Some(Buffer {
                         inner: Arc::new(InnerBuffer {
                             buffer,
@@ -176,8 +192,6 @@ impl RendererSurfaceState {
                         }),
                     });
                 }
-
-                self.textures.clear();
             }
             Some(BufferAssignment::Removed) => {
                 self.reset();
@@ -347,8 +361,8 @@ impl RendererSurfaceState {
 
     fn reset(&mut self) {
         self.buffer_dimensions = None;
-        self.buffer = None;
         self.textures.clear();
+        self.buffer = None;
         self.damage.reset();
         self.surface_view = None;
         self.buffer_has_alpha = None;
@@ -683,4 +697,17 @@ where
     }
 
     Ok(Some(render_damage))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_replace_renderer_buffer;
+
+    #[test]
+    fn explicit_sync_points_refresh_same_renderer_buffer() {
+        assert!(!should_replace_renderer_buffer(false, false));
+        assert!(should_replace_renderer_buffer(true, false));
+        assert!(should_replace_renderer_buffer(false, true));
+        assert!(should_replace_renderer_buffer(true, true));
+    }
 }
