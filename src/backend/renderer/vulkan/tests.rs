@@ -2083,6 +2083,37 @@ fn public_dmabuf_import_is_explicitly_unsupported() {
 }
 
 #[test]
+fn internal_dmabuf_texture_release_rejects_preconditions_before_device_lookup() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut foreign_texture = texture_for_tests((1, 1).into(), Some(Fourcc::Abgr8888));
+    foreign_texture.image.source = VulkanImageSource::DmabufImport;
+    let mut memory_texture = texture_for_tests((1, 1).into(), Some(Fourcc::Abgr8888));
+    memory_texture.context_id = renderer.context_id();
+    memory_texture.image.source = VulkanImageSource::MemoryUpload;
+    let mut missing_sampled_image_texture = texture_for_tests((1, 1).into(), Some(Fourcc::Abgr8888));
+    missing_sampled_image_texture.context_id = renderer.context_id();
+    missing_sampled_image_texture.image.source = VulkanImageSource::DmabufImport;
+    missing_sampled_image_texture.image.layout = VulkanImageLayoutState::ShaderReadOnly;
+    missing_sampled_image_texture.image.sync = VulkanImageSyncState {
+        external_ownership: VulkanExternalImageOwnership::Local,
+        ..VulkanImageSyncState::default()
+    };
+
+    assert!(matches!(
+        renderer.release_imported_dmabuf_texture_to_foreign_general(&foreign_texture, false),
+        Err(VulkanError::UnsupportedOperation("foreign dmabuf texture"))
+    ));
+    assert!(matches!(
+        renderer.release_imported_dmabuf_texture_to_foreign_general(&memory_texture, false),
+        Err(VulkanError::UnsupportedOperation("dmabuf texture"))
+    ));
+    assert!(matches!(
+        renderer.release_imported_dmabuf_texture_to_foreign_general(&missing_sampled_image_texture, true),
+        Err(VulkanError::UnsupportedOperation("dmabuf texture sampled image"))
+    ));
+}
+
+#[test]
 fn public_export_mem_rejects_invalid_vulkan_targets_before_device_lookup() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let foreign_target = render_target_for_tests(

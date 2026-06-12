@@ -43,6 +43,8 @@
 //! Every future feature should follow this pattern: capability flag first, test second, stub
 //! failure path third, real implementation fourth, enablement last.
 
+use std::os::fd::OwnedFd;
+
 use crate::{
     backend::vulkan::PhysicalDevice,
     backend::{
@@ -312,6 +314,32 @@ impl VulkanRenderer {
             &import,
             sampled_image,
         )))
+    }
+
+    /// Release an acquired dmabuf texture back to foreign ownership in `VK_IMAGE_LAYOUT_GENERAL`.
+    ///
+    /// This is an internal counterpart to the known-layout acquire helpers. It does not make public
+    /// dmabuf import/export supported; callers must only pass textures created by the acquired
+    /// dmabuf import path for this renderer.
+    #[allow(dead_code)]
+    fn release_imported_dmabuf_texture_to_foreign_general(
+        &mut self,
+        texture: &VulkanTexture,
+        export_sync_file: bool,
+    ) -> Result<(bool, Option<OwnedFd>), VulkanError> {
+        if texture.context_id != self.context_id {
+            return Err(VulkanError::UnsupportedOperation("foreign dmabuf texture"));
+        }
+        if texture.image.source != image::VulkanImageSource::DmabufImport {
+            return Err(VulkanError::UnsupportedOperation("dmabuf texture"));
+        }
+        let sampled_image = texture
+            .sampled_image
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("dmabuf texture sampled image"))?;
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+
+        device.release_sampled_dmabuf_to_foreign_general(sampled_image.image(), export_sync_file)
     }
 
     #[allow(dead_code)]
