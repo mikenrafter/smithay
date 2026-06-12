@@ -719,6 +719,20 @@ fn dmabuf_external_image_format_query_is_disabled_without_prerequisites() {
             .unwrap()
             .is_none()
     );
+    assert!(
+        // SAFETY: This uninitialized-device test returns before any Vulkan image import or acquire
+        // operation because external-memory prerequisites are unavailable.
+        unsafe {
+            device.create_acquired_dmabuf_sampled_image_resources_with_known_general_layout(
+                &dmabuf,
+                TextureFilter::Linear,
+                TextureFilter::Nearest,
+                None,
+            )
+        }
+        .unwrap()
+        .is_none()
+    );
 }
 
 #[test]
