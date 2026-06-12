@@ -586,6 +586,14 @@ fn image_format_properties_support_extent(
         && properties.sample_counts.contains(vk::SampleCountFlags::TYPE_1)
 }
 
+fn ensure_allocation_available(remaining_allocations: u32) -> Result<(), Error> {
+    if remaining_allocations == 0 {
+        Err(Error::Vk(vk::Result::ERROR_TOO_MANY_OBJECTS))
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ImageInner {
     // TODO: image usage?
@@ -749,9 +757,7 @@ impl VulkanAllocator {
         assert!(height > 0);
 
         // Ensure maximum allocations are not exceeded.
-        if self.remaining_allocations == 0 {
-            todo!()
-        }
+        ensure_allocation_available(self.remaining_allocations)?;
 
         // Now that the list of valid modifiers is known, create an image using one of the modifiers.
         let mut modifier_list =
@@ -915,8 +921,8 @@ impl VulkanAllocator {
 mod tests {
     use super::{
         Error, ImageUsageFlags, VulkanAllocator, dmabuf_plane_count, dmabuf_plane_layout,
-        find_memory_type_index, image_format_properties_support_extent, requires_dedicated_allocation,
-        supports_dma_buf_export,
+        ensure_allocation_available, find_memory_type_index, image_format_properties_support_extent,
+        requires_dedicated_allocation, supports_dma_buf_export,
     };
     use crate::backend::{
         allocator::{Allocator, Buffer, dmabuf::AsDmabuf},
@@ -1098,6 +1104,15 @@ mod tests {
             },
             64,
             32,
+        ));
+    }
+
+    #[test]
+    fn allocation_availability_guard_rejects_exhaustion() {
+        assert!(ensure_allocation_available(1).is_ok());
+        assert!(matches!(
+            ensure_allocation_available(0),
+            Err(Error::Vk(vk::Result::ERROR_TOO_MANY_OBJECTS))
         ));
     }
 
