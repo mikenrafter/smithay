@@ -3669,6 +3669,14 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
     ));
     assert!(matches!(
+        device.release_sampled_dmabuf_to_foreign_general(&owned_image, false),
+        Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+    ));
+    assert!(matches!(
+        device.release_sampled_dmabuf_to_foreign_general(&owned_image, true),
+        Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+    ));
+    assert!(matches!(
         device.copy_buffer_to_image(
             &mut graphics_command_buffer,
             &foreign_copy_buffer,
