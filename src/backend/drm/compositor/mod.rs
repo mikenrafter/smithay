@@ -509,6 +509,15 @@ impl<B: Buffer, F: Framebuffer> Clone for PlaneConfig<B, F> {
     }
 }
 
+fn should_skip_plane_update(
+    has_element_damage: bool,
+    is_compatible: bool,
+    same_framebuffer: bool,
+    has_commit_sync: bool,
+) -> bool {
+    !has_element_damage && is_compatible && same_framebuffer && !has_commit_sync
+}
+
 #[derive(Debug, Clone)]
 struct PlaneElementState {
     id: Id,
@@ -4017,18 +4026,24 @@ where
         // We can only skip the plane update if we have no damage and if
         // the src/dst/alpha properties are unchanged. Also we can not skip if
         // the fb did change (this includes the case where we previously
-        // had not assigned anything to the plane)
-        let skip = !has_element_damage
-            && previous_state
-                .plane_state(plane.handle)
-                .map(|state| {
-                    state
-                        .config
-                        .as_ref()
-                        .map(|c| is_compatible && c.buffer.fb == config.buffer.fb)
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+        // had not assigned anything to the plane), or if the new commit carries
+        // sync state that must be processed and kept alive by a non-empty frame.
+        let same_framebuffer = previous_state
+            .plane_state(plane.handle)
+            .map(|state| {
+                state
+                    .config
+                    .as_ref()
+                    .map(|c| c.buffer.fb == config.buffer.fb)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let skip = should_skip_plane_update(
+            has_element_damage,
+            is_compatible,
+            same_framebuffer,
+            config.sync.is_some(),
+        );
 
         let plane_state = PlaneState {
             skip,
@@ -4442,4 +4457,13 @@ fn drm_compositor_is_send() {
 
     is_send::<DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>>(
     );
+}
+
+#[test]
+fn direct_scanout_with_sync_point_needs_plane_update() {
+    assert!(should_skip_plane_update(false, true, true, false));
+    assert!(!should_skip_plane_update(false, true, true, true));
+    assert!(!should_skip_plane_update(true, true, true, false));
+    assert!(!should_skip_plane_update(false, false, true, false));
+    assert!(!should_skip_plane_update(false, true, false, false));
 }
