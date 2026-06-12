@@ -390,6 +390,21 @@ fn find_memory_type_index(
     fallback.ok_or(Error::UnsupportedMemoryType)
 }
 
+fn supports_dma_buf_export(properties: vk::ExternalMemoryProperties) -> bool {
+    properties
+        .external_memory_features
+        .contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE)
+        && properties
+            .compatible_handle_types
+            .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+}
+
+fn requires_dedicated_allocation(properties: vk::ExternalMemoryProperties) -> bool {
+    properties
+        .external_memory_features
+        .contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY)
+}
+
 impl Drop for VulkanAllocator {
     fn drop(&mut self) {
         unsafe {
@@ -545,6 +560,12 @@ struct FormatEntry {
     modifier_properties: vk::DrmFormatModifierPropertiesEXT,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ExternalImageFormatInfo {
+    image_format_properties: vk::ImageFormatProperties,
+    dedicated_only: bool,
+}
+
 struct ExtensionFns {
     /// Functions to get DRM format information.
     ///
@@ -582,11 +603,13 @@ impl VulkanAllocator {
         &self,
         format: DrmFormat,
         usage: vk::ImageUsageFlags,
-    ) -> Result<Option<vk::ImageFormatProperties>, vk::Result> {
+    ) -> Result<Option<ExternalImageFormatInfo>, vk::Result> {
         let vk_format = format::get_vk_format(format.code);
 
         match vk_format {
             Some(vk_format) => {
+                let mut external_image_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+                    .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
                 let mut image_drm_format_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
                     .drm_format_modifier(format.modifier.into())
                     .sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -597,8 +620,11 @@ impl VulkanAllocator {
                     .usage(usage)
                     .flags(vk::ImageCreateFlags::empty())
                     // VUID-VkPhysicalDeviceImageFormatInfo2-tiling-02249
+                    .push_next(&mut external_image_info)
                     .push_next(&mut image_drm_format_info);
-                let mut image_format_properties = vk::ImageFormatProperties2::default();
+                let mut external_properties = vk::ExternalImageFormatProperties::default();
+                let mut image_format_properties =
+                    vk::ImageFormatProperties2::default().push_next(&mut external_properties);
 
                 // VUID-vkGetPhysicalDeviceImageFormatProperties-tiling-02248: Must use vkGetPhysicalDeviceImageFormatProperties2
                 let result = unsafe {
@@ -612,16 +638,20 @@ impl VulkanAllocator {
                         )
                 };
 
-                result
-                    .map(|_| Some(image_format_properties.image_format_properties))
-                    .or_else(|result| {
-                        // Unsupported format + usage combination
-                        if result == vk::Result::ERROR_FORMAT_NOT_SUPPORTED {
-                            Ok(None)
-                        } else {
-                            Err(result)
-                        }
-                    })
+                match result {
+                    Ok(()) => {
+                        let image_format_properties = image_format_properties.image_format_properties;
+                        let external_memory_properties = external_properties.external_memory_properties;
+                        Ok(supports_dma_buf_export(external_memory_properties).then_some(
+                            ExternalImageFormatInfo {
+                                image_format_properties,
+                                dedicated_only: requires_dedicated_allocation(external_memory_properties),
+                            },
+                        ))
+                    }
+                    Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => Ok(None),
+                    Err(result) => Err(result),
+                }
             }
 
             None => Ok(None),
@@ -655,8 +685,8 @@ impl VulkanAllocator {
                 Some((modifier, info))
             })
             // Filter modifiers where the required image creation limits are not met
-            .filter(move |(_, properties)| {
-                let max_extent = properties.max_extent;
+            .filter(move |(_, info)| {
+                let max_extent = info.image_format_properties.max_extent;
 
                 // VUID-VkImageCreateInfo-extent-02252
                 max_extent.width >= width
@@ -667,7 +697,10 @@ impl VulkanAllocator {
                 // VUID-VkImageCreateInfo-imageType-00957
                 && max_extent.depth >= 1
                 // VUID-VkImageCreateInfo-samples-02258
-                && properties.sample_counts.contains(vk::SampleCountFlags::TYPE_1)
+                && info
+                    .image_format_properties
+                    .sample_counts
+                    .contains(vk::SampleCountFlags::TYPE_1)
             })
             .map(|(modifier, _)| modifier)
             .map(Into::<u64>::into)
@@ -769,6 +802,8 @@ impl VulkanAllocator {
             .unwrap()
             .modifier_properties
             .drm_format_modifier_plane_count;
+        let external_format_info =
+            unsafe { self.get_format_info(format, vk_usage)? }.ok_or(Error::UnsupportedFormat)?;
 
         // Allocate image memory
         let memory_reqs = unsafe { self.device.get_image_memory_requirements(guard.image) };
@@ -781,10 +816,16 @@ impl VulkanAllocator {
         let memory_type_index = find_memory_type_index(&memory_properties, memory_reqs.memory_type_bits)?;
         let mut export_memory_allocate_info = vk::ExportMemoryAllocateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut dedicated_allocate_info = vk::MemoryDedicatedAllocateInfo::default().image(guard.image);
         let alloc_create_info = vk::MemoryAllocateInfo::default()
             .allocation_size(memory_reqs.size)
             .memory_type_index(memory_type_index)
             .push_next(&mut export_memory_allocate_info);
+        let alloc_create_info = if external_format_info.dedicated_only {
+            alloc_create_info.push_next(&mut dedicated_allocate_info)
+        } else {
+            alloc_create_info
+        };
 
         unsafe {
             // Allocate memory for the image.
@@ -847,7 +888,7 @@ impl VulkanAllocator {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, find_memory_type_index};
+    use super::{Error, find_memory_type_index, requires_dedicated_allocation, supports_dma_buf_export};
     use ash::vk;
 
     fn memory_properties_for_tests(flags: &[vk::MemoryPropertyFlags]) -> vk::PhysicalDeviceMemoryProperties {
@@ -893,5 +934,36 @@ mod tests {
         ]);
 
         assert_eq!(find_memory_type_index(&properties, 0b11).unwrap(), 0);
+    }
+
+    #[test]
+    fn external_memory_properties_require_dma_buf_export_support() {
+        let supported = vk::ExternalMemoryProperties {
+            external_memory_features: vk::ExternalMemoryFeatureFlags::EXPORTABLE,
+            export_from_imported_handle_types: vk::ExternalMemoryHandleTypeFlags::empty(),
+            compatible_handle_types: vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+        };
+        assert!(supports_dma_buf_export(supported));
+
+        assert!(!supports_dma_buf_export(vk::ExternalMemoryProperties {
+            external_memory_features: vk::ExternalMemoryFeatureFlags::empty(),
+            ..supported
+        }));
+        assert!(!supports_dma_buf_export(vk::ExternalMemoryProperties {
+            compatible_handle_types: vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD,
+            ..supported
+        }));
+    }
+
+    #[test]
+    fn external_memory_properties_track_dedicated_only() {
+        assert!(requires_dedicated_allocation(vk::ExternalMemoryProperties {
+            external_memory_features: vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY,
+            export_from_imported_handle_types: vk::ExternalMemoryHandleTypeFlags::empty(),
+            compatible_handle_types: vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+        }));
+        assert!(!requires_dedicated_allocation(
+            vk::ExternalMemoryProperties::default()
+        ));
     }
 }
