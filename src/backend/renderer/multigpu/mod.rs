@@ -568,7 +568,7 @@ impl<A: GraphicsApi> GpuManager<A> {
     fn early_import_buffer(
         &mut self,
         target_node: DrmNode,
-        buffer: &wl_buffer::WlBuffer,
+        buffer: &crate::backend::renderer::utils::Buffer,
         surface: &SurfaceData,
         damage: &[Rectangle<i32, BufferCoords>],
     ) -> Result<(), Error<A, A>>
@@ -579,6 +579,14 @@ impl<A: GraphicsApi> GpuManager<A> {
     {
         match buffer_type(buffer) {
             Some(BufferType::Dma) => {
+                // Explicit-sync buffers need the normal import path to preserve the renderer-side
+                // synchronization context. Early import is only an optimization, so skip it rather
+                // than importing or copying the dmabuf before that path can account for the acquire
+                // point.
+                if buffer.acquire_point().is_some() {
+                    return Ok(());
+                }
+
                 let dmabuf = get_dmabuf(buffer).unwrap();
                 let mut texture = MultiTexture::from_surface(Some(surface), dmabuf.size(), dmabuf.format());
 

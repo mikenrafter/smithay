@@ -335,7 +335,9 @@ fn wayland_protocol_capabilities_are_not_advertised_by_default() {
 #[cfg(feature = "wayland_frontend")]
 #[test]
 fn wayland_import_all_uses_shared_buffer_integration() {
-    fn assert_import_all<R: crate::backend::renderer::ImportAll>() {}
+    fn assert_import_all<R: crate::backend::renderer::ImportAll>() {
+        let _ = R::import_buffer_from_surface_state;
+    }
 
     assert_import_all::<VulkanRenderer>();
 }

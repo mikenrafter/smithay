@@ -642,6 +642,20 @@ pub trait ImportDmaWl: ImportDma {
             .expect("import_dma_buffer without checking buffer type?");
         self.import_dmabuf(dmabuf, Some(damage))
     }
+
+    /// Import a dmabuf-based buffer from renderer-managed Wayland surface state.
+    ///
+    /// This default keeps the historical `wl_buffer`-only behavior. Renderers that need
+    /// the renderer-managed buffer wrapper can override this method without changing the
+    /// raw dmabuf import API.
+    fn import_dma_buffer_from_surface_state(
+        &mut self,
+        buffer: &utils::Buffer,
+        surface: Option<&crate::wayland::compositor::SurfaceData>,
+        damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Result<Self::TextureId, Self::Error> {
+        self.import_dma_buffer(buffer, surface, damage)
+    }
 }
 
 /// Trait for Renderers supporting importing dmabufs.
@@ -704,6 +718,19 @@ pub trait ImportAll: Renderer {
         surface: Option<&crate::wayland::compositor::SurfaceData>,
         damage: &[Rectangle<i32, BufferCoord>],
     ) -> Option<Result<Self::TextureId, Self::Error>>;
+
+    /// Import a renderer-managed Wayland surface-state buffer.
+    ///
+    /// This default preserves the existing `wl_buffer`-only import behavior. Implementations
+    /// may override it to use the renderer-managed [`utils::Buffer`] wrapper.
+    fn import_buffer_from_surface_state(
+        &mut self,
+        buffer: &utils::Buffer,
+        surface: Option<&crate::wayland::compositor::SurfaceData>,
+        damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Option<Result<Self::TextureId, Self::Error>> {
+        self.import_buffer(buffer, surface, damage)
+    }
 }
 
 #[cfg(all(
@@ -729,6 +756,29 @@ where
     }
 }
 
+#[cfg(all(
+    feature = "wayland_frontend",
+    any(
+        feature = "renderer_vulkan",
+        not(all(feature = "backend_egl", feature = "use_system_lib"))
+    )
+))]
+pub(super) fn import_shm_dmabuf_buffer_from_surface_state<R>(
+    renderer: &mut R,
+    buffer: &utils::Buffer,
+    surface: Option<&crate::wayland::compositor::SurfaceData>,
+    damage: &[Rectangle<i32, BufferCoord>],
+) -> Option<Result<R::TextureId, R::Error>>
+where
+    R: Renderer + ImportMemWl + ImportDmaWl,
+{
+    match buffer_type(buffer) {
+        Some(BufferType::Shm) => Some(renderer.import_shm_buffer(buffer, surface, damage)),
+        Some(BufferType::Dma) => Some(renderer.import_dma_buffer_from_surface_state(buffer, surface, damage)),
+        _ => None,
+    }
+}
+
 // TODO: Do this with specialization, when possible and do default implementations
 #[cfg(all(
     feature = "wayland_frontend",
@@ -750,6 +800,20 @@ impl<R: Renderer + ImportMemWl + ImportEgl + ImportDmaWl> ImportAll for R {
             _ => None,
         }
     }
+
+    fn import_buffer_from_surface_state(
+        &mut self,
+        buffer: &utils::Buffer,
+        surface: Option<&SurfaceData>,
+        damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Option<Result<Self::TextureId, Self::Error>> {
+        match buffer_type(buffer) {
+            Some(BufferType::Shm) => Some(self.import_shm_buffer(buffer, surface, damage)),
+            Some(BufferType::Egl) => Some(self.import_egl_buffer(buffer, surface, damage)),
+            Some(BufferType::Dma) => Some(self.import_dma_buffer_from_surface_state(buffer, surface, damage)),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(all(
@@ -764,6 +828,15 @@ impl<R: Renderer + ImportMemWl + ImportDmaWl> ImportAll for R {
         damage: &[Rectangle<i32, BufferCoord>],
     ) -> Option<Result<Self::TextureId, Self::Error>> {
         import_shm_dmabuf_buffer(self, buffer, surface, damage)
+    }
+
+    fn import_buffer_from_surface_state(
+        &mut self,
+        buffer: &utils::Buffer,
+        surface: Option<&SurfaceData>,
+        damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Option<Result<Self::TextureId, Self::Error>> {
+        import_shm_dmabuf_buffer_from_surface_state(self, buffer, surface, damage)
     }
 }
 

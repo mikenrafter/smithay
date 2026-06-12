@@ -514,7 +514,7 @@ where
                     return Ok(());
                 }
 
-                match renderer.import_buffer(buffer, Some(states), &buffer_damage) {
+                match renderer.import_buffer_from_surface_state(buffer, Some(states), &buffer_damage) {
                     Some(Ok(m)) => {
                         e.insert(Box::new(m));
                         data.renderer_seen.insert(context_id, data.current_commit());

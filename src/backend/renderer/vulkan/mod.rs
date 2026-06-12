@@ -564,6 +564,15 @@ impl ImportAll for VulkanRenderer {
     ) -> Option<Result<Self::TextureId, Self::Error>> {
         super::import_shm_dmabuf_buffer(self, buffer, surface, damage)
     }
+
+    fn import_buffer_from_surface_state(
+        &mut self,
+        buffer: &super::utils::Buffer,
+        surface: Option<&crate::wayland::compositor::SurfaceData>,
+        damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Option<Result<Self::TextureId, Self::Error>> {
+        super::import_shm_dmabuf_buffer_from_surface_state(self, buffer, surface, damage)
+    }
 }
 
 impl ImportMem for VulkanRenderer {
