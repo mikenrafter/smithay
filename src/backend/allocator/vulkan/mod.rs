@@ -510,7 +510,8 @@ impl AsDmabuf for VulkanImage {
             // VUID-vkGetImageSubresourceLayout-image-02270: All allocate images are created with drm tiling
             let subresource = vk::ImageSubresource::default().aspect_mask(aspect_mask);
             let layout = unsafe { device.get_image_subresource_layout(self.inner.image, subresource) };
-            builder.add_plane(fd.clone(), layout.offset as u32, layout.row_pitch as u32);
+            let (offset, stride) = dmabuf_plane_layout(layout).ok_or(ExportError::Failed)?;
+            builder.add_plane(fd.clone(), offset, stride);
         }
 
         #[cfg(feature = "backend_drm")]
@@ -542,6 +543,17 @@ pub enum ExportError {
     /// Vulkan API error.
     #[error(transparent)]
     Vk(#[from] vk::Result),
+}
+
+fn dmabuf_plane_layout(layout: vk::SubresourceLayout) -> Option<(u32, u32)> {
+    let offset = u32::try_from(layout.offset).ok()?;
+    let stride = u32::try_from(layout.row_pitch).ok()?;
+
+    if stride == 0 {
+        return None;
+    }
+
+    Some((offset, stride))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -889,8 +901,8 @@ impl VulkanAllocator {
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, ImageUsageFlags, VulkanAllocator, find_memory_type_index, requires_dedicated_allocation,
-        supports_dma_buf_export,
+        Error, ImageUsageFlags, VulkanAllocator, dmabuf_plane_layout, find_memory_type_index,
+        requires_dedicated_allocation, supports_dma_buf_export,
     };
     use crate::backend::{
         allocator::{Allocator, Buffer, dmabuf::AsDmabuf},
@@ -972,6 +984,43 @@ mod tests {
         assert!(!requires_dedicated_allocation(
             vk::ExternalMemoryProperties::default()
         ));
+    }
+
+    #[test]
+    fn dmabuf_plane_layout_requires_representable_metadata() {
+        assert_eq!(
+            dmabuf_plane_layout(vk::SubresourceLayout {
+                offset: 16,
+                row_pitch: 256,
+                ..vk::SubresourceLayout::default()
+            }),
+            Some((16, 256)),
+        );
+
+        assert_eq!(
+            dmabuf_plane_layout(vk::SubresourceLayout {
+                offset: u64::from(u32::MAX) + 1,
+                row_pitch: 256,
+                ..vk::SubresourceLayout::default()
+            }),
+            None,
+        );
+        assert_eq!(
+            dmabuf_plane_layout(vk::SubresourceLayout {
+                offset: 16,
+                row_pitch: u64::from(u32::MAX) + 1,
+                ..vk::SubresourceLayout::default()
+            }),
+            None,
+        );
+        assert_eq!(
+            dmabuf_plane_layout(vk::SubresourceLayout {
+                offset: 16,
+                row_pitch: 0,
+                ..vk::SubresourceLayout::default()
+            }),
+            None,
+        );
     }
 
     #[test]
