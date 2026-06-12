@@ -284,6 +284,10 @@ impl VulkanAllocator {
             return false;
         }
 
+        if self.format_plane_count(format).is_none() {
+            return false;
+        }
+
         // TODO: Check if the extents are also valid?
         // Vulkan states a maximum extent size for images.
         // This may also be useful as a function on Allocator.
@@ -556,6 +560,12 @@ fn dmabuf_plane_layout(layout: vk::SubresourceLayout) -> Option<(u32, u32)> {
     Some((offset, stride))
 }
 
+fn dmabuf_plane_count(plane_count: u32) -> Option<u32> {
+    (1..=MAX_PLANES as u32)
+        .contains(&plane_count)
+        .then_some(plane_count)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ImageInner {
     // TODO: image usage?
@@ -807,13 +817,7 @@ impl VulkanAllocator {
         };
 
         // Now that we know the plane count, get the number of planes for the format + modifier
-        let format_plane_count = self
-            .formats
-            .iter()
-            .find(|entry| entry.format == format)
-            .unwrap()
-            .modifier_properties
-            .drm_format_modifier_plane_count;
+        let format_plane_count = self.format_plane_count(format).ok_or(Error::UnsupportedFormat)?;
         let external_format_info =
             unsafe { self.get_format_info(format, vk_usage)? }.ok_or(Error::UnsupportedFormat)?;
 
@@ -896,13 +900,20 @@ impl VulkanAllocator {
             !drop
         })
     }
+
+    fn format_plane_count(&self, format: DrmFormat) -> Option<u32> {
+        self.formats
+            .iter()
+            .find(|entry| entry.format == format)
+            .and_then(|entry| dmabuf_plane_count(entry.modifier_properties.drm_format_modifier_plane_count))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, ImageUsageFlags, VulkanAllocator, dmabuf_plane_layout, find_memory_type_index,
-        requires_dedicated_allocation, supports_dma_buf_export,
+        Error, ImageUsageFlags, VulkanAllocator, dmabuf_plane_count, dmabuf_plane_layout,
+        find_memory_type_index, requires_dedicated_allocation, supports_dma_buf_export,
     };
     use crate::backend::{
         allocator::{Allocator, Buffer, dmabuf::AsDmabuf},
@@ -1021,6 +1032,14 @@ mod tests {
             }),
             None,
         );
+    }
+
+    #[test]
+    fn dmabuf_plane_count_requires_supported_plane_range() {
+        assert_eq!(dmabuf_plane_count(0), None);
+        assert_eq!(dmabuf_plane_count(1), Some(1));
+        assert_eq!(dmabuf_plane_count(4), Some(4));
+        assert_eq!(dmabuf_plane_count(5), None);
     }
 
     #[test]
