@@ -424,6 +424,17 @@ pub(crate) struct VulkanDmabufImportImage {
 
 impl VulkanDmabufExternalImageFormatProperties {
     pub(super) fn supports_sampled_import(&self, import: &VulkanDmabufImportState) -> bool {
+        let Ok(width) = u32::try_from(import.size.w) else {
+            return false;
+        };
+        let Ok(height) = u32::try_from(import.size.h) else {
+            return false;
+        };
+
+        if width == 0 || height == 0 {
+            return false;
+        }
+
         self.importable
             && self
                 .image_format_properties
@@ -431,8 +442,8 @@ impl VulkanDmabufExternalImageFormatProperties {
                 .contains(vk::SampleCountFlags::TYPE_1)
             && self.image_format_properties.max_mip_levels >= 1
             && self.image_format_properties.max_array_layers >= 1
-            && self.image_format_properties.max_extent.width >= import.size.w.try_into().unwrap_or_default()
-            && self.image_format_properties.max_extent.height >= import.size.h.try_into().unwrap_or_default()
+            && self.image_format_properties.max_extent.width >= width
+            && self.image_format_properties.max_extent.height >= height
             && self.image_format_properties.max_extent.depth >= 1
     }
 }

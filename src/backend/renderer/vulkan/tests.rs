@@ -978,6 +978,14 @@ fn dmabuf_import_candidate_requires_importable_single_sample_extent() {
     );
     assert!(supported.supports_sampled_import(&import));
 
+    let mut zero_width_import = import.clone();
+    zero_width_import.size = (0, 3).into();
+    assert!(!supported.supports_sampled_import(&zero_width_import));
+
+    let mut zero_height_import = import.clone();
+    zero_height_import.size = (4, 0).into();
+    assert!(!supported.supports_sampled_import(&zero_height_import));
+
     let non_importable = dmabuf_external_image_properties_for_tests(
         false,
         vk::Extent3D {
