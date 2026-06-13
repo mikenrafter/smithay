@@ -850,6 +850,18 @@ fn dmabuf_external_image_format_query_is_disabled_without_prerequisites() {
     assert!(device.dmabuf_render_target_candidate(&import).unwrap().is_none());
     assert!(
         device
+            .create_dmabuf_render_target_image(&import)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        device
+            .create_bound_dmabuf_render_target_image(&dmabuf)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        device
             .dmabuf_render_target_external_image_format_properties(&import)
             .unwrap()
             .is_none()
