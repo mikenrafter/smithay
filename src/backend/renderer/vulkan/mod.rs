@@ -380,11 +380,9 @@ impl VulkanRenderer {
         )))
     }
 
-    /// Import a dmabuf as an internal render target and acquire it for color-attachment rendering.
+    /// Import a dmabuf as a render target and acquire it for color-attachment rendering.
     ///
-    /// This crate-private helper is intentionally not wired to public [`Bind<Dmabuf>`] yet. It
-    /// exists to build and test the internal acquire/render/release path while public dmabuf
-    /// render-target formats remain unadvertised.
+    /// This is the implementation helper behind public [`Bind<Dmabuf>`].
     ///
     /// # Safety
     ///
@@ -422,9 +420,8 @@ impl VulkanRenderer {
     /// Import a dmabuf as an internal render target and acquire it using a Smithay sync point as the
     /// optional producer-completion dependency.
     ///
-    /// This is a sync-point convenience wrapper for the crate-private acquired dmabuf render-target
-    /// path. It is intentionally not wired to public [`Bind<Dmabuf>`] and does not advertise dmabuf
-    /// render-target formats.
+    /// This is a sync-point convenience wrapper for the acquired dmabuf render-target path used by
+    /// the public [`Bind<Dmabuf>`] implementation.
     ///
     /// # Safety
     ///
@@ -494,8 +491,8 @@ impl VulkanRenderer {
 
     /// Release an acquired dmabuf render target back to foreign ownership in `GENERAL` layout.
     ///
-    /// This is a crate-private counterpart to the acquired dmabuf render-target helper and does not
-    /// make public dmabuf render targets supported.
+    /// This is the release counterpart to the acquired dmabuf render-target helper used by public
+    /// dmabuf render-target binding.
     #[allow(dead_code)]
     pub(crate) fn release_acquired_dmabuf_render_target_to_foreign_general(
         &mut self,
@@ -531,8 +528,8 @@ impl VulkanRenderer {
     /// Release an acquired dmabuf render target and return the exported release fence as a
     /// [`SyncPoint`] when available.
     ///
-    /// This is still a crate-private helper and does not advertise public dmabuf render-target
-    /// support.
+    /// This is a crate-private helper for public dmabuf render-target binding and DRM error
+    /// cleanup.
     #[allow(dead_code)]
     pub(crate) fn release_acquired_dmabuf_render_target_to_foreign_general_sync_point(
         &mut self,
@@ -711,12 +708,31 @@ impl<'target> Bind<VulkanRenderTarget<'target>> for VulkanRenderer {
 
 impl Bind<Dmabuf> for VulkanRenderer {
     fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        let _import = validate_dmabuf_render_target_metadata(target)?;
-        Err(VulkanError::UnsupportedOperation("dmabuf render target"))
+        unsafe {
+            // SAFETY: Public `Bind<Dmabuf>` follows the external-target contract documented on the
+            // trait: callers must only bind dmabufs that are no longer concurrently accessed by a
+            // foreign producer or consumer. For Vulkan this means the foreign side has relinquished
+            // external-memory ownership/access and made prior writes visible before this acquire is
+            // submitted. We discard prior contents and report an effective target age of zero below,
+            // so this acquire does not depend on a preserved foreign layout. `Frame::finish`
+            // releases the target back to foreign ownership; the generic DRM render path calls
+            // `release_after_render_error` if rendering fails first.
+            self.create_acquired_dmabuf_render_target_with_sync_point(target, false, None)
+        }?
+        .ok_or(VulkanError::UnsupportedOperation("dmabuf render target format"))
+    }
+
+    fn target_age(&self, _target: &Dmabuf, _age: usize) -> usize {
+        0
+    }
+
+    fn release_after_render_error(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
+        self.release_acquired_dmabuf_render_target_to_foreign_general_sync_point(target, false)
+            .map(|_| ())
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
-        Some(FormatSet::default())
+        Some(self.capabilities.formats.dmabuf_render_target.clone())
     }
 }
 

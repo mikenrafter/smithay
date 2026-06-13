@@ -135,6 +135,7 @@ impl VulkanFormatCapabilities {
         let mut records = Vec::new();
         let mut modifier_records = Vec::new();
         let mut memory_import = Vec::new();
+        let mut dmabuf_render_target = Vec::new();
 
         for info in renderer_format_infos() {
             let mut properties = vk::FormatProperties2::default();
@@ -173,6 +174,21 @@ impl VulkanFormatCapabilities {
                     .unwrap_or_default()
                 {
                     let record = modifier_record_from_properties(info.fourcc, modifier_properties);
+                    let is_importable_render_target = !info.is_10bit
+                        && record.plane_count == 1
+                        && record.usages.color_attachment
+                        && record.usages.color_attachment_blend
+                        && dmabuf_render_target_external_importable(
+                            physical_device,
+                            info.vk_format,
+                            record.modifier,
+                        )?;
+                    if is_importable_render_target {
+                        dmabuf_render_target.push(Format {
+                            code: record.format,
+                            modifier: record.modifier,
+                        });
+                    }
                     if record.usages.any_supported() {
                         modifier_records.push(record);
                     }
@@ -186,7 +202,7 @@ impl VulkanFormatCapabilities {
             memory_import: memory_import.into_iter().collect(),
             dmabuf_import: FormatSet::default(),
             dmabuf_export: FormatSet::default(),
-            dmabuf_render_target: FormatSet::default(),
+            dmabuf_render_target: dmabuf_render_target.into_iter().collect(),
         })
     }
 
@@ -231,9 +247,13 @@ impl VulkanFormatCapabilities {
         self.modifier_records.iter().find(|record| {
             record.format == import.format()
                 && record.modifier == import.modifier()
+                && get_format_info(record.format)
+                    .map(|info| !info.is_10bit)
+                    .unwrap_or(false)
                 && record.plane_count == 1
                 && record.plane_count as usize == import.plane_count()
                 && record.usages.color_attachment
+                && record.usages.color_attachment_blend
         })
     }
 
@@ -255,6 +275,62 @@ pub(super) fn should_query_modifier_properties(external_memory: &VulkanExternalM
         && external_memory.drm_format_modifiers
         && external_memory.foreign_queue_family
         && external_memory.image_format_list
+}
+
+fn dmabuf_render_target_external_importable(
+    physical_device: &PhysicalDevice,
+    format: vk::Format,
+    modifier: Modifier,
+) -> Result<bool, VulkanError> {
+    let mut external_image_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let mut drm_format_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+        .drm_format_modifier(modifier.into())
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(format)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        .flags(vk::ImageCreateFlags::empty())
+        .push_next(&mut external_image_info)
+        .push_next(&mut drm_format_info);
+    let mut external_properties = vk::ExternalImageFormatProperties::default();
+    let mut image_properties = vk::ImageFormatProperties2::default().push_next(&mut external_properties);
+
+    // SAFETY: `physical_device` belongs to its retained instance. The pNext chains live for the
+    // duration of the call and request only support properties for a 2D color-attachment image with
+    // DRM-format-modifier tiling and DMA_BUF external memory; callers only reach this helper after
+    // the required external-memory and DRM-modifier prerequisites were discovered.
+    let result = unsafe {
+        physical_device
+            .instance()
+            .handle()
+            .get_physical_device_image_format_properties2(
+                physical_device.handle(),
+                &format_info,
+                &mut image_properties,
+            )
+    };
+
+    match result {
+        Ok(()) => {
+            let image_format_properties = image_properties.image_format_properties;
+            let _ = image_properties;
+            let external_memory_properties = external_properties.external_memory_properties;
+            Ok(external_memory_properties
+                .external_memory_features
+                .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+                && external_memory_properties
+                    .compatible_handle_types
+                    .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+                && image_format_properties
+                    .sample_counts
+                    .contains(vk::SampleCountFlags::TYPE_1))
+        }
+        Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => Ok(false),
+        Err(err) => Err(VulkanError::from(err)),
+    }
 }
 
 pub(super) fn modifier_record_from_properties(

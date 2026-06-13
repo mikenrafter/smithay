@@ -752,6 +752,24 @@ fn drm_modifier_capability_lookup_requires_single_plane_color_attachment_target(
         vk::DrmFormatModifierPropertiesEXT {
             drm_format_modifier: Modifier::Linear.into(),
             drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND,
+        },
+    );
+    let ten_bit_record = modifier_record_from_properties(
+        Fourcc::Xrgb2101010,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND,
+        },
+    );
+    let color_only_record = modifier_record_from_properties(
+        Fourcc::Argb8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
             drm_format_modifier_tiling_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT,
         },
     );
@@ -772,7 +790,13 @@ fn drm_modifier_capability_lookup_requires_single_plane_color_attachment_target(
         },
     );
     let caps = VulkanFormatCapabilities {
-        modifier_records: vec![render_target_record, sampled_record, multiplane_color_record],
+        modifier_records: vec![
+            render_target_record,
+            ten_bit_record,
+            color_only_record,
+            sampled_record,
+            multiplane_color_record,
+        ],
         ..VulkanFormatCapabilities::default()
     };
 
@@ -788,6 +812,16 @@ fn drm_modifier_capability_lookup_requires_single_plane_color_attachment_target(
     assert!(caps.dmabuf_render_target_record(&render_target_import).is_some());
     assert!(!caps.has_sampled_dmabuf_modifier_record(&render_target_import));
 
+    let ten_bit_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Xrgb2101010,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let ten_bit_import = VulkanDmabufImportState::from_dmabuf(&ten_bit_dmabuf).unwrap();
+    assert!(!caps.has_dmabuf_render_target_modifier_record(&ten_bit_import));
+
     let sampled_only_dmabuf = dmabuf_with_planes_for_tests(
         (4, 3).into(),
         Fourcc::Xrgb8888,
@@ -797,6 +831,16 @@ fn drm_modifier_capability_lookup_requires_single_plane_color_attachment_target(
     );
     let sampled_only_import = VulkanDmabufImportState::from_dmabuf(&sampled_only_dmabuf).unwrap();
     assert!(!caps.has_dmabuf_render_target_modifier_record(&sampled_only_import));
+
+    let color_only_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Argb8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let color_only_import = VulkanDmabufImportState::from_dmabuf(&color_only_dmabuf).unwrap();
+    assert!(!caps.has_dmabuf_render_target_modifier_record(&color_only_import));
 
     let multiplane_dmabuf = dmabuf_with_planes_for_tests(
         (4, 3).into(),
@@ -3037,16 +3081,20 @@ fn public_bind_rejects_invalid_vulkan_targets_before_device_lookup() {
 }
 
 #[test]
-fn public_dmabuf_bind_is_explicitly_unsupported() {
+fn public_dmabuf_bind_uses_acquired_target_path() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let mut dmabuf = dmabuf_for_tests();
 
     let formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
         .expect("Vulkan dmabuf render targets have an explicit format set");
     assert!(formats.iter().next().is_none());
+    assert_eq!(
+        <VulkanRenderer as Bind<Dmabuf>>::target_age(&renderer, &dmabuf, 3),
+        0
+    );
     assert!(matches!(
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut dmabuf),
-        Err(VulkanError::UnsupportedOperation("dmabuf render target"))
+        Err(VulkanError::VulkanUnavailable)
     ));
     assert!(matches!(
         // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
@@ -3069,7 +3117,26 @@ fn public_dmabuf_bind_is_explicitly_unsupported() {
 }
 
 #[test]
-fn public_dmabuf_bind_validates_metadata_before_unsupported_stub() {
+fn public_dmabuf_bind_supported_formats_use_render_target_capabilities() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.capabilities.formats.dmabuf_render_target = [Format {
+        code: Fourcc::Abgr8888,
+        modifier: Modifier::Linear,
+    }]
+    .into_iter()
+    .collect();
+
+    let formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
+        .expect("Vulkan dmabuf render targets have an explicit format set");
+    assert!(
+        formats
+            .iter()
+            .any(|format| { format.code == Fourcc::Abgr8888 && format.modifier == Modifier::Linear })
+    );
+}
+
+#[test]
+fn public_dmabuf_bind_validates_metadata_before_device_lookup() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let mut zero_width = dmabuf_with_planes_for_tests(
         (0, 1).into(),

@@ -226,7 +226,31 @@ pub trait Bind<Target>: Renderer {
     ///
     /// **Note**: Some renderers might only be able to determine if a handle is compatible
     ///     during a `Renderer::render` call with the resulting `Framebuffer`.
+    ///
+    /// For externally shared targets, callers must ensure the target is not concurrently accessed
+    /// by a foreign producer or consumer, or that the target/renderer pair carries the required
+    /// synchronization. If the underlying graphics API has explicit external-ownership or layout
+    /// requirements, such as Vulkan external-memory queue-family ownership, callers must also
+    /// satisfy those requirements before binding. Binding a target for rendering transfers
+    /// responsibility for returning it to a usable external state to [`Frame::finish`] or
+    /// [`Bind::release_after_render_error`].
     fn bind<'a>(&mut self, target: &'a mut Target) -> Result<Self::Framebuffer<'a>, Self::Error>;
+
+    /// Returns the effective buffer age to use when binding this target.
+    ///
+    /// Renderers that cannot preserve target contents across `bind` may lower this to `0` to force
+    /// a full repaint while still using the generic binding path.
+    fn target_age(&self, _target: &Target, age: usize) -> usize {
+        age
+    }
+
+    /// Cleans up a bound target after rendering failed before [`Frame::finish`].
+    ///
+    /// Most renderers do not need explicit cleanup here. Renderers importing external targets may
+    /// use this to release ownership before the compositor resets or reuses its buffers.
+    fn release_after_render_error(&mut self, _target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     /// Supported pixel formats for given targets, if applicable.
     fn supported_formats(&self) -> Option<FormatSet> {

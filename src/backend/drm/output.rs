@@ -23,9 +23,6 @@ use crate::{
     output::OutputModeSource,
 };
 
-#[cfg(feature = "renderer_vulkan")]
-use crate::backend::renderer::vulkan::VulkanRenderer;
-
 use super::{
     DrmDevice, DrmError, Planes,
     compositor::{
@@ -707,28 +704,6 @@ where
     {
         self.with_compositor(|compositor| {
             compositor.render_frame(renderer, elements, clear_color, frame_mode)
-        })
-    }
-
-    /// Render the next frame using Vulkan's crate-internal dmabuf render-target path.
-    ///
-    /// This keeps public Vulkan [`Bind<Dmabuf>`] support disabled; the swapchain buffer is
-    /// acquired internally for rendering and fully repainted.
-    #[cfg(feature = "renderer_vulkan")]
-    pub fn render_frame_vulkan<'a, E>(
-        &mut self,
-        renderer: &mut VulkanRenderer,
-        elements: &'a [E],
-        clear_color: impl Into<Color32F>,
-        frame_mode: FrameFlags,
-    ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, VulkanRenderer>>
-    where
-        E: RenderElement<VulkanRenderer>,
-        <VulkanRenderer as Renderer>::TextureId: Texture + 'static,
-        <VulkanRenderer as RendererSuper>::Error: Send + Sync + 'static,
-    {
-        self.with_compositor(|compositor| {
-            compositor.render_frame_vulkan(renderer, elements, clear_color, frame_mode)
         })
     }
 
