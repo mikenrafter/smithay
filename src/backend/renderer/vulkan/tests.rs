@@ -913,6 +913,40 @@ fn dmabuf_external_image_format_query_is_disabled_without_prerequisites() {
         .is_none()
     );
     assert!(
+        // SAFETY: This uninitialized-device test returns before any Vulkan image import or acquire
+        // operation because external-memory prerequisites are unavailable.
+        unsafe { device.create_acquired_dmabuf_render_target_image(&dmabuf, false, None) }
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        // SAFETY: This uninitialized-device test returns before any Vulkan image import or acquire
+        // operation because external-memory prerequisites are unavailable. The signaled sync point
+        // does not export or import any fd.
+        unsafe {
+            device.create_acquired_dmabuf_render_target_image_with_sync_point(
+                &dmabuf,
+                false,
+                Some(&SyncPoint::signaled()),
+            )
+        }
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        // SAFETY: This uninitialized-device test returns before any Vulkan image import, sync wait,
+        // fd import, or acquire operation because external-memory prerequisites are unavailable.
+        unsafe {
+            device.create_acquired_dmabuf_render_target_image_with_sync_point(
+                &dmabuf,
+                false,
+                Some(&SyncPoint::from(InterruptedFence)),
+            )
+        }
+        .unwrap()
+        .is_none()
+    );
+    assert!(
         // SAFETY: This uninitialized-device test returns before any Vulkan image import, sync wait,
         // fd import, or acquire operation because external-memory prerequisites are unavailable.
         unsafe {
@@ -3002,6 +3036,18 @@ fn public_dmabuf_bind_is_explicitly_unsupported() {
         unsafe { renderer.create_acquired_dmabuf_render_target(&dmabuf, false, None) },
         Err(VulkanError::VulkanUnavailable)
     ));
+    assert!(matches!(
+        // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
+        // sync-point wait, Vulkan import, or ownership-transfer operation can occur.
+        unsafe {
+            renderer.create_acquired_dmabuf_render_target_with_sync_point(
+                &dmabuf,
+                false,
+                Some(&SyncPoint::signaled()),
+            )
+        },
+        Err(VulkanError::VulkanUnavailable)
+    ));
 }
 
 #[test]
@@ -3040,6 +3086,30 @@ fn public_dmabuf_bind_validates_metadata_before_unsupported_stub() {
         // SAFETY: Invalid metadata is rejected before any Vulkan import or ownership-transfer
         // operation can occur.
         unsafe { renderer.create_acquired_dmabuf_render_target(&multi_plane, false, None) },
+        Err(VulkanError::UnsupportedOperation("dmabuf render target planes"))
+    ));
+    assert!(matches!(
+        // SAFETY: Invalid metadata is rejected before any sync-point wait, Vulkan import, or
+        // ownership-transfer operation can occur.
+        unsafe {
+            renderer.create_acquired_dmabuf_render_target_with_sync_point(
+                &zero_width,
+                false,
+                Some(&SyncPoint::from(InterruptedFence)),
+            )
+        },
+        Err(VulkanError::UnsupportedOperation("dmabuf size"))
+    ));
+    assert!(matches!(
+        // SAFETY: Invalid metadata is rejected before any sync-point wait, Vulkan import, or
+        // ownership-transfer operation can occur.
+        unsafe {
+            renderer.create_acquired_dmabuf_render_target_with_sync_point(
+                &multi_plane,
+                false,
+                Some(&SyncPoint::from(InterruptedFence)),
+            )
+        },
         Err(VulkanError::UnsupportedOperation("dmabuf render target planes"))
     ));
 }

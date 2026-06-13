@@ -365,6 +365,53 @@ impl VulkanRenderer {
         )))
     }
 
+    /// Import a dmabuf as an internal render target and acquire it using a Smithay sync point as the
+    /// optional producer-completion dependency.
+    ///
+    /// This is a sync-point convenience wrapper for the internal acquired dmabuf render-target path.
+    /// It is intentionally not wired to public [`Bind<Dmabuf>`] and does not advertise dmabuf
+    /// render-target formats.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the foreign producer has released ownership to
+    /// `VK_QUEUE_FAMILY_FOREIGN_EXT` before this acquire is submitted. If `preserve_contents` is
+    /// true, the producer must have released the image in `VK_IMAGE_LAYOUT_GENERAL`. If
+    /// `acquire_sync` is present, it must represent the producer's completion dependency for that
+    /// release and signal only after the producer's writes and ownership release for this dmabuf are
+    /// complete. If it is absent, those operations must already be complete and visible to this
+    /// renderer's Vulkan queue submission. If `acquire_sync` exports a fence fd and this device
+    /// supports sync-file import, that fd must be a valid Linux sync-file fd suitable for
+    /// `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT`. If `preserve_contents` is false, previous
+    /// contents are discarded.
+    #[allow(dead_code)]
+    unsafe fn create_acquired_dmabuf_render_target_with_sync_point(
+        &mut self,
+        dmabuf: &Dmabuf,
+        preserve_contents: bool,
+        acquire_sync: Option<&SyncPoint>,
+    ) -> Result<Option<VulkanRenderTarget<'static>>, VulkanError> {
+        let import = validate_dmabuf_render_target_metadata(dmabuf)?;
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+        let Some(color_image) = (unsafe {
+            // SAFETY: Forwarded from this method's caller.
+            device.create_acquired_dmabuf_render_target_image_with_sync_point(
+                dmabuf,
+                preserve_contents,
+                acquire_sync,
+            )
+        })?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(VulkanRenderTarget::from_acquired_dmabuf_render_target(
+            self.context_id.clone(),
+            &import,
+            color_image,
+        )))
+    }
+
     /// Release an acquired dmabuf texture back to foreign ownership in `VK_IMAGE_LAYOUT_GENERAL`.
     ///
     /// This is an internal counterpart to the known-layout acquire helpers. It does not make public
