@@ -382,9 +382,9 @@ impl VulkanRenderer {
 
     /// Import a dmabuf as an internal render target and acquire it for color-attachment rendering.
     ///
-    /// This helper is intentionally not wired to public [`Bind<Dmabuf>`] yet. It exists to build and
-    /// test the internal acquire/render/release path while public dmabuf render-target formats remain
-    /// unadvertised.
+    /// This crate-private helper is intentionally not wired to public [`Bind<Dmabuf>`] yet. It
+    /// exists to build and test the internal acquire/render/release path while public dmabuf
+    /// render-target formats remain unadvertised.
     ///
     /// # Safety
     ///
@@ -396,7 +396,7 @@ impl VulkanRenderer {
     /// this renderer's Vulkan queue submission. If `preserve_contents` is false, previous contents
     /// are discarded.
     #[allow(dead_code)]
-    unsafe fn create_acquired_dmabuf_render_target(
+    pub(crate) unsafe fn create_acquired_dmabuf_render_target(
         &mut self,
         dmabuf: &Dmabuf,
         preserve_contents: bool,
@@ -422,8 +422,8 @@ impl VulkanRenderer {
     /// Import a dmabuf as an internal render target and acquire it using a Smithay sync point as the
     /// optional producer-completion dependency.
     ///
-    /// This is a sync-point convenience wrapper for the internal acquired dmabuf render-target path.
-    /// It is intentionally not wired to public [`Bind<Dmabuf>`] and does not advertise dmabuf
+    /// This is a sync-point convenience wrapper for the crate-private acquired dmabuf render-target
+    /// path. It is intentionally not wired to public [`Bind<Dmabuf>`] and does not advertise dmabuf
     /// render-target formats.
     ///
     /// # Safety
@@ -439,7 +439,7 @@ impl VulkanRenderer {
     /// `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT`. If `preserve_contents` is false, previous
     /// contents are discarded.
     #[allow(dead_code)]
-    unsafe fn create_acquired_dmabuf_render_target_with_sync_point(
+    pub(crate) unsafe fn create_acquired_dmabuf_render_target_with_sync_point(
         &mut self,
         dmabuf: &Dmabuf,
         preserve_contents: bool,
@@ -494,10 +494,10 @@ impl VulkanRenderer {
 
     /// Release an acquired dmabuf render target back to foreign ownership in `GENERAL` layout.
     ///
-    /// This is an internal counterpart to the acquired dmabuf render-target helper and does not make
-    /// public dmabuf render targets supported.
+    /// This is a crate-private counterpart to the acquired dmabuf render-target helper and does not
+    /// make public dmabuf render targets supported.
     #[allow(dead_code)]
-    fn release_acquired_dmabuf_render_target_to_foreign_general(
+    pub(crate) fn release_acquired_dmabuf_render_target_to_foreign_general(
         &mut self,
         target: &mut VulkanRenderTarget<'_>,
         export_sync_file: bool,
@@ -531,9 +531,10 @@ impl VulkanRenderer {
     /// Release an acquired dmabuf render target and return the exported release fence as a
     /// [`SyncPoint`] when available.
     ///
-    /// This is still an internal helper and does not advertise public dmabuf render-target support.
+    /// This is still a crate-private helper and does not advertise public dmabuf render-target
+    /// support.
     #[allow(dead_code)]
-    fn release_acquired_dmabuf_render_target_to_foreign_general_sync_point(
+    pub(crate) fn release_acquired_dmabuf_render_target_to_foreign_general_sync_point(
         &mut self,
         target: &mut VulkanRenderTarget<'_>,
         export_sync_file: bool,
