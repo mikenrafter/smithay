@@ -37,8 +37,8 @@ use super::image::{
     VulkanExternalImageReleaseKind, VulkanExternalMemoryHandleType, VulkanExternalMemoryState,
     VulkanImageLayoutState, VulkanImageSource, VulkanImageState, VulkanImageSyncState, VulkanImageUsage,
     clear_damage_to_clear_areas, damage_to_scissor_areas, dmabuf_acquired_image_state,
-    dmabuf_import_image_state, dmabuf_render_target_image_state, draw_solid_damage_to_clear_areas,
-    render_texture_damage_to_scissor_areas, source_to_uv_rect,
+    dmabuf_acquired_render_target_image_state, dmabuf_import_image_state, dmabuf_render_target_image_state,
+    draw_solid_damage_to_clear_areas, render_texture_damage_to_scissor_areas, source_to_uv_rect,
 };
 use super::*;
 
@@ -1059,6 +1059,19 @@ fn dmabuf_render_target_image_state_tracks_color_attachment_without_advertising_
     );
     assert!(!image.sync.pending_write);
     assert!(!image.sync.exportable_sync);
+
+    let acquired = dmabuf_acquired_render_target_image_state(&import);
+    assert_eq!(acquired.size, (4, 3).into());
+    assert_eq!(acquired.format, Some(Fourcc::Abgr8888));
+    assert_eq!(acquired.source, VulkanImageSource::RenderTarget);
+    assert!(acquired.usage.color_attachment);
+    assert!(!acquired.usage.sampled);
+    assert_eq!(acquired.layout, VulkanImageLayoutState::ColorAttachment);
+    assert!(!acquired.sync.external_acquire_pending);
+    assert_eq!(
+        acquired.sync.external_ownership,
+        VulkanExternalImageOwnership::Local
+    );
 }
 
 #[test]
@@ -2983,6 +2996,12 @@ fn public_dmabuf_bind_is_explicitly_unsupported() {
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut dmabuf),
         Err(VulkanError::UnsupportedOperation("dmabuf render target"))
     ));
+    assert!(matches!(
+        // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
+        // Vulkan import or ownership-transfer operation can occur.
+        unsafe { renderer.create_acquired_dmabuf_render_target(&dmabuf, false, None) },
+        Err(VulkanError::VulkanUnavailable)
+    ));
 }
 
 #[test]
@@ -3010,6 +3029,54 @@ fn public_dmabuf_bind_validates_metadata_before_unsupported_stub() {
     assert!(matches!(
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut multi_plane),
         Err(VulkanError::UnsupportedOperation("dmabuf render target planes"))
+    ));
+    assert!(matches!(
+        // SAFETY: Invalid metadata is rejected before any Vulkan import or ownership-transfer
+        // operation can occur.
+        unsafe { renderer.create_acquired_dmabuf_render_target(&zero_width, false, None) },
+        Err(VulkanError::UnsupportedOperation("dmabuf size"))
+    ));
+    assert!(matches!(
+        // SAFETY: Invalid metadata is rejected before any Vulkan import or ownership-transfer
+        // operation can occur.
+        unsafe { renderer.create_acquired_dmabuf_render_target(&multi_plane, false, None) },
+        Err(VulkanError::UnsupportedOperation("dmabuf render target planes"))
+    ));
+}
+
+#[test]
+fn internal_dmabuf_render_target_release_rejects_preconditions_before_device_lookup() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut foreign_target = render_target_for_tests(
+        ContextId::new(),
+        VulkanImageSource::RenderTarget,
+        (1, 1).into(),
+        Some(Fourcc::Argb8888),
+    );
+    let mut wrong_source = render_target_for_tests(
+        renderer.context_id(),
+        VulkanImageSource::Offscreen,
+        (1, 1).into(),
+        Some(Fourcc::Argb8888),
+    );
+    let mut missing_image = render_target_for_tests(
+        renderer.context_id(),
+        VulkanImageSource::RenderTarget,
+        (1, 1).into(),
+        Some(Fourcc::Argb8888),
+    );
+
+    assert!(matches!(
+        renderer.release_acquired_dmabuf_render_target_to_foreign_general(&mut foreign_target, false),
+        Err(VulkanError::UnsupportedOperation("foreign dmabuf render target"))
+    ));
+    assert!(matches!(
+        renderer.release_acquired_dmabuf_render_target_to_foreign_general(&mut wrong_source, false),
+        Err(VulkanError::UnsupportedOperation("dmabuf render target"))
+    ));
+    assert!(matches!(
+        renderer.release_acquired_dmabuf_render_target_to_foreign_general(&mut missing_image, false),
+        Err(VulkanError::UnsupportedOperation("dmabuf render target image"))
     ));
 }
 
@@ -3694,6 +3761,39 @@ fn renderer_render_rejects_non_offscreen_targets_before_device_lookup() {
     assert!(matches!(
         renderer.render(&mut target, (1, 1).into(), Transform::Normal),
         Err(VulkanError::UnsupportedOperation("render target"))
+    ));
+}
+
+#[test]
+fn renderer_render_accepts_internal_dmabuf_target_source_before_device_lookup() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut target = render_target_for_tests(
+        renderer.context_id(),
+        VulkanImageSource::RenderTarget,
+        (1, 1).into(),
+        Some(Fourcc::Argb8888),
+    );
+
+    assert!(matches!(
+        renderer.render(&mut target, (1, 1).into(), Transform::Normal),
+        Err(VulkanError::UnsupportedOperation("render target image"))
+    ));
+}
+
+#[test]
+fn renderer_render_rejects_released_dmabuf_target_before_device_lookup() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut target = render_target_for_tests(
+        renderer.context_id(),
+        VulkanImageSource::RenderTarget,
+        (1, 1).into(),
+        Some(Fourcc::Argb8888),
+    );
+    target.image.sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+
+    assert!(matches!(
+        renderer.render(&mut target, (1, 1).into(), Transform::Normal),
+        Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"))
     ));
 }
 

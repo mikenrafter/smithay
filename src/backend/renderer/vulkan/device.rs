@@ -1157,6 +1157,43 @@ impl VulkanDeviceState {
         )
     }
 
+    /// Create and acquire a dmabuf image for use as a color-attachment render target.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the foreign producer has released ownership to
+    /// `VK_QUEUE_FAMILY_FOREIGN_EXT` before this acquire is submitted. If `preserve_contents` is
+    /// true, the producer must have released the image in `VK_IMAGE_LAYOUT_GENERAL`. If
+    /// `acquire_semaphore` is present, it must signal only after the producer's writes and ownership
+    /// release complete. If it is absent, those operations must already be complete and visible to
+    /// this renderer's Vulkan queue submission. If `preserve_contents` is false, this helper discards
+    /// the old contents and acquires from an unknown foreign layout with `UNDEFINED` as the old
+    /// layout.
+    #[allow(dead_code)]
+    pub(crate) unsafe fn create_acquired_dmabuf_render_target_image(
+        &self,
+        dmabuf: &Dmabuf,
+        preserve_contents: bool,
+        acquire_semaphore: Option<&VulkanSyncFileSemaphore>,
+    ) -> Result<Option<VulkanOwnedImage>, VulkanError> {
+        let sync = if preserve_contents {
+            VulkanImageSyncState::foreign_known_general_for_dmabuf_import()
+        } else {
+            dmabuf_import_sync_state()
+        };
+        let Some(image) =
+            self.create_bound_dmabuf_image_with_sync(dmabuf, sync, vk::ImageUsageFlags::COLOR_ATTACHMENT)?
+        else {
+            return Ok(None);
+        };
+
+        if !self.submit_dmabuf_render_target_foreign_acquire(&image, preserve_contents, acquire_semaphore)? {
+            return Err(VulkanError::UnsupportedOperation("dmabuf external ownership"));
+        }
+
+        Ok(Some(image))
+    }
+
     fn create_bound_dmabuf_import_image_with_sync(
         &self,
         dmabuf: &Dmabuf,

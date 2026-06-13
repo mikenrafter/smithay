@@ -245,6 +245,26 @@ pub(super) fn dmabuf_render_target_image_state(import: &VulkanDmabufImportState)
 }
 
 #[allow(dead_code)]
+pub(super) fn dmabuf_acquired_render_target_image_state(
+    import: &VulkanDmabufImportState,
+) -> VulkanImageState {
+    VulkanImageState {
+        size: import.size,
+        format: Some(import.format()),
+        source: VulkanImageSource::RenderTarget,
+        usage: VulkanImageUsage {
+            color_attachment: true,
+            ..VulkanImageUsage::default()
+        },
+        layout: VulkanImageLayoutState::ColorAttachment,
+        sync: VulkanImageSyncState {
+            external_ownership: VulkanExternalImageOwnership::Local,
+            ..VulkanImageSyncState::default()
+        },
+    }
+}
+
+#[allow(dead_code)]
 pub(super) fn dmabuf_import_sync_state() -> VulkanImageSyncState {
     VulkanImageSyncState {
         external_acquire_pending: true,
@@ -944,6 +964,20 @@ impl VulkanRenderTarget<'_> {
                 layout: VulkanImageLayoutState::Undefined,
                 sync: VulkanImageSyncState::default(),
             },
+            color_image: Some(color_image),
+            _target: PhantomData,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn from_acquired_dmabuf_render_target(
+        context_id: ContextId<VulkanTexture>,
+        import: &VulkanDmabufImportState,
+        color_image: VulkanOwnedImage,
+    ) -> Self {
+        Self {
+            context_id,
+            image: dmabuf_acquired_render_target_image_state(import),
             color_image: Some(color_image),
             _target: PhantomData,
         }

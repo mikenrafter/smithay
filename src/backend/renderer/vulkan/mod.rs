@@ -326,6 +326,45 @@ impl VulkanRenderer {
         )))
     }
 
+    /// Import a dmabuf as an internal render target and acquire it for color-attachment rendering.
+    ///
+    /// This helper is intentionally not wired to public [`Bind<Dmabuf>`] yet. It exists to build and
+    /// test the internal acquire/render/release path while public dmabuf render-target formats remain
+    /// unadvertised.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the foreign producer has released ownership to
+    /// `VK_QUEUE_FAMILY_FOREIGN_EXT` before this acquire is submitted. If `preserve_contents` is
+    /// true, the producer must have released the image in `VK_IMAGE_LAYOUT_GENERAL`. If
+    /// `acquire_semaphore` is present, it must signal only after the producer's writes and ownership
+    /// release complete. If it is absent, those operations must already be complete and visible to
+    /// this renderer's Vulkan queue submission. If `preserve_contents` is false, previous contents
+    /// are discarded.
+    #[allow(dead_code)]
+    unsafe fn create_acquired_dmabuf_render_target(
+        &mut self,
+        dmabuf: &Dmabuf,
+        preserve_contents: bool,
+        acquire_semaphore: Option<&VulkanSyncFileSemaphore>,
+    ) -> Result<Option<VulkanRenderTarget<'static>>, VulkanError> {
+        let import = validate_dmabuf_render_target_metadata(dmabuf)?;
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+        let Some(color_image) = (unsafe {
+            // SAFETY: Forwarded from this method's caller.
+            device.create_acquired_dmabuf_render_target_image(dmabuf, preserve_contents, acquire_semaphore)
+        })?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(VulkanRenderTarget::from_acquired_dmabuf_render_target(
+            self.context_id.clone(),
+            &import,
+            color_image,
+        )))
+    }
+
     /// Release an acquired dmabuf texture back to foreign ownership in `VK_IMAGE_LAYOUT_GENERAL`.
     ///
     /// This is an internal counterpart to the known-layout acquire helpers. It does not make public
@@ -350,6 +389,39 @@ impl VulkanRenderer {
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
 
         device.release_sampled_dmabuf_to_foreign_general(sampled_image.image(), export_sync_file)
+    }
+
+    /// Release an acquired dmabuf render target back to foreign ownership in `GENERAL` layout.
+    ///
+    /// This is an internal counterpart to the acquired dmabuf render-target helper and does not make
+    /// public dmabuf render targets supported.
+    #[allow(dead_code)]
+    fn release_acquired_dmabuf_render_target_to_foreign_general(
+        &mut self,
+        target: &mut VulkanRenderTarget<'_>,
+        export_sync_file: bool,
+    ) -> Result<(bool, Option<OwnedFd>), VulkanError> {
+        if target.context_id != self.context_id {
+            return Err(VulkanError::UnsupportedOperation("foreign dmabuf render target"));
+        }
+        if target.image.source != image::VulkanImageSource::RenderTarget {
+            return Err(VulkanError::UnsupportedOperation("dmabuf render target"));
+        }
+        let color_image = target
+            .color_image
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("dmabuf render target image"))?;
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+        let release =
+            device.release_dmabuf_render_target_to_foreign_general(color_image, export_sync_file)?;
+        if release.0 {
+            // The foreign side now owns the image in GENERAL. Keep the renderer-facing layout
+            // unusable until a later explicit acquire restores local color-attachment ownership.
+            target.image.layout = image::VulkanImageLayoutState::Undefined;
+            target.image.sync = image::VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+        }
+
+        Ok(release)
     }
 
     #[allow(dead_code)]
@@ -448,7 +520,10 @@ impl Renderer for VulkanRenderer {
         if framebuffer.context_id != self.context_id {
             return Err(VulkanError::UnsupportedOperation("foreign render target"));
         }
-        if framebuffer.image.source != image::VulkanImageSource::Offscreen {
+        if !matches!(
+            framebuffer.image.source,
+            image::VulkanImageSource::Offscreen | image::VulkanImageSource::RenderTarget
+        ) {
             return Err(VulkanError::UnsupportedOperation("render target"));
         }
         if output_size.w <= 0 || output_size.h <= 0 {
@@ -456,6 +531,11 @@ impl Renderer for VulkanRenderer {
         }
         if framebuffer.image.size.w != output_size.w || framebuffer.image.size.h != output_size.h {
             return Err(VulkanError::UnsupportedOperation("frame size"));
+        }
+        if framebuffer.image.source == image::VulkanImageSource::RenderTarget
+            && !framebuffer.image.sync.is_locally_usable()
+        {
+            return Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"));
         }
         if framebuffer.color_image.is_none() {
             return Err(VulkanError::UnsupportedOperation("render target image"));
