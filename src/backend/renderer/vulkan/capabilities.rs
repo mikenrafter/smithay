@@ -40,7 +40,8 @@ pub struct VulkanRendererCapabilities {
 /// Raw per-format Vulkan image feature capabilities.
 ///
 /// Records describe renderer-internal Vulkan support. Smithay-facing [`FormatSet`] values remain
-/// limited to import/export traits and stay empty until those traits are implemented.
+/// limited to implemented renderer traits and stay empty until those traits can safely support the
+/// advertised pairs.
 #[non_exhaustive]
 #[derive(Debug, Default, Clone)]
 pub struct VulkanFormatCapabilities {
@@ -55,6 +56,8 @@ pub struct VulkanFormatCapabilities {
     pub dmabuf_import: FormatSet,
     /// Formats exportable as dmabufs.
     pub dmabuf_export: FormatSet,
+    /// Formats usable as imported dmabuf render targets.
+    pub dmabuf_render_target: FormatSet,
 }
 
 /// Capability record for a DRM format and Vulkan image tiling.
@@ -183,6 +186,7 @@ impl VulkanFormatCapabilities {
             memory_import: memory_import.into_iter().collect(),
             dmabuf_import: FormatSet::default(),
             dmabuf_export: FormatSet::default(),
+            dmabuf_render_target: FormatSet::default(),
         })
     }
 
@@ -509,6 +513,10 @@ pub struct VulkanExportCapabilities {
 pub struct VulkanRenderingCapabilities {
     /// Whether offscreen rendering is supported.
     pub offscreen: bool,
+    /// Whether imported dmabufs can be used as renderer framebuffers.
+    pub dmabuf_targets: bool,
+    /// Whether modifier-aware imported dmabuf render targets are supported.
+    pub dmabuf_target_modifiers: bool,
     /// Whether Smithay `Blit` operations are supported.
     pub blit: bool,
     /// Whether 10-bit render targets are supported.

@@ -285,6 +285,8 @@ fn vulkan_renderer_default_capabilities_are_false() {
     assert!(!caps.export.dmabuf);
     assert!(!caps.export.modifiers);
     assert!(!caps.rendering.offscreen);
+    assert!(!caps.rendering.dmabuf_targets);
+    assert!(!caps.rendering.dmabuf_target_modifiers);
     assert!(!caps.rendering.blit);
     assert!(!caps.rendering.render_target_10bit);
     assert!(!caps.rendering.render_target_fp16);
@@ -313,6 +315,7 @@ fn vulkan_format_capability_matrix_defaults_empty() {
     assert!(caps.formats.memory_import.iter().next().is_none());
     assert!(caps.formats.dmabuf_import.iter().next().is_none());
     assert!(caps.formats.dmabuf_export.iter().next().is_none());
+    assert!(caps.formats.dmabuf_render_target.iter().next().is_none());
 }
 
 #[test]
@@ -325,11 +328,14 @@ fn wayland_protocol_capabilities_are_not_advertised_by_default() {
     assert!(!caps.export.memory);
     assert!(!caps.export.dmabuf);
     assert!(!caps.export.modifiers);
+    assert!(!caps.rendering.dmabuf_targets);
+    assert!(!caps.rendering.dmabuf_target_modifiers);
     assert!(!caps.sync.explicit);
     assert!(!caps.external_sync.prerequisites_available);
     assert!(caps.formats.memory_import.iter().next().is_none());
     assert!(caps.formats.dmabuf_import.iter().next().is_none());
     assert!(caps.formats.dmabuf_export.iter().next().is_none());
+    assert!(caps.formats.dmabuf_render_target.iter().next().is_none());
 }
 
 #[cfg(feature = "wayland_frontend")]
@@ -392,8 +398,11 @@ fn external_memory_capability_discovery_tracks_prerequisites_without_advertising
     assert!(!renderer_caps.import.modifiers);
     assert!(!renderer_caps.export.dmabuf);
     assert!(!renderer_caps.export.modifiers);
+    assert!(!renderer_caps.rendering.dmabuf_targets);
+    assert!(!renderer_caps.rendering.dmabuf_target_modifiers);
     assert!(renderer_caps.formats.dmabuf_import.iter().next().is_none());
     assert!(renderer_caps.formats.dmabuf_export.iter().next().is_none());
+    assert!(renderer_caps.formats.dmabuf_render_target.iter().next().is_none());
 }
 
 #[test]
@@ -457,6 +466,7 @@ fn external_sync_capability_discovery_tracks_sync_file_prerequisites_without_adv
     assert!(!renderer_caps.sync.explicit);
     assert!(!renderer_caps.import.dmabuf);
     assert!(!renderer_caps.export.dmabuf);
+    assert!(!renderer_caps.rendering.dmabuf_targets);
 }
 
 #[test]
@@ -647,8 +657,10 @@ fn drm_modifier_capability_records_map_vulkan_properties_without_advertising_dma
     };
     assert!(!renderer_caps.import.dmabuf);
     assert!(!renderer_caps.export.dmabuf);
+    assert!(!renderer_caps.rendering.dmabuf_targets);
     assert!(renderer_caps.formats.dmabuf_import.iter().next().is_none());
     assert!(renderer_caps.formats.dmabuf_export.iter().next().is_none());
+    assert!(renderer_caps.formats.dmabuf_render_target.iter().next().is_none());
 }
 
 #[test]
@@ -726,6 +738,7 @@ fn drm_modifier_capability_lookup_requires_sampled_exact_match() {
     assert!(!caps.has_sampled_dmabuf_modifier_record(&non_sampled));
     assert!(caps.dmabuf_import.iter().next().is_none());
     assert!(caps.dmabuf_export.iter().next().is_none());
+    assert!(caps.dmabuf_render_target.iter().next().is_none());
 }
 
 #[test]
@@ -2021,6 +2034,8 @@ fn initialized_device_capabilities_do_not_enable_format_backed_rendering_before_
     assert!(!caps.export.memory);
     assert!(!caps.export.dmabuf);
     assert!(!caps.rendering.offscreen);
+    assert!(!caps.rendering.dmabuf_targets);
+    assert!(!caps.rendering.dmabuf_target_modifiers);
     assert!(!caps.rendering.blit);
     assert!(!caps.sync.explicit);
     assert!(caps.formats.records.is_empty());
@@ -4367,6 +4382,9 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert!(!caps.import.dmabuf);
     assert_eq!(caps.export.memory, caps.rendering.offscreen);
     assert!(!caps.export.dmabuf);
+    assert!(!caps.rendering.dmabuf_targets);
+    assert!(!caps.rendering.dmabuf_target_modifiers);
+    assert!(caps.formats.dmabuf_render_target.iter().next().is_none());
     assert!(!caps.sync.explicit);
     if let Some(record) = caps
         .formats
@@ -4403,6 +4421,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         }
         assert!(!caps.import.dmabuf);
         assert!(caps.formats.dmabuf_import.iter().next().is_none());
+        assert!(caps.formats.dmabuf_render_target.iter().next().is_none());
     }
     assert!(caps.rendering.offscreen);
     assert!(!caps.rendering.blit);
@@ -4541,6 +4560,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     };
     assert!(caps.formats.dmabuf_import.iter().next().is_none());
     assert!(caps.formats.dmabuf_export.iter().next().is_none());
+    assert!(caps.formats.dmabuf_render_target.iter().next().is_none());
     drop(renderer);
     drop(retained_offscreen_target);
 }
@@ -6033,6 +6053,7 @@ fn runtime_format_discovery_finds_device_backed_formats_without_import_export() 
     );
     assert!(caps.dmabuf_import.iter().next().is_none());
     assert!(caps.dmabuf_export.iter().next().is_none());
+    assert!(caps.dmabuf_render_target.iter().next().is_none());
 }
 
 #[test]
