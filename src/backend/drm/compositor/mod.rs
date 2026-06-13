@@ -2354,9 +2354,9 @@ where
                     // as we probably now have some half drawn buffer
                     self.swapchain.reset_buffers();
                     if let Some(err) = release_error {
-                        return Err(
-                            RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)).into(),
-                        );
+                        return Err(RenderFrameError::RenderFrame(
+                            OutputDamageTrackerError::Rendering(err),
+                        ));
                     }
                     return Err(RenderFrameError::from(err));
                 }
