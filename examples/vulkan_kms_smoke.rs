@@ -1,12 +1,12 @@
 //! Minimal real-screen Vulkan/DRM smoke test.
 //!
-//! This example is intended to be run manually from an inactive physical VT with DRM master
-//! permissions. It opens a DRM card node directly, may take over the connected display, does not use
-//! Smithay's session backend, and does not restore previous KMS state. It renders a solid colour
-//! into a GBM scanout buffer through [`VulkanRenderer`]'s public `Bind<Dmabuf>` path and commits it
-//! with KMS.
+//! This example is intended to be run manually from an active physical VT with DRM master
+//! permissions. It opens a DRM card node through Smithay's libseat session backend, may take over
+//! the connected display, and does not restore previous KMS state. It renders a solid colour into a
+//! GBM scanout buffer through [`VulkanRenderer`]'s public `Bind<Dmabuf>` path and commits it with
+//! KMS.
 
-use std::{env, error::Error, fs::File, os::fd::OwnedFd, thread, time::Duration};
+use std::{env, error::Error, path::Path, thread, time::Duration};
 
 use ash::ext;
 use smithay::{
@@ -26,10 +26,14 @@ use smithay::{
             element::{Id, Kind, solid::SolidColorRenderElement},
             vulkan::VulkanRenderer,
         },
+        session::{Session, libseat::LibSeatSession},
         vulkan::{Instance, PhysicalDevice, version::Version},
     },
     output::OutputModeSource,
-    reexports::drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc},
+    reexports::{
+        drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc},
+        rustix::fs::OFlags,
+    },
     utils::{DeviceFd, Physical, Rectangle, Size, Transform},
 };
 
@@ -47,8 +51,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         .and_then(|seconds| seconds.parse::<u64>().ok())
         .unwrap_or(5);
 
-    let file = File::options().read(true).write(true).open(&device_path)?;
-    let drm_fd = DrmDeviceFd::new(DeviceFd::from(Into::<OwnedFd>::into(file)));
+    let (mut session, _session_notifier) = LibSeatSession::new()?;
+    if !session.is_active() {
+        return Err(format!(
+            "session for seat {} is not active; run from an active physical VT or via a seat manager",
+            session.seat()
+        )
+        .into());
+    }
+    let fd = session.open(
+        Path::new(&device_path),
+        OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
+    )?;
+    let drm_fd = DrmDeviceFd::new(DeviceFd::from(fd));
     let drm_node = DrmNode::from_path(&device_path)?;
     let (connector, crtc, mode) = pick_connector_crtc_mode(&drm_fd)?;
     let (width, height) = mode.size();

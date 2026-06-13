@@ -136,7 +136,7 @@ required-features = ["backend_vulkan"]
 
 [[example]]
 name = "vulkan_kms_smoke"
-required-features = ["backend_drm", "backend_gbm", "backend_vulkan", "renderer_vulkan", "wayland_frontend"]
+required-features = ["backend_drm", "backend_gbm", "backend_session_libseat", "backend_vulkan", "renderer_vulkan", "wayland_frontend"]
 
 [[example]]
 name = "buffer_test"
