@@ -742,6 +742,74 @@ fn drm_modifier_capability_lookup_requires_sampled_exact_match() {
 }
 
 #[test]
+fn drm_modifier_capability_lookup_requires_single_plane_color_attachment_target() {
+    let render_target_record = modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT,
+        },
+    );
+    let sampled_record = modifier_record_from_properties(
+        Fourcc::Xrgb8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    );
+    let multiplane_color_record = modifier_record_from_properties(
+        Fourcc::Nv12,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 2,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::COLOR_ATTACHMENT,
+        },
+    );
+    let caps = VulkanFormatCapabilities {
+        modifier_records: vec![render_target_record, sampled_record, multiplane_color_record],
+        ..VulkanFormatCapabilities::default()
+    };
+
+    let render_target_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let render_target_import = VulkanDmabufImportState::from_dmabuf(&render_target_dmabuf).unwrap();
+    assert!(caps.has_dmabuf_render_target_modifier_record(&render_target_import));
+    assert!(caps.dmabuf_render_target_record(&render_target_import).is_some());
+    assert!(!caps.has_sampled_dmabuf_modifier_record(&render_target_import));
+
+    let sampled_only_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Xrgb8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let sampled_only_import = VulkanDmabufImportState::from_dmabuf(&sampled_only_dmabuf).unwrap();
+    assert!(!caps.has_dmabuf_render_target_modifier_record(&sampled_only_import));
+
+    let multiplane_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Nv12,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4), (1, 4, 4)],
+    );
+    let multiplane_import = VulkanDmabufImportState::from_dmabuf(&multiplane_dmabuf).unwrap();
+    assert!(!caps.has_dmabuf_render_target_modifier_record(&multiplane_import));
+
+    assert!(caps.dmabuf_import.iter().next().is_none());
+    assert!(caps.dmabuf_export.iter().next().is_none());
+    assert!(caps.dmabuf_render_target.iter().next().is_none());
+}
+
+#[test]
 fn vulkan_device_state_uninitialized_starts_empty() {
     let device = VulkanDeviceState::empty_for_tests();
     assert!(device.instance.is_none());
@@ -779,6 +847,13 @@ fn dmabuf_external_image_format_query_is_disabled_without_prerequisites() {
             .is_none()
     );
     assert!(device.dmabuf_import_candidate(&import).unwrap().is_none());
+    assert!(device.dmabuf_render_target_candidate(&import).unwrap().is_none());
+    assert!(
+        device
+            .dmabuf_render_target_external_image_format_properties(&import)
+            .unwrap()
+            .is_none()
+    );
     assert!(device.create_dmabuf_import_image(&import).unwrap().is_none());
     assert!(
         device
@@ -1084,6 +1159,72 @@ fn dmabuf_import_candidate_requires_importable_single_sample_extent() {
         vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY;
     assert!(dedicated_only.supports_sampled_import(&import));
     assert!(dedicated_only.dedicated_only);
+}
+
+#[test]
+fn dmabuf_render_target_candidate_requires_importable_single_plane_single_sample_extent() {
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let import = VulkanDmabufImportState::from_dmabuf(&dmabuf).unwrap();
+    let supported = dmabuf_external_image_properties_for_tests(
+        true,
+        vk::Extent3D {
+            width: 4,
+            height: 3,
+            depth: 1,
+        },
+        vk::SampleCountFlags::TYPE_1,
+    );
+
+    assert!(supported.supports_render_target_import(&import));
+
+    let multiplane_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Nv12,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4), (1, 4, 4)],
+    );
+    let multiplane_import = VulkanDmabufImportState::from_dmabuf(&multiplane_dmabuf).unwrap();
+    assert!(!supported.supports_render_target_import(&multiplane_import));
+
+    let too_small = dmabuf_external_image_properties_for_tests(
+        true,
+        vk::Extent3D {
+            width: 3,
+            height: 3,
+            depth: 1,
+        },
+        vk::SampleCountFlags::TYPE_1,
+    );
+    assert!(!too_small.supports_render_target_import(&import));
+
+    let no_single_sample = dmabuf_external_image_properties_for_tests(
+        true,
+        vk::Extent3D {
+            width: 4,
+            height: 3,
+            depth: 1,
+        },
+        vk::SampleCountFlags::TYPE_2,
+    );
+    assert!(!no_single_sample.supports_render_target_import(&import));
+
+    let non_importable = dmabuf_external_image_properties_for_tests(
+        false,
+        vk::Extent3D {
+            width: 4,
+            height: 3,
+            depth: 1,
+        },
+        vk::SampleCountFlags::TYPE_1,
+    );
+    assert!(!non_importable.supports_render_target_import(&import));
 }
 
 #[test]

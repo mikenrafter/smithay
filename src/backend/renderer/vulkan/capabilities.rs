@@ -224,8 +224,27 @@ impl VulkanFormatCapabilities {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn dmabuf_render_target_record(
+        &self,
+        import: &VulkanDmabufImportState,
+    ) -> Option<&VulkanDrmFormatModifierCapabilityRecord> {
+        self.modifier_records.iter().find(|record| {
+            record.format == import.format()
+                && record.modifier == import.modifier()
+                && record.plane_count == 1
+                && record.plane_count as usize == import.plane_count()
+                && record.usages.color_attachment
+        })
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn has_sampled_dmabuf_modifier_record(&self, import: &VulkanDmabufImportState) -> bool {
         self.dmabuf_import_record(import).is_some()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn has_dmabuf_render_target_modifier_record(&self, import: &VulkanDmabufImportState) -> bool {
+        self.dmabuf_render_target_record(import).is_some()
     }
 }
 

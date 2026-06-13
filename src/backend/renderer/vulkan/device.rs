@@ -423,7 +423,7 @@ pub(crate) struct VulkanDmabufImportImage {
 }
 
 impl VulkanDmabufExternalImageFormatProperties {
-    pub(super) fn supports_sampled_import(&self, import: &VulkanDmabufImportState) -> bool {
+    fn supports_single_sample_import_extent(&self, import: &VulkanDmabufImportState) -> bool {
         let Ok(width) = u32::try_from(import.size.w) else {
             return false;
         };
@@ -445,6 +445,14 @@ impl VulkanDmabufExternalImageFormatProperties {
             && self.image_format_properties.max_extent.width >= width
             && self.image_format_properties.max_extent.height >= height
             && self.image_format_properties.max_extent.depth >= 1
+    }
+
+    pub(super) fn supports_sampled_import(&self, import: &VulkanDmabufImportState) -> bool {
+        self.supports_single_sample_import_extent(import)
+    }
+
+    pub(super) fn supports_render_target_import(&self, import: &VulkanDmabufImportState) -> bool {
+        import.plane_count() == 1 && self.supports_single_sample_import_extent(import)
     }
 }
 
@@ -890,11 +898,38 @@ impl VulkanDeviceState {
         &self,
         import: &VulkanDmabufImportState,
     ) -> Result<Option<VulkanDmabufExternalImageFormatProperties>, VulkanError> {
+        self.dmabuf_external_image_format_properties_for_usage(import, vk::ImageUsageFlags::SAMPLED)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn dmabuf_render_target_external_image_format_properties(
+        &self,
+        import: &VulkanDmabufImportState,
+    ) -> Result<Option<VulkanDmabufExternalImageFormatProperties>, VulkanError> {
+        self.dmabuf_external_image_format_properties_for_usage(import, vk::ImageUsageFlags::COLOR_ATTACHMENT)
+    }
+
+    #[allow(dead_code)]
+    fn dmabuf_external_image_format_properties_for_usage(
+        &self,
+        import: &VulkanDmabufImportState,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Option<VulkanDmabufExternalImageFormatProperties>, VulkanError> {
         if !self.capabilities.external_memory.prerequisites_available || self.external_memory_fns.is_none() {
             return Ok(None);
         }
 
-        if self.capabilities.formats.dmabuf_import_record(import).is_none() {
+        let has_modifier_record = if usage == vk::ImageUsageFlags::SAMPLED {
+            self.capabilities.formats.dmabuf_import_record(import).is_some()
+        } else if usage == vk::ImageUsageFlags::COLOR_ATTACHMENT {
+            self.capabilities
+                .formats
+                .dmabuf_render_target_record(import)
+                .is_some()
+        } else {
+            false
+        };
+        if !has_modifier_record {
             return Ok(None);
         }
 
@@ -912,7 +947,7 @@ impl VulkanDeviceState {
             .format(vk_format)
             .ty(vk::ImageType::TYPE_2D)
             .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .usage(vk::ImageUsageFlags::SAMPLED)
+            .usage(usage)
             .flags(vk::ImageCreateFlags::empty())
             .push_next(&mut external_image_info)
             .push_next(&mut drm_format_info);
@@ -921,8 +956,8 @@ impl VulkanDeviceState {
 
         // SAFETY: `physical_device` belongs to the retained instance. The pNext chains are built
         // from stack values that outlive the call, use Vulkan-defined structs, and request only a
-        // 2D sampled DRM-modifier image with DMA_BUF external memory after the corresponding device
-        // extensions and modifier record have been discovered.
+        // 2D sampled or color-attachment DRM-modifier image with DMA_BUF external memory after the
+        // corresponding device extensions and modifier record have been discovered.
         let result = unsafe {
             physical_device
                 .instance()
@@ -969,6 +1004,25 @@ impl VulkanDeviceState {
         };
 
         if !properties.supports_sampled_import(import) {
+            return Ok(None);
+        }
+
+        Ok(Some(VulkanDmabufImportCandidate {
+            dedicated_only: properties.dedicated_only,
+            properties,
+        }))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn dmabuf_render_target_candidate(
+        &self,
+        import: &VulkanDmabufImportState,
+    ) -> Result<Option<VulkanDmabufImportCandidate>, VulkanError> {
+        let Some(properties) = self.dmabuf_render_target_external_image_format_properties(import)? else {
+            return Ok(None);
+        };
+
+        if !properties.supports_render_target_import(import) {
             return Ok(None);
         }
 
