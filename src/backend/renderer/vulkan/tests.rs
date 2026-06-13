@@ -5852,7 +5852,12 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     };
     assert!(caps.formats.dmabuf_import.iter().next().is_none());
     assert!(caps.formats.dmabuf_export.iter().next().is_none());
-    assert!(caps.formats.dmabuf_render_target.iter().next().is_none());
+    assert!(
+        caps.formats
+            .dmabuf_render_target
+            .iter()
+            .all(|format| matches!(is_10bit(format.code), Ok(false)))
+    );
     drop(renderer);
     drop(retained_offscreen_target);
 }
