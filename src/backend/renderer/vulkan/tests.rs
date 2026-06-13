@@ -2262,6 +2262,34 @@ fn public_dmabuf_bind_is_explicitly_unsupported() {
 }
 
 #[test]
+fn public_dmabuf_bind_validates_metadata_before_unsupported_stub() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut zero_width = dmabuf_with_planes_for_tests(
+        (0, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let mut multi_plane = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Nv12,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4), (1, 4, 4)],
+    );
+
+    assert!(matches!(
+        <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut zero_width),
+        Err(VulkanError::UnsupportedOperation("dmabuf size"))
+    ));
+    assert!(matches!(
+        <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut multi_plane),
+        Err(VulkanError::UnsupportedOperation("dmabuf render target planes"))
+    ));
+}
+
+#[test]
 fn public_dmabuf_import_is_explicitly_unsupported() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let dmabuf = dmabuf_for_tests();

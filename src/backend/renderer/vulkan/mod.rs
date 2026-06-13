@@ -510,13 +510,25 @@ impl<'target> Bind<VulkanRenderTarget<'target>> for VulkanRenderer {
 }
 
 impl Bind<Dmabuf> for VulkanRenderer {
-    fn bind<'a>(&mut self, _target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
+    fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        let _import = validate_dmabuf_render_target_metadata(target)?;
         Err(VulkanError::UnsupportedOperation("dmabuf render target"))
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
         Some(FormatSet::default())
     }
+}
+
+fn validate_dmabuf_render_target_metadata(
+    target: &Dmabuf,
+) -> Result<image::VulkanDmabufImportState, VulkanError> {
+    let import = image::VulkanDmabufImportState::from_dmabuf(target)?;
+    if import.plane_count() != 1 {
+        return Err(VulkanError::UnsupportedOperation("dmabuf render target planes"));
+    }
+
+    Ok(import)
 }
 
 impl Offscreen<VulkanRenderTarget<'static>> for VulkanRenderer {
