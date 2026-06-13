@@ -719,15 +719,16 @@ impl VulkanAllocator {
         let mut filtered = Vec::new();
 
         for modifier in modifiers.iter().copied() {
-            let info = unsafe {
-                self.get_format_info(
-                    DrmFormat {
-                        code: fourcc,
-                        modifier,
-                    },
-                    vk_usage,
-                )?
+            let format = DrmFormat {
+                code: fourcc,
+                modifier,
             };
+
+            if self.format_plane_count(format).is_none() {
+                continue;
+            }
+
+            let info = unsafe { self.get_format_info(format, vk_usage)? };
             let Some(info) = info else {
                 continue;
             };
