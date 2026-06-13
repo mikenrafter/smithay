@@ -43,7 +43,7 @@
 //! Every future feature should follow this pattern: capability flag first, test second, stub
 //! failure path third, real implementation fourth, enablement last.
 
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 
 #[cfg(all(
     feature = "wayland_frontend",
@@ -59,7 +59,8 @@ use crate::{
         allocator::{Format, Fourcc, Modifier, dmabuf::Dmabuf, format::FormatSet},
         renderer::{
             Bind, Color32F, ContextId, DebugFlags, ExportMem, ImportDma, ImportMem, Offscreen, Renderer,
-            RendererSuper, Texture, TextureFilter, sync::SyncPoint,
+            RendererSuper, Texture, TextureFilter,
+            sync::{Fence, Interrupted, SyncPoint},
         },
     },
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
@@ -91,6 +92,59 @@ use self::{
     },
     format::{get_format_info, get_render_vk_format},
 };
+
+#[derive(Debug)]
+struct VulkanSyncFileFence {
+    fd: OwnedFd,
+}
+
+impl VulkanSyncFileFence {
+    fn new(fd: OwnedFd) -> Self {
+        Self { fd }
+    }
+}
+
+impl Fence for VulkanSyncFileFence {
+    fn is_signaled(&self) -> bool {
+        let mut poll_fd = [rustix::event::PollFd::new(&self.fd, rustix::event::PollFlags::IN)];
+        matches!(
+            rustix::event::poll(
+                &mut poll_fd,
+                Some(&rustix::time::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                }),
+            ),
+            Ok(ready) if ready > 0
+        )
+    }
+
+    fn wait(&self) -> Result<(), Interrupted> {
+        let mut poll_fd = [rustix::event::PollFd::new(&self.fd, rustix::event::PollFlags::IN)];
+        loop {
+            match rustix::event::poll(&mut poll_fd, None) {
+                Ok(ready) if ready > 0 => return Ok(()),
+                Ok(_) => continue,
+                Err(_) => return Err(Interrupted),
+            }
+        }
+    }
+
+    fn is_exportable(&self) -> bool {
+        true
+    }
+
+    fn export(&self) -> Option<OwnedFd> {
+        self.fd.as_fd().try_clone_to_owned().ok()
+    }
+}
+
+fn sync_point_from_sync_file(sync_file: Option<OwnedFd>) -> SyncPoint {
+    match sync_file {
+        Some(fd) => SyncPoint::from(VulkanSyncFileFence::new(fd)),
+        None => SyncPoint::signaled(),
+    }
+}
 
 /// Provisional native Vulkan renderer for explicit-device in-memory/offscreen rendering.
 #[derive(Debug)]
@@ -472,6 +526,21 @@ impl VulkanRenderer {
         }
 
         Ok(release)
+    }
+
+    /// Release an acquired dmabuf render target and return the exported release fence as a
+    /// [`SyncPoint`] when available.
+    ///
+    /// This is still an internal helper and does not advertise public dmabuf render-target support.
+    #[allow(dead_code)]
+    fn release_acquired_dmabuf_render_target_to_foreign_general_sync_point(
+        &mut self,
+        target: &mut VulkanRenderTarget<'_>,
+        export_sync_file: bool,
+    ) -> Result<(bool, SyncPoint), VulkanError> {
+        let (released, sync_file) =
+            self.release_acquired_dmabuf_render_target_to_foreign_general(target, export_sync_file)?;
+        Ok((released, sync_point_from_sync_file(sync_file)))
     }
 
     #[allow(dead_code)]

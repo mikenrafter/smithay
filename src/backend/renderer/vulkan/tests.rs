@@ -1026,6 +1026,24 @@ fn sync_point_wait_semaphore_falls_back_without_vulkan_sync_file_import() {
 }
 
 #[test]
+fn sync_file_release_fence_exports_and_waits_pollable_fd() {
+    let signaled = sync_point_from_sync_file(None);
+    assert!(!signaled.contains_fence());
+    assert!(signaled.is_reached());
+    assert!(signaled.wait().is_ok());
+
+    // `/dev/null` is used only as an always-ready pollable fd for the private fence wrapper. Runtime
+    // Vulkan paths pass Linux sync-file fds exported from Vulkan semaphores.
+    let fd: OwnedFd = File::open("/dev/null").unwrap().into();
+    let sync = sync_point_from_sync_file(Some(fd));
+    assert!(sync.contains_fence());
+    assert!(sync.is_exportable());
+    assert!(sync.export().is_some());
+    assert!(sync.is_reached());
+    assert!(sync.wait().is_ok());
+}
+
+#[test]
 fn dmabuf_import_image_state_tracks_sampled_dmabuf_without_advertising_renderability() {
     let dmabuf = dmabuf_with_planes_for_tests(
         (4, 3).into(),
@@ -3158,6 +3176,11 @@ fn internal_dmabuf_render_target_release_rejects_preconditions_before_device_loo
     assert!(matches!(
         renderer.release_acquired_dmabuf_render_target_to_foreign_general(&mut released_target, false),
         Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"))
+    ));
+    assert!(matches!(
+        renderer
+            .release_acquired_dmabuf_render_target_to_foreign_general_sync_point(&mut missing_image, true),
+        Err(VulkanError::UnsupportedOperation("dmabuf render target image"))
     ));
 }
 
