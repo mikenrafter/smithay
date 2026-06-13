@@ -33,8 +33,8 @@ use super::image::{
     VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalImageOwnership, VulkanExternalMemoryHandleType,
     VulkanExternalMemoryState, VulkanImageLayoutState, VulkanImageSource, VulkanImageState,
     VulkanImageSyncState, VulkanImageUsage, clear_damage_to_clear_areas, damage_to_scissor_areas,
-    dmabuf_acquired_image_state, dmabuf_import_image_state, draw_solid_damage_to_clear_areas,
-    render_texture_damage_to_scissor_areas, source_to_uv_rect,
+    dmabuf_acquired_image_state, dmabuf_import_image_state, dmabuf_render_target_image_state,
+    draw_solid_damage_to_clear_areas, render_texture_damage_to_scissor_areas, source_to_uv_rect,
 };
 use super::*;
 
@@ -1026,6 +1026,35 @@ fn dmabuf_import_image_state_tracks_sampled_dmabuf_without_advertising_renderabi
         acquired.sync.external_ownership,
         VulkanExternalImageOwnership::Local
     );
+}
+
+#[test]
+fn dmabuf_render_target_image_state_tracks_color_attachment_without_advertising_support() {
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let import = VulkanDmabufImportState::from_dmabuf(&dmabuf).unwrap();
+    let image = dmabuf_render_target_image_state(&import);
+
+    assert_eq!(image.size, (4, 3).into());
+    assert_eq!(image.format, Some(Fourcc::Abgr8888));
+    assert_eq!(image.source, VulkanImageSource::DmabufImport);
+    assert!(image.usage.color_attachment);
+    assert!(!image.usage.sampled);
+    assert!(!image.usage.transfer_src);
+    assert!(!image.usage.transfer_dst);
+    assert_eq!(image.layout, VulkanImageLayoutState::Undefined);
+    assert!(image.sync.external_acquire_pending);
+    assert_eq!(
+        image.sync.external_ownership,
+        VulkanExternalImageOwnership::ForeignUnknown
+    );
+    assert!(!image.sync.pending_write);
+    assert!(!image.sync.exportable_sync);
 }
 
 #[test]

@@ -224,6 +224,21 @@ pub(super) fn dmabuf_acquired_image_state(import: &VulkanDmabufImportState) -> V
 }
 
 #[allow(dead_code)]
+pub(super) fn dmabuf_render_target_image_state(import: &VulkanDmabufImportState) -> VulkanImageState {
+    VulkanImageState {
+        size: import.size,
+        format: Some(import.format()),
+        source: VulkanImageSource::DmabufImport,
+        usage: VulkanImageUsage {
+            color_attachment: true,
+            ..VulkanImageUsage::default()
+        },
+        layout: VulkanImageLayoutState::Undefined,
+        sync: dmabuf_import_sync_state(),
+    }
+}
+
+#[allow(dead_code)]
 pub(super) fn dmabuf_import_sync_state() -> VulkanImageSyncState {
     VulkanImageSyncState {
         external_acquire_pending: true,
