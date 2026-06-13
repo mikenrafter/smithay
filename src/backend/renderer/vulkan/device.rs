@@ -20,8 +20,8 @@ use super::{
     VulkanError, VulkanRendererCapabilities,
     format::get_render_vk_format,
     image::{
-        VulkanDmabufImportState, VulkanExternalImageOwnership, VulkanExternalMemoryHandleType,
-        VulkanImageSyncState, dmabuf_import_sync_state,
+        VulkanDmabufImportState, VulkanDmabufRenderTargetAcquireRestore, VulkanExternalImageOwnership,
+        VulkanExternalMemoryHandleType, VulkanImageSyncState, dmabuf_import_sync_state,
     },
 };
 
@@ -2855,6 +2855,35 @@ fn ensure_image_locally_usable(image: &VulkanOwnedImage) -> Result<(), VulkanErr
     }
 }
 
+fn ensure_image_locally_usable_for_recorded_color_attachment_work(
+    command_buffer: &VulkanCommandBuffer,
+    image: &VulkanOwnedImage,
+) -> Result<(), VulkanError> {
+    if command_buffer
+        .projected_dmabuf_render_target_local_sync(image)?
+        .is_locally_usable()
+    {
+        Ok(())
+    } else {
+        Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"))
+    }
+}
+
+fn ensure_image_locally_usable_for_recorded_layout_transition(
+    command_buffer: &VulkanCommandBuffer,
+    image: &VulkanOwnedImage,
+    new_layout: vk::ImageLayout,
+) -> Result<(), VulkanError> {
+    if image.sync_state()?.is_locally_usable() {
+        return Ok(());
+    }
+    if new_layout == vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+        return ensure_image_locally_usable_for_recorded_color_attachment_work(command_buffer, image);
+    }
+
+    Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"))
+}
+
 fn vulkan_error_is_device_lost(err: &VulkanError) -> bool {
     matches!(
         err,
@@ -3032,7 +3061,7 @@ fn transition_image_layout(
 ) -> Result<(), VulkanError> {
     ensure_command_buffer_recording(command_buffer)?;
     ensure_command_buffer_image_device(command_buffer, image)?;
-    ensure_image_locally_usable(image)?;
+    ensure_image_locally_usable_for_recorded_layout_transition(command_buffer, image, new_layout)?;
     let old_layout = command_buffer
         .pending_layout_for(image)?
         .unwrap_or(image.layout()?);
@@ -3191,6 +3220,178 @@ fn record_sampled_dmabuf_foreign_release_barrier(
     command_buffer.pending_image_syncs.push(VulkanPendingImageSync {
         resource: Arc::clone(&image.inner),
         operation: VulkanPendingImageSyncOperation::SampledDmabufForeignRelease,
+    });
+    command_buffer.referenced_images.push(Arc::clone(&image.inner));
+
+    Ok(true)
+}
+
+#[allow(dead_code)]
+fn record_dmabuf_render_target_foreign_acquire_barrier(
+    command_buffer: &mut VulkanCommandBuffer,
+    image: &VulkanOwnedImage,
+    preserve_contents: bool,
+) -> Result<bool, VulkanError> {
+    ensure_command_buffer_recording(command_buffer)?;
+    ensure_graphics_command_buffer(command_buffer)?;
+    ensure_command_buffer_image_device(command_buffer, image)?;
+    ensure_dmabuf_external_image(image)?;
+    let Some(_) = command_buffer.plan_dmabuf_render_target_foreign_acquire_barrier(
+        &image.sync_state()?,
+        image.usage(),
+        preserve_contents,
+    )?
+    else {
+        return Ok(false);
+    };
+
+    let restore = image
+        .inner
+        .sync
+        .begin_dmabuf_render_target_foreign_acquire(preserve_contents)?;
+    let external_layout = match restore.ownership() {
+        VulkanExternalImageOwnership::ForeignUnknown => vk::ImageLayout::UNDEFINED,
+        VulkanExternalImageOwnership::ForeignKnownGeneral => vk::ImageLayout::GENERAL,
+        VulkanExternalImageOwnership::None
+        | VulkanExternalImageOwnership::AcquirePending
+        | VulkanExternalImageOwnership::Local
+        | VulkanExternalImageOwnership::ReleasePending => {
+            let err = VulkanError::UnsupportedOperation("dmabuf external ownership");
+            image
+                .inner
+                .sync
+                .abort_dmabuf_render_target_foreign_acquire(restore)?;
+            return Err(err);
+        }
+    };
+    let barrier = match dmabuf_render_target_foreign_acquire_barrier(
+        external_layout,
+        command_buffer.queue_family_index(),
+        image.usage(),
+    ) {
+        Ok(barrier) => barrier,
+        Err(err) => {
+            image
+                .inner
+                .sync
+                .abort_dmabuf_render_target_foreign_acquire(restore)?;
+            return Err(err);
+        }
+    };
+    let vk_barrier = barrier.to_color_image_memory_barrier(image.image());
+    let pool_guard = match command_buffer.command_pool.lock_host_access() {
+        Ok(guard) => guard,
+        Err(err) => {
+            image
+                .inner
+                .sync
+                .abort_dmabuf_render_target_foreign_acquire(restore)?;
+            return Err(err);
+        }
+    };
+
+    // SAFETY: `command_buffer` is in recording state and belongs to a live graphics command
+    // pool/device. `image` is a bound dmabuf external-memory image retained below until command
+    // completion. The barrier is built from the restore token returned by the host-side begin step:
+    // unknown discard acquires use UNDEFINED, while known-general acquires use GENERAL even when the
+    // caller does not need to preserve contents. The barrier helper validates color-attachment usage
+    // and a local destination queue family before selecting the FOREIGN -> local ownership transfer
+    // and COLOR_ATTACHMENT layout transition.
+    unsafe {
+        command_buffer
+            .command_pool
+            .logical_device
+            .handle()
+            .cmd_pipeline_barrier(
+                command_buffer.handle,
+                barrier.src_stage,
+                barrier.dst_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vk_barrier],
+            )
+    };
+    drop(pool_guard);
+    command_buffer
+        .pending_image_layouts
+        .push(VulkanPendingImageLayout {
+            image: image.image(),
+            resource: Arc::clone(&image.inner),
+            new_layout: barrier.new_layout,
+        });
+    command_buffer.pending_image_syncs.push(VulkanPendingImageSync {
+        resource: Arc::clone(&image.inner),
+        operation: VulkanPendingImageSyncOperation::DmabufRenderTargetForeignAcquire { restore },
+    });
+    command_buffer.referenced_images.push(Arc::clone(&image.inner));
+
+    Ok(true)
+}
+
+#[allow(dead_code)]
+/// Record a dmabuf render-target release for an image locally owned by the renderer.
+///
+/// The release planner also projects earlier pending render-target acquires in this command buffer
+/// as locally owned, which allows acquire -> release barrier ordering in one submission without
+/// advertising public dmabuf render-target support yet.
+fn record_dmabuf_render_target_foreign_release_barrier(
+    command_buffer: &mut VulkanCommandBuffer,
+    image: &VulkanOwnedImage,
+) -> Result<bool, VulkanError> {
+    ensure_command_buffer_recording(command_buffer)?;
+    ensure_graphics_command_buffer(command_buffer)?;
+    ensure_command_buffer_image_device(command_buffer, image)?;
+    ensure_dmabuf_external_image(image)?;
+    let local_layout = command_buffer
+        .pending_layout_for(image)?
+        .unwrap_or(image.layout()?);
+    let sync = command_buffer.projected_dmabuf_render_target_release_sync(image)?;
+    let Some(barrier) = command_buffer.plan_dmabuf_render_target_foreign_release_barrier(
+        &sync,
+        local_layout,
+        image.usage(),
+    )?
+    else {
+        return Ok(false);
+    };
+    let vk_barrier = barrier.to_color_image_memory_barrier(image.image());
+    let _pool_guard = command_buffer.command_pool.lock_host_access()?;
+
+    image.inner.sync.begin_dmabuf_render_target_foreign_release()?;
+    // SAFETY: `command_buffer` is in recording state and belongs to a live graphics command
+    // pool/device. `image` is a bound dmabuf external-memory image retained below until command
+    // completion. The image was created through the dmabuf external-memory path, which requires the
+    // foreign queue-family extension before this operation can be reached. The barrier is produced
+    // by the render-target dmabuf foreign release planner, which validates color-attachment usage,
+    // current local COLOR_ATTACHMENT_OPTIMAL layout, and a local source queue family before
+    // selecting the local -> FOREIGN ownership transfer and COLOR_ATTACHMENT_OPTIMAL -> GENERAL
+    // layout transition.
+    unsafe {
+        command_buffer
+            .command_pool
+            .logical_device
+            .handle()
+            .cmd_pipeline_barrier(
+                command_buffer.handle,
+                barrier.src_stage,
+                barrier.dst_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vk_barrier],
+            )
+    };
+    command_buffer
+        .pending_image_layouts
+        .push(VulkanPendingImageLayout {
+            image: image.image(),
+            resource: Arc::clone(&image.inner),
+            new_layout: barrier.new_layout,
+        });
+    command_buffer.pending_image_syncs.push(VulkanPendingImageSync {
+        resource: Arc::clone(&image.inner),
+        operation: VulkanPendingImageSyncOperation::DmabufRenderTargetForeignRelease,
     });
     command_buffer.referenced_images.push(Arc::clone(&image.inner));
 
@@ -3381,7 +3582,7 @@ fn record_color_attachment_clear(
 ) -> Result<(), VulkanError> {
     ensure_command_buffer_recording(command_buffer)?;
     ensure_command_buffer_image_device(command_buffer, image)?;
-    ensure_image_locally_usable(image)?;
+    ensure_image_locally_usable_for_recorded_color_attachment_work(command_buffer, image)?;
     if !image.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
         return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
     }
@@ -3436,7 +3637,7 @@ fn record_color_attachment_clear_rects(
 ) -> Result<(), VulkanError> {
     ensure_command_buffer_recording(command_buffer)?;
     ensure_command_buffer_image_device(command_buffer, image)?;
-    ensure_image_locally_usable(image)?;
+    ensure_image_locally_usable_for_recorded_color_attachment_work(command_buffer, image)?;
     if clear_areas.is_empty() {
         return Ok(());
     }
@@ -3505,7 +3706,7 @@ fn record_sampled_texture_draw(
 ) -> Result<(), VulkanError> {
     ensure_command_buffer_recording(command_buffer)?;
     ensure_command_buffer_image_device(command_buffer, target)?;
-    ensure_image_locally_usable(target)?;
+    ensure_image_locally_usable_for_recorded_color_attachment_work(command_buffer, target)?;
     ensure_image_locally_usable(descriptor_set.sampled_image().image())?;
     if !target.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
         return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
@@ -3609,7 +3810,7 @@ fn record_solid_color_draw(
 ) -> Result<(), VulkanError> {
     ensure_command_buffer_recording(command_buffer)?;
     ensure_command_buffer_image_device(command_buffer, target)?;
-    ensure_image_locally_usable(target)?;
+    ensure_image_locally_usable_for_recorded_color_attachment_work(command_buffer, target)?;
     if !target.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
         return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
     }
@@ -3848,7 +4049,7 @@ fn synchronize_color_attachment_load(
 ) -> Result<(), VulkanError> {
     ensure_command_buffer_recording(command_buffer)?;
     ensure_command_buffer_image_device(command_buffer, image)?;
-    ensure_image_locally_usable(image)?;
+    ensure_image_locally_usable_for_recorded_color_attachment_work(command_buffer, image)?;
     if !image.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
         return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
     }
@@ -4255,6 +4456,42 @@ pub(super) fn plan_dmabuf_render_target_foreign_release_barrier(
         | (VulkanExternalImageOwnership::ForeignKnownGeneral, _)
         | (VulkanExternalImageOwnership::AcquirePending, _)
         | (VulkanExternalImageOwnership::ReleasePending, _) => {
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(super) fn project_dmabuf_render_target_sync_after_pending_acquire(
+    mut sync: VulkanImageSyncState,
+) -> Result<VulkanImageSyncState, VulkanError> {
+    match (
+        sync.external_ownership(),
+        sync.external_acquire_pending(),
+        sync.external_acquire_kind,
+    ) {
+        (
+            VulkanExternalImageOwnership::AcquirePending,
+            true,
+            super::image::VulkanExternalImageAcquireKind::RenderTarget,
+        ) if sync.render_target_acquire_restore_token.is_some()
+            && sync.external_release_kind == super::image::VulkanExternalImageReleaseKind::None
+            && sync.render_target_release_restore.is_none() =>
+        {
+            sync.external_ownership = VulkanExternalImageOwnership::Local;
+            sync.external_acquire_pending = false;
+            sync.external_acquire_kind = super::image::VulkanExternalImageAcquireKind::None;
+            sync.render_target_acquire_restore_token = None;
+            Ok(sync)
+        }
+        (VulkanExternalImageOwnership::None, false, _)
+        | (VulkanExternalImageOwnership::Local, false, _)
+        | (VulkanExternalImageOwnership::ForeignUnknown, _, _)
+        | (VulkanExternalImageOwnership::ForeignKnownGeneral, _, _)
+        | (VulkanExternalImageOwnership::AcquirePending, _, _)
+        | (VulkanExternalImageOwnership::None, true, _)
+        | (VulkanExternalImageOwnership::Local, true, _)
+        | (VulkanExternalImageOwnership::ReleasePending, _, _) => {
             Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
         }
     }
@@ -5018,6 +5255,36 @@ impl VulkanCommandBuffer {
         plan_sampled_dmabuf_foreign_release_barrier(sync, local_layout, self.queue_family_index(), usage)
     }
 
+    #[allow(dead_code)]
+    pub(super) fn plan_dmabuf_render_target_foreign_acquire_barrier(
+        &self,
+        sync: &VulkanImageSyncState,
+        usage: vk::ImageUsageFlags,
+        preserve_contents: bool,
+    ) -> Result<Option<VulkanExternalImageBarrier>, VulkanError> {
+        plan_dmabuf_render_target_foreign_acquire_barrier(
+            sync,
+            self.queue_family_index(),
+            usage,
+            preserve_contents,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn plan_dmabuf_render_target_foreign_release_barrier(
+        &self,
+        sync: &VulkanImageSyncState,
+        local_layout: vk::ImageLayout,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Option<VulkanExternalImageBarrier>, VulkanError> {
+        plan_dmabuf_render_target_foreign_release_barrier(
+            sync,
+            local_layout,
+            self.queue_family_index(),
+            usage,
+        )
+    }
+
     fn pending_layout_for(&self, image: &VulkanOwnedImage) -> Result<Option<vk::ImageLayout>, VulkanError> {
         Ok(self
             .pending_image_layouts
@@ -5025,6 +5292,34 @@ impl VulkanCommandBuffer {
             .rev()
             .find(|pending| pending.image == image.image())
             .map(|pending| pending.new_layout))
+    }
+
+    fn projected_dmabuf_render_target_local_sync(
+        &self,
+        image: &VulkanOwnedImage,
+    ) -> Result<VulkanImageSyncState, VulkanError> {
+        let mut sync = image.sync_state()?;
+
+        for pending in &self.pending_image_syncs {
+            if !Arc::ptr_eq(&pending.resource, &image.inner) {
+                continue;
+            }
+
+            if let VulkanPendingImageSyncOperation::DmabufRenderTargetForeignAcquire { .. } =
+                &pending.operation
+            {
+                sync = project_dmabuf_render_target_sync_after_pending_acquire(sync)?;
+            }
+        }
+
+        Ok(sync)
+    }
+
+    fn projected_dmabuf_render_target_release_sync(
+        &self,
+        image: &VulkanOwnedImage,
+    ) -> Result<VulkanImageSyncState, VulkanError> {
+        self.projected_dmabuf_render_target_local_sync(image)
     }
 
     fn commit_pending_image_layouts_and_syncs(&mut self) -> Result<(), VulkanError> {
@@ -5051,11 +5346,9 @@ impl VulkanCommandBuffer {
     }
 
     fn abort_pending_image_syncs(&mut self) -> Result<(), VulkanError> {
-        for pending in self.pending_image_syncs.iter().rev() {
+        while let Some(pending) = self.pending_image_syncs.pop() {
             pending.abort()?;
         }
-
-        self.pending_image_syncs.clear();
         Ok(())
     }
 }
@@ -5075,10 +5368,17 @@ struct VulkanPendingImageSync {
 }
 
 impl VulkanPendingImageSync {
-    fn abort(&self) -> Result<(), VulkanError> {
+    fn abort(self) -> Result<(), VulkanError> {
         match self.operation {
             VulkanPendingImageSyncOperation::SampledDmabufForeignAcquire => {
                 self.resource.sync.abort_sampled_dmabuf_foreign_acquire()
+            }
+            VulkanPendingImageSyncOperation::DmabufRenderTargetForeignAcquire { restore } => self
+                .resource
+                .sync
+                .abort_dmabuf_render_target_foreign_acquire(restore),
+            VulkanPendingImageSyncOperation::DmabufRenderTargetForeignRelease => {
+                self.resource.sync.abort_dmabuf_render_target_foreign_release()
             }
             VulkanPendingImageSyncOperation::SampledDmabufForeignRelease => {
                 self.resource.sync.abort_sampled_dmabuf_foreign_release()
@@ -5093,10 +5393,18 @@ impl VulkanPendingImageSync {
     /// The caller must ensure the Vulkan queue-family ownership transfer and layout transition that
     /// caused this pending sync operation has been submitted and completed before calling this.
     unsafe fn complete(&self) -> Result<(), VulkanError> {
-        match self.operation {
+        match &self.operation {
             VulkanPendingImageSyncOperation::SampledDmabufForeignAcquire => {
                 // SAFETY: Upheld by this method's caller.
                 unsafe { self.resource.sync.complete_sampled_dmabuf_foreign_acquire() }
+            }
+            VulkanPendingImageSyncOperation::DmabufRenderTargetForeignAcquire { .. } => {
+                // SAFETY: Upheld by this method's caller.
+                unsafe { self.resource.sync.complete_dmabuf_render_target_foreign_acquire() }
+            }
+            VulkanPendingImageSyncOperation::DmabufRenderTargetForeignRelease => {
+                // SAFETY: Upheld by this method's caller.
+                unsafe { self.resource.sync.complete_dmabuf_render_target_foreign_release() }
             }
             VulkanPendingImageSyncOperation::SampledDmabufForeignRelease => {
                 // SAFETY: Upheld by this method's caller.
@@ -5106,10 +5414,14 @@ impl VulkanPendingImageSync {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 enum VulkanPendingImageSyncOperation {
     SampledDmabufForeignAcquire,
+    DmabufRenderTargetForeignAcquire {
+        restore: VulkanDmabufRenderTargetAcquireRestore,
+    },
+    DmabufRenderTargetForeignRelease,
     SampledDmabufForeignRelease,
 }
 
@@ -5259,6 +5571,53 @@ impl VulkanSharedImageSyncState {
             .abort_sampled_dmabuf_foreign_acquire()
     }
 
+    #[allow(dead_code)]
+    pub(super) fn begin_dmabuf_render_target_foreign_acquire(
+        &self,
+        preserve_contents: bool,
+    ) -> Result<VulkanDmabufRenderTargetAcquireRestore, VulkanError> {
+        self.state
+            .lock()
+            .map_err(|_| host_synchronization_failed())?
+            .begin_dmabuf_render_target_foreign_acquire(preserve_contents)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn abort_dmabuf_render_target_foreign_acquire(
+        &self,
+        restore: VulkanDmabufRenderTargetAcquireRestore,
+    ) -> Result<(), VulkanError> {
+        self.state
+            .lock()
+            .map_err(|_| host_synchronization_failed())?
+            .abort_dmabuf_render_target_foreign_acquire(restore)
+    }
+
+    /// Complete a pending dmabuf render-target foreign acquire after the Vulkan barrier has executed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the matching queue-family ownership transfer and layout transition
+    /// from foreign ownership to this renderer's queue has completed before calling this.
+    #[allow(dead_code)]
+    unsafe fn complete_dmabuf_render_target_foreign_acquire(&self) -> Result<(), VulkanError> {
+        // SAFETY: Forwarded from this method's caller.
+        unsafe {
+            self.state
+                .lock()
+                .map_err(|_| host_synchronization_failed())?
+                .complete_dmabuf_render_target_foreign_acquire()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) unsafe fn complete_dmabuf_render_target_foreign_acquire_for_tests(
+        &self,
+    ) -> Result<(), VulkanError> {
+        // SAFETY: Forwarded from this test-only method's caller.
+        unsafe { self.complete_dmabuf_render_target_foreign_acquire() }
+    }
+
     /// Complete a pending sampled-dmabuf foreign acquire after the Vulkan barrier has executed.
     ///
     /// # Safety
@@ -5294,6 +5653,47 @@ impl VulkanSharedImageSyncState {
             .lock()
             .map_err(|_| host_synchronization_failed())?
             .abort_sampled_dmabuf_foreign_release()
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn begin_dmabuf_render_target_foreign_release(&self) -> Result<(), VulkanError> {
+        self.state
+            .lock()
+            .map_err(|_| host_synchronization_failed())?
+            .begin_dmabuf_render_target_foreign_release()
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn abort_dmabuf_render_target_foreign_release(&self) -> Result<(), VulkanError> {
+        self.state
+            .lock()
+            .map_err(|_| host_synchronization_failed())?
+            .abort_dmabuf_render_target_foreign_release()
+    }
+
+    /// Complete a pending dmabuf render-target foreign release after the Vulkan barrier has executed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the matching queue-family ownership transfer and layout transition
+    /// from this renderer's queue to foreign ownership has completed before calling this.
+    #[allow(dead_code)]
+    unsafe fn complete_dmabuf_render_target_foreign_release(&self) -> Result<(), VulkanError> {
+        // SAFETY: Forwarded from this method's caller.
+        unsafe {
+            self.state
+                .lock()
+                .map_err(|_| host_synchronization_failed())?
+                .complete_dmabuf_render_target_foreign_release()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) unsafe fn complete_dmabuf_render_target_foreign_release_for_tests(
+        &self,
+    ) -> Result<(), VulkanError> {
+        // SAFETY: Forwarded from this test-only method's caller.
+        unsafe { self.complete_dmabuf_render_target_foreign_release() }
     }
 
     /// Complete a pending sampled-dmabuf foreign release after the Vulkan barrier has executed.

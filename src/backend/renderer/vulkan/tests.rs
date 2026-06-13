@@ -27,16 +27,18 @@ use super::device::{
     find_memory_type_index, image_copy_buffer_offset, image_copy_required_size, image_layout_transition,
     plan_dmabuf_render_target_foreign_acquire_barrier, plan_dmabuf_render_target_foreign_release_barrier,
     plan_sampled_dmabuf_foreign_acquire_barrier, plan_sampled_dmabuf_foreign_release_barrier,
-    sampled_dmabuf_foreign_acquire_barrier, sampled_dmabuf_foreign_release_barrier, select_queue_families,
-    tightly_packed_image_size, validate_submit_wait_stage, vulkan_filter,
+    project_dmabuf_render_target_sync_after_pending_acquire, sampled_dmabuf_foreign_acquire_barrier,
+    sampled_dmabuf_foreign_release_barrier, select_queue_families, tightly_packed_image_size,
+    validate_submit_wait_stage, vulkan_filter,
 };
 use super::error::vulkan_api_result_invalidates_context;
 use super::image::{
-    VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalImageOwnership, VulkanExternalMemoryHandleType,
-    VulkanExternalMemoryState, VulkanImageLayoutState, VulkanImageSource, VulkanImageState,
-    VulkanImageSyncState, VulkanImageUsage, clear_damage_to_clear_areas, damage_to_scissor_areas,
-    dmabuf_acquired_image_state, dmabuf_import_image_state, dmabuf_render_target_image_state,
-    draw_solid_damage_to_clear_areas, render_texture_damage_to_scissor_areas, source_to_uv_rect,
+    VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalImageAcquireKind, VulkanExternalImageOwnership,
+    VulkanExternalImageReleaseKind, VulkanExternalMemoryHandleType, VulkanExternalMemoryState,
+    VulkanImageLayoutState, VulkanImageSource, VulkanImageState, VulkanImageSyncState, VulkanImageUsage,
+    clear_damage_to_clear_areas, damage_to_scissor_areas, dmabuf_acquired_image_state,
+    dmabuf_import_image_state, dmabuf_render_target_image_state, draw_solid_damage_to_clear_areas,
+    render_texture_damage_to_scissor_areas, source_to_uv_rect,
 };
 use super::*;
 
@@ -1903,6 +1905,19 @@ fn dmabuf_render_target_foreign_barriers_distinguish_discard_and_preserve_acquir
         ),
         Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
     ));
+    let mut acquire_pending_sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+    acquire_pending_sync
+        .begin_dmabuf_render_target_foreign_acquire(true)
+        .unwrap();
+    assert!(matches!(
+        plan_dmabuf_render_target_foreign_release_barrier(
+            &acquire_pending_sync,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            2,
+            usage,
+        ),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
     assert!(matches!(
         dmabuf_render_target_foreign_release_barrier(vk::QUEUE_FAMILY_FOREIGN_EXT, usage),
         Err(VulkanError::UnsupportedOperation("dmabuf queue family"))
@@ -1924,6 +1939,518 @@ fn dmabuf_render_target_foreign_barriers_distinguish_discard_and_preserve_acquir
     );
     assert_eq!(vk_barrier.subresource_range.level_count, 1);
     assert_eq!(vk_barrier.subresource_range.layer_count, 1);
+}
+
+#[test]
+fn dmabuf_render_target_acquire_sync_restores_discard_or_preserve_source_on_abort() {
+    let mut discard_sync = VulkanImageSyncState {
+        external_acquire_pending: true,
+        external_ownership: VulkanExternalImageOwnership::ForeignUnknown,
+        ..VulkanImageSyncState::default()
+    };
+    let discard_restore = discard_sync
+        .begin_dmabuf_render_target_foreign_acquire(false)
+        .unwrap();
+    assert_eq!(
+        discard_restore.ownership(),
+        VulkanExternalImageOwnership::ForeignUnknown
+    );
+    assert_eq!(
+        discard_sync.external_ownership,
+        VulkanExternalImageOwnership::AcquirePending
+    );
+    assert!(discard_sync.external_acquire_pending);
+    discard_sync
+        .abort_dmabuf_render_target_foreign_acquire(discard_restore)
+        .unwrap();
+    assert_eq!(
+        discard_sync.external_ownership,
+        VulkanExternalImageOwnership::ForeignUnknown
+    );
+    assert!(discard_sync.external_acquire_pending);
+
+    let mut preserve_sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+    let preserve_restore = preserve_sync
+        .begin_dmabuf_render_target_foreign_acquire(true)
+        .unwrap();
+    assert_eq!(
+        preserve_restore.ownership(),
+        VulkanExternalImageOwnership::ForeignKnownGeneral
+    );
+    assert_eq!(
+        preserve_sync.external_ownership,
+        VulkanExternalImageOwnership::AcquirePending
+    );
+    preserve_sync
+        .abort_dmabuf_render_target_foreign_acquire(preserve_restore)
+        .unwrap();
+    assert_eq!(
+        preserve_sync.external_ownership,
+        VulkanExternalImageOwnership::ForeignKnownGeneral
+    );
+    assert_eq!(
+        preserve_sync.known_foreign_layout(),
+        Some(vk::ImageLayout::GENERAL)
+    );
+
+    let mut completed_sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+    completed_sync
+        .begin_dmabuf_render_target_foreign_acquire(true)
+        .unwrap();
+    // SAFETY: This unit test exercises only the host-side state transition; production callers may
+    // complete a pending transfer only after the corresponding Vulkan barrier has completed.
+    unsafe {
+        completed_sync
+            .complete_dmabuf_render_target_foreign_acquire()
+            .unwrap()
+    };
+    assert_eq!(
+        completed_sync.external_ownership,
+        VulkanExternalImageOwnership::Local
+    );
+    assert!(!completed_sync.external_acquire_pending);
+    assert!(completed_sync.is_locally_usable());
+
+    assert!(matches!(
+        VulkanImageSyncState {
+            external_acquire_pending: true,
+            external_ownership: VulkanExternalImageOwnership::ForeignUnknown,
+            ..VulkanImageSyncState::default()
+        }
+        .begin_dmabuf_render_target_foreign_acquire(true),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    assert!(matches!(
+        completed_sync.abort_dmabuf_render_target_foreign_acquire(
+            VulkanImageSyncState::foreign_known_general_for_dmabuf_import()
+                .begin_dmabuf_render_target_foreign_acquire(true)
+                .unwrap()
+        ),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+
+    let mut pending_without_restore_token = VulkanImageSyncState {
+        external_acquire_pending: true,
+        external_ownership: VulkanExternalImageOwnership::AcquirePending,
+        external_acquire_kind: VulkanExternalImageAcquireKind::RenderTarget,
+        ..VulkanImageSyncState::default()
+    };
+    // SAFETY: This intentionally checks precondition validation and returns before mutating because
+    // a render-target acquire completion must have a matching restore token from begin.
+    unsafe {
+        assert!(matches!(
+            pending_without_restore_token.complete_dmabuf_render_target_foreign_acquire(),
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        ));
+    }
+
+    let mut mismatch_sync = VulkanImageSyncState {
+        external_acquire_pending: true,
+        external_ownership: VulkanExternalImageOwnership::ForeignUnknown,
+        ..VulkanImageSyncState::default()
+    };
+    let correct_restore = mismatch_sync
+        .begin_dmabuf_render_target_foreign_acquire(false)
+        .unwrap();
+    let wrong_restore = VulkanImageSyncState::foreign_known_general_for_dmabuf_import()
+        .begin_dmabuf_render_target_foreign_acquire(true)
+        .unwrap();
+    assert!(matches!(
+        mismatch_sync.abort_dmabuf_render_target_foreign_acquire(wrong_restore),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    assert_eq!(
+        mismatch_sync.external_ownership,
+        VulkanExternalImageOwnership::AcquirePending
+    );
+    mismatch_sync
+        .abort_dmabuf_render_target_foreign_acquire(correct_restore)
+        .unwrap();
+    assert_eq!(
+        mismatch_sync.external_ownership,
+        VulkanExternalImageOwnership::ForeignUnknown
+    );
+
+    let mut render_target_pending_sync = VulkanImageSyncState {
+        external_acquire_pending: true,
+        external_ownership: VulkanExternalImageOwnership::ForeignUnknown,
+        ..VulkanImageSyncState::default()
+    };
+    let render_target_restore = render_target_pending_sync
+        .begin_dmabuf_render_target_foreign_acquire(false)
+        .unwrap();
+    assert!(matches!(
+        render_target_pending_sync.abort_sampled_dmabuf_foreign_acquire(),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    // SAFETY: The call is expected to fail before changing host-side state because this is a
+    // render-target acquire, not a sampled acquire.
+    unsafe {
+        assert!(matches!(
+            render_target_pending_sync.complete_sampled_dmabuf_foreign_acquire(),
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        ));
+    }
+    assert_eq!(
+        render_target_pending_sync.external_ownership,
+        VulkanExternalImageOwnership::AcquirePending
+    );
+    render_target_pending_sync
+        .abort_dmabuf_render_target_foreign_acquire(render_target_restore)
+        .unwrap();
+
+    let mut sampled_pending_sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+    sampled_pending_sync
+        .begin_sampled_dmabuf_foreign_acquire()
+        .unwrap();
+    assert!(matches!(
+        sampled_pending_sync.abort_dmabuf_render_target_foreign_acquire(
+            VulkanImageSyncState::foreign_known_general_for_dmabuf_import()
+                .begin_dmabuf_render_target_foreign_acquire(true)
+                .unwrap()
+        ),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    // SAFETY: The call is expected to fail before changing host-side state because this is a sampled
+    // acquire, not a render-target acquire.
+    unsafe {
+        assert!(matches!(
+            sampled_pending_sync.complete_dmabuf_render_target_foreign_acquire(),
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        ));
+    }
+    sampled_pending_sync
+        .abort_sampled_dmabuf_foreign_acquire()
+        .unwrap();
+
+    let shared = VulkanSharedImageSyncState::new(VulkanImageSyncState {
+        external_acquire_pending: true,
+        external_ownership: VulkanExternalImageOwnership::ForeignUnknown,
+        ..VulkanImageSyncState::default()
+    });
+    let restore = shared.begin_dmabuf_render_target_foreign_acquire(false).unwrap();
+    assert_eq!(restore.ownership(), VulkanExternalImageOwnership::ForeignUnknown);
+    assert_eq!(
+        shared.get().unwrap().external_ownership(),
+        VulkanExternalImageOwnership::AcquirePending
+    );
+    shared
+        .abort_dmabuf_render_target_foreign_acquire(restore)
+        .unwrap();
+    assert_eq!(
+        shared.get().unwrap().external_ownership(),
+        VulkanExternalImageOwnership::ForeignUnknown
+    );
+
+    let shared_complete =
+        VulkanSharedImageSyncState::new(VulkanImageSyncState::foreign_known_general_for_dmabuf_import());
+    shared_complete
+        .begin_dmabuf_render_target_foreign_acquire(true)
+        .unwrap();
+    // SAFETY: This unit test exercises only the host-side state transition; production callers may
+    // complete a pending transfer only after the corresponding Vulkan barrier has completed.
+    unsafe {
+        shared_complete
+            .complete_dmabuf_render_target_foreign_acquire_for_tests()
+            .unwrap()
+    };
+    assert_eq!(
+        shared_complete.get().unwrap().external_ownership(),
+        VulkanExternalImageOwnership::Local
+    );
+}
+
+#[test]
+fn dmabuf_render_target_release_sync_rejects_sampled_cross_operations() {
+    let mut render_target_release = VulkanImageSyncState {
+        external_ownership: VulkanExternalImageOwnership::Local,
+        ..VulkanImageSyncState::default()
+    };
+    render_target_release
+        .begin_dmabuf_render_target_foreign_release()
+        .unwrap();
+    assert_eq!(
+        render_target_release.external_ownership,
+        VulkanExternalImageOwnership::ReleasePending
+    );
+    assert_eq!(
+        render_target_release.external_release_kind,
+        VulkanExternalImageReleaseKind::RenderTarget
+    );
+    assert!(!render_target_release.external_acquire_pending);
+    assert!(!render_target_release.is_locally_usable());
+    assert!(matches!(
+        render_target_release.abort_sampled_dmabuf_foreign_release(),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    // SAFETY: The call is expected to fail before changing host-side state because this is a
+    // render-target release, not a sampled release.
+    unsafe {
+        assert!(matches!(
+            render_target_release.complete_sampled_dmabuf_foreign_release(),
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        ));
+    }
+    render_target_release
+        .abort_dmabuf_render_target_foreign_release()
+        .unwrap();
+    assert_eq!(
+        render_target_release.external_ownership,
+        VulkanExternalImageOwnership::Local
+    );
+    assert_eq!(
+        render_target_release.external_release_kind,
+        VulkanExternalImageReleaseKind::None
+    );
+
+    render_target_release
+        .begin_dmabuf_render_target_foreign_release()
+        .unwrap();
+    // SAFETY: This unit test exercises only the host-side state transition; production callers may
+    // complete a pending transfer only after the corresponding Vulkan barrier has completed.
+    unsafe {
+        render_target_release
+            .complete_dmabuf_render_target_foreign_release()
+            .unwrap()
+    };
+    assert_eq!(
+        render_target_release.external_ownership,
+        VulkanExternalImageOwnership::ForeignKnownGeneral
+    );
+    assert!(render_target_release.external_acquire_pending);
+    assert_eq!(
+        render_target_release.external_release_kind,
+        VulkanExternalImageReleaseKind::None
+    );
+    assert_eq!(
+        render_target_release.known_foreign_layout(),
+        Some(vk::ImageLayout::GENERAL)
+    );
+
+    let mut sampled_release = VulkanImageSyncState {
+        external_ownership: VulkanExternalImageOwnership::Local,
+        ..VulkanImageSyncState::default()
+    };
+    sampled_release.begin_sampled_dmabuf_foreign_release().unwrap();
+    assert_eq!(
+        sampled_release.external_release_kind,
+        VulkanExternalImageReleaseKind::Sampled
+    );
+    assert!(matches!(
+        sampled_release.abort_dmabuf_render_target_foreign_release(),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    // SAFETY: The call is expected to fail before changing host-side state because this is a sampled
+    // release, not a render-target release.
+    unsafe {
+        assert!(matches!(
+            sampled_release.complete_dmabuf_render_target_foreign_release(),
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        ));
+    }
+    sampled_release.abort_sampled_dmabuf_foreign_release().unwrap();
+
+    assert!(matches!(
+        VulkanImageSyncState::default().begin_dmabuf_render_target_foreign_release(),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    assert!(matches!(
+        VulkanImageSyncState {
+            external_ownership: VulkanExternalImageOwnership::Local,
+            external_acquire_pending: true,
+            ..VulkanImageSyncState::default()
+        }
+        .begin_dmabuf_render_target_foreign_release(),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+
+    let shared = VulkanSharedImageSyncState::new(VulkanImageSyncState {
+        external_ownership: VulkanExternalImageOwnership::Local,
+        ..VulkanImageSyncState::default()
+    });
+    shared.begin_dmabuf_render_target_foreign_release().unwrap();
+    assert_eq!(
+        shared.get().unwrap().external_ownership(),
+        VulkanExternalImageOwnership::ReleasePending
+    );
+    shared.abort_dmabuf_render_target_foreign_release().unwrap();
+    assert_eq!(
+        shared.get().unwrap().external_ownership(),
+        VulkanExternalImageOwnership::Local
+    );
+
+    let shared_complete = VulkanSharedImageSyncState::new(VulkanImageSyncState {
+        external_ownership: VulkanExternalImageOwnership::Local,
+        ..VulkanImageSyncState::default()
+    });
+    shared_complete
+        .begin_dmabuf_render_target_foreign_release()
+        .unwrap();
+    // SAFETY: This unit test exercises only the host-side state transition; production callers may
+    // complete a pending transfer only after the corresponding Vulkan barrier has completed.
+    unsafe {
+        shared_complete
+            .complete_dmabuf_render_target_foreign_release_for_tests()
+            .unwrap()
+    };
+    assert_eq!(
+        shared_complete.get().unwrap().external_ownership(),
+        VulkanExternalImageOwnership::ForeignKnownGeneral
+    );
+    assert!(shared_complete.get().unwrap().external_acquire_pending());
+}
+
+#[test]
+fn dmabuf_render_target_release_can_nest_after_pending_acquire_host_side() {
+    let mut abort_sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+    let acquire_restore = abort_sync
+        .begin_dmabuf_render_target_foreign_acquire(true)
+        .unwrap();
+    abort_sync.begin_dmabuf_render_target_foreign_release().unwrap();
+    assert_eq!(
+        abort_sync.external_ownership,
+        VulkanExternalImageOwnership::ReleasePending
+    );
+    assert!(abort_sync.external_acquire_pending);
+    assert_eq!(
+        abort_sync.external_acquire_kind,
+        VulkanExternalImageAcquireKind::RenderTarget
+    );
+    assert_eq!(
+        abort_sync.external_release_kind,
+        VulkanExternalImageReleaseKind::RenderTarget
+    );
+    abort_sync.abort_dmabuf_render_target_foreign_release().unwrap();
+    assert_eq!(
+        abort_sync.external_ownership,
+        VulkanExternalImageOwnership::AcquirePending
+    );
+    assert!(abort_sync.external_acquire_pending);
+    assert_eq!(
+        abort_sync.external_acquire_kind,
+        VulkanExternalImageAcquireKind::RenderTarget
+    );
+    abort_sync
+        .abort_dmabuf_render_target_foreign_acquire(acquire_restore)
+        .unwrap();
+    assert_eq!(
+        abort_sync,
+        VulkanImageSyncState::foreign_known_general_for_dmabuf_import()
+    );
+
+    let mut complete_sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+    complete_sync
+        .begin_dmabuf_render_target_foreign_acquire(true)
+        .unwrap();
+    complete_sync
+        .begin_dmabuf_render_target_foreign_release()
+        .unwrap();
+    // SAFETY: This intentionally checks precondition validation and returns before mutating because
+    // release completion must happen after the acquire barrier has completed.
+    unsafe {
+        assert!(matches!(
+            complete_sync.complete_dmabuf_render_target_foreign_release(),
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        ));
+    }
+    // SAFETY: This unit test exercises only the host-side state transition; production callers may
+    // complete a pending acquire only after the corresponding Vulkan barrier has completed.
+    unsafe {
+        complete_sync
+            .complete_dmabuf_render_target_foreign_acquire()
+            .unwrap()
+    };
+    assert_eq!(
+        complete_sync.external_ownership,
+        VulkanExternalImageOwnership::ReleasePending
+    );
+    assert!(!complete_sync.external_acquire_pending);
+    assert_eq!(
+        complete_sync.external_acquire_kind,
+        VulkanExternalImageAcquireKind::None
+    );
+    assert_eq!(
+        complete_sync.external_release_kind,
+        VulkanExternalImageReleaseKind::RenderTarget
+    );
+    // SAFETY: This unit test exercises only the host-side state transition; production callers may
+    // complete a pending release only after the corresponding Vulkan barrier has completed.
+    unsafe {
+        complete_sync
+            .complete_dmabuf_render_target_foreign_release()
+            .unwrap()
+    };
+    assert_eq!(
+        complete_sync,
+        VulkanImageSyncState::foreign_known_general_for_dmabuf_import()
+    );
+}
+
+#[test]
+fn dmabuf_render_target_pending_acquire_projects_to_release_plannable_local_sync() {
+    let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+    let mut acquire_pending_sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+    acquire_pending_sync
+        .begin_dmabuf_render_target_foreign_acquire(true)
+        .unwrap();
+
+    let projected = project_dmabuf_render_target_sync_after_pending_acquire(acquire_pending_sync).unwrap();
+    assert_eq!(projected.external_ownership, VulkanExternalImageOwnership::Local);
+    assert!(!projected.external_acquire_pending);
+    assert_eq!(
+        projected.external_acquire_kind,
+        VulkanExternalImageAcquireKind::None
+    );
+    assert_eq!(projected.render_target_acquire_restore_token, None);
+    assert_eq!(
+        plan_dmabuf_render_target_foreign_release_barrier(
+            &projected,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            2,
+            usage,
+        )
+        .unwrap(),
+        Some(dmabuf_render_target_foreign_release_barrier(2, usage).unwrap())
+    );
+
+    assert!(matches!(
+        project_dmabuf_render_target_sync_after_pending_acquire(VulkanImageSyncState::default()),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+
+    let mut discard_pending_sync = VulkanImageSyncState {
+        external_acquire_pending: true,
+        external_ownership: VulkanExternalImageOwnership::ForeignUnknown,
+        ..VulkanImageSyncState::default()
+    };
+    discard_pending_sync
+        .begin_dmabuf_render_target_foreign_acquire(false)
+        .unwrap();
+    let projected_discard =
+        project_dmabuf_render_target_sync_after_pending_acquire(discard_pending_sync).unwrap();
+    assert_eq!(
+        projected_discard.external_ownership,
+        VulkanExternalImageOwnership::Local
+    );
+    assert!(!projected_discard.external_acquire_pending);
+    assert_eq!(
+        projected_discard.external_acquire_kind,
+        VulkanExternalImageAcquireKind::None
+    );
+    assert_eq!(projected_discard.render_target_acquire_restore_token, None);
+    assert_eq!(projected_discard.known_foreign_layout(), None);
+
+    let mut nested_release_pending = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+    nested_release_pending
+        .begin_dmabuf_render_target_foreign_acquire(true)
+        .unwrap();
+    nested_release_pending
+        .begin_dmabuf_render_target_foreign_release()
+        .unwrap();
+    assert!(matches!(
+        project_dmabuf_render_target_sync_after_pending_acquire(nested_release_pending),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
 }
 
 #[test]
