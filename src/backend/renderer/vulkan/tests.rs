@@ -4801,6 +4801,19 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         Err(VulkanError::UnsupportedOperation("command buffer recording"))
     ));
     assert!(matches!(
+        device.record_dmabuf_render_target_foreign_acquire_barrier(
+            &mut graphics_command_buffer,
+            &owned_image,
+            false,
+        ),
+        Err(VulkanError::UnsupportedOperation("command buffer recording"))
+    ));
+    assert!(matches!(
+        device
+            .record_dmabuf_render_target_foreign_release_barrier(&mut graphics_command_buffer, &owned_image),
+        Err(VulkanError::UnsupportedOperation("command buffer recording"))
+    ));
+    assert!(matches!(
         device.end_command_buffer(&mut transfer_command_buffer),
         Err(VulkanError::UnsupportedOperation("command buffer recording"))
     ));
@@ -4828,6 +4841,19 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
     ));
     assert!(matches!(
+        device.record_dmabuf_render_target_foreign_acquire_barrier(
+            &mut graphics_command_buffer,
+            &owned_image,
+            false,
+        ),
+        Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+    ));
+    assert!(matches!(
+        device
+            .record_dmabuf_render_target_foreign_release_barrier(&mut graphics_command_buffer, &owned_image),
+        Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+    ));
+    assert!(matches!(
         device.submit_sampled_dmabuf_foreign_acquire(&owned_image, None),
         Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
     ));
@@ -4841,6 +4867,22 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     ));
     assert!(matches!(
         device.release_sampled_dmabuf_to_foreign_general(&owned_image, true),
+        Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+    ));
+    assert!(matches!(
+        device.submit_dmabuf_render_target_foreign_acquire(&owned_image, false, None),
+        Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+    ));
+    assert!(matches!(
+        device.submit_dmabuf_render_target_foreign_release(&owned_image, None),
+        Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+    ));
+    assert!(matches!(
+        device.release_dmabuf_render_target_to_foreign_general(&owned_image, false),
+        Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+    ));
+    assert!(matches!(
+        device.release_dmabuf_render_target_to_foreign_general(&owned_image, true),
         Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
     ));
     assert!(matches!(
@@ -4912,6 +4954,21 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         ));
         assert!(matches!(
             device.record_sampled_dmabuf_foreign_release_barrier(
+                &mut transfer_barrier_command_buffer,
+                &owned_image,
+            ),
+            Err(VulkanError::UnsupportedOperation("command buffer graphics queue"))
+        ));
+        assert!(matches!(
+            device.record_dmabuf_render_target_foreign_acquire_barrier(
+                &mut transfer_barrier_command_buffer,
+                &owned_image,
+                false,
+            ),
+            Err(VulkanError::UnsupportedOperation("command buffer graphics queue"))
+        ));
+        assert!(matches!(
+            device.record_dmabuf_render_target_foreign_release_barrier(
                 &mut transfer_barrier_command_buffer,
                 &owned_image,
             ),
@@ -5010,6 +5067,23 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         );
         assert!(matches!(
             device.submit_sampled_dmabuf_foreign_release(&owned_image, Some(&release_semaphore)),
+            Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+        ));
+        assert_eq!(
+            release_semaphore.payload_state_for_tests().unwrap(),
+            VulkanSyncFileSemaphorePayloadState::Unsignaled
+        );
+        assert!(matches!(
+            device
+                .submit_dmabuf_render_target_foreign_acquire(&owned_image, false, Some(&acquire_semaphore),),
+            Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
+        ));
+        assert_eq!(
+            acquire_semaphore.payload_state_for_tests().unwrap(),
+            VulkanSyncFileSemaphorePayloadState::Signaled
+        );
+        assert!(matches!(
+            device.submit_dmabuf_render_target_foreign_release(&owned_image, Some(&release_semaphore)),
             Err(VulkanError::UnsupportedOperation("dmabuf external memory"))
         ));
         assert_eq!(
