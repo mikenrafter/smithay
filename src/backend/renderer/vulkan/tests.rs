@@ -4131,6 +4131,51 @@ fn frame_finish_is_signaled_without_submitted_work() {
 }
 
 #[test]
+fn frame_finish_releases_internal_dmabuf_target_preconditions() {
+    let context_id = ContextId::new();
+    let mut missing_image = render_target_for_tests(
+        context_id.clone(),
+        VulkanImageSource::RenderTarget,
+        (1, 1).into(),
+        Some(Fourcc::Argb8888),
+    );
+    let frame = VulkanFrame {
+        context_id: context_id.clone(),
+        output_size: (1, 1).into(),
+        transform: Transform::Normal,
+        device: None,
+        target: Some(&mut missing_image),
+        _renderer: PhantomData,
+    };
+
+    assert!(matches!(
+        frame.finish(),
+        Err(VulkanError::UnsupportedOperation("dmabuf render target image"))
+    ));
+
+    let mut released_target = render_target_for_tests(
+        context_id.clone(),
+        VulkanImageSource::RenderTarget,
+        (1, 1).into(),
+        Some(Fourcc::Argb8888),
+    );
+    released_target.image.sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+    let frame = VulkanFrame {
+        context_id,
+        output_size: (1, 1).into(),
+        transform: Transform::Normal,
+        device: None,
+        target: Some(&mut released_target),
+        _renderer: PhantomData,
+    };
+
+    assert!(matches!(
+        frame.finish(),
+        Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"))
+    ));
+}
+
+#[test]
 fn frame_render_texture_supports_source_transforms_before_device_lookup() {
     let context_id = ContextId::new();
     let mut texture = texture_for_tests((2, 3).into(), Some(Fourcc::Argb8888));

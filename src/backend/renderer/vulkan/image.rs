@@ -23,6 +23,7 @@ use super::{
         VulkanSolidColorDrawConstants,
     },
     format::{get_format_info, get_render_vk_format},
+    sync_point_from_sync_file,
 };
 
 /// Vulkan frame for the provisional in-memory/offscreen renderer.
@@ -1329,8 +1330,32 @@ impl Frame for VulkanFrame<'_, '_> {
         sync.wait().map_err(|_| VulkanError::SyncInterrupted)
     }
 
-    fn finish(self) -> Result<SyncPoint, Self::Error> {
-        Ok(SyncPoint::signaled())
+    fn finish(mut self) -> Result<SyncPoint, Self::Error> {
+        let Some(target) = self.target.take() else {
+            return Ok(SyncPoint::signaled());
+        };
+        if target.image.source != VulkanImageSource::RenderTarget {
+            return Ok(SyncPoint::signaled());
+        }
+        if !target.image.sync.is_locally_usable() {
+            return Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"));
+        }
+
+        let color_image = target
+            .color_image
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("dmabuf render target image"))?;
+        let device = self
+            .device
+            .ok_or(VulkanError::UnsupportedOperation("dmabuf render target device"))?;
+        let (released, sync_file) =
+            device.release_dmabuf_render_target_to_foreign_general(color_image, false)?;
+        if released {
+            target.image.layout = VulkanImageLayoutState::Undefined;
+            target.image.sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+        }
+
+        Ok(sync_point_from_sync_file(sync_file))
     }
 }
 
