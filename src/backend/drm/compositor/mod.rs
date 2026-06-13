@@ -143,6 +143,8 @@ use smallvec::SmallVec;
 use tracing::{debug, error, info, info_span, instrument, trace, warn};
 use wayland_server::{Resource, protocol::wl_buffer::WlBuffer};
 
+#[cfg(feature = "renderer_vulkan")]
+use crate::backend::renderer::vulkan::{VulkanError, VulkanRenderer};
 #[cfg(feature = "renderer_pixman")]
 use crate::backend::renderer::{
     Frame as _, ImportAll,
@@ -186,6 +188,72 @@ mod frame_result;
 
 use elements::*;
 pub use frame_result::*;
+
+trait PrimaryRenderTargetBinder<R: Renderer> {
+    fn bind_primary<'target>(
+        renderer: &'target mut R,
+        dmabuf: &'target mut Dmabuf,
+        age: usize,
+    ) -> Result<(R::Framebuffer<'target>, usize), R::Error>;
+
+    fn release_after_render_error(
+        _renderer: &mut R,
+        _target: &mut R::Framebuffer<'_>,
+    ) -> Result<(), R::Error> {
+        Ok(())
+    }
+}
+
+struct DmabufPrimaryRenderTargetBinder;
+
+impl<R> PrimaryRenderTargetBinder<R> for DmabufPrimaryRenderTargetBinder
+where
+    R: Renderer + Bind<Dmabuf>,
+{
+    fn bind_primary<'target>(
+        renderer: &'target mut R,
+        dmabuf: &'target mut Dmabuf,
+        age: usize,
+    ) -> Result<(R::Framebuffer<'target>, usize), R::Error> {
+        renderer.bind(dmabuf).map(|target| (target, age))
+    }
+}
+
+#[cfg(feature = "renderer_vulkan")]
+struct VulkanPrimaryRenderTargetBinder;
+
+#[cfg(feature = "renderer_vulkan")]
+impl PrimaryRenderTargetBinder<VulkanRenderer> for VulkanPrimaryRenderTargetBinder {
+    fn bind_primary<'target>(
+        renderer: &'target mut VulkanRenderer,
+        dmabuf: &'target mut Dmabuf,
+        _age: usize,
+    ) -> Result<(<VulkanRenderer as Renderer>::Framebuffer<'target>, usize), VulkanError> {
+        let target = unsafe {
+            // SAFETY: `Swapchain::acquire` only hands out a GBM slot that is no longer pending for
+            // KMS scanout in this compositor. This path renders only through the acquired Vulkan
+            // target until `Frame::finish` releases it back to foreign ownership; render errors use
+            // `release_after_render_error` for the same handoff. Full repaint below avoids relying
+            // on preserved contents while acquire-fence and previous-layout handling is still
+            // scaffolded.
+            renderer.create_acquired_dmabuf_render_target_with_sync_point(dmabuf, false, None)
+        }?
+        .ok_or(VulkanError::UnsupportedOperation("dmabuf render target format"))?;
+
+        // Do not rely on preserved contents until the KMS/GBM -> Vulkan acquire path has explicit
+        // previous-layout and acquire-fence handling. Full repaint keeps the initial DRM path safe.
+        Ok((target, 0))
+    }
+
+    fn release_after_render_error(
+        renderer: &mut VulkanRenderer,
+        target: &mut <VulkanRenderer as Renderer>::Framebuffer<'_>,
+    ) -> Result<(), VulkanError> {
+        renderer
+            .release_acquired_dmabuf_render_target_to_foreign_general_sync_point(target, false)
+            .map(|_| ())
+    }
+}
 
 impl RenderElementState {
     pub(crate) fn zero_copy(visible_area: usize) -> Self {
@@ -1704,6 +1772,54 @@ where
         R: Renderer + Bind<Dmabuf>,
         R::TextureId: Texture + 'static,
     {
+        self.render_frame_with_primary_binder::<R, E, DmabufPrimaryRenderTargetBinder>(
+            renderer,
+            elements,
+            clear_color,
+            frame_flags,
+        )
+    }
+
+    /// Render the next frame using Vulkan's crate-internal dmabuf render-target path.
+    ///
+    /// This does not enable public Vulkan [`Bind<Dmabuf>`] support. The GBM swapchain buffer is
+    /// acquired by Vulkan as a render target and fully repainted before `Frame::finish` releases it
+    /// back to foreign ownership for KMS scanout.
+    #[cfg(feature = "renderer_vulkan")]
+    #[instrument(level = "trace", parent = &self.span, skip_all)]
+    #[profiling::function]
+    pub fn render_frame_vulkan<'a, E>(
+        &mut self,
+        renderer: &mut VulkanRenderer,
+        elements: &'a [E],
+        clear_color: impl Into<Color32F>,
+        frame_flags: FrameFlags,
+    ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, VulkanRenderer>>
+    where
+        E: RenderElement<VulkanRenderer>,
+        <VulkanRenderer as Renderer>::TextureId: Texture + 'static,
+    {
+        self.render_frame_with_primary_binder::<VulkanRenderer, E, VulkanPrimaryRenderTargetBinder>(
+            renderer,
+            elements,
+            clear_color,
+            frame_flags,
+        )
+    }
+
+    fn render_frame_with_primary_binder<'a, R, E, B>(
+        &mut self,
+        renderer: &mut R,
+        elements: &'a [E],
+        clear_color: impl Into<Color32F>,
+        frame_flags: FrameFlags,
+    ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
+    where
+        E: RenderElement<R>,
+        R: Renderer,
+        R::TextureId: Texture + 'static,
+        B: PrimaryRenderTargetBinder<R>,
+    {
         let mut clear_color = clear_color.into();
 
         if !self.surface.is_active() {
@@ -2247,8 +2363,7 @@ where
                 )
                 .collect::<Vec<_>>();
 
-            let mut framebuffer = renderer
-                .bind(&mut dmabuf)
+            let (mut framebuffer, age) = B::bind_primary(renderer, &mut dmabuf, age)
                 .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
             let render_res =
                 self.damage_tracker
@@ -2347,9 +2462,16 @@ where
                     }
                 }
                 Err(err) => {
+                    let release_error = B::release_after_render_error(renderer, &mut framebuffer).err();
+
                     // Rendering failed at some point, reset the buffers
                     // as we probably now have some half drawn buffer
                     self.swapchain.reset_buffers();
+                    if let Some(err) = release_error {
+                        return Err(
+                            RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)).into(),
+                        );
+                    }
                     return Err(RenderFrameError::from(err));
                 }
             }

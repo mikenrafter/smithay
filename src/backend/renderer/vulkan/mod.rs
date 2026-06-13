@@ -439,12 +439,12 @@ impl VulkanRenderer {
     /// `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT`. If `preserve_contents` is false, previous
     /// contents are discarded.
     #[allow(dead_code)]
-    pub(crate) unsafe fn create_acquired_dmabuf_render_target_with_sync_point(
+    pub(crate) unsafe fn create_acquired_dmabuf_render_target_with_sync_point<'target>(
         &mut self,
-        dmabuf: &Dmabuf,
+        dmabuf: &'target Dmabuf,
         preserve_contents: bool,
         acquire_sync: Option<&SyncPoint>,
-    ) -> Result<Option<VulkanRenderTarget<'static>>, VulkanError> {
+    ) -> Result<Option<VulkanRenderTarget<'target>>, VulkanError> {
         let import = validate_dmabuf_render_target_metadata(dmabuf)?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
         let Some(color_image) = (unsafe {
