@@ -32,6 +32,7 @@ use super::device::{
     validate_submit_wait_stage, vulkan_filter,
 };
 use super::error::vulkan_api_result_invalidates_context;
+use super::format::is_10bit;
 use super::image::{
     VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalImageAcquireKind, VulkanExternalImageOwnership,
     VulkanExternalImageReleaseKind, VulkanExternalMemoryHandleType, VulkanExternalMemoryState,
@@ -5665,9 +5666,18 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert!(!caps.import.dmabuf);
     assert_eq!(caps.export.memory, caps.rendering.offscreen);
     assert!(!caps.export.dmabuf);
-    assert!(!caps.rendering.dmabuf_targets);
-    assert!(!caps.rendering.dmabuf_target_modifiers);
-    assert!(caps.formats.dmabuf_render_target.iter().next().is_none());
+    let has_dmabuf_render_target_formats = caps.formats.dmabuf_render_target.iter().next().is_some();
+    assert_eq!(caps.rendering.dmabuf_targets, has_dmabuf_render_target_formats);
+    assert_eq!(
+        caps.rendering.dmabuf_target_modifiers,
+        has_dmabuf_render_target_formats
+    );
+    assert!(
+        caps.formats
+            .dmabuf_render_target
+            .iter()
+            .all(|format| matches!(is_10bit(format.code), Ok(false)))
+    );
     assert!(!caps.sync.explicit);
     if let Some(record) = caps
         .formats
@@ -5704,7 +5714,6 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         }
         assert!(!caps.import.dmabuf);
         assert!(caps.formats.dmabuf_import.iter().next().is_none());
-        assert!(caps.formats.dmabuf_render_target.iter().next().is_none());
     }
     assert!(caps.rendering.offscreen);
     assert!(!caps.rendering.blit);
@@ -7336,7 +7345,11 @@ fn runtime_format_discovery_finds_device_backed_formats_without_import_export() 
     );
     assert!(caps.dmabuf_import.iter().next().is_none());
     assert!(caps.dmabuf_export.iter().next().is_none());
-    assert!(caps.dmabuf_render_target.iter().next().is_none());
+    assert!(
+        caps.dmabuf_render_target
+            .iter()
+            .all(|format| matches!(is_10bit(format.code), Ok(false)))
+    );
 }
 
 #[test]
