@@ -1034,6 +1034,18 @@ fn dmabuf_import_candidate_requires_importable_single_sample_extent() {
     zero_layers.image_format_properties.max_array_layers = 0;
     assert!(!zero_layers.supports_sampled_import(&import));
 
+    let mut zero_mip_levels = dmabuf_external_image_properties_for_tests(
+        true,
+        vk::Extent3D {
+            width: 4,
+            height: 3,
+            depth: 1,
+        },
+        vk::SampleCountFlags::TYPE_1,
+    );
+    zero_mip_levels.image_format_properties.max_mip_levels = 0;
+    assert!(!zero_mip_levels.supports_sampled_import(&import));
+
     let no_single_sample = dmabuf_external_image_properties_for_tests(
         true,
         vk::Extent3D {

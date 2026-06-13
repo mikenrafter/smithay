@@ -429,6 +429,7 @@ impl VulkanDmabufExternalImageFormatProperties {
                 .image_format_properties
                 .sample_counts
                 .contains(vk::SampleCountFlags::TYPE_1)
+            && self.image_format_properties.max_mip_levels >= 1
             && self.image_format_properties.max_array_layers >= 1
             && self.image_format_properties.max_extent.width >= import.size.w.try_into().unwrap_or_default()
             && self.image_format_properties.max_extent.height >= import.size.h.try_into().unwrap_or_default()
