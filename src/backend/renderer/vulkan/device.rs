@@ -4083,6 +4083,61 @@ pub(super) fn sampled_dmabuf_foreign_release_barrier(
 }
 
 #[allow(dead_code)]
+pub(super) fn dmabuf_render_target_foreign_acquire_barrier(
+    external_layout: vk::ImageLayout,
+    graphics_queue_family: u32,
+    usage: vk::ImageUsageFlags,
+) -> Result<VulkanExternalImageBarrier, VulkanError> {
+    if !usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+        return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
+    }
+    if !is_local_queue_family_index(graphics_queue_family) {
+        return Err(VulkanError::UnsupportedOperation("dmabuf queue family"));
+    }
+    if !matches!(
+        external_layout,
+        vk::ImageLayout::UNDEFINED | vk::ImageLayout::GENERAL
+    ) {
+        return Err(VulkanError::UnsupportedOperation("dmabuf external layout"));
+    }
+
+    Ok(VulkanExternalImageBarrier {
+        src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+        dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        src_access: vk::AccessFlags::empty(),
+        dst_access: vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        old_layout: external_layout,
+        new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        src_queue_family_index: vk::QUEUE_FAMILY_FOREIGN_EXT,
+        dst_queue_family_index: graphics_queue_family,
+    })
+}
+
+#[allow(dead_code)]
+pub(super) fn dmabuf_render_target_foreign_release_barrier(
+    graphics_queue_family: u32,
+    usage: vk::ImageUsageFlags,
+) -> Result<VulkanExternalImageBarrier, VulkanError> {
+    if !usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+        return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
+    }
+    if !is_local_queue_family_index(graphics_queue_family) {
+        return Err(VulkanError::UnsupportedOperation("dmabuf queue family"));
+    }
+
+    Ok(VulkanExternalImageBarrier {
+        src_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        dst_stage: vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+        src_access: vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        dst_access: vk::AccessFlags::empty(),
+        old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        new_layout: vk::ImageLayout::GENERAL,
+        src_queue_family_index: graphics_queue_family,
+        dst_queue_family_index: vk::QUEUE_FAMILY_FOREIGN_EXT,
+    })
+}
+
+#[allow(dead_code)]
 pub(super) fn plan_sampled_dmabuf_foreign_acquire_barrier(
     sync: &VulkanImageSyncState,
     graphics_queue_family: u32,
@@ -4126,6 +4181,73 @@ pub(super) fn plan_sampled_dmabuf_foreign_release_barrier(
             }
 
             sampled_dmabuf_foreign_release_barrier(graphics_queue_family, usage).map(Some)
+        }
+        (VulkanExternalImageOwnership::None, false) => Ok(None),
+        (VulkanExternalImageOwnership::None, true)
+        | (VulkanExternalImageOwnership::ForeignUnknown, _)
+        | (VulkanExternalImageOwnership::ForeignKnownGeneral, _)
+        | (VulkanExternalImageOwnership::AcquirePending, _)
+        | (VulkanExternalImageOwnership::ReleasePending, _) => {
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(super) fn plan_dmabuf_render_target_foreign_acquire_barrier(
+    sync: &VulkanImageSyncState,
+    graphics_queue_family: u32,
+    usage: vk::ImageUsageFlags,
+    preserve_contents: bool,
+) -> Result<Option<VulkanExternalImageBarrier>, VulkanError> {
+    match (sync.external_ownership(), sync.external_acquire_pending()) {
+        (VulkanExternalImageOwnership::ForeignKnownGeneral, true) => {
+            let external_layout = sync
+                .known_foreign_layout()
+                .ok_or(VulkanError::UnsupportedOperation("dmabuf external layout"))?;
+            dmabuf_render_target_foreign_acquire_barrier(external_layout, graphics_queue_family, usage)
+                .map(Some)
+        }
+        (VulkanExternalImageOwnership::ForeignUnknown, true) if !preserve_contents => {
+            dmabuf_render_target_foreign_acquire_barrier(
+                vk::ImageLayout::UNDEFINED,
+                graphics_queue_family,
+                usage,
+            )
+            .map(Some)
+        }
+        (VulkanExternalImageOwnership::None, false) | (VulkanExternalImageOwnership::Local, false) => {
+            Ok(None)
+        }
+        (VulkanExternalImageOwnership::ForeignUnknown, true)
+        | (VulkanExternalImageOwnership::ForeignUnknown, false)
+        | (VulkanExternalImageOwnership::ForeignKnownGeneral, false)
+        | (VulkanExternalImageOwnership::AcquirePending, _)
+        | (VulkanExternalImageOwnership::None, true)
+        | (VulkanExternalImageOwnership::Local, true)
+        | (VulkanExternalImageOwnership::ReleasePending, _) => {
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(super) fn plan_dmabuf_render_target_foreign_release_barrier(
+    sync: &VulkanImageSyncState,
+    local_layout: vk::ImageLayout,
+    graphics_queue_family: u32,
+    usage: vk::ImageUsageFlags,
+) -> Result<Option<VulkanExternalImageBarrier>, VulkanError> {
+    match (sync.external_ownership(), sync.external_acquire_pending()) {
+        (VulkanExternalImageOwnership::Local, true) => {
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        }
+        (VulkanExternalImageOwnership::Local, false) => {
+            if local_layout != vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+                return Err(VulkanError::UnsupportedOperation("dmabuf local layout"));
+            }
+
+            dmabuf_render_target_foreign_release_barrier(graphics_queue_family, usage).map(Some)
         }
         (VulkanExternalImageOwnership::None, false) => Ok(None),
         (VulkanExternalImageOwnership::None, true)

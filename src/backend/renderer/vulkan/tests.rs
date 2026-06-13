@@ -23,7 +23,9 @@ use super::device::{
     VulkanDeviceState, VulkanDmabufExternalImageFormatProperties, VulkanSampledTexturePipelineShaders,
     VulkanShaderSpirv, VulkanSharedImageSyncState, VulkanSubmitSynchronization, VulkanSyncFileImport,
     VulkanSyncFileSemaphorePayloadState, dmabuf_import_memory_type_bits, dmabuf_plane_layouts,
+    dmabuf_render_target_foreign_acquire_barrier, dmabuf_render_target_foreign_release_barrier,
     find_memory_type_index, image_copy_buffer_offset, image_copy_required_size, image_layout_transition,
+    plan_dmabuf_render_target_foreign_acquire_barrier, plan_dmabuf_render_target_foreign_release_barrier,
     plan_sampled_dmabuf_foreign_acquire_barrier, plan_sampled_dmabuf_foreign_release_barrier,
     sampled_dmabuf_foreign_acquire_barrier, sampled_dmabuf_foreign_release_barrier, select_queue_families,
     tightly_packed_image_size, validate_submit_wait_stage, vulkan_filter,
@@ -1768,6 +1770,160 @@ fn sampled_dmabuf_foreign_barriers_require_known_external_layout() {
         release_vk_barrier.dst_queue_family_index,
         release.dst_queue_family_index
     );
+}
+
+#[test]
+fn dmabuf_render_target_foreign_barriers_distinguish_discard_and_preserve_acquire() {
+    let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+    let fresh_import_sync = VulkanImageSyncState {
+        external_acquire_pending: true,
+        external_ownership: VulkanExternalImageOwnership::ForeignUnknown,
+        ..VulkanImageSyncState::default()
+    };
+    let released_sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+    let local_sync = VulkanImageSyncState {
+        external_ownership: VulkanExternalImageOwnership::Local,
+        ..VulkanImageSyncState::default()
+    };
+    let pending_local_sync = VulkanImageSyncState {
+        external_acquire_pending: true,
+        external_ownership: VulkanExternalImageOwnership::Local,
+        ..VulkanImageSyncState::default()
+    };
+
+    let discard_acquire =
+        dmabuf_render_target_foreign_acquire_barrier(vk::ImageLayout::UNDEFINED, 2, usage).unwrap();
+    assert_eq!(discard_acquire.src_stage, vk::PipelineStageFlags::TOP_OF_PIPE);
+    assert_eq!(
+        discard_acquire.dst_stage,
+        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+    );
+    assert_eq!(discard_acquire.src_access, vk::AccessFlags::empty());
+    assert_eq!(
+        discard_acquire.dst_access,
+        vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+    );
+    assert_eq!(discard_acquire.old_layout, vk::ImageLayout::UNDEFINED);
+    assert_eq!(
+        discard_acquire.new_layout,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+    );
+    assert_eq!(
+        discard_acquire.src_queue_family_index,
+        vk::QUEUE_FAMILY_FOREIGN_EXT
+    );
+    assert_eq!(discard_acquire.dst_queue_family_index, 2);
+    assert_eq!(
+        plan_dmabuf_render_target_foreign_acquire_barrier(&fresh_import_sync, 2, usage, false).unwrap(),
+        Some(discard_acquire)
+    );
+    assert!(matches!(
+        plan_dmabuf_render_target_foreign_acquire_barrier(&fresh_import_sync, 2, usage, true),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+
+    let preserve_acquire =
+        dmabuf_render_target_foreign_acquire_barrier(vk::ImageLayout::GENERAL, 2, usage).unwrap();
+    assert_eq!(preserve_acquire.old_layout, vk::ImageLayout::GENERAL);
+    assert_eq!(
+        preserve_acquire.new_layout,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+    );
+    assert_eq!(
+        plan_dmabuf_render_target_foreign_acquire_barrier(&released_sync, 2, usage, true).unwrap(),
+        Some(preserve_acquire)
+    );
+    assert_eq!(
+        plan_dmabuf_render_target_foreign_acquire_barrier(&local_sync, 2, usage, false).unwrap(),
+        None
+    );
+    assert!(matches!(
+        dmabuf_render_target_foreign_acquire_barrier(vk::ImageLayout::PREINITIALIZED, 2, usage),
+        Err(VulkanError::UnsupportedOperation("dmabuf external layout"))
+    ));
+    assert!(matches!(
+        dmabuf_render_target_foreign_acquire_barrier(
+            vk::ImageLayout::UNDEFINED,
+            2,
+            vk::ImageUsageFlags::SAMPLED,
+        ),
+        Err(VulkanError::UnsupportedOperation("image color attachment usage"))
+    ));
+    assert!(matches!(
+        dmabuf_render_target_foreign_acquire_barrier(
+            vk::ImageLayout::UNDEFINED,
+            vk::QUEUE_FAMILY_FOREIGN_EXT,
+            usage,
+        ),
+        Err(VulkanError::UnsupportedOperation("dmabuf queue family"))
+    ));
+
+    let release = dmabuf_render_target_foreign_release_barrier(2, usage).unwrap();
+    assert_eq!(release.src_stage, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT);
+    assert_eq!(release.dst_stage, vk::PipelineStageFlags::BOTTOM_OF_PIPE);
+    assert_eq!(
+        release.src_access,
+        vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+    );
+    assert_eq!(release.dst_access, vk::AccessFlags::empty());
+    assert_eq!(release.old_layout, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    assert_eq!(release.new_layout, vk::ImageLayout::GENERAL);
+    assert_eq!(release.src_queue_family_index, 2);
+    assert_eq!(release.dst_queue_family_index, vk::QUEUE_FAMILY_FOREIGN_EXT);
+    assert_eq!(
+        plan_dmabuf_render_target_foreign_release_barrier(
+            &local_sync,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            2,
+            usage,
+        )
+        .unwrap(),
+        Some(release)
+    );
+    assert_eq!(
+        plan_dmabuf_render_target_foreign_release_barrier(
+            &VulkanImageSyncState::default(),
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            2,
+            usage,
+        )
+        .unwrap(),
+        None
+    );
+    assert!(matches!(
+        plan_dmabuf_render_target_foreign_release_barrier(&local_sync, vk::ImageLayout::GENERAL, 2, usage,),
+        Err(VulkanError::UnsupportedOperation("dmabuf local layout"))
+    ));
+    assert!(matches!(
+        plan_dmabuf_render_target_foreign_release_barrier(
+            &pending_local_sync,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            2,
+            usage,
+        ),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    assert!(matches!(
+        dmabuf_render_target_foreign_release_barrier(vk::QUEUE_FAMILY_FOREIGN_EXT, usage),
+        Err(VulkanError::UnsupportedOperation("dmabuf queue family"))
+    ));
+    assert!(matches!(
+        dmabuf_render_target_foreign_release_barrier(2, vk::ImageUsageFlags::SAMPLED),
+        Err(VulkanError::UnsupportedOperation("image color attachment usage"))
+    ));
+
+    let image = vk::Image::null();
+    let vk_barrier = discard_acquire.to_color_image_memory_barrier(image);
+    assert_eq!(vk_barrier.s_type, vk::StructureType::IMAGE_MEMORY_BARRIER);
+    assert_eq!(vk_barrier.image, image);
+    assert_eq!(vk_barrier.old_layout, vk::ImageLayout::UNDEFINED);
+    assert_eq!(vk_barrier.new_layout, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    assert_eq!(
+        vk_barrier.subresource_range.aspect_mask,
+        vk::ImageAspectFlags::COLOR
+    );
+    assert_eq!(vk_barrier.subresource_range.level_count, 1);
+    assert_eq!(vk_barrier.subresource_range.layer_count, 1);
 }
 
 #[test]
