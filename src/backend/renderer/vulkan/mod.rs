@@ -407,6 +407,9 @@ impl VulkanRenderer {
         if target.image.source != image::VulkanImageSource::RenderTarget {
             return Err(VulkanError::UnsupportedOperation("dmabuf render target"));
         }
+        if !target.image.sync.is_locally_usable() {
+            return Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"));
+        }
         let color_image = target
             .color_image
             .as_ref()

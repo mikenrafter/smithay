@@ -3065,6 +3065,13 @@ fn internal_dmabuf_render_target_release_rejects_preconditions_before_device_loo
         (1, 1).into(),
         Some(Fourcc::Argb8888),
     );
+    let mut released_target = render_target_for_tests(
+        renderer.context_id(),
+        VulkanImageSource::RenderTarget,
+        (1, 1).into(),
+        Some(Fourcc::Argb8888),
+    );
+    released_target.image.sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
 
     assert!(matches!(
         renderer.release_acquired_dmabuf_render_target_to_foreign_general(&mut foreign_target, false),
@@ -3077,6 +3084,10 @@ fn internal_dmabuf_render_target_release_rejects_preconditions_before_device_loo
     assert!(matches!(
         renderer.release_acquired_dmabuf_render_target_to_foreign_general(&mut missing_image, false),
         Err(VulkanError::UnsupportedOperation("dmabuf render target image"))
+    ));
+    assert!(matches!(
+        renderer.release_acquired_dmabuf_render_target_to_foreign_general(&mut released_target, false),
+        Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"))
     ));
 }
 
