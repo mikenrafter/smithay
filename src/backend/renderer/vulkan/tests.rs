@@ -548,6 +548,7 @@ fn external_sync_file_properties_map_import_export_features() {
 fn sync_file_semaphore_helpers_require_capabilities_before_device_lookup() {
     let device = VulkanDeviceState::empty_for_tests();
 
+    assert!(!device.can_export_sync_file());
     assert!(matches!(
         // SAFETY: The helper returns before using the import payload because sync-file import
         // capabilities are disabled on an empty test device.

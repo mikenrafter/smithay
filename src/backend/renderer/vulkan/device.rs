@@ -747,6 +747,10 @@ impl VulkanDeviceState {
         self.create_sync_file_semaphore(true, false)
     }
 
+    pub(crate) fn can_export_sync_file(&self) -> bool {
+        self.capabilities.external_sync.sync_file_exportable && self.external_sync_fns.is_some()
+    }
+
     /// Import a Linux sync-file fd into a temporary Vulkan binary semaphore payload.
     ///
     /// # Safety
@@ -1577,7 +1581,13 @@ impl VulkanDeviceState {
             // SAFETY: `submit_dmabuf_render_target_foreign_release` waits for queue completion before
             // returning successfully. The semaphore was created by this device for sync-file export
             // and has a completed signal payload from that waited release submit.
-            unsafe { self.export_sync_file_semaphore(&release_semaphore)? }
+            match unsafe { self.export_sync_file_semaphore(&release_semaphore) } {
+                Ok(sync_file) => sync_file,
+                Err(err) => {
+                    tracing::warn!(?err, "failed to export dmabuf render-target release fence");
+                    None
+                }
+            }
         } else {
             None
         };
@@ -1604,7 +1614,13 @@ impl VulkanDeviceState {
             // SAFETY: `submit_sampled_dmabuf_foreign_release` waits for queue completion before
             // returning successfully. The semaphore was created by this device for sync-file export
             // and has a completed signal payload from that waited release submit.
-            unsafe { self.export_sync_file_semaphore(&release_semaphore)? }
+            match unsafe { self.export_sync_file_semaphore(&release_semaphore) } {
+                Ok(sync_file) => sync_file,
+                Err(err) => {
+                    tracing::warn!(?err, "failed to export sampled dmabuf release fence");
+                    None
+                }
+            }
         } else {
             None
         };

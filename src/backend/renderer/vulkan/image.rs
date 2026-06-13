@@ -1348,8 +1348,8 @@ impl Frame for VulkanFrame<'_, '_> {
         let device = self
             .device
             .ok_or(VulkanError::UnsupportedOperation("dmabuf render target device"))?;
-        let (released, sync_file) =
-            device.release_dmabuf_render_target_to_foreign_general(color_image, false)?;
+        let (released, sync_file) = device
+            .release_dmabuf_render_target_to_foreign_general(color_image, device.can_export_sync_file())?;
         if released {
             target.image.layout = VulkanImageLayoutState::Undefined;
             target.image.sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
