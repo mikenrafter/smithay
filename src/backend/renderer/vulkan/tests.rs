@@ -3086,10 +3086,17 @@ fn public_bind_rejects_invalid_vulkan_targets_before_device_lookup() {
 fn public_dmabuf_bind_uses_acquired_target_path() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let mut dmabuf = dmabuf_for_tests();
+    let default_acquire = VulkanDmabufRenderTargetAcquire::default();
+    let signaled_sync = SyncPoint::signaled();
+    let preserve_acquire = VulkanDmabufRenderTargetAcquire::preserve(Some(&signaled_sync));
 
     let formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
         .expect("Vulkan dmabuf render targets have an explicit format set");
     assert!(formats.iter().next().is_none());
+    assert!(!default_acquire.preserve_contents);
+    assert!(default_acquire.acquire_sync.is_none());
+    assert!(preserve_acquire.preserve_contents);
+    assert!(preserve_acquire.acquire_sync.is_some());
     assert_eq!(
         <VulkanRenderer as Bind<Dmabuf>>::target_age(&renderer, &dmabuf, 3),
         0
@@ -3114,6 +3121,20 @@ fn public_dmabuf_bind_uses_acquired_target_path() {
                 Some(&SyncPoint::signaled()),
             )
         },
+        Err(VulkanError::VulkanUnavailable)
+    ));
+    assert!(matches!(
+        // SAFETY: This scaffold renderer has no Vulkan device, so the public explicit API returns
+        // before any sync-point wait, Vulkan import, or ownership-transfer operation can occur.
+        unsafe {
+            renderer.bind_dmabuf_render_target(&mut dmabuf, VulkanDmabufRenderTargetAcquire::discard())
+        },
+        Err(VulkanError::VulkanUnavailable)
+    ));
+    assert!(matches!(
+        // SAFETY: This scaffold renderer has no Vulkan device, so the public explicit API returns
+        // before any sync-point wait, Vulkan import, or ownership-transfer operation can occur.
+        unsafe { renderer.bind_dmabuf_render_target(&mut dmabuf, preserve_acquire) },
         Err(VulkanError::VulkanUnavailable)
     ));
 }
@@ -3161,6 +3182,22 @@ fn public_dmabuf_bind_validates_metadata_before_device_lookup() {
     ));
     assert!(matches!(
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut multi_plane),
+        Err(VulkanError::UnsupportedOperation("dmabuf render target planes"))
+    ));
+    assert!(matches!(
+        // SAFETY: Invalid metadata is rejected before any Vulkan import or ownership-transfer
+        // operation can occur.
+        unsafe {
+            renderer.bind_dmabuf_render_target(&mut zero_width, VulkanDmabufRenderTargetAcquire::discard())
+        },
+        Err(VulkanError::UnsupportedOperation("dmabuf size"))
+    ));
+    assert!(matches!(
+        // SAFETY: Invalid metadata is rejected before any Vulkan import or ownership-transfer
+        // operation can occur.
+        unsafe {
+            renderer.bind_dmabuf_render_target(&mut multi_plane, VulkanDmabufRenderTargetAcquire::discard())
+        },
         Err(VulkanError::UnsupportedOperation("dmabuf render target planes"))
     ));
     assert!(matches!(

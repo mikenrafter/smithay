@@ -1,21 +1,24 @@
 //! Native Vulkan renderer.
 //!
 //! This module provides a provisional, opt-in Vulkan renderer for an explicit [`PhysicalDevice`]. It
-//! can upload sampled textures from CPU memory, render to in-memory/offscreen targets, and read back
+//! can upload sampled textures from CPU memory, render to in-memory/offscreen targets, read back
 //! those offscreen targets through Smithay's public [`ImportMem`], [`Bind`], [`Offscreen`],
-//! [`Renderer`], and [`ExportMem`] traits. It remains intentionally incomplete and does not expose
-//! general Vulkan compositor support, present to KMS, implement HDR, or perform colour-management
-//! policy.
+//! [`Renderer`], and [`ExportMem`] traits, and expose experimental public dmabuf render-target
+//! development hooks. It remains intentionally incomplete and does not provide a complete compositor
+//! renderer, HDR, colour-management policy, or a fully integrated presentation backend.
 //!
 //! Downstream compositors must not treat the presence of this module or the `renderer_vulkan`
 //! feature as broad Vulkan rendering support. Real enablement must be added incrementally behind
 //! explicit capability bits, with tests and stub failure paths before enabling working
 //! functionality.
 //!
-//! Smithay's optional renderer traits are capability surfaces. This module currently supports the
-//! tested CPU-memory/offscreen path only. `ImportDma`, texture `ExportMem`, `ExportDma`, explicit
-//! sync, blit/copy, and presentation remain unsupported until the corresponding capability bit can
-//! become true with coverage.
+//! Smithay's optional renderer traits are capability surfaces. The CPU-memory/offscreen path is the
+//! most complete path. Dmabuf render-target support is intentionally public in this development fork,
+//! but its Vulkan external-ownership and synchronization preconditions are explicit on
+//! [`VulkanRenderer::bind_dmabuf_render_target`]. Generic [`Bind<Dmabuf>`] is a convenience bridge to
+//! that public development path, not proof that arbitrary dmabufs are safe to bind. `ImportDma`,
+//! texture `ExportMem`, `ExportDma`, broad explicit sync, blit/copy, and full presentation remain
+//! unsupported until their corresponding capability bits can become true with coverage.
 //!
 //! Intended implementation order:
 //!
@@ -85,6 +88,47 @@ pub use self::{
     error::VulkanError,
     image::{VulkanFrame, VulkanMemoryMapping, VulkanRenderTarget, VulkanTexture},
 };
+
+/// Acquire options for binding a foreign dmabuf as a Vulkan render target.
+///
+/// This is the public development-fork API for the Vulkan-specific external target contract. It is
+/// explicit because a plain [`Dmabuf`] does not encode Vulkan queue-family ownership, image layout,
+/// or acquire synchronization.
+#[derive(Debug, Clone, Copy)]
+pub struct VulkanDmabufRenderTargetAcquire<'a> {
+    /// Preserve previous target contents during acquire.
+    ///
+    /// If this is `true`, the foreign side must have released the image in
+    /// `VK_IMAGE_LAYOUT_GENERAL`. If this is `false`, previous contents are discarded and the
+    /// renderer will force an effective target age of zero through the generic bridge.
+    pub preserve_contents: bool,
+    /// Optional producer-completion dependency for the foreign release into Vulkan ownership.
+    pub acquire_sync: Option<&'a SyncPoint>,
+}
+
+impl<'a> VulkanDmabufRenderTargetAcquire<'a> {
+    /// Acquire for a full repaint, discarding previous contents.
+    pub fn discard() -> Self {
+        Self {
+            preserve_contents: false,
+            acquire_sync: None,
+        }
+    }
+
+    /// Acquire while preserving previous contents after `acquire_sync` is satisfied.
+    pub fn preserve(acquire_sync: Option<&'a SyncPoint>) -> Self {
+        Self {
+            preserve_contents: true,
+            acquire_sync,
+        }
+    }
+}
+
+impl Default for VulkanDmabufRenderTargetAcquire<'_> {
+    fn default() -> Self {
+        Self::discard()
+    }
+}
 
 use self::{
     device::{
@@ -382,7 +426,8 @@ impl VulkanRenderer {
 
     /// Import a dmabuf as a render target and acquire it for color-attachment rendering.
     ///
-    /// This is the implementation helper behind public [`Bind<Dmabuf>`].
+    /// This is the implementation helper behind the explicit public dmabuf render-target API and
+    /// generic [`Bind<Dmabuf>`] bridge.
     ///
     /// # Safety
     ///
@@ -421,7 +466,7 @@ impl VulkanRenderer {
     /// optional producer-completion dependency.
     ///
     /// This is a sync-point convenience wrapper for the acquired dmabuf render-target path used by
-    /// the public [`Bind<Dmabuf>`] implementation.
+    /// the explicit public dmabuf render-target API and generic [`Bind<Dmabuf>`] bridge.
     ///
     /// # Safety
     ///
@@ -461,6 +506,44 @@ impl VulkanRenderer {
             &import,
             color_image,
         )))
+    }
+
+    /// Bind a foreign dmabuf as a Vulkan render target using explicit Vulkan acquire semantics.
+    ///
+    /// This method is intentionally public in this development fork. It is the correct Vulkan-shaped
+    /// entry point for callers that can reason about external-memory ownership, layout, and acquire
+    /// synchronization. The generic [`Bind<Dmabuf>`] implementation delegates here with
+    /// [`VulkanDmabufRenderTargetAcquire::discard`] for the current DRM development path.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the foreign producer has released ownership to
+    /// `VK_QUEUE_FAMILY_FOREIGN_EXT` before this acquire is submitted. If
+    /// `acquire.preserve_contents` is true, the producer must have released the image in
+    /// `VK_IMAGE_LAYOUT_GENERAL`. If `acquire.acquire_sync` is present, it must represent the
+    /// producer's completion dependency for that release and signal only after the producer's writes
+    /// and ownership release for this dmabuf are complete. If it is absent, those operations must
+    /// already be complete and visible to this renderer's Vulkan queue submission. If the sync point
+    /// exports a fence fd and this device supports sync-file import, that fd must be a valid Linux
+    /// sync-file fd suitable for `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT`. If
+    /// `preserve_contents` is false, previous contents are discarded. The caller must not bind the
+    /// same underlying dmabuf storage through another alias while the returned target is acquired.
+    /// After a successful acquire, renderers must either finish a frame for the returned target or
+    /// call the matching error-cleanup path before reusing the dmabuf externally; dropping the target
+    /// alone does not release Vulkan ownership back to the foreign queue family.
+    pub unsafe fn bind_dmabuf_render_target<'target>(
+        &mut self,
+        dmabuf: &'target mut Dmabuf,
+        acquire: VulkanDmabufRenderTargetAcquire<'_>,
+    ) -> Result<Option<VulkanRenderTarget<'target>>, VulkanError> {
+        // SAFETY: Forwarded from this public unsafe method's caller.
+        unsafe {
+            self.create_acquired_dmabuf_render_target_with_sync_point(
+                dmabuf,
+                acquire.preserve_contents,
+                acquire.acquire_sync,
+            )
+        }
     }
 
     /// Release an acquired dmabuf texture back to foreign ownership in `VK_IMAGE_LAYOUT_GENERAL`.
@@ -709,15 +792,12 @@ impl<'target> Bind<VulkanRenderTarget<'target>> for VulkanRenderer {
 impl Bind<Dmabuf> for VulkanRenderer {
     fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
         unsafe {
-            // SAFETY: Public `Bind<Dmabuf>` follows the external-target contract documented on the
-            // trait: callers must only bind dmabufs that are no longer concurrently accessed by a
-            // foreign producer or consumer. For Vulkan this means the foreign side has relinquished
-            // external-memory ownership/access and made prior writes visible before this acquire is
-            // submitted. We discard prior contents and report an effective target age of zero below,
-            // so this acquire does not depend on a preserved foreign layout. `Frame::finish`
-            // releases the target back to foreign ownership; the generic DRM render path calls
-            // `release_after_render_error` if rendering fails first.
-            self.create_acquired_dmabuf_render_target_with_sync_point(target, false, None)
+            // SAFETY: This generic bridge intentionally selects the discard acquire mode of the
+            // explicit public dmabuf render-target API. Callers still need to satisfy that method's
+            // external-ownership and visibility preconditions before binding. The generic DRM path
+            // currently has no typed way to carry those invariants, so this remains a development
+            // bridge rather than a claim that arbitrary dmabufs are safe Vulkan targets.
+            self.bind_dmabuf_render_target(target, VulkanDmabufRenderTargetAcquire::discard())
         }?
         .ok_or(VulkanError::UnsupportedOperation("dmabuf render target format"))
     }

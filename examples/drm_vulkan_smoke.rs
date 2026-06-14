@@ -1,10 +1,10 @@
-//! Minimal real-screen Vulkan/DRM smoke test.
+//! Minimal real-screen DRM/Vulkan smoke test.
 //!
-//! This example is intended to be run manually from an active physical VT with DRM master
-//! permissions. It opens a DRM card node through Smithay's libseat session backend, may take over
-//! the connected display, and does not restore previous KMS state. It renders a solid colour into a
-//! GBM scanout buffer through [`VulkanRenderer`]'s public `Bind<Dmabuf>` path and commits it with
-//! KMS.
+//! This is local hardware bring-up tooling, not a normal compositor example. Run it manually from an
+//! active physical VT with DRM master permissions. It opens a DRM card node through Smithay's
+//! libseat session backend, may take over the connected display, and does not restore previous DRM
+//! state. It renders a solid colour into a GBM scanout buffer through [`VulkanRenderer`]'s public
+//! dmabuf render-target development path and commits it with DRM.
 
 use std::{env, error::Error, path::Path, thread, time::Duration};
 
@@ -145,7 +145,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ?crtc,
         ?size,
         seconds,
-        "Vulkan KMS smoke frame committed"
+        "DRM Vulkan smoke frame committed"
     );
     thread::sleep(Duration::from_secs(seconds));
     Ok(())
