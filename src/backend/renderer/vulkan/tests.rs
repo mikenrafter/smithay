@@ -8,8 +8,8 @@ use crate::backend::allocator::{
 };
 use crate::backend::renderer::sync::Interrupted;
 use crate::backend::renderer::{
-    Bind, Color32F, DebugFlags, ExportMem, Frame, ImportDma, ImportMem, Offscreen, Renderer, Texture,
-    TextureMapping,
+    Bind, Color32F, DebugFlags, ExportMem, Frame, ImportDma, ImportMem, Offscreen, RenderTargetLifecycle,
+    Renderer, Texture, TextureMapping,
     sync::{Fence, SyncPoint},
 };
 use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
@@ -3090,7 +3090,7 @@ fn public_bind_rejects_invalid_vulkan_targets_before_device_lookup() {
 }
 
 #[test]
-fn public_dmabuf_bind_uses_acquired_target_path() {
+fn public_dmabuf_bind_requires_explicit_acquire_path() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let mut dmabuf = dmabuf_for_tests();
     let default_acquire = VulkanDmabufRenderTargetAcquire::default();
@@ -3105,12 +3105,14 @@ fn public_dmabuf_bind_uses_acquired_target_path() {
     assert!(preserve_acquire.preserve_contents);
     assert!(preserve_acquire.acquire_sync.is_some());
     assert_eq!(
-        <VulkanRenderer as Bind<Dmabuf>>::target_age(&renderer, &dmabuf, 3),
-        0
+        <VulkanRenderer as RenderTargetLifecycle<Dmabuf>>::target_age(&renderer, &dmabuf, 3),
+        3
     );
     assert!(matches!(
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut dmabuf),
-        Err(VulkanError::VulkanUnavailable)
+        Err(VulkanError::UnsupportedOperation(
+            "dmabuf render target requires explicit Vulkan acquire"
+        ))
     ));
     assert!(matches!(
         // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
@@ -3147,7 +3149,7 @@ fn public_dmabuf_bind_uses_acquired_target_path() {
 }
 
 #[test]
-fn public_dmabuf_bind_supported_formats_use_render_target_capabilities() {
+fn public_dmabuf_bind_does_not_advertise_explicit_target_formats() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     renderer.capabilities.formats.dmabuf_render_target = [Format {
         code: Fourcc::Abgr8888,
@@ -3162,13 +3164,17 @@ fn public_dmabuf_bind_supported_formats_use_render_target_capabilities() {
     assert!(!renderer.capabilities.rendering.dmabuf_targets);
     assert!(!renderer.capabilities.rendering.dmabuf_target_modifiers);
     assert!(!renderer.capabilities.rendering.dmabuf_target_development);
-    let formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
-        .expect("Vulkan dmabuf render targets have an explicit format set");
     assert!(
-        formats
+        renderer
+            .capabilities
+            .formats
+            .dmabuf_render_target
             .iter()
             .any(|format| { format.code == Fourcc::Abgr8888 && format.modifier == Modifier::Linear })
     );
+    let formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
+        .expect("Vulkan dmabuf Bind has an explicit empty format set");
+    assert!(formats.iter().next().is_none());
 }
 
 #[test]
@@ -3191,11 +3197,15 @@ fn public_dmabuf_bind_validates_metadata_before_device_lookup() {
 
     assert!(matches!(
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut zero_width),
-        Err(VulkanError::UnsupportedOperation("dmabuf size"))
+        Err(VulkanError::UnsupportedOperation(
+            "dmabuf render target requires explicit Vulkan acquire"
+        ))
     ));
     assert!(matches!(
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut multi_plane),
-        Err(VulkanError::UnsupportedOperation("dmabuf render target planes"))
+        Err(VulkanError::UnsupportedOperation(
+            "dmabuf render target requires explicit Vulkan acquire"
+        ))
     ));
     assert!(matches!(
         // SAFETY: Invalid metadata is rejected before any Vulkan import or ownership-transfer
@@ -3299,6 +3309,10 @@ fn internal_dmabuf_render_target_release_rejects_preconditions_before_device_loo
     assert!(matches!(
         renderer
             .release_acquired_dmabuf_render_target_to_foreign_general_sync_point(&mut missing_image, true),
+        Err(VulkanError::UnsupportedOperation("dmabuf render target image"))
+    ));
+    assert!(matches!(
+        renderer.release_dmabuf_render_target_after_render_error(&mut missing_image),
         Err(VulkanError::UnsupportedOperation("dmabuf render target image"))
     ));
 }

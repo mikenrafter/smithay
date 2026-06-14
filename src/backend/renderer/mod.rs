@@ -231,15 +231,28 @@ pub trait Bind<Target>: Renderer {
     /// by a foreign producer or consumer, or that the target/renderer pair carries the required
     /// synchronization. If the underlying graphics API has explicit external-ownership or layout
     /// requirements, such as Vulkan external-memory queue-family ownership, callers must also
-    /// satisfy those requirements before binding. Binding a target for rendering transfers
-    /// responsibility for returning it to a usable external state to [`Frame::finish`] or
-    /// [`Bind::release_after_render_error`].
+    /// satisfy those requirements before binding. If the target needs explicit release after
+    /// successful or failed rendering, callers should require [`RenderTargetLifecycle`] in addition
+    /// to this trait.
     fn bind<'a>(&mut self, target: &'a mut Target) -> Result<Self::Framebuffer<'a>, Self::Error>;
 
-    /// Returns the effective buffer age to use when binding this target.
+    /// Supported pixel formats for given targets, if applicable.
+    fn supported_formats(&self) -> Option<FormatSet> {
+        None
+    }
+}
+
+/// Lifecycle hooks for render targets that need explicit acquire/release handling around rendering.
+///
+/// [`Bind`] only creates a framebuffer for a target. Some target/renderer pairs also need policy for
+/// buffer-age validity or error cleanup once a target has been acquired. Keeping those hooks in this
+/// separate trait lets generic compositor code opt into the stronger lifecycle contract instead of
+/// treating all bindings as having external ownership state.
+pub trait RenderTargetLifecycle<Target>: Bind<Target> {
+    /// Returns the effective buffer age to use when rendering into this target.
     ///
     /// Renderers that cannot preserve target contents across `bind` may lower this to `0` to force
-    /// a full repaint while still using the generic binding path.
+    /// a full repaint while still using a generic render path.
     fn target_age(&self, _target: &Target, age: usize) -> usize {
         age
     }
@@ -250,11 +263,6 @@ pub trait Bind<Target>: Renderer {
     /// use this to release ownership before the compositor resets or reuses its buffers.
     fn release_after_render_error(&mut self, _target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
         Ok(())
-    }
-
-    /// Supported pixel formats for given targets, if applicable.
-    fn supported_formats(&self) -> Option<FormatSet> {
-        None
     }
 }
 

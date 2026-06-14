@@ -17,7 +17,7 @@ use crate::{
         egl::EGLContext,
         renderer::{
             Bind, Blit, BlitFrame, Color32F, DebugFlags, ExportMem, ImportDma, ImportMem, Offscreen,
-            Renderer, RendererSuper, TextureFilter,
+            RenderTargetLifecycle, Renderer, RendererSuper, TextureFilter,
             element::UnderlyingStorage,
             gles::{element::*, *},
             sync,
@@ -582,6 +582,19 @@ where
     }
     fn supported_formats(&self) -> Option<FormatSet> {
         self.gl.as_ref().supported_formats()
+    }
+}
+
+impl<T> RenderTargetLifecycle<T> for GlowRenderer
+where
+    GlesRenderer: RenderTargetLifecycle<T>,
+{
+    fn target_age(&self, target: &T, age: usize) -> usize {
+        RenderTargetLifecycle::target_age(self.gl.as_ref(), target, age)
+    }
+
+    fn release_after_render_error(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
+        RenderTargetLifecycle::release_after_render_error(self.gl.as_mut(), target)
     }
 }
 

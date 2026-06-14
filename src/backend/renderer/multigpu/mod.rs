@@ -49,7 +49,8 @@ use std::{
 
 use super::{
     Bind, Blit, BlitFrame, Color32F, ContextId, DebugFlags, ErasedContextId, ExportMem, Frame, ImportDma,
-    ImportMem, Offscreen, Renderer, RendererSuper, Texture, TextureFilter, TextureMapping,
+    ImportMem, Offscreen, RenderTargetLifecycle, Renderer, RendererSuper, Texture, TextureFilter,
+    TextureMapping,
     sync::{self, SyncPoint},
 };
 #[cfg(feature = "wayland_frontend")]
@@ -1163,6 +1164,57 @@ where
                 )
             };
             Bind::<Target>::supported_formats(renderer)
+        }
+    }
+}
+
+impl<R: GraphicsApi, T: GraphicsApi, Target> RenderTargetLifecycle<Target> for MultiRenderer<'_, '_, R, T>
+where
+    <T::Device as ApiDevice>::Renderer: RenderTargetLifecycle<Target>,
+    R: 'static,
+    R::Error: 'static,
+    T::Error: 'static,
+    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
+    <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
+{
+    fn target_age(&self, bind: &Target, age: usize) -> usize {
+        if let Some(target) = self.target.as_ref() {
+            RenderTargetLifecycle::target_age(target.device.renderer(), bind, age)
+        } else {
+            // SAFETY: We know this is safe, because `self.target` can only be `None` if R == T.
+            let renderer = unsafe {
+                std::mem::transmute::<&<R::Device as ApiDevice>::Renderer, &<T::Device as ApiDevice>::Renderer>(
+                    self.render.renderer(),
+                )
+            };
+            RenderTargetLifecycle::target_age(renderer, bind, age)
+        }
+    }
+
+    fn release_after_render_error(
+        &mut self,
+        framebuffer: &mut Self::Framebuffer<'_>,
+    ) -> Result<(), Self::Error> {
+        match (&mut self.target, &mut framebuffer.0) {
+            (Some(target), MultiFramebufferInternal::Target(framebuffer)) => {
+                RenderTargetLifecycle::release_after_render_error(target.device.renderer_mut(), framebuffer)
+                    .map_err(Error::Target)
+            }
+            (None, MultiFramebufferInternal::Render(framebuffer)) => {
+                // SAFETY: We know this is safe, because `self.target` can only be `None` if R == T.
+                let renderer = unsafe {
+                    std::mem::transmute::<
+                        &mut <R::Device as ApiDevice>::Renderer,
+                        &mut <T::Device as ApiDevice>::Renderer,
+                    >(self.render.renderer_mut())
+                };
+                RenderTargetLifecycle::release_after_render_error(renderer, framebuffer)
+                    .map_err(Error::Target)
+            }
+            _ => Ok(()),
         }
     }
 }

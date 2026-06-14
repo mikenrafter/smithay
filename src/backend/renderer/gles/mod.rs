@@ -44,7 +44,8 @@ use self::version::GlVersion;
 
 use super::{
     Bind, Blit, BlitFrame, Color32F, ContextId, DebugFlags, ExportMem, Frame, ImportDma, ImportMem,
-    Offscreen, Renderer, RendererSuper, Texture, TextureFilter, TextureMapping, sync::SyncPoint,
+    Offscreen, RenderTargetLifecycle, Renderer, RendererSuper, Texture, TextureFilter, TextureMapping,
+    sync::SyncPoint,
 };
 use crate::{
     backend::{
@@ -1631,6 +1632,8 @@ impl Bind<Dmabuf> for GlesRenderer {
         Some(self.egl.display().dmabuf_render_formats().clone())
     }
 }
+
+impl RenderTargetLifecycle<Dmabuf> for GlesRenderer {}
 
 impl Bind<GlesTexture> for GlesRenderer {
     fn bind<'a>(&mut self, texture: &'a mut GlesTexture) -> Result<GlesTarget<'a>, GlesError> {

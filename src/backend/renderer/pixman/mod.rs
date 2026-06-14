@@ -38,8 +38,8 @@ use wayland_server::protocol::wl_buffer;
 ))]
 use super::ImportEgl;
 use super::{
-    Bind, Color32F, ContextId, DebugFlags, ExportMem, Frame, ImportDma, ImportMem, Offscreen, Renderer,
-    RendererSuper, Texture, TextureFilter, TextureMapping, sync::SyncPoint,
+    Bind, Color32F, ContextId, DebugFlags, ExportMem, Frame, ImportDma, ImportMem, Offscreen,
+    RenderTargetLifecycle, Renderer, RendererSuper, Texture, TextureFilter, TextureMapping, sync::SyncPoint,
 };
 
 mod error;
@@ -1257,6 +1257,8 @@ impl Bind<Dmabuf> for PixmanRenderer {
         Some(DMABUF_FORMATS.clone())
     }
 }
+
+impl RenderTargetLifecycle<Dmabuf> for PixmanRenderer {}
 
 impl Offscreen<Image<'static, 'static>> for PixmanRenderer {
     #[profiling::function]

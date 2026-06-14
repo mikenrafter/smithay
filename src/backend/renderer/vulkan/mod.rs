@@ -15,10 +15,11 @@
 //! Smithay's optional renderer traits are capability surfaces. The CPU-memory/offscreen path is the
 //! most complete path. Dmabuf render-target support is intentionally public in this development fork,
 //! but its Vulkan external-ownership and synchronization preconditions are explicit on
-//! [`VulkanRenderer::bind_dmabuf_render_target`]. Generic [`Bind<Dmabuf>`] is a convenience bridge to
-//! that public development path, not proof that arbitrary dmabufs are safe to bind. `ImportDma`,
-//! texture `ExportMem`, `ExportDma`, broad explicit sync, blit/copy, and full presentation remain
-//! unsupported until their corresponding capability bits can become true with coverage.
+//! [`VulkanRenderer::bind_dmabuf_render_target`]. Generic safe [`Bind<Dmabuf>`] deliberately does
+//! not acquire Vulkan dmabuf render targets, because a plain [`Dmabuf`] cannot carry the required
+//! ownership/layout/synchronization proof. `ImportDma`, texture `ExportMem`, `ExportDma`, broad
+//! explicit sync, blit/copy, and full presentation remain unsupported until their corresponding
+//! capability bits can become true with coverage.
 //!
 //! Intended implementation order:
 //!
@@ -61,8 +62,8 @@ use crate::{
     backend::{
         allocator::{Format, Fourcc, Modifier, dmabuf::Dmabuf, format::FormatSet},
         renderer::{
-            Bind, Color32F, ContextId, DebugFlags, ExportMem, ImportDma, ImportMem, Offscreen, Renderer,
-            RendererSuper, Texture, TextureFilter,
+            Bind, Color32F, ContextId, DebugFlags, ExportMem, ImportDma, ImportMem, Offscreen,
+            RenderTargetLifecycle, Renderer, RendererSuper, Texture, TextureFilter,
             sync::{Fence, Interrupted, SyncPoint},
         },
     },
@@ -426,8 +427,7 @@ impl VulkanRenderer {
 
     /// Import a dmabuf as a render target and acquire it for color-attachment rendering.
     ///
-    /// This is the implementation helper behind the explicit public dmabuf render-target API and
-    /// generic [`Bind<Dmabuf>`] bridge.
+    /// This is the implementation helper behind the explicit public dmabuf render-target API.
     ///
     /// # Safety
     ///
@@ -466,7 +466,7 @@ impl VulkanRenderer {
     /// optional producer-completion dependency.
     ///
     /// This is a sync-point convenience wrapper for the acquired dmabuf render-target path used by
-    /// the explicit public dmabuf render-target API and generic [`Bind<Dmabuf>`] bridge.
+    /// the explicit public dmabuf render-target API.
     ///
     /// # Safety
     ///
@@ -512,8 +512,8 @@ impl VulkanRenderer {
     ///
     /// This method is intentionally public in this development fork. It is the correct Vulkan-shaped
     /// entry point for callers that can reason about external-memory ownership, layout, and acquire
-    /// synchronization. The generic [`Bind<Dmabuf>`] implementation delegates here with
-    /// [`VulkanDmabufRenderTargetAcquire::discard`] for the current DRM development path.
+    /// synchronization. Generic safe [`Bind<Dmabuf>`] intentionally does not delegate here; callers
+    /// that use this method are opting into the explicit unsafe external-memory contract.
     ///
     /// # Safety
     ///
@@ -529,8 +529,9 @@ impl VulkanRenderer {
     /// `preserve_contents` is false, previous contents are discarded. The caller must not bind the
     /// same underlying dmabuf storage through another alias while the returned target is acquired.
     /// After a successful acquire, renderers must either finish a frame for the returned target or
-    /// call the matching error-cleanup path before reusing the dmabuf externally; dropping the target
-    /// alone does not release Vulkan ownership back to the foreign queue family.
+    /// call [`VulkanRenderer::release_dmabuf_render_target_after_render_error`] before reusing the
+    /// dmabuf externally; dropping the target alone does not release Vulkan ownership back to the
+    /// foreign queue family.
     pub unsafe fn bind_dmabuf_render_target<'target>(
         &mut self,
         dmabuf: &'target mut Dmabuf,
@@ -622,6 +623,21 @@ impl VulkanRenderer {
         let (released, sync_file) =
             self.release_acquired_dmabuf_render_target_to_foreign_general(target, export_sync_file)?;
         Ok((released, sync_point_from_sync_file(sync_file)))
+    }
+
+    /// Release an explicitly acquired dmabuf render target after rendering failed before frame finish.
+    ///
+    /// This is the public error-cleanup counterpart to
+    /// [`VulkanRenderer::bind_dmabuf_render_target`]. It returns the target to foreign ownership in
+    /// `VK_IMAGE_LAYOUT_GENERAL` without exporting a release fence. Call this before reusing the
+    /// dmabuf externally when rendering fails before
+    /// [`Frame::finish`](crate::backend::renderer::Frame::finish).
+    pub fn release_dmabuf_render_target_after_render_error(
+        &mut self,
+        target: &mut VulkanRenderTarget<'_>,
+    ) -> Result<(), VulkanError> {
+        self.release_acquired_dmabuf_render_target_to_foreign_general_sync_point(target, false)
+            .map(|_| ())
     }
 
     #[allow(dead_code)]
@@ -790,31 +806,18 @@ impl<'target> Bind<VulkanRenderTarget<'target>> for VulkanRenderer {
 }
 
 impl Bind<Dmabuf> for VulkanRenderer {
-    fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        unsafe {
-            // SAFETY: This generic bridge intentionally selects the discard acquire mode of the
-            // explicit public dmabuf render-target API. Callers still need to satisfy that method's
-            // external-ownership and visibility preconditions before binding. The generic DRM path
-            // currently has no typed way to carry those invariants, so this remains a development
-            // bridge rather than a claim that arbitrary dmabufs are safe Vulkan targets.
-            self.bind_dmabuf_render_target(target, VulkanDmabufRenderTargetAcquire::discard())
-        }?
-        .ok_or(VulkanError::UnsupportedOperation("dmabuf render target format"))
-    }
-
-    fn target_age(&self, _target: &Dmabuf, _age: usize) -> usize {
-        0
-    }
-
-    fn release_after_render_error(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
-        self.release_acquired_dmabuf_render_target_to_foreign_general_sync_point(target, false)
-            .map(|_| ())
+    fn bind<'a>(&mut self, _target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        Err(VulkanError::UnsupportedOperation(
+            "dmabuf render target requires explicit Vulkan acquire",
+        ))
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
-        Some(self.capabilities.formats.dmabuf_render_target.clone())
+        Some(FormatSet::default())
     }
 }
+
+impl RenderTargetLifecycle<Dmabuf> for VulkanRenderer {}
 
 fn validate_dmabuf_render_target_metadata(
     target: &Dmabuf,

@@ -18,7 +18,10 @@ use crate::{
             dmabuf::{AsDmabuf, Dmabuf},
             gbm::GbmDevice,
         },
-        renderer::{Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture, element::RenderElement},
+        renderer::{
+            Color32F, DebugFlags, RenderTargetLifecycle, Renderer, RendererSuper, Texture,
+            element::RenderElement,
+        },
     },
     output::OutputModeSource,
 };
@@ -322,7 +325,7 @@ where
     ) -> DrmOutputManagerResult<DrmOutput<A, F, U, G>, A, F, R>
     where
         E: RenderElement<R>,
-        R: Renderer + Bind<Dmabuf>,
+        R: Renderer + RenderTargetLifecycle<Dmabuf>,
         R::TextureId: Texture + 'static,
         R::Error: Send + Sync + 'static,
     {
@@ -516,7 +519,7 @@ where
     ) -> DrmOutputManagerResult<(), A, F, R>
     where
         E: RenderElement<R>,
-        R: Renderer + Bind<Dmabuf>,
+        R: Renderer + RenderTargetLifecycle<Dmabuf>,
         R::TextureId: Texture + 'static,
         R::Error: Send + Sync + 'static,
     {
@@ -545,7 +548,7 @@ where
     ) -> DrmOutputManagerResult<(), A, F, R>
     where
         E: RenderElement<R>,
-        R: Renderer + Bind<Dmabuf>,
+        R: Renderer + RenderTargetLifecycle<Dmabuf>,
         R::TextureId: Texture + 'static,
         R::Error: Send + Sync + 'static,
     {
@@ -698,7 +701,7 @@ where
     ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
     where
         E: RenderElement<R>,
-        R: Renderer + Bind<Dmabuf>,
+        R: Renderer + RenderTargetLifecycle<Dmabuf>,
         R::TextureId: Texture + 'static,
         R::Error: Send + Sync + 'static,
     {
@@ -760,7 +763,7 @@ where
     ) -> DrmOutputManagerResult<(), A, F, R>
     where
         E: RenderElement<R>,
-        R: Renderer + Bind<Dmabuf>,
+        R: Renderer + RenderTargetLifecycle<Dmabuf>,
         R::TextureId: Texture + 'static,
         R::Error: Send + Sync + 'static,
     {
@@ -835,7 +838,7 @@ where
     G: AsFd + std::clone::Clone + 'static,
     U: 'static,
     E: RenderElement<R>,
-    R: Renderer + Bind<Dmabuf>,
+    R: Renderer + RenderTargetLifecycle<Dmabuf>,
     R::TextureId: Texture + 'static,
     R::Error: Send + Sync + 'static,
 {
@@ -926,7 +929,7 @@ where
 pub struct DrmOutputRenderElements<R, E>
 where
     E: RenderElement<R>,
-    R: Renderer + Bind<Dmabuf>,
+    R: Renderer + RenderTargetLifecycle<Dmabuf>,
     R::TextureId: Texture + 'static,
     R::Error: Send + Sync + 'static,
 {
@@ -937,7 +940,7 @@ where
 impl<R, E> DrmOutputRenderElements<R, E>
 where
     E: RenderElement<R>,
-    R: Renderer + Bind<Dmabuf>,
+    R: Renderer + RenderTargetLifecycle<Dmabuf>,
     R::TextureId: Texture + 'static,
     R::Error: Send + Sync + 'static,
 {
@@ -962,7 +965,7 @@ where
 impl<R, E> Default for DrmOutputRenderElements<R, E>
 where
     E: RenderElement<R>,
-    R: Renderer + Bind<Dmabuf>,
+    R: Renderer + RenderTargetLifecycle<Dmabuf>,
     R::TextureId: Texture + 'static,
     R::Error: Send + Sync + 'static,
 {
@@ -974,7 +977,7 @@ where
 impl<R, E> DrmOutputRenderElements<R, E>
 where
     E: RenderElement<R>,
-    R: Renderer + Bind<Dmabuf>,
+    R: Renderer + RenderTargetLifecycle<Dmabuf>,
     R::TextureId: Texture + 'static,
     R::Error: Send + Sync + 'static,
 {

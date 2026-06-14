@@ -159,7 +159,8 @@ use crate::{
         },
         drm::{DrmError, PlaneDamageClips, plane_has_property},
         renderer::{
-            Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture, buffer_y_inverted,
+            Bind, Color32F, DebugFlags, RenderTargetLifecycle, Renderer, RendererSuper, Texture,
+            buffer_y_inverted,
             damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
             element::{
                 Element, Id, Kind, RenderElement, RenderElementPresentationState, RenderElementState,
@@ -1701,7 +1702,7 @@ where
     ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
     where
         E: RenderElement<R>,
-        R: Renderer + Bind<Dmabuf>,
+        R: Renderer + RenderTargetLifecycle<Dmabuf>,
         R::TextureId: Texture + 'static,
     {
         let mut clear_color = clear_color.into();
@@ -2247,7 +2248,7 @@ where
                 )
                 .collect::<Vec<_>>();
 
-            let age = renderer.target_age(&dmabuf, age);
+            let age = RenderTargetLifecycle::target_age(renderer, &dmabuf, age);
             let mut framebuffer = renderer
                 .bind(&mut dmabuf)
                 .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
@@ -2348,7 +2349,8 @@ where
                     }
                 }
                 Err(err) => {
-                    let release_error = renderer.release_after_render_error(&mut framebuffer).err();
+                    let release_error =
+                        RenderTargetLifecycle::release_after_render_error(renderer, &mut framebuffer).err();
 
                     // Rendering failed at some point, reset the buffers
                     // as we probably now have some half drawn buffer
