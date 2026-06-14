@@ -3146,6 +3146,47 @@ fn public_dmabuf_bind_requires_explicit_acquire_path() {
         unsafe { renderer.bind_dmabuf_render_target(&mut dmabuf, preserve_acquire) },
         Err(VulkanError::VulkanUnavailable)
     ));
+
+    let mut discard_target = unsafe {
+        // SAFETY: This scaffold renderer has no Vulkan device, so binding the wrapper returns before
+        // any Vulkan import or ownership-transfer operation can occur.
+        VulkanDmabufRenderTarget::discard(&mut dmabuf)
+    };
+    assert!(!discard_target.preserve_contents());
+    assert!(!discard_target.acquire().preserve_contents);
+    assert_eq!(
+        <VulkanRenderer as RenderTargetLifecycle<VulkanDmabufRenderTarget<'_, '_>>>::target_age(
+            &renderer,
+            &discard_target,
+            3,
+        ),
+        0
+    );
+    assert!(matches!(
+        <VulkanRenderer as Bind<VulkanDmabufRenderTarget<'_, '_>>>::bind(&mut renderer, &mut discard_target),
+        Err(VulkanError::VulkanUnavailable)
+    ));
+    drop(discard_target);
+
+    let mut preserve_target = unsafe {
+        // SAFETY: This scaffold renderer has no Vulkan device, so binding the wrapper returns before
+        // any sync-point wait, Vulkan import, or ownership-transfer operation can occur.
+        VulkanDmabufRenderTarget::preserve(&mut dmabuf, Some(&signaled_sync))
+    };
+    assert!(preserve_target.preserve_contents());
+    assert!(preserve_target.acquire().acquire_sync.is_some());
+    assert_eq!(
+        <VulkanRenderer as RenderTargetLifecycle<VulkanDmabufRenderTarget<'_, '_>>>::target_age(
+            &renderer,
+            &preserve_target,
+            3,
+        ),
+        3
+    );
+    assert!(matches!(
+        <VulkanRenderer as Bind<VulkanDmabufRenderTarget<'_, '_>>>::bind(&mut renderer, &mut preserve_target),
+        Err(VulkanError::VulkanUnavailable)
+    ));
 }
 
 #[test]
@@ -3175,6 +3216,14 @@ fn public_dmabuf_bind_does_not_advertise_explicit_target_formats() {
     let formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
         .expect("Vulkan dmabuf Bind has an explicit empty format set");
     assert!(formats.iter().next().is_none());
+    let explicit_formats =
+        <VulkanRenderer as Bind<VulkanDmabufRenderTarget<'static, 'static>>>::supported_formats(&renderer)
+            .expect("Vulkan explicit dmabuf render targets have a probed format set");
+    assert!(
+        explicit_formats
+            .iter()
+            .any(|format| { format.code == Fourcc::Abgr8888 && format.modifier == Modifier::Linear })
+    );
 }
 
 #[test]
@@ -3313,6 +3362,13 @@ fn internal_dmabuf_render_target_release_rejects_preconditions_before_device_loo
     ));
     assert!(matches!(
         renderer.release_dmabuf_render_target_after_render_error(&mut missing_image),
+        Err(VulkanError::UnsupportedOperation("dmabuf render target image"))
+    ));
+    assert!(matches!(
+        <VulkanRenderer as RenderTargetLifecycle<VulkanDmabufRenderTarget<'static, 'static>>>::release_after_render_error(
+            &mut renderer,
+            &mut missing_image,
+        ),
         Err(VulkanError::UnsupportedOperation("dmabuf render target image"))
     ));
 }

@@ -131,6 +131,67 @@ impl Default for VulkanDmabufRenderTargetAcquire<'_> {
     }
 }
 
+/// Typed target wrapper for binding a foreign dmabuf through Vulkan's explicit acquire path.
+///
+/// This wrapper is the safe [`Bind`] target for Vulkan dmabuf render-target development. Creating it
+/// is unsafe because the caller must prove the same external-memory ownership, layout, and acquire
+/// synchronization requirements as [`VulkanRenderer::bind_dmabuf_render_target`]. Those requirements
+/// are not a one-time construction check: they must be true each time the wrapper is bound. Once
+/// constructed, generic render paths can bind it without smuggling those requirements through a plain
+/// [`Dmabuf`].
+#[derive(Debug)]
+pub struct VulkanDmabufRenderTarget<'target, 'sync> {
+    dmabuf: &'target mut Dmabuf,
+    acquire: VulkanDmabufRenderTargetAcquire<'sync>,
+}
+
+impl<'target, 'sync> VulkanDmabufRenderTarget<'target, 'sync> {
+    /// Creates a Vulkan dmabuf render-target wrapper with explicit acquire options.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy the safety requirements documented on
+    /// [`VulkanRenderer::bind_dmabuf_render_target`] for `dmabuf` and `acquire` before every later
+    /// safe bind of this wrapper. The same underlying dmabuf storage must not be bound through
+    /// another alias while this wrapper, or a framebuffer created from it, is live.
+    pub unsafe fn new(dmabuf: &'target mut Dmabuf, acquire: VulkanDmabufRenderTargetAcquire<'sync>) -> Self {
+        Self { dmabuf, acquire }
+    }
+
+    /// Creates a discard/full-repaint target wrapper.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy the discard-acquire requirements documented on
+    /// [`VulkanRenderer::bind_dmabuf_render_target`] before every later safe bind of this wrapper.
+    pub unsafe fn discard(dmabuf: &'target mut Dmabuf) -> Self {
+        // SAFETY: Forwarded to this constructor's caller.
+        unsafe { Self::new(dmabuf, VulkanDmabufRenderTargetAcquire::discard()) }
+    }
+
+    /// Creates a preserve-content target wrapper.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy the preserve-acquire requirements documented on
+    /// [`VulkanRenderer::bind_dmabuf_render_target`] before every later safe bind of this wrapper,
+    /// including the foreign release in `VK_IMAGE_LAYOUT_GENERAL`.
+    pub unsafe fn preserve(dmabuf: &'target mut Dmabuf, acquire_sync: Option<&'sync SyncPoint>) -> Self {
+        // SAFETY: Forwarded to this constructor's caller.
+        unsafe { Self::new(dmabuf, VulkanDmabufRenderTargetAcquire::preserve(acquire_sync)) }
+    }
+
+    /// Returns whether this acquire preserves previous contents.
+    pub fn preserve_contents(&self) -> bool {
+        self.acquire.preserve_contents
+    }
+
+    /// Returns the acquire options carried by this wrapper.
+    pub fn acquire(&self) -> VulkanDmabufRenderTargetAcquire<'sync> {
+        self.acquire
+    }
+}
+
 use self::{
     device::{
         VulkanDeviceState, VulkanSyncFileSemaphore, image_copy_buffer_offset, tightly_packed_image_size,
@@ -802,6 +863,36 @@ impl<'target> Bind<VulkanRenderTarget<'target>> for VulkanRenderer {
 
     fn supported_formats(&self) -> Option<FormatSet> {
         Some(self.render_target_formats())
+    }
+}
+
+impl<'target, 'sync> Bind<VulkanDmabufRenderTarget<'target, 'sync>> for VulkanRenderer {
+    fn bind<'a>(
+        &mut self,
+        target: &'a mut VulkanDmabufRenderTarget<'target, 'sync>,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        unsafe {
+            // SAFETY: `VulkanDmabufRenderTarget` can only be constructed by callers that accepted
+            // and upheld the explicit Vulkan external-memory acquire contract. Reborrow the wrapped
+            // dmabuf for the lifetime of the returned framebuffer so Rust prevents rebinding through
+            // this wrapper while the framebuffer is live.
+            self.bind_dmabuf_render_target(&mut *target.dmabuf, target.acquire)
+        }?
+        .ok_or(VulkanError::UnsupportedOperation("dmabuf render target format"))
+    }
+
+    fn supported_formats(&self) -> Option<FormatSet> {
+        Some(self.capabilities.formats.dmabuf_render_target.clone())
+    }
+}
+
+impl<'target, 'sync> RenderTargetLifecycle<VulkanDmabufRenderTarget<'target, 'sync>> for VulkanRenderer {
+    fn target_age(&self, target: &VulkanDmabufRenderTarget<'target, 'sync>, age: usize) -> usize {
+        if target.preserve_contents() { age } else { 0 }
+    }
+
+    fn release_after_render_error(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
+        self.release_dmabuf_render_target_after_render_error(target)
     }
 }
 
