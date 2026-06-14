@@ -18,6 +18,7 @@ use crate::backend::{
 
 use super::{
     VulkanError, VulkanRendererCapabilities,
+    error::vulkan_api_result_invalidates_context,
     format::get_render_vk_format,
     image::{
         VulkanDmabufImportState, VulkanDmabufRenderTargetAcquireRestore, VulkanExternalImageOwnership,
@@ -286,6 +287,14 @@ fn complete_pending_semaphore_payloads(pending: &[VulkanPendingSemaphorePayload]
                 VulkanSyncFileSemaphorePayloadState::Signaled
             }
             VulkanSyncFileSemaphorePayloadState::Unsignaled
+                if pending.previous_state == VulkanSyncFileSemaphorePayloadState::Unsignaled =>
+            {
+                // A pending signal may already have been exported as SYNC_FD. Export consumes the
+                // semaphore payload back to the unsignaled state, but the submitted batch still
+                // refers to the semaphore object until the fence completes.
+                VulkanSyncFileSemaphorePayloadState::Unsignaled
+            }
+            VulkanSyncFileSemaphorePayloadState::Unsignaled
             | VulkanSyncFileSemaphorePayloadState::AwaitableSyncFileImport
             | VulkanSyncFileSemaphorePayloadState::Signaled => {
                 return Err(VulkanError::UnsupportedOperation("semaphore submit payload"));
@@ -511,6 +520,7 @@ pub(crate) struct VulkanDeviceState {
     sampled_texture_descriptor_set_layout: Mutex<Option<Arc<VulkanDescriptorSetLayout>>>,
     sampled_texture_pipeline_layout: Mutex<Option<Arc<VulkanSampledTexturePipelineLayout>>>,
     solid_color_pipeline_layout: Mutex<Option<Arc<VulkanPipelineLayout>>>,
+    pending_graphics_submissions: Mutex<Vec<VulkanSubmittedCommandBuffer>>,
 }
 
 impl VulkanDeviceState {
@@ -659,6 +669,7 @@ impl VulkanDeviceState {
             sampled_texture_descriptor_set_layout: Mutex::new(None),
             sampled_texture_pipeline_layout: Mutex::new(None),
             solid_color_pipeline_layout: Mutex::new(None),
+            pending_graphics_submissions: Mutex::new(Vec::new()),
         })
     }
 
@@ -683,11 +694,53 @@ impl VulkanDeviceState {
             sampled_texture_descriptor_set_layout: Mutex::new(None),
             sampled_texture_pipeline_layout: Mutex::new(None),
             solid_color_pipeline_layout: Mutex::new(None),
+            pending_graphics_submissions: Mutex::new(Vec::new()),
         }
+    }
+
+    fn collect_completed_graphics_submissions(&self) -> Result<(), VulkanError> {
+        let mut pending = self
+            .pending_graphics_submissions
+            .lock()
+            .map_err(|_| host_synchronization_failed())?;
+        let mut index = 0;
+        while index < pending.len() {
+            if pending[index].is_complete()? {
+                let submission = pending.swap_remove(index);
+                submission.complete()?;
+            } else {
+                index += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn retain_graphics_submission(
+        &self,
+        submission: VulkanSubmittedCommandBuffer,
+    ) -> Result<(), VulkanError> {
+        if let Err(err) = self.collect_completed_graphics_submissions() {
+            if vulkan_error_invalidates_context(&err) {
+                return Err(err);
+            }
+            tracing::warn!(?err, "failed to collect completed Vulkan graphics submissions");
+        }
+        match self.pending_graphics_submissions.lock() {
+            Ok(mut pending) => pending.push(submission),
+            Err(_) => {
+                tracing::warn!(
+                    "Vulkan graphics submission tracking lock poisoned; leaking pending submission"
+                );
+                std::mem::forget(submission);
+            }
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]
     pub(super) fn allocate_graphics_command_buffer(&self) -> Result<VulkanCommandBuffer, VulkanError> {
+        self.collect_completed_graphics_submissions()?;
         self.logical_device
             .as_ref()
             .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
@@ -1494,6 +1547,36 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    fn submit_sampled_dmabuf_foreign_release_async(
+        &self,
+        image: &VulkanOwnedImage,
+        release_semaphore: &VulkanSyncFileSemaphore,
+    ) -> Result<Option<VulkanSubmittedCommandBuffer>, VulkanError> {
+        let mut command_buffer = self.allocate_graphics_command_buffer()?;
+        self.begin_command_buffer(&mut command_buffer)?;
+        if !self.record_sampled_dmabuf_foreign_release_barrier(&mut command_buffer, image)? {
+            return Ok(None);
+        }
+        self.end_command_buffer(&mut command_buffer)?;
+
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        let queue =
+            self.queues.graphics.as_ref().ok_or_else(|| {
+                VulkanError::DeviceInitializationFailed("missing graphics queue".to_owned())
+            })?;
+        let synchronization = VulkanSubmitSynchronization::default().signal_sync_file(release_semaphore);
+        // SAFETY: This submit has no semaphore waits, and `submit_owned_command_buffer` validates
+        // that the signal semaphore belongs to this device, is not duplicated in the submit, and has
+        // an unsignaled tracked payload before the queue operation is attempted. The returned
+        // submission retains all objects referenced by the pending queue batch.
+        unsafe { submit_owned_command_buffer(logical_device, queue, command_buffer, &synchronization) }
+            .map(Some)
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn submit_dmabuf_render_target_foreign_acquire(
         &self,
         image: &VulkanOwnedImage,
@@ -1563,6 +1646,36 @@ impl VulkanDeviceState {
     }
 
     #[allow(dead_code)]
+    fn submit_dmabuf_render_target_foreign_release_async(
+        &self,
+        image: &VulkanOwnedImage,
+        release_semaphore: &VulkanSyncFileSemaphore,
+    ) -> Result<Option<VulkanSubmittedCommandBuffer>, VulkanError> {
+        let mut command_buffer = self.allocate_graphics_command_buffer()?;
+        self.begin_command_buffer(&mut command_buffer)?;
+        if !self.record_dmabuf_render_target_foreign_release_barrier(&mut command_buffer, image)? {
+            return Ok(None);
+        }
+        self.end_command_buffer(&mut command_buffer)?;
+
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        let queue =
+            self.queues.graphics.as_ref().ok_or_else(|| {
+                VulkanError::DeviceInitializationFailed("missing graphics queue".to_owned())
+            })?;
+        let synchronization = VulkanSubmitSynchronization::default().signal_sync_file(release_semaphore);
+        // SAFETY: This submit has no semaphore waits, and `submit_owned_command_buffer` validates
+        // that the signal semaphore belongs to this device, is not duplicated in the submit, and has
+        // an unsignaled tracked payload before the queue operation is attempted. The returned
+        // submission retains all objects referenced by the pending queue batch.
+        unsafe { submit_owned_command_buffer(logical_device, queue, command_buffer, &synchronization) }
+            .map(Some)
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn release_dmabuf_render_target_to_foreign_general(
         &self,
         image: &VulkanOwnedImage,
@@ -1574,22 +1687,35 @@ impl VulkanDeviceState {
         } else {
             None
         };
-        if !self.submit_dmabuf_render_target_foreign_release(image, release_semaphore.as_ref())? {
-            return Ok((false, None));
-        }
-        let release_sync_file = if let Some(release_semaphore) = release_semaphore {
-            // SAFETY: `submit_dmabuf_render_target_foreign_release` waits for queue completion before
-            // returning successfully. The semaphore was created by this device for sync-file export
-            // and has a completed signal payload from that waited release submit.
-            match unsafe { self.export_sync_file_semaphore(&release_semaphore) } {
-                Ok(sync_file) => sync_file,
-                Err(err) => {
-                    tracing::warn!(?err, "failed to export dmabuf render-target release fence");
-                    None
-                }
+        let Some(release_semaphore) = release_semaphore else {
+            if !self.submit_dmabuf_render_target_foreign_release(image, None)? {
+                return Ok((false, None));
             }
-        } else {
-            None
+            return Ok((true, None));
+        };
+
+        let Some(submission) =
+            self.submit_dmabuf_render_target_foreign_release_async(image, &release_semaphore)?
+        else {
+            return Ok((false, None));
+        };
+        // SAFETY: `submit_dmabuf_render_target_foreign_release_async` submitted the signal operation
+        // and returned only after `vkQueueSubmit` accepted it. SYNC_FD export permits a pending
+        // signal operation whose dependencies have been submitted. On successful export, the
+        // submission is retained until the batch fence completes so the command buffer and semaphore
+        // object outlive queue use. On non-fatal export failure, we wait below before returning no
+        // fence so callers do not observe an unfenced pending release as complete.
+        let release_sync_file = match unsafe { self.export_sync_file_semaphore(&release_semaphore) } {
+            Ok(sync_file) => {
+                self.retain_graphics_submission(submission)?;
+                sync_file
+            }
+            Err(err) if vulkan_error_invalidates_context(&err) => return Err(err),
+            Err(err) => {
+                tracing::warn!(?err, "failed to export dmabuf render-target release fence");
+                submission.wait_complete()?;
+                None
+            }
         };
 
         Ok((true, release_sync_file))
@@ -1607,22 +1733,34 @@ impl VulkanDeviceState {
         } else {
             None
         };
-        if !self.submit_sampled_dmabuf_foreign_release(image, release_semaphore.as_ref())? {
-            return Ok((false, None));
-        }
-        let release_sync_file = if let Some(release_semaphore) = release_semaphore {
-            // SAFETY: `submit_sampled_dmabuf_foreign_release` waits for queue completion before
-            // returning successfully. The semaphore was created by this device for sync-file export
-            // and has a completed signal payload from that waited release submit.
-            match unsafe { self.export_sync_file_semaphore(&release_semaphore) } {
-                Ok(sync_file) => sync_file,
-                Err(err) => {
-                    tracing::warn!(?err, "failed to export sampled dmabuf release fence");
-                    None
-                }
+        let Some(release_semaphore) = release_semaphore else {
+            if !self.submit_sampled_dmabuf_foreign_release(image, None)? {
+                return Ok((false, None));
             }
-        } else {
-            None
+            return Ok((true, None));
+        };
+
+        let Some(submission) = self.submit_sampled_dmabuf_foreign_release_async(image, &release_semaphore)?
+        else {
+            return Ok((false, None));
+        };
+        // SAFETY: `submit_sampled_dmabuf_foreign_release_async` submitted the signal operation and
+        // returned only after `vkQueueSubmit` accepted it. SYNC_FD export permits a pending signal
+        // operation whose dependencies have been submitted. On successful export, the submission is
+        // retained until the batch fence completes so the command buffer and semaphore object outlive
+        // queue use. On non-fatal export failure, we wait below before returning no fence so callers
+        // do not observe an unfenced pending release as complete.
+        let release_sync_file = match unsafe { self.export_sync_file_semaphore(&release_semaphore) } {
+            Ok(sync_file) => {
+                self.retain_graphics_submission(submission)?;
+                sync_file
+            }
+            Err(err) if vulkan_error_invalidates_context(&err) => return Err(err),
+            Err(err) => {
+                tracing::warn!(?err, "failed to export sampled dmabuf release fence");
+                submission.wait_complete()?;
+                None
+            }
         };
 
         Ok((true, release_sync_file))
@@ -1715,6 +1853,27 @@ impl VulkanDeviceState {
         // requirements for the supplied synchronization description. This method selected the
         // graphics queue matching the command buffer's queue-family check below.
         unsafe { submit_command_buffer_and_wait(logical_device, queue, command_buffer, synchronization) }
+    }
+
+    #[cfg(test)]
+    pub(super) unsafe fn submit_graphics_command_buffer_with_synchronization_for_tests(
+        &self,
+        command_buffer: VulkanCommandBuffer,
+        synchronization: &VulkanSubmitSynchronization<'_>,
+    ) -> Result<VulkanSubmittedCommandBuffer, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        let queue =
+            self.queues.graphics.as_ref().ok_or_else(|| {
+                VulkanError::DeviceInitializationFailed("missing graphics queue".to_owned())
+            })?;
+
+        // SAFETY: Forwarded from this test-only helper's caller. This selects the same graphics
+        // queue as the waited helper and returns an owner that retains submitted resources until the
+        // test waits or drops it.
+        unsafe { submit_owned_command_buffer(logical_device, queue, command_buffer, synchronization) }
     }
 
     #[allow(dead_code)]
@@ -3115,6 +3274,23 @@ fn vulkan_error_is_device_lost(err: &VulkanError) -> bool {
     )
 }
 
+fn vulkan_error_invalidates_context(err: &VulkanError) -> bool {
+    match err {
+        VulkanError::DeviceLost => true,
+        VulkanError::VulkanApi(result) => vulkan_api_result_invalidates_context(*result),
+        VulkanError::VulkanUnavailable
+        | VulkanError::MissingRequiredExtension(_)
+        | VulkanError::DeviceInitializationFailed(_)
+        | VulkanError::QueueFamilyUnsupported
+        | VulkanError::ExternalMemoryUnsupported => true,
+        VulkanError::UnsupportedOperation(_)
+        | VulkanError::UnsupportedFormat(_)
+        | VulkanError::UnsupportedModifier
+        | VulkanError::SyncInterrupted
+        | VulkanError::MemoryTypeUnsupported => false,
+    }
+}
+
 fn submit_command_buffer_and_wait_without_synchronization(
     logical_device: &VulkanLogicalDevice,
     queue: &VulkanQueue,
@@ -3276,6 +3452,90 @@ unsafe fn submit_command_buffer_and_wait(
     }
     image_result.expect("queue completion proven without wait error")?;
     complete_result
+}
+
+unsafe fn submit_owned_command_buffer(
+    logical_device: &VulkanLogicalDevice,
+    queue: &VulkanQueue,
+    mut command_buffer: VulkanCommandBuffer,
+    synchronization: &VulkanSubmitSynchronization<'_>,
+) -> Result<VulkanSubmittedCommandBuffer, VulkanError> {
+    ensure_command_buffer_executable(&command_buffer)?;
+    if !logical_device.is_same_device(&command_buffer.command_pool.logical_device) {
+        return Err(VulkanError::UnsupportedOperation("command buffer device"));
+    }
+    if command_buffer.queue_family_index() != queue.queue_family_index() {
+        return Err(VulkanError::UnsupportedOperation("command buffer queue family"));
+    }
+    synchronization.validate(logical_device)?;
+
+    let fence_info = vk::FenceCreateInfo::default();
+    let fence =
+        unsafe { logical_device.handle().create_fence(&fence_info, None) }.map_err(VulkanError::from)?;
+    let command_buffers = [command_buffer.handle];
+    let wait_semaphores = synchronization.wait_handles();
+    let wait_stage_masks = synchronization.wait_stage_masks();
+    let signal_semaphores = synchronization.signal_handles();
+    let submit_infos = [vk::SubmitInfo::default()
+        .wait_semaphores(&wait_semaphores)
+        .wait_dst_stage_mask(&wait_stage_masks)
+        .command_buffers(&command_buffers)
+        .signal_semaphores(&signal_semaphores)];
+    let semaphore_guards = match synchronization.lock_host_access() {
+        Ok(guards) => guards,
+        Err(err) => {
+            unsafe { logical_device.handle().destroy_fence(fence, None) };
+            return Err(err);
+        }
+    };
+    let pending_semaphore_payloads = match synchronization.mark_payloads_pending_submit() {
+        Ok(pending) => pending,
+        Err(err) => {
+            drop(semaphore_guards);
+            unsafe { logical_device.handle().destroy_fence(fence, None) };
+            return Err(err);
+        }
+    };
+
+    let submit_result = command_buffer
+        .command_pool
+        .lock_host_access()
+        .and_then(|_pool_guard| {
+            queue.lock_host_access().and_then(|_queue_guard| {
+                // SAFETY: `logical_device`, `queue.handle`, `command_buffer.handle`, `fence`, and
+                // all semaphores in `submit_infos` belong to the same live device. The returned
+                // `VulkanSubmittedCommandBuffer` retains the command buffer, fence, image/buffer
+                // references, and semaphore clones until fence completion. Queue and semaphore host
+                // access are externally synchronized by their mutexes. Slice storage used by
+                // `submit_infos` lives until `queue_submit` returns. The caller upholds binary
+                // semaphore payload-state and wait-stage valid usage.
+                unsafe {
+                    logical_device
+                        .handle()
+                        .queue_submit(queue.handle, &submit_infos, fence)
+                }
+                .map_err(VulkanError::from)
+            })
+        });
+
+    if let Err(err) = submit_result {
+        let _ = restore_pending_semaphore_payloads(&pending_semaphore_payloads);
+        let abort_result = command_buffer.abort_pending_image_syncs();
+        command_buffer.state = VulkanCommandBufferState::Invalid;
+        drop(semaphore_guards);
+        unsafe { logical_device.handle().destroy_fence(fence, None) };
+        abort_result?;
+        return Err(err);
+    }
+
+    command_buffer.state = VulkanCommandBufferState::Submitted;
+    drop(semaphore_guards);
+    Ok(VulkanSubmittedCommandBuffer::new(
+        logical_device.clone(),
+        command_buffer,
+        fence,
+        pending_semaphore_payloads,
+    ))
 }
 
 fn transition_image_layout(
@@ -5679,6 +5939,105 @@ impl Drop for VulkanCommandBuffer {
                 .handle()
                 .free_command_buffers(self.command_pool.handle, &[self.handle])
         };
+    }
+}
+
+/// Submitted command buffer whose fence has not necessarily completed yet.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(super) struct VulkanSubmittedCommandBuffer {
+    logical_device: VulkanLogicalDevice,
+    command_buffer: Option<VulkanCommandBuffer>,
+    fence: Option<vk::Fence>,
+    pending_semaphore_payloads: Vec<VulkanPendingSemaphorePayload>,
+}
+
+impl VulkanSubmittedCommandBuffer {
+    fn new(
+        logical_device: VulkanLogicalDevice,
+        command_buffer: VulkanCommandBuffer,
+        fence: vk::Fence,
+        pending_semaphore_payloads: Vec<VulkanPendingSemaphorePayload>,
+    ) -> Self {
+        Self {
+            logical_device,
+            command_buffer: Some(command_buffer),
+            fence: Some(fence),
+            pending_semaphore_payloads,
+        }
+    }
+
+    fn is_complete(&self) -> Result<bool, VulkanError> {
+        let fence = self.fence.ok_or(VulkanError::UnsupportedOperation(
+            "submitted command buffer fence",
+        ))?;
+        // SAFETY: `fence` belongs to `self.logical_device` and remains live until `complete` or this
+        // object's drop path destroys or intentionally leaks it.
+        unsafe { self.logical_device.handle().get_fence_status(fence) }.map_err(VulkanError::from)
+    }
+
+    fn complete(mut self) -> Result<(), VulkanError> {
+        self.complete_inner()
+    }
+
+    pub(super) fn wait_complete(mut self) -> Result<(), VulkanError> {
+        let fence = self.fence.ok_or(VulkanError::UnsupportedOperation(
+            "submitted command buffer fence",
+        ))?;
+        // SAFETY: `fence` belongs to `self.logical_device` and remains live while this submission
+        // owner exists. Waiting for all fences with an infinite timeout proves that the queue batch no
+        // longer references the retained command buffer, image resources, or semaphores before they
+        // are completed and dropped below.
+        unsafe {
+            self.logical_device
+                .handle()
+                .wait_for_fences(&[fence], true, u64::MAX)
+        }
+        .map_err(VulkanError::from)?;
+        self.complete_inner()
+    }
+
+    fn complete_inner(&mut self) -> Result<(), VulkanError> {
+        let command_buffer = self
+            .command_buffer
+            .as_mut()
+            .ok_or(VulkanError::UnsupportedOperation("submitted command buffer"))?;
+        command_buffer.commit_pending_image_layouts_and_syncs()?;
+        complete_pending_semaphore_payloads(&self.pending_semaphore_payloads)?;
+        self.pending_semaphore_payloads.clear();
+        if let Some(fence) = self.fence.take() {
+            // SAFETY: The fence was created by this logical device for this completed submission.
+            // No allocation callbacks were used.
+            unsafe { self.logical_device.handle().destroy_fence(fence, None) };
+        }
+        self.command_buffer.take();
+        Ok(())
+    }
+
+    fn leak_pending(&mut self) {
+        if let Some(mut command_buffer) = self.command_buffer.take() {
+            command_buffer.state = VulkanCommandBufferState::SubmitCompletionUnknown;
+            std::mem::forget(command_buffer);
+        }
+        self.fence.take();
+        std::mem::forget(std::mem::take(&mut self.pending_semaphore_payloads));
+    }
+}
+
+impl Drop for VulkanSubmittedCommandBuffer {
+    fn drop(&mut self) {
+        let Some(fence) = self.fence else {
+            return;
+        };
+        // SAFETY: `fence` belongs to `self.logical_device` and remains live while this owner exists.
+        match unsafe { self.logical_device.handle().get_fence_status(fence) } {
+            Ok(true) => {
+                if self.complete_inner().is_err() {
+                    self.leak_pending();
+                }
+            }
+            Ok(false) | Err(_) => self.leak_pending(),
+        }
     }
 }
 

@@ -5514,6 +5514,46 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
             release_semaphore.payload_state_for_tests().unwrap(),
             VulkanSyncFileSemaphorePayloadState::Signaled
         );
+
+        let async_release_semaphore = device.create_exportable_sync_file_semaphore().unwrap();
+        let mut async_release_command_buffer = device.allocate_graphics_command_buffer().unwrap();
+        device
+            .begin_command_buffer(&mut async_release_command_buffer)
+            .unwrap();
+        device
+            .end_command_buffer(&mut async_release_command_buffer)
+            .unwrap();
+        let async_release = VulkanSubmitSynchronization::default().signal_sync_file(&async_release_semaphore);
+        // SAFETY: The command buffer is executable, the signal semaphore is unsignaled and belongs
+        // to this device, and there are no wait semaphores.
+        let async_submission = unsafe {
+            device
+                .submit_graphics_command_buffer_with_synchronization_for_tests(
+                    async_release_command_buffer,
+                    &async_release,
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            async_release_semaphore.payload_state_for_tests().unwrap(),
+            VulkanSyncFileSemaphorePayloadState::PendingSignal
+        );
+        // SAFETY: The signal operation has been submitted and has no unsubmitted dependencies, so
+        // SYNC_FD export of the pending signal payload is valid.
+        let _async_release_sync_file = unsafe {
+            device
+                .export_sync_file_semaphore(&async_release_semaphore)
+                .unwrap()
+        };
+        assert_eq!(
+            async_release_semaphore.payload_state_for_tests().unwrap(),
+            VulkanSyncFileSemaphorePayloadState::Unsignaled
+        );
+        async_submission.wait_complete().unwrap();
+        assert_eq!(
+            async_release_semaphore.payload_state_for_tests().unwrap(),
+            VulkanSyncFileSemaphorePayloadState::Unsignaled
+        );
     }
     drop(owned_image);
     let uploaded_image = device
