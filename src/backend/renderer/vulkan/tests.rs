@@ -292,6 +292,7 @@ fn vulkan_renderer_default_capabilities_are_false() {
     assert!(!caps.rendering.offscreen);
     assert!(!caps.rendering.dmabuf_targets);
     assert!(!caps.rendering.dmabuf_target_modifiers);
+    assert!(!caps.rendering.dmabuf_target_development);
     assert!(!caps.rendering.blit);
     assert!(!caps.rendering.render_target_10bit);
     assert!(!caps.rendering.render_target_fp16);
@@ -335,6 +336,7 @@ fn wayland_protocol_capabilities_are_not_advertised_by_default() {
     assert!(!caps.export.modifiers);
     assert!(!caps.rendering.dmabuf_targets);
     assert!(!caps.rendering.dmabuf_target_modifiers);
+    assert!(!caps.rendering.dmabuf_target_development);
     assert!(!caps.sync.explicit);
     assert!(!caps.external_sync.prerequisites_available);
     assert!(caps.formats.memory_import.iter().next().is_none());
@@ -405,6 +407,7 @@ fn external_memory_capability_discovery_tracks_prerequisites_without_advertising
     assert!(!renderer_caps.export.modifiers);
     assert!(!renderer_caps.rendering.dmabuf_targets);
     assert!(!renderer_caps.rendering.dmabuf_target_modifiers);
+    assert!(!renderer_caps.rendering.dmabuf_target_development);
     assert!(renderer_caps.formats.dmabuf_import.iter().next().is_none());
     assert!(renderer_caps.formats.dmabuf_export.iter().next().is_none());
     assert!(renderer_caps.formats.dmabuf_render_target.iter().next().is_none());
@@ -472,6 +475,7 @@ fn external_sync_capability_discovery_tracks_sync_file_prerequisites_without_adv
     assert!(!renderer_caps.import.dmabuf);
     assert!(!renderer_caps.export.dmabuf);
     assert!(!renderer_caps.rendering.dmabuf_targets);
+    assert!(!renderer_caps.rendering.dmabuf_target_development);
 }
 
 #[test]
@@ -664,6 +668,8 @@ fn drm_modifier_capability_records_map_vulkan_properties_without_advertising_dma
     assert!(!renderer_caps.import.dmabuf);
     assert!(!renderer_caps.export.dmabuf);
     assert!(!renderer_caps.rendering.dmabuf_targets);
+    assert!(!renderer_caps.rendering.dmabuf_target_modifiers);
+    assert!(!renderer_caps.rendering.dmabuf_target_development);
     assert!(renderer_caps.formats.dmabuf_import.iter().next().is_none());
     assert!(renderer_caps.formats.dmabuf_export.iter().next().is_none());
     assert!(renderer_caps.formats.dmabuf_render_target.iter().next().is_none());
@@ -3012,6 +3018,7 @@ fn initialized_device_capabilities_do_not_enable_format_backed_rendering_before_
     assert!(!caps.rendering.offscreen);
     assert!(!caps.rendering.dmabuf_targets);
     assert!(!caps.rendering.dmabuf_target_modifiers);
+    assert!(!caps.rendering.dmabuf_target_development);
     assert!(!caps.rendering.blit);
     assert!(!caps.sync.explicit);
     assert!(caps.formats.records.is_empty());
@@ -3149,6 +3156,12 @@ fn public_dmabuf_bind_supported_formats_use_render_target_capabilities() {
     .into_iter()
     .collect();
 
+    // This scaffold state intentionally patches only the raw/probed format set. Runtime discovery
+    // is responsible for promoting that probe result into the development capability bit; neither
+    // the raw set nor the generic bridge should promote fully integrated capability bits by itself.
+    assert!(!renderer.capabilities.rendering.dmabuf_targets);
+    assert!(!renderer.capabilities.rendering.dmabuf_target_modifiers);
+    assert!(!renderer.capabilities.rendering.dmabuf_target_development);
     let formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
         .expect("Vulkan dmabuf render targets have an explicit format set");
     assert!(
@@ -5745,9 +5758,10 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert_eq!(caps.export.memory, caps.rendering.offscreen);
     assert!(!caps.export.dmabuf);
     let has_dmabuf_render_target_formats = caps.formats.dmabuf_render_target.iter().next().is_some();
-    assert_eq!(caps.rendering.dmabuf_targets, has_dmabuf_render_target_formats);
+    assert!(!caps.rendering.dmabuf_targets);
+    assert!(!caps.rendering.dmabuf_target_modifiers);
     assert_eq!(
-        caps.rendering.dmabuf_target_modifiers,
+        caps.rendering.dmabuf_target_development,
         has_dmabuf_render_target_formats
     );
     assert!(

@@ -39,9 +39,9 @@ pub struct VulkanRendererCapabilities {
 
 /// Raw per-format Vulkan image feature capabilities.
 ///
-/// Records describe renderer-internal Vulkan support. Smithay-facing [`FormatSet`] values remain
-/// limited to implemented renderer traits and stay empty until those traits can safely support the
-/// advertised pairs.
+/// Records describe renderer-internal Vulkan support. Smithay-facing [`FormatSet`] values are
+/// limited to implemented renderer traits. The dmabuf render-target set is deliberately a probed
+/// development-path set and is separated from the fully integrated rendering capability bits below.
 #[non_exhaustive]
 #[derive(Debug, Default, Clone)]
 pub struct VulkanFormatCapabilities {
@@ -56,7 +56,11 @@ pub struct VulkanFormatCapabilities {
     pub dmabuf_import: FormatSet,
     /// Formats exportable as dmabufs.
     pub dmabuf_export: FormatSet,
-    /// Formats usable as imported dmabuf render targets.
+    /// Formats probed as usable by the explicit Vulkan dmabuf render-target development path.
+    ///
+    /// This is a raw Vulkan external-memory format set, not a broad compositor capability. Public
+    /// [`VulkanRenderingCapabilities`] bits decide whether those formats are advertised as fully
+    /// integrated renderer functionality.
     pub dmabuf_render_target: FormatSet,
 }
 
@@ -608,10 +612,21 @@ pub struct VulkanExportCapabilities {
 pub struct VulkanRenderingCapabilities {
     /// Whether offscreen rendering is supported.
     pub offscreen: bool,
-    /// Whether imported dmabufs can be used as renderer framebuffers.
+    /// Whether fully integrated imported dmabuf renderer framebuffers are supported.
+    ///
+    /// This remains false while Vulkan dmabuf render targets require explicit development-fork
+    /// ownership/layout/synchronization contracts.
     pub dmabuf_targets: bool,
-    /// Whether modifier-aware imported dmabuf render targets are supported.
+    /// Whether modifier-aware fully integrated imported dmabuf render targets are supported.
+    ///
+    /// This remains false while Vulkan dmabuf render targets require explicit development-fork
+    /// ownership/layout/synchronization contracts.
     pub dmabuf_target_modifiers: bool,
+    /// Whether the explicit Vulkan dmabuf render-target development API has probed formats.
+    ///
+    /// Callers using this path must satisfy [`crate::backend::renderer::vulkan::VulkanRenderer::bind_dmabuf_render_target`]
+    /// safety requirements. This flag does not imply broad Smithay compositor integration.
+    pub dmabuf_target_development: bool,
     /// Whether Smithay `Blit` operations are supported.
     pub blit: bool,
     /// Whether 10-bit render targets are supported.

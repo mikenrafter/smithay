@@ -574,8 +574,7 @@ impl VulkanDeviceState {
         capabilities.rendering.offscreen = has_public_render_target_formats;
         let has_dmabuf_render_target_formats =
             capabilities.formats.dmabuf_render_target.iter().next().is_some();
-        capabilities.rendering.dmabuf_targets = has_dmabuf_render_target_formats;
-        capabilities.rendering.dmabuf_target_modifiers = has_dmabuf_render_target_formats;
+        capabilities.rendering.dmabuf_target_development = has_dmabuf_render_target_formats;
         capabilities.export.memory = has_public_render_target_formats;
 
         let queue_priorities = [1.0];
