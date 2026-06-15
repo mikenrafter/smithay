@@ -32,7 +32,7 @@ use smithay::{
     output::OutputModeSource,
     reexports::{
         drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc},
-        rustix::fs::{Mode, OFlags, open},
+        rustix::fs::OFlags,
     },
     utils::{DeviceFd, Physical, Rectangle, Size, Transform},
 };
@@ -80,17 +80,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into());
     }
     let open_flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK;
-    let fd = match session.open(Path::new(&device_path), open_flags) {
-        Ok(fd) => fd,
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                ?device_path,
-                "failed to open DRM node through libseat, trying direct active-session open"
-            );
-            open(Path::new(&device_path), open_flags, Mode::empty())?
-        }
-    };
+    let fd = session.open(Path::new(&device_path), open_flags)?;
     let drm_fd = DrmDeviceFd::new(DeviceFd::from(fd));
     let drm_node = DrmNode::from_path(&device_path)?;
     let (connector, crtc, mode) = pick_connector_crtc_mode(&drm_fd)?;
