@@ -264,6 +264,16 @@ pub trait RenderTargetLifecycle<Target>: Bind<Target> {
     fn release_after_render_error(&mut self, _target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
         Ok(())
     }
+
+    /// Cleans up a bound target if no rendering happened after [`Bind::bind`].
+    ///
+    /// Most renderers do not need explicit cleanup here. Renderers importing external targets may
+    /// acquire ownership during [`Bind::bind`], but a damage tracker can decide that no drawing is
+    /// needed and therefore never call [`Frame::finish`]. Such renderers may use this hook to release
+    /// ownership before the compositor reuses or scans out the target.
+    fn release_after_no_render(&mut self, _target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 /// A two dimensional texture

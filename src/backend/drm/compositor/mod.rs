@@ -154,7 +154,7 @@ use crate::{
         allocator::{
             Allocator, Buffer, Slot, Swapchain,
             dmabuf::{AsDmabuf, Dmabuf},
-            format::{get_opaque, has_alpha},
+            format::{FormatSet, get_opaque, has_alpha},
             gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice},
         },
         drm::{DrmError, PlaneDamageClips, plane_has_property},
@@ -290,6 +290,47 @@ where
             Self::Exporter(arg0) => f.debug_tuple("Exporter").field(arg0).finish(),
             Self::Gbm(arg0) => f.debug_tuple("Gbm").field(arg0).finish(),
         }
+    }
+}
+
+/// Converts a swapchain [`Dmabuf`] into the render target expected by a renderer.
+///
+/// The DRM compositor always allocates and exports the primary-plane render buffer through its normal
+/// allocator, swapchain, and framebuffer-exporter path. This adapter only describes how that exported
+/// dmabuf is presented to [`Bind`] and [`RenderTargetLifecycle`]. It must not submit rendering work,
+/// allocate side-channel presentation buffers, or query DRM-specific renderer capabilities.
+pub trait DrmRenderTarget<R>
+where
+    R: Renderer,
+{
+    /// Target type passed to [`Bind`] for rendering into the exported swapchain buffer.
+    type Target;
+
+    /// Returns formats supported by `renderer` for this target type.
+    fn supported_formats(&self, renderer: &R) -> Option<FormatSet>
+    where
+        R: Bind<Self::Target>,
+    {
+        renderer.supported_formats()
+    }
+
+    /// Builds the target passed to [`Bind`] from an exported swapchain dmabuf.
+    fn target_from_dmabuf(&mut self, dmabuf: Dmabuf) -> Self::Target;
+}
+
+/// Default DRM render-target adapter using plain [`Dmabuf`] targets.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DmabufRenderTarget;
+
+impl<R> DrmRenderTarget<R> for DmabufRenderTarget
+where
+    R: Renderer + Bind<Dmabuf>,
+{
+    type Target = Dmabuf;
+
+    #[inline]
+    fn target_from_dmabuf(&mut self, dmabuf: Dmabuf) -> Self::Target {
+        dmabuf
     }
 }
 
@@ -1705,6 +1746,40 @@ where
         R: Renderer + RenderTargetLifecycle<Dmabuf>,
         R::TextureId: Texture + 'static,
     {
+        self.render_frame_with_render_target(
+            renderer,
+            &mut DmabufRenderTarget,
+            elements,
+            clear_color,
+            frame_flags,
+        )
+    }
+
+    /// Render the next frame using an explicit render-target adapter.
+    ///
+    /// This follows the same DRM allocation, swapchain, framebuffer-export, damage tracking, sync,
+    /// and commit preparation path as [`DrmCompositor::render_frame`]. The adapter only controls the
+    /// type passed to [`Bind`] for the exported primary-plane dmabuf.
+    ///
+    /// - `render_target` converts the exported primary-plane dmabuf into the renderer target type
+    /// - `elements` for this frame in front-to-back order
+    /// - `frame_flags` specifies techniques allowed to realize the frame
+    #[instrument(level = "trace", parent = &self.span, skip_all)]
+    #[profiling::function]
+    pub fn render_frame_with_render_target<'a, R, E, T>(
+        &mut self,
+        renderer: &mut R,
+        render_target: &mut T,
+        elements: &'a [E],
+        clear_color: impl Into<Color32F>,
+        frame_flags: FrameFlags,
+    ) -> Result<RenderFrameResult<'a, A::Buffer, F::Framebuffer, E>, RenderFrameErrorType<A, F, R>>
+    where
+        E: RenderElement<R>,
+        T: DrmRenderTarget<R>,
+        R: Renderer + RenderTargetLifecycle<T::Target>,
+        R::TextureId: Texture + 'static,
+    {
         let mut clear_color = clear_color.into();
 
         if !self.surface.is_active() {
@@ -2183,7 +2258,7 @@ where
                 primary_plane_elements.len(),
                 self.surface.plane(),
             );
-            let (mut dmabuf, age) = {
+            let (dmabuf, age) = {
                 let primary_plane_state = next_frame_state.plane_state(self.surface.plane()).unwrap();
                 let config = primary_plane_state.config.as_ref().unwrap();
                 let slot = match &config.buffer.buffer {
@@ -2196,6 +2271,7 @@ where
                 let age = slot.age().into();
                 (dmabuf, age)
             };
+            let mut target = render_target.target_from_dmabuf(dmabuf);
 
             // store the current renderer debug flags and replace them
             // with our own
@@ -2248,9 +2324,9 @@ where
                 )
                 .collect::<Vec<_>>();
 
-            let age = RenderTargetLifecycle::target_age(renderer, &dmabuf, age);
+            let age = RenderTargetLifecycle::target_age(renderer, &target, age);
             let mut framebuffer = renderer
-                .bind(&mut dmabuf)
+                .bind(&mut target)
                 .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
             let render_res =
                 self.damage_tracker
@@ -2263,6 +2339,15 @@ where
                 Ok(render_output_result) => {
                     if render_output_result.damage.is_none() {
                         // if we receive no damage we can assume no rendering took place
+                        if let Err(err) =
+                            RenderTargetLifecycle::release_after_no_render(renderer, &mut framebuffer)
+                        {
+                            self.swapchain.reset_buffers();
+                            return Err(RenderFrameError::RenderFrame(
+                                OutputDamageTrackerError::Rendering(err),
+                            ));
+                        }
+
                         // and we should trigger a cleanup of the renderer texture cache
                         // to prevent holding textures longer then necessary
                         let _ = renderer.cleanup_texture_cache();
@@ -2850,7 +2935,7 @@ where
         frame_flags: FrameFlags,
     ) -> Result<PlaneAssignment, Option<RenderingReason>>
     where
-        R: Renderer + Bind<Dmabuf>,
+        R: Renderer,
         E: RenderElement<R>,
     {
         // Check if we have a free plane, otherwise we can exit early

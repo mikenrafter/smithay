@@ -13,18 +13,18 @@ use smithay::{
     backend::{
         allocator::{
             Fourcc,
+            dmabuf::Dmabuf,
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
         },
         drm::{
             DrmDevice, DrmDeviceFd, DrmNode,
-            compositor::{FrameFlags, PrimaryPlaneElement},
+            compositor::{DrmCompositor, DrmRenderTarget, FrameFlags, PrimaryPlaneElement},
             exporter::gbm::GbmFramebufferExporter,
-            output::{DrmOutputManager, DrmOutputRenderElements},
         },
         renderer::{
-            Bind, Color32F,
+            Color32F,
             element::{Id, Kind, solid::SolidColorRenderElement},
-            vulkan::VulkanRenderer,
+            vulkan::{VulkanOwnedDmabufRenderTarget, VulkanRenderer},
         },
         session::{Session, libseat::LibSeatSession},
         vulkan::{Instance, PhysicalDevice, version::Version},
@@ -36,6 +36,26 @@ use smithay::{
     },
     utils::{DeviceFd, Physical, Rectangle, Size, Transform},
 };
+
+#[derive(Debug, Default)]
+struct VulkanDiscardRenderTarget;
+
+impl DrmRenderTarget<VulkanRenderer> for VulkanDiscardRenderTarget {
+    type Target = VulkanOwnedDmabufRenderTarget<'static>;
+
+    fn target_from_dmabuf(&mut self, dmabuf: Dmabuf) -> Self::Target {
+        unsafe {
+            // SAFETY: `DrmCompositor` only calls this for a swapchain slot it acquired for the
+            // primary plane through Smithay's normal GBM swapchain path. This smoke test always does
+            // a full repaint and discards previous contents, so the Vulkan acquire path may treat
+            // previous contents as undefined instead of requiring a preserved layout. Successful
+            // Vulkan frames release the image to `VK_QUEUE_FAMILY_FOREIGN_EXT` in `GENERAL` before
+            // KMS sees the framebuffer; reused slots have already left scanout before the swapchain
+            // returns them, so no additional acquire sync point is available or required here.
+            VulkanOwnedDmabufRenderTarget::discard(dmabuf)
+        }
+    }
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     if let Ok(env_filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
@@ -69,7 +89,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (width, height) = mode.size();
     let size = Size::<i32, Physical>::from((width as i32, height as i32));
 
-    let (drm, _notifier) = DrmDevice::new(drm_fd.clone(), false)?;
+    let (mut drm, _notifier) = DrmDevice::new(drm_fd.clone(), false)?;
     let gbm = GbmDevice::new(drm_fd)?;
     let allocator = GbmAllocator::new(gbm.clone(), GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
     let exporter = GbmFramebufferExporter::new(gbm.clone(), None.into());
@@ -80,9 +100,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_physical_device(physical_device)
         .build()?;
 
-    let renderer_formats =
-        <VulkanRenderer as Bind<smithay::backend::allocator::dmabuf::Dmabuf>>::supported_formats(&renderer)
-            .unwrap_or_default();
+    let renderer_formats = VulkanDiscardRenderTarget
+        .supported_formats(&renderer)
+        .unwrap_or_default();
     if renderer_formats.iter().next().is_none() {
         return Err("Vulkan renderer did not advertise any dmabuf render-target formats".into());
     }
@@ -95,27 +115,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("Vulkan renderer did not advertise an 8-bit ARGB/ABGR dmabuf target format".into());
     }
 
-    let mut output_manager = DrmOutputManager::<_, _, (), _>::new(
-        drm,
-        allocator,
-        exporter,
-        Some(gbm),
-        color_formats,
-        renderer_formats,
-    );
     let mode_source = OutputModeSource::Static {
         size,
         scale: 1.0.into(),
         transform: Transform::Normal,
     };
-    let mut output = output_manager.lock().initialize_output(
-        crtc,
-        mode,
-        &[connector],
+    let cursor_size = drm.cursor_size();
+    let surface = drm.create_surface(crtc, mode, &[connector])?;
+    let mut compositor = DrmCompositor::<_, _, (), _>::new(
         mode_source,
+        surface,
         None,
-        &mut renderer,
-        &DrmOutputRenderElements::<VulkanRenderer, SolidColorRenderElement>::default(),
+        allocator,
+        exporter,
+        color_formats,
+        renderer_formats,
+        cursor_size,
+        Some(gbm),
     )?;
 
     let element = SolidColorRenderElement::new(
@@ -126,8 +142,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         Kind::Unspecified,
     );
     let elements = [element];
-    let frame = output.render_frame(
+    let mut render_target = VulkanDiscardRenderTarget;
+    let frame = compositor.render_frame_with_render_target(
         &mut renderer,
+        &mut render_target,
         &elements,
         Color32F::new(0.0, 0.0, 0.0, 1.0),
         FrameFlags::empty(),
@@ -137,7 +155,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             primary.sync.wait()?;
         }
     }
-    output.commit_frame()?;
+    compositor.commit_frame()?;
 
     tracing::info!(
         ?device_path,
