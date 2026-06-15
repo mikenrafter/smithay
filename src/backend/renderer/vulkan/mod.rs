@@ -1002,6 +1002,10 @@ impl<'sync> RenderTargetLifecycle<VulkanOwnedDmabufRenderTarget<'sync>> for Vulk
 
 impl Bind<Dmabuf> for VulkanRenderer {
     fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        if !self.capabilities.rendering.dmabuf_target_development {
+            return Err(VulkanError::UnsupportedOperation("dmabuf render target"));
+        }
+
         unsafe {
             // SAFETY: `Bind<Dmabuf>` follows Smithay's renderer target contract. For externally
             // shared targets, that contract requires callers to ensure no concurrent foreign access
@@ -1016,7 +1020,11 @@ impl Bind<Dmabuf> for VulkanRenderer {
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
-        Some(self.capabilities.formats.dmabuf_render_target.clone())
+        if self.capabilities.rendering.dmabuf_target_development {
+            Some(self.capabilities.formats.dmabuf_render_target.clone())
+        } else {
+            Some(FormatSet::default())
+        }
     }
 }
 

@@ -3092,6 +3092,7 @@ fn public_bind_rejects_invalid_vulkan_targets_before_device_lookup() {
 #[test]
 fn public_dmabuf_bind_uses_discard_acquire_path() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.capabilities.rendering.dmabuf_target_development = true;
     let mut dmabuf = dmabuf_for_tests();
     let default_acquire = VulkanDmabufRenderTargetAcquire::default();
     let signaled_sync = SyncPoint::signaled();
@@ -3237,6 +3238,7 @@ fn public_dmabuf_bind_uses_discard_acquire_path() {
 #[test]
 fn public_dmabuf_bind_advertises_render_target_formats() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut dmabuf = dmabuf_for_tests();
     renderer.capabilities.formats.dmabuf_render_target = [Format {
         code: Fourcc::Abgr8888,
         modifier: Modifier::Linear,
@@ -3246,8 +3248,7 @@ fn public_dmabuf_bind_advertises_render_target_formats() {
 
     // This scaffold state intentionally patches only the raw/probed format set. Runtime discovery
     // is responsible for promoting that probe result into the development capability bit; the
-    // `Bind<Dmabuf>` format surface reports the renderer target formats without independently
-    // promoting broader capability bits.
+    // `Bind<Dmabuf>` format surface must not enable itself from raw formats alone.
     assert!(!renderer.capabilities.rendering.dmabuf_targets);
     assert!(!renderer.capabilities.rendering.dmabuf_target_modifiers);
     assert!(!renderer.capabilities.rendering.dmabuf_target_development);
@@ -3261,6 +3262,15 @@ fn public_dmabuf_bind_advertises_render_target_formats() {
     );
     let formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
         .expect("Vulkan dmabuf Bind has an explicit render-target format set");
+    assert!(formats.iter().next().is_none());
+    assert!(matches!(
+        <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut dmabuf),
+        Err(VulkanError::UnsupportedOperation("dmabuf render target"))
+    ));
+
+    renderer.capabilities.rendering.dmabuf_target_development = true;
+    let formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
+        .expect("Vulkan dmabuf Bind has a gated render-target format set");
     assert!(
         formats
             .iter()
@@ -3287,6 +3297,7 @@ fn public_dmabuf_bind_advertises_render_target_formats() {
 #[test]
 fn public_dmabuf_bind_validates_metadata_before_device_lookup() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.capabilities.rendering.dmabuf_target_development = true;
     let mut zero_width = dmabuf_with_planes_for_tests(
         (0, 1).into(),
         Fourcc::Abgr8888,
