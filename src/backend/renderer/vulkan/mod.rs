@@ -15,9 +15,9 @@
 //! Smithay's optional renderer traits are capability surfaces. The CPU-memory/offscreen path is the
 //! most complete path. Dmabuf render-target support is intentionally public in this development fork,
 //! but its Vulkan external-ownership and synchronization preconditions are explicit on
-//! [`VulkanRenderer::bind_dmabuf_render_target`]. Generic safe [`Bind<Dmabuf>`] deliberately does
-//! not acquire Vulkan dmabuf render targets, because a plain [`Dmabuf`] cannot carry the required
-//! ownership/layout/synchronization proof. `ImportDma`, texture `ExportMem`, `ExportDma`, broad
+//! [`VulkanRenderer::bind_dmabuf_render_target`]. Generic [`Bind<Dmabuf>`] uses that path with a
+//! conservative discard/full-repaint acquire policy so DRM/GBM compositor rendering follows the same
+//! target abstraction as the other renderers. `ImportDma`, texture `ExportMem`, `ExportDma`, broad
 //! explicit sync, blit/copy, and full presentation remain unsupported until their corresponding
 //! capability bits can become true with coverage.
 //!
@@ -638,8 +638,9 @@ impl VulkanRenderer {
     ///
     /// This method is intentionally public in this development fork. It is the correct Vulkan-shaped
     /// entry point for callers that can reason about external-memory ownership, layout, and acquire
-    /// synchronization. Generic safe [`Bind<Dmabuf>`] intentionally does not delegate here; callers
-    /// that use this method are opting into the explicit unsafe external-memory contract.
+    /// synchronization. Generic [`Bind<Dmabuf>`] delegates here with discard/full-repaint acquire
+    /// policy; callers that use this method directly are opting into the explicit unsafe
+    /// external-memory contract and may provide preserve/acquire-sync policy themselves.
     ///
     /// # Safety
     ///
@@ -1000,18 +1001,41 @@ impl<'sync> RenderTargetLifecycle<VulkanOwnedDmabufRenderTarget<'sync>> for Vulk
 }
 
 impl Bind<Dmabuf> for VulkanRenderer {
-    fn bind<'a>(&mut self, _target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        Err(VulkanError::UnsupportedOperation(
-            "dmabuf render target requires explicit Vulkan acquire",
-        ))
+    fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        unsafe {
+            // SAFETY: `Bind<Dmabuf>` follows Smithay's renderer target contract. For externally
+            // shared targets, that contract requires callers to ensure no concurrent foreign access
+            // and to satisfy renderer-specific external ownership/layout requirements before
+            // binding. The Vulkan dmabuf target path uses a discard/full-repaint acquire policy here,
+            // so previous contents are not preserved and no acquire fence is required by this
+            // binding. Successful frames release the image for foreign/KMS use from `Frame::finish`;
+            // failed or skipped renders are handled by `RenderTargetLifecycle<Dmabuf>` below.
+            self.bind_dmabuf_render_target(target, VulkanDmabufRenderTargetAcquire::discard())
+        }?
+        .ok_or(VulkanError::UnsupportedOperation("dmabuf render target format"))
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
-        Some(FormatSet::default())
+        Some(self.capabilities.formats.dmabuf_render_target.clone())
     }
 }
 
-impl RenderTargetLifecycle<Dmabuf> for VulkanRenderer {}
+impl RenderTargetLifecycle<Dmabuf> for VulkanRenderer {
+    fn target_age(&self, _target: &Dmabuf, _age: usize) -> usize {
+        // The generic dmabuf binding currently uses discard acquire, so preserved contents are not
+        // part of the contract. Force full repaint until a future preserve/acquire-sync policy is
+        // modeled in the standard path.
+        0
+    }
+
+    fn release_after_render_error(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
+        self.release_dmabuf_render_target_after_render_error(target)
+    }
+
+    fn release_after_no_render(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
+        self.release_dmabuf_render_target_after_render_error(target)
+    }
+}
 
 fn validate_dmabuf_render_target_metadata(
     target: &Dmabuf,

@@ -596,6 +596,10 @@ where
     fn release_after_render_error(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
         RenderTargetLifecycle::release_after_render_error(self.gl.as_mut(), target)
     }
+
+    fn release_after_no_render(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
+        RenderTargetLifecycle::release_after_no_render(self.gl.as_mut(), target)
+    }
 }
 
 impl<T> Offscreen<T> for GlowRenderer

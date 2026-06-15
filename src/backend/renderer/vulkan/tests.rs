@@ -3090,7 +3090,7 @@ fn public_bind_rejects_invalid_vulkan_targets_before_device_lookup() {
 }
 
 #[test]
-fn public_dmabuf_bind_requires_explicit_acquire_path() {
+fn public_dmabuf_bind_uses_discard_acquire_path() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let mut dmabuf = dmabuf_for_tests();
     let default_acquire = VulkanDmabufRenderTargetAcquire::default();
@@ -3106,13 +3106,11 @@ fn public_dmabuf_bind_requires_explicit_acquire_path() {
     assert!(preserve_acquire.acquire_sync.is_some());
     assert_eq!(
         <VulkanRenderer as RenderTargetLifecycle<Dmabuf>>::target_age(&renderer, &dmabuf, 3),
-        3
+        0
     );
     assert!(matches!(
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut dmabuf),
-        Err(VulkanError::UnsupportedOperation(
-            "dmabuf render target requires explicit Vulkan acquire"
-        ))
+        Err(VulkanError::VulkanUnavailable)
     ));
     assert!(matches!(
         // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
@@ -3237,7 +3235,7 @@ fn public_dmabuf_bind_requires_explicit_acquire_path() {
 }
 
 #[test]
-fn public_dmabuf_bind_does_not_advertise_explicit_target_formats() {
+fn public_dmabuf_bind_advertises_render_target_formats() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     renderer.capabilities.formats.dmabuf_render_target = [Format {
         code: Fourcc::Abgr8888,
@@ -3247,8 +3245,9 @@ fn public_dmabuf_bind_does_not_advertise_explicit_target_formats() {
     .collect();
 
     // This scaffold state intentionally patches only the raw/probed format set. Runtime discovery
-    // is responsible for promoting that probe result into the development capability bit; neither
-    // the raw set nor the generic bridge should promote fully integrated capability bits by itself.
+    // is responsible for promoting that probe result into the development capability bit; the
+    // `Bind<Dmabuf>` format surface reports the renderer target formats without independently
+    // promoting broader capability bits.
     assert!(!renderer.capabilities.rendering.dmabuf_targets);
     assert!(!renderer.capabilities.rendering.dmabuf_target_modifiers);
     assert!(!renderer.capabilities.rendering.dmabuf_target_development);
@@ -3261,8 +3260,12 @@ fn public_dmabuf_bind_does_not_advertise_explicit_target_formats() {
             .any(|format| { format.code == Fourcc::Abgr8888 && format.modifier == Modifier::Linear })
     );
     let formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
-        .expect("Vulkan dmabuf Bind has an explicit empty format set");
-    assert!(formats.iter().next().is_none());
+        .expect("Vulkan dmabuf Bind has an explicit render-target format set");
+    assert!(
+        formats
+            .iter()
+            .any(|format| { format.code == Fourcc::Abgr8888 && format.modifier == Modifier::Linear })
+    );
     let explicit_formats =
         <VulkanRenderer as Bind<VulkanDmabufRenderTarget<'static, 'static>>>::supported_formats(&renderer)
             .expect("Vulkan explicit dmabuf render targets have a probed format set");
@@ -3301,15 +3304,11 @@ fn public_dmabuf_bind_validates_metadata_before_device_lookup() {
 
     assert!(matches!(
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut zero_width),
-        Err(VulkanError::UnsupportedOperation(
-            "dmabuf render target requires explicit Vulkan acquire"
-        ))
+        Err(VulkanError::UnsupportedOperation("dmabuf size"))
     ));
     assert!(matches!(
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut multi_plane),
-        Err(VulkanError::UnsupportedOperation(
-            "dmabuf render target requires explicit Vulkan acquire"
-        ))
+        Err(VulkanError::UnsupportedOperation("dmabuf render target planes"))
     ));
     assert!(matches!(
         // SAFETY: Invalid metadata is rejected before any Vulkan import or ownership-transfer

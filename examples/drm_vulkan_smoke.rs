@@ -3,8 +3,8 @@
 //! This is local hardware bring-up tooling, not a normal compositor example. Run it manually from an
 //! active physical VT with DRM master permissions. It opens a DRM card node through Smithay's
 //! libseat session backend, may take over the connected display, and does not restore previous DRM
-//! state. It renders a solid colour into a GBM scanout buffer through [`VulkanRenderer`]'s public
-//! dmabuf render-target development path and commits it with DRM.
+//! state. It renders a solid colour into a GBM scanout buffer through Smithay's normal
+//! [`Bind<Dmabuf>`] DRM compositor path and commits it with DRM.
 
 use std::{env, error::Error, path::Path, thread, time::Duration};
 
@@ -18,13 +18,13 @@ use smithay::{
         },
         drm::{
             DrmDevice, DrmDeviceFd, DrmNode,
-            compositor::{DrmCompositor, DrmRenderTarget, FrameFlags, PrimaryPlaneElement},
+            compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement},
             exporter::gbm::GbmFramebufferExporter,
         },
         renderer::{
-            Color32F,
+            Bind, Color32F,
             element::{Id, Kind, solid::SolidColorRenderElement},
-            vulkan::{VulkanOwnedDmabufRenderTarget, VulkanRenderer},
+            vulkan::VulkanRenderer,
         },
         session::{Session, libseat::LibSeatSession},
         vulkan::{Instance, PhysicalDevice, version::Version},
@@ -36,26 +36,6 @@ use smithay::{
     },
     utils::{DeviceFd, Physical, Rectangle, Size, Transform},
 };
-
-#[derive(Debug, Default)]
-struct VulkanDiscardRenderTarget;
-
-impl DrmRenderTarget<VulkanRenderer> for VulkanDiscardRenderTarget {
-    type Target = VulkanOwnedDmabufRenderTarget<'static>;
-
-    fn target_from_dmabuf(&mut self, dmabuf: Dmabuf) -> Self::Target {
-        unsafe {
-            // SAFETY: `DrmCompositor` only calls this for a swapchain slot it acquired for the
-            // primary plane through Smithay's normal GBM swapchain path. This smoke test always does
-            // a full repaint and discards previous contents, so the Vulkan acquire path may treat
-            // previous contents as undefined instead of requiring a preserved layout. Successful
-            // Vulkan frames release the image to `VK_QUEUE_FAMILY_FOREIGN_EXT` in `GENERAL` before
-            // KMS sees the framebuffer; reused slots have already left scanout before the swapchain
-            // returns them, so no additional acquire sync point is available or required here.
-            VulkanOwnedDmabufRenderTarget::discard(dmabuf)
-        }
-    }
-}
 
 fn main() -> Result<(), Box<dyn Error>> {
     if let Ok(env_filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
@@ -98,9 +78,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_physical_device(physical_device)
         .build()?;
 
-    let renderer_formats = VulkanDiscardRenderTarget
-        .supported_formats(&renderer)
-        .unwrap_or_default();
+    let renderer_formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer).unwrap_or_default();
     if renderer_formats.iter().next().is_none() {
         return Err("Vulkan renderer did not advertise any dmabuf render-target formats".into());
     }
@@ -140,10 +118,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Kind::Unspecified,
     );
     let elements = [element];
-    let mut render_target = VulkanDiscardRenderTarget;
-    let frame = compositor.render_frame_with_render_target(
+    let frame = compositor.render_frame(
         &mut renderer,
-        &mut render_target,
         &elements,
         Color32F::new(0.0, 0.0, 0.0, 1.0),
         FrameFlags::empty(),

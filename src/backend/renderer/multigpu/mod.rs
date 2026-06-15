@@ -1217,6 +1217,29 @@ where
             _ => Ok(()),
         }
     }
+
+    fn release_after_no_render(
+        &mut self,
+        framebuffer: &mut Self::Framebuffer<'_>,
+    ) -> Result<(), Self::Error> {
+        match (&mut self.target, &mut framebuffer.0) {
+            (Some(target), MultiFramebufferInternal::Target(framebuffer)) => {
+                RenderTargetLifecycle::release_after_no_render(target.device.renderer_mut(), framebuffer)
+                    .map_err(Error::Target)
+            }
+            (None, MultiFramebufferInternal::Render(framebuffer)) => {
+                // SAFETY: We know this is safe, because `self.target` can only be `None` if R == T.
+                let renderer = unsafe {
+                    std::mem::transmute::<
+                        &mut <R::Device as ApiDevice>::Renderer,
+                        &mut <T::Device as ApiDevice>::Renderer,
+                    >(self.render.renderer_mut())
+                };
+                RenderTargetLifecycle::release_after_no_render(renderer, framebuffer).map_err(Error::Target)
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 const MAX_CPU_COPIES: usize = 3; // TODO, benchmark this
