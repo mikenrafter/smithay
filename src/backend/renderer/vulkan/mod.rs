@@ -3,7 +3,7 @@
 //! This module provides a provisional, opt-in Vulkan renderer for an explicit [`PhysicalDevice`]. It
 //! can upload sampled textures from CPU memory, render to in-memory/offscreen targets, read back
 //! those offscreen targets through Smithay's public [`ImportMem`], [`Bind`], [`Offscreen`],
-//! [`Renderer`], and [`ExportMem`] traits, and expose experimental public dmabuf render-target
+//! [`Renderer`], and [`ExportMem`] traits, and expose validation-stage dmabuf render-target
 //! development hooks. It remains intentionally incomplete and does not provide a complete compositor
 //! renderer, HDR, colour-management policy, or a fully integrated presentation backend.
 //!
@@ -13,13 +13,13 @@
 //! functionality.
 //!
 //! Smithay's optional renderer traits are capability surfaces. The CPU-memory/offscreen path is the
-//! most complete path. Dmabuf render-target support is intentionally public in this development fork,
-//! but its Vulkan external-ownership and synchronization preconditions are explicit on
+//! most complete path. Dmabuf render-target support is development-gated in this fork, and its Vulkan
+//! external-ownership and synchronization preconditions are explicit on
 //! [`VulkanRenderer::bind_dmabuf_render_target`]. Generic [`Bind<Dmabuf>`] uses that path with a
 //! conservative discard/full-repaint acquire policy so DRM/GBM compositor rendering follows the same
-//! target abstraction as the other renderers. `ImportDma`, texture `ExportMem`, `ExportDma`, broad
-//! explicit sync, blit/copy, and full presentation remain unsupported until their corresponding
-//! capability bits can become true with coverage.
+//! target abstraction as the other renderers once the validation-stage gate is true. `ImportDma`,
+//! texture `ExportMem`, `ExportDma`, broad explicit sync, blit/copy, and full presentation remain
+//! unsupported until their corresponding capability bits can become true with coverage.
 //!
 //! Intended implementation order:
 //!
@@ -92,9 +92,9 @@ pub use self::{
 
 /// Acquire options for binding a foreign dmabuf as a Vulkan render target.
 ///
-/// This is the public development-fork API for the Vulkan-specific external target contract. It is
-/// explicit because a plain [`Dmabuf`] does not encode Vulkan queue-family ownership, image layout,
-/// or acquire synchronization.
+/// This is the development-fork API for the Vulkan-specific external target contract. It is explicit
+/// because a plain [`Dmabuf`] does not encode Vulkan queue-family ownership, image layout, or acquire
+/// synchronization.
 #[derive(Debug, Clone, Copy)]
 pub struct VulkanDmabufRenderTargetAcquire<'a> {
     /// Preserve previous target contents during acquire.
@@ -423,6 +423,22 @@ impl VulkanRenderer {
 
     fn render_target_formats(&self) -> FormatSet {
         self.capabilities.formats.render_target_formats()
+    }
+
+    fn development_gated_dmabuf_render_target_formats(&self) -> FormatSet {
+        if self.capabilities.rendering.dmabuf_target_development {
+            self.capabilities.formats.dmabuf_render_target.clone()
+        } else {
+            FormatSet::default()
+        }
+    }
+
+    fn public_dmabuf_import_formats(&self) -> FormatSet {
+        if self.capabilities.import.dmabuf {
+            self.capabilities.formats.dmabuf_import.clone()
+        } else {
+            FormatSet::default()
+        }
     }
 
     fn render_target_format_supported(&self, format: Fourcc) -> bool {
@@ -950,7 +966,7 @@ impl<'target, 'sync> Bind<VulkanDmabufRenderTarget<'target, 'sync>> for VulkanRe
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
-        Some(self.capabilities.formats.dmabuf_render_target.clone())
+        Some(self.development_gated_dmabuf_render_target_formats())
     }
 }
 
@@ -986,7 +1002,7 @@ impl<'sync> Bind<VulkanOwnedDmabufRenderTarget<'sync>> for VulkanRenderer {
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
-        Some(self.capabilities.formats.dmabuf_render_target.clone())
+        Some(self.development_gated_dmabuf_render_target_formats())
     }
 }
 
@@ -1026,11 +1042,7 @@ impl Bind<Dmabuf> for VulkanRenderer {
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
-        if self.capabilities.rendering.dmabuf_target_development {
-            Some(self.capabilities.formats.dmabuf_render_target.clone())
-        } else {
-            Some(FormatSet::default())
-        }
+        Some(self.development_gated_dmabuf_render_target_formats())
     }
 }
 
@@ -1078,7 +1090,7 @@ impl Offscreen<VulkanRenderTarget<'static>> for VulkanRenderer {
 
 impl ImportDma for VulkanRenderer {
     fn dmabuf_formats(&self) -> FormatSet {
-        self.capabilities.formats.dmabuf_import.clone()
+        self.public_dmabuf_import_formats()
     }
 
     fn import_dmabuf(

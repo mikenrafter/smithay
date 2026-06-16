@@ -3237,7 +3237,7 @@ fn public_dmabuf_bind_uses_discard_acquire_path() {
 }
 
 #[test]
-fn public_dmabuf_bind_advertises_render_target_formats() {
+fn public_dmabuf_bind_gates_render_target_formats() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let mut dmabuf = dmabuf_for_tests();
     renderer.capabilities.formats.dmabuf_render_target = [Format {
@@ -3264,6 +3264,14 @@ fn public_dmabuf_bind_advertises_render_target_formats() {
     let formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
         .expect("Vulkan dmabuf Bind has an explicit render-target format set");
     assert!(formats.iter().next().is_none());
+    let explicit_formats =
+        <VulkanRenderer as Bind<VulkanDmabufRenderTarget<'static, 'static>>>::supported_formats(&renderer)
+            .expect("Vulkan explicit dmabuf render targets have a gated format set");
+    assert!(explicit_formats.iter().next().is_none());
+    let owned_explicit_formats =
+        <VulkanRenderer as Bind<VulkanOwnedDmabufRenderTarget<'static>>>::supported_formats(&renderer)
+            .expect("Vulkan owned explicit dmabuf render targets have a gated format set");
+    assert!(owned_explicit_formats.iter().next().is_none());
     assert!(matches!(
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut dmabuf),
         Err(VulkanError::NotPublicAdvertised("dmabuf render target"))
@@ -3279,7 +3287,7 @@ fn public_dmabuf_bind_advertises_render_target_formats() {
     );
     let explicit_formats =
         <VulkanRenderer as Bind<VulkanDmabufRenderTarget<'static, 'static>>>::supported_formats(&renderer)
-            .expect("Vulkan explicit dmabuf render targets have a probed format set");
+            .expect("Vulkan explicit dmabuf render targets have a gated format set");
     assert!(
         explicit_formats
             .iter()
@@ -3287,7 +3295,7 @@ fn public_dmabuf_bind_advertises_render_target_formats() {
     );
     let owned_explicit_formats =
         <VulkanRenderer as Bind<VulkanOwnedDmabufRenderTarget<'static>>>::supported_formats(&renderer)
-            .expect("Vulkan owned explicit dmabuf render targets have a probed format set");
+            .expect("Vulkan owned explicit dmabuf render targets have a gated format set");
     assert!(
         owned_explicit_formats
             .iter()
@@ -3440,14 +3448,24 @@ fn internal_dmabuf_render_target_release_rejects_preconditions_before_device_loo
 }
 
 #[test]
-fn public_dmabuf_import_is_not_public_advertised_yet() {
+fn public_dmabuf_import_gates_formats() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let dmabuf = dmabuf_for_tests();
     let format = Format {
         code: Fourcc::Abgr8888,
         modifier: Modifier::Invalid,
     };
+    renderer.capabilities.formats.dmabuf_import = [format].into_iter().collect();
 
+    assert!(!renderer.capabilities.import.dmabuf);
+    assert!(
+        renderer
+            .capabilities
+            .formats
+            .dmabuf_import
+            .iter()
+            .any(|candidate| *candidate == format)
+    );
     assert!(renderer.dmabuf_formats().iter().next().is_none());
     assert!(!renderer.has_dmabuf_format(format));
     assert!(matches!(
@@ -6565,6 +6583,69 @@ fn runtime_frame_render_texture_draws_uploaded_sampled_image() {
 
 #[test]
 #[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_frame_render_texture_draws_imported_memory_texture() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let mut renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let Some(render_format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.memory_import
+                && record.usages.color_attachment
+                && record.usages.color_attachment_blend
+                && record.usages.transfer_src
+                && record.usages.transfer_dst
+        })
+        .map(|record| record.format)
+    else {
+        return;
+    };
+
+    let texture = renderer
+        .import_memory(&[0x00, 0xff, 0x00, 0xff], render_format, (1, 1).into(), false)
+        .unwrap();
+    let mut target = renderer
+        .create_offscreen_render_target(render_format, (1, 1).into())
+        .unwrap();
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((1, 1)))];
+        let mut frame = renderer
+            .render(&mut target, (1, 1).into(), Transform::Normal)
+            .unwrap();
+
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::from_size((1.0, 1.0).into()),
+                Rectangle::from_size((1, 1).into()),
+                &full_damage,
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .unwrap();
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
+    assert_eq!(readback, [0, 255, 0, 255]);
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
 fn runtime_frame_draw_solid_respects_destination_local_damage() {
     let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
     let physical_device = PhysicalDevice::enumerate(&instance)
@@ -7309,6 +7390,98 @@ fn runtime_frame_render_texture_respects_partial_damage_scissor() {
         readback,
         [255, 0, 0, 255, 255, 0, 0, 255, 0, 0, 255, 255, 255, 0, 0, 255]
     );
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_frame_render_texture_clips_partial_destination() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let mut renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let Some(render_format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.sampled
+                && record.usages.color_attachment
+                && record.usages.color_attachment_blend
+                && record.usages.transfer_src
+                && record.usages.transfer_dst
+        })
+        .map(|record| record.format)
+    else {
+        return;
+    };
+
+    let sampled_image = renderer
+        .device
+        .as_ref()
+        .unwrap()
+        .create_uploaded_sampled_image(
+            vk::Extent3D {
+                width: 4,
+                height: 1,
+                depth: 1,
+            },
+            super::get_render_vk_format(render_format).unwrap(),
+            &[
+                255, 0, 0, 255, // clipped left
+                0, 255, 0, 255, // visible x = 0
+                0, 0, 255, 255, // visible x = 1
+                255, 255, 255, 255, // visible x = 2
+            ],
+            TextureFilter::Nearest,
+            TextureFilter::Nearest,
+        )
+        .unwrap();
+    let texture = VulkanTexture::from_sampled_image(
+        renderer.context_id(),
+        (4, 1).into(),
+        render_format,
+        sampled_image,
+        false,
+    );
+    let mut target = renderer
+        .create_offscreen_render_target(render_format, (3, 1).into())
+        .unwrap();
+
+    {
+        let clear_damage = [Rectangle::from_size(Size::<i32, Physical>::from((3, 1)))];
+        let texture_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 1)))];
+        let mut frame = renderer
+            .render(&mut target, (3, 1).into(), Transform::Normal)
+            .unwrap();
+
+        frame
+            .clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &clear_damage)
+            .unwrap();
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::from_size((4.0, 1.0).into()),
+                Rectangle::new((-1, 0).into(), (4, 1).into()),
+                &texture_damage,
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .unwrap();
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
+    assert_eq!(readback, [0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]);
 }
 
 #[test]
