@@ -3509,6 +3509,14 @@ fn public_dmabuf_import_gates_formats() {
         Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
     ));
     assert!(matches!(
+        // SAFETY: This scaffold renderer has no Vulkan device, so the explicit validation-stage
+        // helper returns before any Vulkan import, fd import, or ownership-transfer operation can
+        // occur. The important contract here is that known-layout sampled dmabuf import remains
+        // reachable without advertising generic ImportDma support.
+        unsafe { renderer.import_dmabuf_texture_with_known_general_layout(&dmabuf, None) },
+        Err(VulkanError::VulkanUnavailable)
+    ));
+    assert!(matches!(
         // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
         // Vulkan import or ownership-transfer operation can occur.
         unsafe { renderer.create_imported_dmabuf_texture_with_known_general_layout(&dmabuf, None) },
@@ -3554,6 +3562,13 @@ fn internal_dmabuf_texture_release_rejects_preconditions_before_device_lookup() 
     ));
     assert!(matches!(
         renderer.release_imported_dmabuf_texture_to_foreign_general(&missing_sampled_image_texture, true),
+        Err(VulkanError::UnsupportedOperation("dmabuf texture sampled image"))
+    ));
+    assert!(matches!(
+        renderer.release_imported_dmabuf_texture_to_foreign_general_sync_point(
+            &missing_sampled_image_texture,
+            true
+        ),
         Err(VulkanError::UnsupportedOperation("dmabuf texture sampled image"))
     ));
 }

@@ -139,6 +139,10 @@ name = "drm_vulkan_smoke"
 required-features = ["backend_drm", "backend_gbm", "backend_session_libseat", "renderer_vulkan", "wayland_frontend"]
 
 [[example]]
+name = "wayland_vulkan_smoke"
+required-features = ["renderer_vulkan", "wayland_frontend", "backend_egl", "use_system_lib"]
+
+[[example]]
 name = "buffer_test"
 required-features = ["backend_drm", "backend_gbm", "backend_egl", "backend_vulkan", "renderer_gl"]
 

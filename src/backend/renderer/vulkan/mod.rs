@@ -17,9 +17,11 @@
 //! external-ownership and synchronization preconditions are explicit on
 //! [`VulkanRenderer::bind_dmabuf_render_target`]. Generic [`Bind<Dmabuf>`] uses that path with a
 //! conservative discard/full-repaint acquire policy so DRM/GBM compositor rendering follows the same
-//! target abstraction as the other renderers once the validation-stage gate is true. `ImportDma`,
-//! texture `ExportMem`, `ExportDma`, broad explicit sync, blit/copy, and full presentation remain
-//! unsupported until their corresponding capability bits can become true with coverage.
+//! target abstraction as the other renderers once the validation-stage gate is true. Generic
+//! `ImportDma`, texture `ExportMem`, `ExportDma`, broad explicit sync, blit/copy, and full
+//! presentation remain unsupported until their corresponding capability bits can become true with
+//! coverage. Sampled dmabuf import is validation-reachable only through the explicit known-layout
+//! development helper; it is not public-advertised through `ImportDma` yet.
 //!
 //! Intended implementation order:
 //!
@@ -690,9 +692,41 @@ impl VulkanRenderer {
         }
     }
 
+    /// Import a dmabuf as a sampled texture when the producer's Vulkan external state is known.
+    ///
+    /// This is a validation-stage development helper for the intended sampled dmabuf path. It does
+    /// not make generic [`ImportDma`] public-advertised, and `dmabuf_formats()` remains gated by
+    /// [`VulkanImportCapabilities::dmabuf`] until arbitrary client-buffer acquire/layout/sync
+    /// contracts are implemented and tested.
+    ///
+    /// Use [`VulkanRenderer::release_imported_dmabuf_texture_to_foreign_general_sync_point`] before
+    /// handing the dmabuf back to a foreign Vulkan producer/consumer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the dmabuf producer released the image to
+    /// `VK_QUEUE_FAMILY_FOREIGN_EXT` in `VK_IMAGE_LAYOUT_GENERAL`. If `acquire_sync` is `Some`, it
+    /// must represent the producer's completion dependency for that release and signal only after
+    /// the producer's writes and ownership release for this dmabuf are complete. If `acquire_sync`
+    /// is `None`, the caller must ensure those writes and ownership release are already complete and
+    /// visible to this renderer's Vulkan queue submission. If `acquire_sync` exports a fence fd and
+    /// this device supports sync-file import, that fd must be a valid Linux sync-file fd suitable for
+    /// `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT`.
+    pub unsafe fn import_dmabuf_texture_with_known_general_layout(
+        &mut self,
+        dmabuf: &Dmabuf,
+        acquire_sync: Option<&SyncPoint>,
+    ) -> Result<Option<VulkanTexture>, VulkanError> {
+        // SAFETY: Forwarded from this public unsafe method's caller.
+        unsafe {
+            self.create_imported_dmabuf_texture_with_known_general_layout_and_sync_point(dmabuf, acquire_sync)
+        }
+    }
+
     /// Release an acquired dmabuf texture back to foreign ownership in `VK_IMAGE_LAYOUT_GENERAL`.
     ///
-    /// This is an internal counterpart to the known-layout acquire helpers. It does not make public
+    /// This is the release counterpart to
+    /// [`VulkanRenderer::import_dmabuf_texture_with_known_general_layout`]. It does not make public
     /// dmabuf import/export supported; callers must only pass textures created by the acquired
     /// dmabuf import path for this renderer.
     #[allow(dead_code)]
@@ -714,6 +748,24 @@ impl VulkanRenderer {
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
 
         device.release_sampled_dmabuf_to_foreign_general(sampled_image.image(), export_sync_file)
+    }
+
+    /// Release an acquired dmabuf texture and return the exported release fence as a [`SyncPoint`]
+    /// when available.
+    ///
+    /// This is a validation-stage development helper for explicit known-layout sampled dmabuf
+    /// imports. It does not make generic [`ImportDma`] public-advertised. When `released` is true,
+    /// the texture's dmabuf image has been returned to foreign ownership and must not be sampled by
+    /// this renderer again until it is reacquired. The returned [`SyncPoint`] is the release
+    /// dependency for the foreign producer or consumer.
+    pub fn release_imported_dmabuf_texture_to_foreign_general_sync_point(
+        &mut self,
+        texture: &VulkanTexture,
+        export_sync_file: bool,
+    ) -> Result<(bool, SyncPoint), VulkanError> {
+        let (released, sync_file) =
+            self.release_imported_dmabuf_texture_to_foreign_general(texture, export_sync_file)?;
+        Ok((released, sync_point_from_sync_file(sync_file)))
     }
 
     /// Release an acquired dmabuf render target back to foreign ownership in `GENERAL` layout.
