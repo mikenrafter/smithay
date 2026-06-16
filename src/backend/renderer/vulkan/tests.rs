@@ -37,9 +37,10 @@ use super::image::{
     VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalImageAcquireKind, VulkanExternalImageOwnership,
     VulkanExternalImageReleaseKind, VulkanExternalMemoryHandleType, VulkanExternalMemoryState,
     VulkanImageLayoutState, VulkanImageSource, VulkanImageState, VulkanImageSyncState, VulkanImageUsage,
-    clear_damage_to_clear_areas, damage_to_scissor_areas, dmabuf_acquired_image_state,
-    dmabuf_acquired_render_target_image_state, dmabuf_import_image_state, dmabuf_render_target_image_state,
-    draw_solid_damage_to_clear_areas, render_texture_damage_to_scissor_areas, source_to_uv_rect,
+    clear_damage_to_clear_areas, clip_render_texture_draw_area, damage_to_scissor_areas,
+    dmabuf_acquired_image_state, dmabuf_acquired_render_target_image_state, dmabuf_import_image_state,
+    dmabuf_render_target_image_state, draw_solid_damage_to_clear_areas,
+    render_texture_damage_to_scissor_areas, source_to_uv_rect,
 };
 use super::*;
 
@@ -4602,8 +4603,24 @@ fn frame_render_texture_rejects_narrow_path_preconditions_before_device_lookup()
         &[],
         Transform::Normal,
         1.0,
-        "render texture destination",
+        "render texture device",
     );
+
+    let mut frame = frame_for_tests(frame_context_id.clone(), output_size, Transform::Normal);
+    assert!(
+        frame
+            .render_texture_from_to(
+                &texture,
+                full_src,
+                Rectangle::new((8, 0).into(), (2, 6).into()),
+                &full_damage,
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .is_ok()
+    );
+
     assert_render_texture_error(
         &texture,
         frame_context_id.clone(),
@@ -4936,6 +4953,108 @@ fn render_texture_damage_to_scissor_areas_treats_implicit_opaque_as_opaque() {
             offset: vk::Offset2D { x: 1, y: 0 },
             extent: vk::Extent2D { width: 4, height: 1 },
         }]
+    );
+}
+
+#[test]
+fn clip_render_texture_draw_area_preserves_visible_destinations() {
+    let output_size = Size::<i32, Physical>::from((8, 6));
+    let dst = Rectangle::new((1, 2).into(), (4, 3).into());
+
+    let (draw_area, uv_origin, uv_x_axis, uv_y_axis) =
+        clip_render_texture_draw_area(output_size, dst, [0.25, 0.5], [0.5, 0.0], [0.0, 0.25])
+            .unwrap()
+            .unwrap();
+
+    assert_eq!(
+        draw_area,
+        vk::Rect2D {
+            offset: vk::Offset2D { x: 1, y: 2 },
+            extent: vk::Extent2D { width: 4, height: 3 },
+        }
+    );
+    assert_eq!(uv_origin, [0.25, 0.5]);
+    assert_eq!(uv_x_axis, [0.5, 0.0]);
+    assert_eq!(uv_y_axis, [0.0, 0.25]);
+}
+
+#[test]
+fn clip_render_texture_draw_area_remaps_uvs_for_output_clipping() {
+    let output_size = Size::<i32, Physical>::from((4, 3));
+    let dst = Rectangle::new((-2, -1).into(), (8, 4).into());
+
+    let (draw_area, uv_origin, uv_x_axis, uv_y_axis) =
+        clip_render_texture_draw_area(output_size, dst, [0.0, 0.0], [1.0, 0.0], [0.0, 1.0])
+            .unwrap()
+            .unwrap();
+
+    assert_eq!(
+        draw_area,
+        vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D { width: 4, height: 3 },
+        }
+    );
+    assert_eq!(uv_origin, [0.25, 0.25]);
+    assert_eq!(uv_x_axis, [0.5, 0.0]);
+    assert_eq!(uv_y_axis, [0.0, 0.75]);
+}
+
+#[test]
+fn clip_render_texture_draw_area_handles_transformed_uv_axes() {
+    let output_size = Size::<i32, Physical>::from((4, 4));
+    let dst = Rectangle::new((2, 1).into(), (4, 4).into());
+
+    let (draw_area, uv_origin, uv_x_axis, uv_y_axis) =
+        clip_render_texture_draw_area(output_size, dst, [0.0, 1.0], [0.0, -1.0], [1.0, 0.0])
+            .unwrap()
+            .unwrap();
+
+    assert_eq!(
+        draw_area,
+        vk::Rect2D {
+            offset: vk::Offset2D { x: 2, y: 1 },
+            extent: vk::Extent2D { width: 2, height: 3 },
+        }
+    );
+    assert_eq!(uv_origin, [0.0, 1.0]);
+    assert_eq!(uv_x_axis, [0.0, -0.5]);
+    assert_eq!(uv_y_axis, [0.75, 0.0]);
+}
+
+#[test]
+fn clip_render_texture_draw_area_reports_offscreen_and_invalid_destinations() {
+    let output_size = Size::<i32, Physical>::from((4, 3));
+
+    assert_eq!(
+        clip_render_texture_draw_area(
+            output_size,
+            Rectangle::new((4, 0).into(), (2, 2).into()),
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ),
+        Some(None)
+    );
+    assert_eq!(
+        clip_render_texture_draw_area(
+            output_size,
+            Rectangle::new((0, 0).into(), (0, 2).into()),
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ),
+        None
+    );
+    assert_eq!(
+        clip_render_texture_draw_area(
+            (0, 3).into(),
+            Rectangle::new((0, 0).into(), (2, 2).into()),
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ),
+        None
     );
 }
 

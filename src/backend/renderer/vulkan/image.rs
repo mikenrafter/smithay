@@ -1213,14 +1213,15 @@ impl Frame for VulkanFrame<'_, '_> {
         let (uv_origin, uv_x_axis, uv_y_axis) =
             source_to_uv_rect(texture.image.size, src, texture.y_inverted, src_transform)
                 .ok_or(VulkanError::UnsupportedOperation("render texture source"))?;
-        let draw_area = output_destination_to_vk_rect(self.output_size, dst)
-            .ok_or(VulkanError::UnsupportedOperation("render texture destination"))?;
-        if draw_area.extent.width == 0 || draw_area.extent.height == 0 {
-            return Err(VulkanError::UnsupportedOperation("render texture destination"));
-        }
         if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
             return Err(VulkanError::UnsupportedOperation("render texture alpha"));
         }
+        let Some((draw_area, uv_origin, uv_x_axis, uv_y_axis)) =
+            clip_render_texture_draw_area(self.output_size, dst, uv_origin, uv_x_axis, uv_y_axis)
+                .ok_or(VulkanError::UnsupportedOperation("render texture destination"))?
+        else {
+            return Ok(());
+        };
         let device = self
             .device
             .ok_or(VulkanError::UnsupportedOperation("render texture device"))?;
@@ -1512,6 +1513,38 @@ pub(super) fn render_texture_damage_to_scissor_areas(
         damage_to_scissor_areas(output_size, dst, &non_opaque_damage)?,
         damage_to_scissor_areas(output_size, dst, &opaque_damage)?,
     ))
+}
+
+pub(super) fn clip_render_texture_draw_area(
+    output_size: Size<i32, Physical>,
+    dst: Rectangle<i32, Physical>,
+    uv_origin: [f32; 2],
+    uv_x_axis: [f32; 2],
+    uv_y_axis: [f32; 2],
+) -> Option<Option<(vk::Rect2D, [f32; 2], [f32; 2], [f32; 2])>> {
+    if output_size.w <= 0 || output_size.h <= 0 || dst.size.w <= 0 || dst.size.h <= 0 {
+        return None;
+    }
+
+    let output = Rectangle::from_size(output_size);
+    let clipped_dst = match output.intersection(dst) {
+        Some(clipped) => clipped,
+        None => return Some(None),
+    };
+
+    let draw_area = output_destination_to_vk_rect(output_size, clipped_dst)?;
+    let x_offset = (f64::from(clipped_dst.loc.x) - f64::from(dst.loc.x)) / f64::from(dst.size.w);
+    let y_offset = (f64::from(clipped_dst.loc.y) - f64::from(dst.loc.y)) / f64::from(dst.size.h);
+    let x_scale = f64::from(clipped_dst.size.w) / f64::from(dst.size.w);
+    let y_scale = f64::from(clipped_dst.size.h) / f64::from(dst.size.h);
+    let uv_origin = [
+        uv_origin[0] + uv_x_axis[0] * x_offset as f32 + uv_y_axis[0] * y_offset as f32,
+        uv_origin[1] + uv_x_axis[1] * x_offset as f32 + uv_y_axis[1] * y_offset as f32,
+    ];
+    let uv_x_axis = [uv_x_axis[0] * x_scale as f32, uv_x_axis[1] * x_scale as f32];
+    let uv_y_axis = [uv_y_axis[0] * y_scale as f32, uv_y_axis[1] * y_scale as f32];
+
+    Some(Some((draw_area, uv_origin, uv_x_axis, uv_y_axis)))
 }
 
 pub(super) fn source_to_uv_rect(
