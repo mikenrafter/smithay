@@ -3265,7 +3265,7 @@ fn public_dmabuf_bind_advertises_render_target_formats() {
     assert!(formats.iter().next().is_none());
     assert!(matches!(
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut dmabuf),
-        Err(VulkanError::UnsupportedOperation("dmabuf render target"))
+        Err(VulkanError::NotPublicAdvertised("dmabuf render target"))
     ));
 
     renderer.capabilities.rendering.dmabuf_target_development = true;
@@ -3418,7 +3418,7 @@ fn internal_dmabuf_render_target_release_rejects_preconditions_before_device_loo
     ));
     assert!(matches!(
         renderer.release_acquired_dmabuf_render_target_to_foreign_general(&mut released_target, false),
-        Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"))
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
     ));
     assert!(matches!(
         renderer
@@ -3439,7 +3439,7 @@ fn internal_dmabuf_render_target_release_rejects_preconditions_before_device_loo
 }
 
 #[test]
-fn public_dmabuf_import_is_explicitly_unsupported() {
+fn public_dmabuf_import_is_not_public_advertised_yet() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let dmabuf = dmabuf_for_tests();
     let format = Format {
@@ -3451,7 +3451,7 @@ fn public_dmabuf_import_is_explicitly_unsupported() {
     assert!(!renderer.has_dmabuf_format(format));
     assert!(matches!(
         renderer.import_dmabuf(&dmabuf, None),
-        Err(VulkanError::UnsupportedOperation("dmabuf import"))
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
     ));
     assert!(matches!(
         // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
@@ -3893,6 +3893,8 @@ fn vulkan_errors_map_to_swap_buffers_error() {
 
     let temporary_errors = [
         VulkanError::UnsupportedOperation("test"),
+        VulkanError::NotPublicAdvertised("test"),
+        VulkanError::MissingCapability("test"),
         VulkanError::UnsupportedFormat(Fourcc::Argb8888),
         VulkanError::UnsupportedModifier,
         VulkanError::MemoryTypeUnsupported,
@@ -4151,7 +4153,7 @@ fn renderer_render_rejects_released_dmabuf_target_before_device_lookup() {
 
     assert!(matches!(
         renderer.render(&mut target, (1, 1).into(), Transform::Normal),
-        Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"))
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
     ));
 }
 
@@ -4425,7 +4427,7 @@ fn frame_finish_releases_internal_dmabuf_target_preconditions() {
 
     assert!(matches!(
         frame.finish(),
-        Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"))
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
     ));
 }
 
@@ -4551,18 +4553,19 @@ fn frame_render_texture_rejects_narrow_path_preconditions_before_device_lookup()
     ] {
         let mut externally_owned_texture = texture.clone();
         externally_owned_texture.image.sync = sync;
-        assert_render_texture_error(
-            &externally_owned_texture,
-            frame_context_id.clone(),
-            Transform::Normal,
-            full_src,
-            full_dst,
-            &full_damage,
-            &[],
-            Transform::Normal,
-            1.0,
-            "dmabuf import synchronization",
-        );
+        let mut frame = frame_for_tests(frame_context_id.clone(), output_size, Transform::Normal);
+        assert!(matches!(
+            frame.render_texture_from_to(
+                &externally_owned_texture,
+                full_src,
+                full_dst,
+                &full_damage,
+                &[],
+                Transform::Normal,
+                1.0,
+            ),
+            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        ));
     }
 
     assert_render_texture_error(
@@ -5426,7 +5429,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
             &owned_image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         ),
-        Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"))
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
     ));
     owned_image
         .set_sync_state(VulkanImageSyncState::default())

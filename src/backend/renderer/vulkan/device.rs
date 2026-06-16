@@ -3233,7 +3233,7 @@ fn ensure_image_locally_usable(image: &VulkanOwnedImage) -> Result<(), VulkanErr
     if image.sync_state()?.is_locally_usable() {
         Ok(())
     } else {
-        Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"))
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
     }
 }
 
@@ -3247,7 +3247,7 @@ fn ensure_image_locally_usable_for_recorded_color_attachment_work(
     {
         Ok(())
     } else {
-        Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"))
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
     }
 }
 
@@ -3263,7 +3263,7 @@ fn ensure_image_locally_usable_for_recorded_layout_transition(
         return ensure_image_locally_usable_for_recorded_color_attachment_work(command_buffer, image);
     }
 
-    Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"))
+    Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
 }
 
 fn vulkan_error_is_device_lost(err: &VulkanError) -> bool {
@@ -3283,6 +3283,8 @@ fn vulkan_error_invalidates_context(err: &VulkanError) -> bool {
         | VulkanError::QueueFamilyUnsupported
         | VulkanError::ExternalMemoryUnsupported => true,
         VulkanError::UnsupportedOperation(_)
+        | VulkanError::NotPublicAdvertised(_)
+        | VulkanError::MissingCapability(_)
         | VulkanError::UnsupportedFormat(_)
         | VulkanError::UnsupportedModifier
         | VulkanError::SyncInterrupted

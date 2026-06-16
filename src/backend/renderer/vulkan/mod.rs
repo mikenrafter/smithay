@@ -717,7 +717,7 @@ impl VulkanRenderer {
             return Err(VulkanError::UnsupportedOperation("dmabuf render target"));
         }
         if !target.image.sync.is_locally_usable() {
-            return Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"));
+            return Err(VulkanError::UnsupportedOperation("dmabuf external ownership"));
         }
         let color_image = target
             .color_image
@@ -878,7 +878,7 @@ impl Renderer for VulkanRenderer {
         if framebuffer.image.source == image::VulkanImageSource::RenderTarget
             && !framebuffer.image.sync.is_locally_usable()
         {
-            return Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"));
+            return Err(VulkanError::UnsupportedOperation("dmabuf external ownership"));
         }
         if framebuffer.color_image.is_none() {
             return Err(VulkanError::UnsupportedOperation("render target image"));
@@ -944,7 +944,9 @@ impl<'target, 'sync> Bind<VulkanDmabufRenderTarget<'target, 'sync>> for VulkanRe
             // this wrapper while the framebuffer is live.
             self.bind_dmabuf_render_target(&mut *target.dmabuf, target.acquire)
         }?
-        .ok_or(VulkanError::UnsupportedOperation("dmabuf render target format"))
+        .ok_or(VulkanError::MissingCapability(
+            "dmabuf render target format/modifier",
+        ))
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
@@ -978,7 +980,9 @@ impl<'sync> Bind<VulkanOwnedDmabufRenderTarget<'sync>> for VulkanRenderer {
             // through this wrapper while the framebuffer is live.
             self.bind_dmabuf_render_target(&mut target.dmabuf, target.acquire)
         }?
-        .ok_or(VulkanError::UnsupportedOperation("dmabuf render target format"))
+        .ok_or(VulkanError::MissingCapability(
+            "dmabuf render target format/modifier",
+        ))
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
@@ -1003,7 +1007,7 @@ impl<'sync> RenderTargetLifecycle<VulkanOwnedDmabufRenderTarget<'sync>> for Vulk
 impl Bind<Dmabuf> for VulkanRenderer {
     fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
         if !self.capabilities.rendering.dmabuf_target_development {
-            return Err(VulkanError::UnsupportedOperation("dmabuf render target"));
+            return Err(VulkanError::NotPublicAdvertised("dmabuf render target"));
         }
 
         unsafe {
@@ -1016,7 +1020,9 @@ impl Bind<Dmabuf> for VulkanRenderer {
             // failed or skipped renders are handled by `RenderTargetLifecycle<Dmabuf>` below.
             self.bind_dmabuf_render_target(target, VulkanDmabufRenderTargetAcquire::discard())
         }?
-        .ok_or(VulkanError::UnsupportedOperation("dmabuf render target format"))
+        .ok_or(VulkanError::MissingCapability(
+            "dmabuf render target format/modifier",
+        ))
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
@@ -1080,7 +1086,7 @@ impl ImportDma for VulkanRenderer {
         _dmabuf: &Dmabuf,
         _damage: Option<&[Rectangle<i32, BufferCoord>]>,
     ) -> Result<Self::TextureId, Self::Error> {
-        Err(VulkanError::UnsupportedOperation("dmabuf import"))
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
     }
 }
 

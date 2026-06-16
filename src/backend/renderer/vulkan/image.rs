@@ -1205,7 +1205,7 @@ impl Frame for VulkanFrame<'_, '_> {
             return Err(VulkanError::UnsupportedOperation("foreign render texture"));
         }
         if !texture.sync_state()?.is_locally_usable() {
-            return Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"));
+            return Err(VulkanError::UnsupportedOperation("dmabuf external ownership"));
         }
         if self.transform != Transform::Normal {
             return Err(VulkanError::UnsupportedOperation("render texture transform"));
@@ -1338,7 +1338,7 @@ impl Frame for VulkanFrame<'_, '_> {
             return Ok(SyncPoint::signaled());
         }
         if !target.image.sync.is_locally_usable() {
-            return Err(VulkanError::UnsupportedOperation("dmabuf import synchronization"));
+            return Err(VulkanError::UnsupportedOperation("dmabuf external ownership"));
         }
 
         let color_image = target

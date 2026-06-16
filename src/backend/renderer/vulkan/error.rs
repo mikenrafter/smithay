@@ -13,6 +13,12 @@ pub enum VulkanError {
     /// The requested operation is not supported by the current Vulkan renderer capability set.
     #[error("Unsupported Vulkan renderer operation: {0}")]
     UnsupportedOperation(&'static str),
+    /// The requested operation is on an intended development path but is not public-advertised yet.
+    #[error("Vulkan renderer path is not public-advertised yet: {0}")]
+    NotPublicAdvertised(&'static str),
+    /// The requested operation requires a Vulkan/device capability that is not available.
+    #[error("Vulkan renderer missing capability: {0}")]
+    MissingCapability(&'static str),
     /// The requested format is unsupported.
     #[error("Unsupported Vulkan renderer format: {0:?}")]
     UnsupportedFormat(Fourcc),
@@ -61,6 +67,8 @@ impl From<VulkanError> for SwapBuffersError {
                 SwapBuffersError::ContextLost(Box::new(err))
             }
             VulkanError::UnsupportedOperation(_)
+            | VulkanError::NotPublicAdvertised(_)
+            | VulkanError::MissingCapability(_)
             | VulkanError::UnsupportedFormat(_)
             | VulkanError::UnsupportedModifier
             | VulkanError::MemoryTypeUnsupported
