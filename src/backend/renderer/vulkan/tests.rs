@@ -3276,6 +3276,42 @@ fn public_dmabuf_bind_gates_render_target_formats() {
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut dmabuf),
         Err(VulkanError::NotPublicAdvertised("dmabuf render target"))
     ));
+    assert!(matches!(
+        // SAFETY: This scaffold renderer has no Vulkan device, so the explicit development path
+        // returns before any Vulkan import or ownership-transfer operation can occur. The important
+        // contract here is that the explicit path remains validation-reachable even while its format
+        // surface is not advertised.
+        unsafe {
+            renderer.bind_dmabuf_render_target(&mut dmabuf, VulkanDmabufRenderTargetAcquire::discard())
+        },
+        Err(VulkanError::VulkanUnavailable)
+    ));
+    {
+        let mut explicit_target = unsafe {
+            // SAFETY: This scaffold renderer has no Vulkan device, so binding the wrapper returns
+            // before any Vulkan import or ownership-transfer operation can occur.
+            VulkanDmabufRenderTarget::discard(&mut dmabuf)
+        };
+        assert!(matches!(
+            <VulkanRenderer as Bind<VulkanDmabufRenderTarget<'_, '_>>>::bind(
+                &mut renderer,
+                &mut explicit_target,
+            ),
+            Err(VulkanError::VulkanUnavailable)
+        ));
+    }
+    let mut owned_explicit_target = unsafe {
+        // SAFETY: This scaffold renderer has no Vulkan device, so binding the wrapper returns before
+        // any Vulkan import or ownership-transfer operation can occur.
+        VulkanOwnedDmabufRenderTarget::discard(dmabuf.clone())
+    };
+    assert!(matches!(
+        <VulkanRenderer as Bind<VulkanOwnedDmabufRenderTarget<'_>>>::bind(
+            &mut renderer,
+            &mut owned_explicit_target,
+        ),
+        Err(VulkanError::VulkanUnavailable)
+    ));
 
     renderer.capabilities.rendering.dmabuf_target_development = true;
     let formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
