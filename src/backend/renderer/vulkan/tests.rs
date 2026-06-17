@@ -3711,6 +3711,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         &explicit_acquire,
         &policy_release_evidence,
         true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
     );
     assert!(matches!(
         renderer.validate_sampled_dmabuf_known_layout_contract(SampledDmabufLayoutEvidence::WaylandDmabuf),
@@ -3732,6 +3733,19 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     ));
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_reacquire_layout_policy(&policy_context),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan reacquire layout history"
+        ))
+    ));
+    let renderer_release_history_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_import,
+        &explicit_acquire,
+        &policy_release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_reacquire_layout_policy(&renderer_release_history_context),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan reacquire layout policy"
         ))
@@ -3763,6 +3777,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         &signaled_acquire,
         &policy_release_evidence,
         true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
     );
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_acquire_sync_policy(&implicit_policy_context),
@@ -3778,6 +3793,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         &explicit_acquire,
         &policy_release_evidence,
         false,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
     );
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&stale_cache_policy_context),
