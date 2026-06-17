@@ -3486,12 +3486,26 @@ fn internal_dmabuf_render_target_release_rejects_preconditions_before_device_loo
 #[test]
 fn public_dmabuf_import_gates_formats() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
-    let dmabuf = dmabuf_for_tests();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
     let format = Format {
         code: Fourcc::Abgr8888,
-        modifier: Modifier::Invalid,
+        modifier: Modifier::Linear,
     };
     renderer.capabilities.formats.dmabuf_import = [format].into_iter().collect();
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
 
     assert!(!renderer.capabilities.import.dmabuf);
     assert!(
@@ -3532,6 +3546,77 @@ fn public_dmabuf_import_gates_formats() {
             )
         },
         Err(VulkanError::VulkanUnavailable)
+    ));
+}
+
+#[test]
+fn sampled_dmabuf_import_validation_guards_metadata_before_device_lookup() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let valid_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_import_metadata(&valid_dmabuf),
+        Err(VulkanError::MissingCapability("sampled dmabuf format/modifier"))
+    ));
+
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
+    assert!(
+        renderer
+            .validate_sampled_dmabuf_import_metadata(&valid_dmabuf)
+            .is_ok()
+    );
+
+    let zero_width = dmabuf_with_planes_for_tests(
+        (0, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let multi_plane = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Nv12,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4), (1, 12, 4)],
+    );
+    let implicit_modifier = dmabuf_for_tests();
+    let unsupported_format = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Yuyv,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 8)],
+    );
+
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_import_metadata(&zero_width),
+        Err(VulkanError::UnsupportedOperation("dmabuf size"))
+    ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_import_metadata(&multi_plane),
+        Err(VulkanError::UnsupportedOperation("sampled dmabuf planes"))
+    ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_import_metadata(&implicit_modifier),
+        Err(VulkanError::MissingCapability("sampled dmabuf explicit modifier"))
+    ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_import_metadata(&unsupported_format),
+        Err(VulkanError::UnsupportedFormat(Fourcc::Yuyv))
     ));
 }
 

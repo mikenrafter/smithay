@@ -443,6 +443,41 @@ impl VulkanRenderer {
         }
     }
 
+    /// Validate the development-stage sampled dmabuf import subset before any Vulkan object work.
+    ///
+    /// This is intentionally separate from public [`ImportDma`] advertisement. It models the next
+    /// intended path in small fail-closed steps so future work has a clear continuation point:
+    ///
+    /// 1. validate dmabuf metadata and raw Vulkan modifier capability,
+    /// 2. consume Wayland explicit acquire synchronization from the surface-state buffer,
+    /// 3. require/provide the missing external ownership and image-layout contract,
+    /// 4. release the sampled image back to foreign ownership only after Vulkan sampling is done,
+    /// 5. public-advertise [`ImportDma`] formats only after the whole lifecycle is covered.
+    fn validate_sampled_dmabuf_import_metadata(
+        &self,
+        dmabuf: &Dmabuf,
+    ) -> Result<image::VulkanDmabufImportState, VulkanError> {
+        let import = image::VulkanDmabufImportState::from_dmabuf(dmabuf)?;
+
+        if import.plane_count() != 1 {
+            return Err(VulkanError::UnsupportedOperation("sampled dmabuf planes"));
+        }
+        if import.modifier() == Modifier::Invalid {
+            return Err(VulkanError::MissingCapability("sampled dmabuf explicit modifier"));
+        }
+        get_format_info(import.format())?;
+
+        if !self
+            .capabilities
+            .formats
+            .has_sampled_dmabuf_modifier_record(&import)
+        {
+            return Err(VulkanError::MissingCapability("sampled dmabuf format/modifier"));
+        }
+
+        Ok(import)
+    }
+
     fn render_target_format_supported(&self, format: Fourcc) -> bool {
         self.render_target_formats().contains(&Format {
             code: format,
@@ -474,8 +509,8 @@ impl VulkanRenderer {
         &mut self,
         dmabuf: &Dmabuf,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
+        let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
-        let import = image::VulkanDmabufImportState::from_dmabuf(dmabuf)?;
         let Some(sampled_image) = device.create_dmabuf_sampled_image_resources(
             dmabuf,
             self.downscale_filter,
@@ -507,8 +542,8 @@ impl VulkanRenderer {
         dmabuf: &Dmabuf,
         acquire_semaphore: Option<&VulkanSyncFileSemaphore>,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
+        let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
-        let import = image::VulkanDmabufImportState::from_dmabuf(dmabuf)?;
         let Some(sampled_image) = (unsafe {
             // SAFETY: Forwarded from this method's caller.
             device.create_acquired_dmabuf_sampled_image_resources_with_known_general_layout(
@@ -547,8 +582,8 @@ impl VulkanRenderer {
         dmabuf: &Dmabuf,
         acquire_sync: Option<&SyncPoint>,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
+        let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
-        let import = image::VulkanDmabufImportState::from_dmabuf(dmabuf)?;
         let Some(sampled_image) = (unsafe {
             // SAFETY: Forwarded from this method's caller.
             device.create_acquired_dmabuf_sampled_image_resources_with_known_general_layout_and_sync_point(
@@ -1155,7 +1190,42 @@ impl ImportDma for VulkanRenderer {
 }
 
 #[cfg(feature = "wayland_frontend")]
-impl ImportDmaWl for VulkanRenderer {}
+impl ImportDmaWl for VulkanRenderer {
+    fn import_dma_buffer_from_surface_state(
+        &mut self,
+        buffer: &super::utils::Buffer,
+        _surface: Option<&crate::wayland::compositor::SurfaceData>,
+        _damage: &[Rectangle<i32, BufferCoord>],
+    ) -> Result<Self::TextureId, Self::Error> {
+        let dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
+            .expect("import_dma_buffer_from_surface_state without checking buffer type?");
+
+        self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
+
+        #[cfg(feature = "backend_drm")]
+        {
+            if buffer.acquire_point().is_none() {
+                return Err(VulkanError::NotPublicAdvertised("sampled dmabuf implicit sync"));
+            }
+
+            // The Wayland explicit-sync acquire point proves when the producer's writes are
+            // complete, but it does not by itself prove the Vulkan external-memory image is in
+            // `VK_QUEUE_FAMILY_FOREIGN_EXT` ownership and `VK_IMAGE_LAYOUT_GENERAL`. Keep the
+            // intended Smithay `ImportDmaWl` path reachable, but stop at that exact missing
+            // validation-stage contract until the acquire/layout/release lifecycle is modeled.
+            Err(VulkanError::MissingCapability(
+                "sampled dmabuf known-layout contract",
+            ))
+        }
+
+        #[cfg(not(feature = "backend_drm"))]
+        {
+            Err(VulkanError::MissingCapability(
+                "sampled dmabuf explicit sync contract",
+            ))
+        }
+    }
+}
 
 #[cfg(all(
     feature = "wayland_frontend",
