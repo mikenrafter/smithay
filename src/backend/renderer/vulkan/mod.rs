@@ -1063,25 +1063,30 @@ impl VulkanRenderer {
         &self,
         context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufLayoutEvidence, VulkanError> {
+        let contracts = self.sampled_dmabuf_wayland_vulkan_interop_policy_contracts(context)?;
+        self.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(context.dmabuf, &contracts)
+            .map(SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy)
+    }
+
+    /// Assemble all currently modeled Smithay Wayland/Vulkan sampled-dmabuf policy contracts.
+    ///
+    /// This helper deliberately preserves the staged fail-closed order used by the normal
+    /// `ImportDmaWl` path. It does not construct public `ImportDma` support; it only gathers the
+    /// validation-stage contract tokens needed before the aggregate policy evidence can be produced.
+    #[allow(dead_code)]
+    fn sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
+        &self,
+        context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
+    ) -> Result<SampledDmabufWaylandVulkanInteropPolicyContracts, VulkanError> {
         self.validate_sampled_dmabuf_wayland_context_metadata(context)?;
-        let layout = self.validate_sampled_dmabuf_wayland_layout_policy(context)?;
-        let foreign_general = self.validate_sampled_dmabuf_wayland_foreign_general_policy(context)?;
-        let queue_family_transfer = self.validate_sampled_dmabuf_wayland_queue_family_policy(context)?;
-        let acquire_sync = self.validate_sampled_dmabuf_wayland_acquire_sync_policy(context)?;
-        let release_sync = self.validate_sampled_dmabuf_wayland_release_sync_policy(context)?;
-        let texture_cache_reuse = self.validate_sampled_dmabuf_wayland_texture_cache_policy(context)?;
-        self.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
-            context.dmabuf,
-            &SampledDmabufWaylandVulkanInteropPolicyContracts {
-                layout: Some(layout),
-                foreign_general: Some(foreign_general),
-                queue_family_transfer: Some(queue_family_transfer),
-                acquire_sync: Some(acquire_sync),
-                release_sync: Some(release_sync),
-                texture_cache_reuse: Some(texture_cache_reuse),
-            },
-        )
-        .map(SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy)
+        Ok(SampledDmabufWaylandVulkanInteropPolicyContracts {
+            layout: Some(self.validate_sampled_dmabuf_wayland_layout_policy(context)?),
+            foreign_general: Some(self.validate_sampled_dmabuf_wayland_foreign_general_policy(context)?),
+            queue_family_transfer: Some(self.validate_sampled_dmabuf_wayland_queue_family_policy(context)?),
+            acquire_sync: Some(self.validate_sampled_dmabuf_wayland_acquire_sync_policy(context)?),
+            release_sync: Some(self.validate_sampled_dmabuf_wayland_release_sync_policy(context)?),
+            texture_cache_reuse: Some(self.validate_sampled_dmabuf_wayland_texture_cache_policy(context)?),
+        })
     }
 
     /// Validate that the policy context's parsed import metadata still describes the current dmabuf.

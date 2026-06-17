@@ -4264,6 +4264,12 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         ))
     ));
     assert!(matches!(
+        renderer.sampled_dmabuf_wayland_vulkan_interop_policy_contracts(&mismatched_import_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland import metadata"
+        ))
+    ));
+    assert!(matches!(
         renderer.validate_sampled_dmabuf_known_layout_contract(
             &policy_dmabuf,
             SampledDmabufLayoutEvidence::WaylandDmabuf,
@@ -4274,6 +4280,12 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     ));
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&policy_context),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan first-import layout policy"
+        ))
+    ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_vulkan_interop_policy_contracts(&policy_context),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan first-import layout policy"
         ))
@@ -4381,6 +4393,12 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     ));
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&current_reacquire_context),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan foreign GENERAL policy"
+        ))
+    ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_vulkan_interop_policy_contracts(&current_reacquire_context),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan foreign GENERAL policy"
         ))
