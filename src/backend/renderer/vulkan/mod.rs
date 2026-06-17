@@ -123,7 +123,7 @@ impl SampledDmabufKnownLayoutEvidence {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SampledDmabufLayoutEvidence {
     /// A normal Wayland linux-dmabuf commit. Explicit acquire sync may prove producer completion,
     /// but it does not prove Vulkan queue-family ownership or image layout.
@@ -148,9 +148,17 @@ enum SampledDmabufLayoutEvidence {
 /// future work from treating `linux-dmabuf` protocol metadata or explicit sync alone as a Vulkan
 /// layout/ownership proof.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandVulkanInteropPolicy {
+    dmabuf: WeakDmabuf,
     foreign_general: SampledDmabufKnownLayoutEvidence,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufWaylandVulkanInteropPolicy {
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
 }
 
 /// Evidence for Smithay's chosen first-import external image state for a Wayland dmabuf.
@@ -933,6 +941,7 @@ impl VulkanRenderer {
         let release_sync = self.validate_sampled_dmabuf_wayland_release_sync_policy(context)?;
         let texture_cache_reuse = self.validate_sampled_dmabuf_wayland_texture_cache_policy(context)?;
         self.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
+            context.dmabuf,
             SampledDmabufWaylandVulkanInteropPolicyContracts {
                 layout: Some(layout),
                 foreign_general: Some(foreign_general),
@@ -1144,6 +1153,7 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
         &self,
+        dmabuf: &Dmabuf,
         contracts: SampledDmabufWaylandVulkanInteropPolicyContracts,
     ) -> Result<SampledDmabufWaylandVulkanInteropPolicy, VulkanError> {
         if contracts.layout.is_none() {
@@ -1177,7 +1187,10 @@ impl VulkanRenderer {
             ));
         }
 
-        Ok(SampledDmabufWaylandVulkanInteropPolicy { foreign_general })
+        Ok(SampledDmabufWaylandVulkanInteropPolicy {
+            dmabuf: dmabuf.weak(),
+            foreign_general,
+        })
     }
 
     /// Validate the external ownership and image-layout contract for sampled dmabuf import.
@@ -1188,11 +1201,19 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_known_layout_contract(
         &self,
+        dmabuf: &Dmabuf,
         evidence: SampledDmabufLayoutEvidence,
     ) -> Result<SampledDmabufKnownLayoutEvidence, VulkanError> {
         match evidence {
             SampledDmabufLayoutEvidence::KnownForeignGeneral(evidence) => Ok(evidence),
-            SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(policy) => Ok(policy.foreign_general),
+            SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(policy) => {
+                if !policy.is_for_dmabuf(dmabuf) {
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf Wayland policy identity",
+                    ));
+                }
+                Ok(policy.foreign_general)
+            }
             SampledDmabufLayoutEvidence::WaylandDmabuf => Err(VulkanError::MissingCapability(
                 "sampled dmabuf known-layout contract",
             )),
@@ -1281,6 +1302,7 @@ impl VulkanRenderer {
         acquire_semaphore: Option<&VulkanSyncFileSemaphore>,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
         self.validate_sampled_dmabuf_known_layout_contract(
+            dmabuf,
             SampledDmabufLayoutEvidence::KnownForeignGeneral(foreign_general),
         )?;
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
@@ -1326,6 +1348,7 @@ impl VulkanRenderer {
         acquire_sync: Option<&SyncPoint>,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
         self.validate_sampled_dmabuf_known_layout_contract(
+            dmabuf,
             SampledDmabufLayoutEvidence::KnownForeignGeneral(foreign_general),
         )?;
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
@@ -1366,6 +1389,7 @@ impl VulkanRenderer {
         release_evidence: SampledDmabufReleaseEvidence,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
         self.validate_sampled_dmabuf_known_layout_contract(
+            dmabuf,
             SampledDmabufLayoutEvidence::KnownForeignGeneral(foreign_general),
         )?;
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
@@ -2122,7 +2146,7 @@ impl ImportDmaWl for VulkanRenderer {
             layout_history,
         );
         let layout_evidence = self.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&policy_context)?;
-        let foreign_general = self.validate_sampled_dmabuf_known_layout_contract(layout_evidence)?;
+        let foreign_general = self.validate_sampled_dmabuf_known_layout_contract(dmabuf, layout_evidence)?;
 
         let texture = unsafe {
             // SAFETY: The validation-stage Wayland path above only produces layout evidence from
