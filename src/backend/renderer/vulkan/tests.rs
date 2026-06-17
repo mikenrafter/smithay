@@ -4605,6 +4605,10 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         Ok(SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(_))
     ));
     assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&first_import_context),
+        Ok(SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(_))
+    ));
+    assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&renderer_release_history_context),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan current reacquire layout policy"
