@@ -230,6 +230,32 @@ struct SampledDmabufWaylandAcquireSyncPolicy {
     _private: (),
 }
 
+/// Evidence that a Wayland acquire sync point is tied to a sampled dmabuf identity.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct SampledDmabufAcquireSyncEvidence {
+    dmabuf: WeakDmabuf,
+    sync: SyncPoint,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufAcquireSyncEvidence {
+    fn new(dmabuf: &Dmabuf, sync: SyncPoint) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+            sync,
+        }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+
+    fn sync(&self) -> &SyncPoint {
+        &self.sync
+    }
+}
+
 /// Evidence that Vulkan sampled-dmabuf release is mapped to the Wayland release point.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,7 +296,7 @@ enum SampledDmabufWaylandLayoutHistory {
 struct SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
     dmabuf: &'a Dmabuf,
     import: &'a image::VulkanDmabufImportState,
-    acquire_sync: &'a SyncPoint,
+    acquire_sync: &'a SampledDmabufAcquireSyncEvidence,
     release_evidence: &'a SampledDmabufReleaseEvidence,
     per_commit_texture_import: bool,
     layout_history: SampledDmabufWaylandLayoutHistory,
@@ -282,7 +308,7 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
     fn new(
         dmabuf: &'a Dmabuf,
         import: &'a image::VulkanDmabufImportState,
-        acquire_sync: &'a SyncPoint,
+        acquire_sync: &'a SampledDmabufAcquireSyncEvidence,
         release_evidence: &'a SampledDmabufReleaseEvidence,
         per_commit_texture_import: bool,
         layout_history: SampledDmabufWaylandLayoutHistory,
@@ -806,20 +832,24 @@ impl VulkanRenderer {
 
     /// Convert Wayland explicit-sync state into the renderer sync-point contract used by Vulkan.
     #[cfg(feature = "wayland_frontend")]
-    fn sampled_dmabuf_wayland_acquire_sync_point(
+    fn sampled_dmabuf_wayland_acquire_sync_evidence(
         &self,
+        dmabuf: &Dmabuf,
         #[cfg(feature = "backend_drm")] buffer: &super::utils::Buffer,
         #[cfg(not(feature = "backend_drm"))] _buffer: &super::utils::Buffer,
-    ) -> Result<SyncPoint, VulkanError> {
+    ) -> Result<SampledDmabufAcquireSyncEvidence, VulkanError> {
         #[cfg(feature = "backend_drm")]
         {
             let acquire_sync = buffer.acquire_point().cloned().map(SyncPoint::from);
             self.validate_sampled_dmabuf_wayland_acquire_sync_contract(acquire_sync.as_ref())?;
-            acquire_sync.ok_or(VulkanError::NotPublicAdvertised("sampled dmabuf implicit sync"))
+            acquire_sync
+                .map(|sync| SampledDmabufAcquireSyncEvidence::new(dmabuf, sync))
+                .ok_or(VulkanError::NotPublicAdvertised("sampled dmabuf implicit sync"))
         }
 
         #[cfg(not(feature = "backend_drm"))]
         {
+            let _ = dmabuf;
             Err(VulkanError::MissingCapability(
                 "sampled dmabuf explicit sync contract",
             ))
@@ -1117,7 +1147,12 @@ impl VulkanRenderer {
         &self,
         context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandAcquireSyncPolicy, VulkanError> {
-        self.validate_sampled_dmabuf_wayland_acquire_sync_contract(Some(context.acquire_sync))?;
+        if !context.acquire_sync.is_for_dmabuf(context.dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf acquire sync identity",
+            ));
+        }
+        self.validate_sampled_dmabuf_wayland_acquire_sync_contract(Some(context.acquire_sync.sync()))?;
         Ok(SampledDmabufWaylandAcquireSyncPolicy { _private: () })
     }
 
@@ -2157,7 +2192,7 @@ impl ImportDmaWl for VulkanRenderer {
 
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
 
-        let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_point(buffer)?;
+        let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_evidence(dmabuf, buffer)?;
         let release_evidence = self.sampled_dmabuf_wayland_release_evidence(dmabuf, buffer)?;
         let layout_history = self.sampled_dmabuf_layout_history(dmabuf);
         let policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
@@ -2179,7 +2214,7 @@ impl ImportDmaWl for VulkanRenderer {
             self.create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
                 dmabuf,
                 foreign_general,
-                Some(&acquire_sync),
+                Some(acquire_sync.sync()),
                 release_evidence,
             )?
         };

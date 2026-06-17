@@ -4135,6 +4135,8 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         DmabufFlags::empty(),
         &[(0, 0, 16)],
     );
+    let policy_acquire_evidence =
+        SampledDmabufAcquireSyncEvidence::new(&policy_dmabuf, explicit_acquire.clone());
     let policy_import = VulkanDmabufImportState::from_dmabuf(&policy_dmabuf).unwrap();
     let policy_release_evidence = renderer
         .validate_sampled_dmabuf_wayland_release_point_contract(&policy_dmabuf, true)
@@ -4170,7 +4172,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     let mismatched_release_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
         &policy_dmabuf,
         &policy_import,
-        &explicit_acquire,
+        &policy_acquire_evidence,
         &unrelated_release_evidence,
         true,
         SampledDmabufWaylandLayoutHistory::NoRendererHistory,
@@ -4179,6 +4181,22 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.validate_sampled_dmabuf_wayland_release_sync_policy(&mismatched_release_context),
         Err(VulkanError::UnsupportedOperation(
             "sampled dmabuf release evidence identity"
+        ))
+    ));
+    let unrelated_acquire_evidence =
+        SampledDmabufAcquireSyncEvidence::new(&unrelated_dmabuf, explicit_acquire.clone());
+    let mismatched_acquire_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
+        &policy_import,
+        &unrelated_acquire_evidence,
+        &policy_release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_acquire_sync_policy(&mismatched_acquire_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf acquire sync identity"
         ))
     ));
     history_renderer.record_sampled_dmabuf_locally_acquired(&policy_dmabuf);
@@ -4207,7 +4225,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     let policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
         &policy_dmabuf,
         &policy_import,
-        &explicit_acquire,
+        &policy_acquire_evidence,
         &policy_release_evidence,
         true,
         SampledDmabufWaylandLayoutHistory::NoRendererHistory,
@@ -4228,7 +4246,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     let mismatched_import_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
         &policy_dmabuf,
         &mismatched_import,
-        &explicit_acquire,
+        &policy_acquire_evidence,
         &policy_release_evidence,
         true,
         SampledDmabufWaylandLayoutHistory::NoRendererHistory,
@@ -4281,7 +4299,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     let renderer_release_history_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
         &policy_dmabuf,
         &policy_import,
-        &explicit_acquire,
+        &policy_acquire_evidence,
         &policy_release_evidence,
         true,
         SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
@@ -4309,7 +4327,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     let local_acquire_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
         &policy_dmabuf,
         &policy_import,
-        &explicit_acquire,
+        &policy_acquire_evidence,
         &policy_release_evidence,
         true,
         SampledDmabufWaylandLayoutHistory::LocallyAcquired,
@@ -4323,7 +4341,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     let mut current_reacquire_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
         &policy_dmabuf,
         &policy_import,
-        &explicit_acquire,
+        &policy_acquire_evidence,
         &policy_release_evidence,
         true,
         SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
@@ -4413,10 +4431,11 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             .is_ok()
     );
     let signaled_acquire = SyncPoint::signaled();
+    let signaled_acquire_evidence = SampledDmabufAcquireSyncEvidence::new(&policy_dmabuf, signaled_acquire);
     let implicit_policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
         &policy_dmabuf,
         &policy_import,
-        &signaled_acquire,
+        &signaled_acquire_evidence,
         &policy_release_evidence,
         true,
         SampledDmabufWaylandLayoutHistory::NoRendererHistory,
@@ -4433,7 +4452,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     let stale_cache_policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
         &policy_dmabuf,
         &policy_import,
-        &explicit_acquire,
+        &policy_acquire_evidence,
         &policy_release_evidence,
         false,
         SampledDmabufWaylandLayoutHistory::NoRendererHistory,
