@@ -3660,12 +3660,17 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     ));
 
     assert!(matches!(
-        renderer.validate_sampled_dmabuf_wayland_acquire_contract(false),
+        renderer.validate_sampled_dmabuf_wayland_acquire_sync_contract(None),
         Err(VulkanError::NotPublicAdvertised("sampled dmabuf implicit sync"))
     ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_acquire_sync_contract(Some(&SyncPoint::signaled())),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf implicit sync"))
+    ));
+    let explicit_acquire = SyncPoint::from(SignaledExportableFence);
     assert!(
         renderer
-            .validate_sampled_dmabuf_wayland_acquire_contract(true)
+            .validate_sampled_dmabuf_wayland_acquire_sync_contract(Some(&explicit_acquire))
             .is_ok()
     );
     assert!(matches!(

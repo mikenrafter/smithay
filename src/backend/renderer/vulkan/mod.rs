@@ -469,16 +469,18 @@ impl VulkanRenderer {
         Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     }
 
-    /// Validate the Wayland explicit-sync plumbing needed before sampled dmabuf import can proceed.
+    /// Convert Wayland explicit-sync state into the renderer sync-point contract used by Vulkan.
     #[cfg(feature = "wayland_frontend")]
-    fn validate_sampled_dmabuf_wayland_explicit_sync_contract(
+    fn sampled_dmabuf_wayland_acquire_sync_point(
         &self,
         #[cfg(feature = "backend_drm")] buffer: &super::utils::Buffer,
         #[cfg(not(feature = "backend_drm"))] _buffer: &super::utils::Buffer,
-    ) -> Result<(), VulkanError> {
+    ) -> Result<SyncPoint, VulkanError> {
         #[cfg(feature = "backend_drm")]
         {
-            self.validate_sampled_dmabuf_wayland_acquire_contract(buffer.acquire_point().is_some())
+            let acquire_sync = buffer.acquire_point().cloned().map(SyncPoint::from);
+            self.validate_sampled_dmabuf_wayland_acquire_sync_contract(acquire_sync.as_ref())?;
+            acquire_sync.ok_or(VulkanError::NotPublicAdvertised("sampled dmabuf implicit sync"))
         }
 
         #[cfg(not(feature = "backend_drm"))]
@@ -531,11 +533,11 @@ impl VulkanRenderer {
     /// validation-stage path accepts only commits that carry explicit acquire synchronization through
     /// Smithay's renderer-managed surface-state buffer.
     #[allow(dead_code)]
-    fn validate_sampled_dmabuf_wayland_acquire_contract(
+    fn validate_sampled_dmabuf_wayland_acquire_sync_contract(
         &self,
-        has_explicit_acquire: bool,
+        acquire_sync: Option<&SyncPoint>,
     ) -> Result<(), VulkanError> {
-        if has_explicit_acquire {
+        if acquire_sync.is_some_and(SyncPoint::contains_fence) {
             Ok(())
         } else {
             Err(VulkanError::NotPublicAdvertised("sampled dmabuf implicit sync"))
@@ -1289,14 +1291,16 @@ impl ImportDmaWl for VulkanRenderer {
 
         self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
 
-        self.validate_sampled_dmabuf_wayland_explicit_sync_contract(buffer)?;
+        let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_point(buffer)?;
         self.validate_sampled_dmabuf_known_layout_contract()?;
 
         // Future implementation continuation point:
         // - import/acquire the dmabuf as a Vulkan sampled image using the known-layout helper,
+        //   passing `acquire_sync` as the producer-completion dependency,
         // - store renderer-side release state with the imported texture/frame use,
         // - release back to foreign ownership after sampling completes,
         // - signal or satisfy the Wayland/DRM syncobj release point only after that release.
+        let _ = acquire_sync;
         self.validate_sampled_dmabuf_release_lifecycle_contract()?;
 
         Err(VulkanError::MissingCapability("sampled dmabuf texture import"))
