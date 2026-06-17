@@ -13,7 +13,10 @@ use ash::vk;
 use crate::wayland::drm_syncobj::DrmSyncPoint;
 use crate::{
     backend::{
-        allocator::{Buffer, Fourcc, Modifier, dmabuf::Dmabuf},
+        allocator::{
+            Buffer, Fourcc, Modifier,
+            dmabuf::{Dmabuf, WeakDmabuf},
+        },
         renderer::{Color32F, ContextId, Frame, Texture, TextureMapping, sync::SyncPoint},
     },
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
@@ -47,6 +50,7 @@ pub struct VulkanTexture {
     pub(super) image: VulkanImageState,
     pub(super) sampled_image: Option<Arc<VulkanSampledImage>>,
     pub(super) sampled_dmabuf_release: Option<VulkanSampledDmabufRelease>,
+    pub(super) sampled_dmabuf: Option<WeakDmabuf>,
     #[allow(dead_code)]
     pub(super) y_inverted: bool,
 }
@@ -149,6 +153,7 @@ impl VulkanTexture {
             },
             sampled_image: Some(Arc::new(sampled_image)),
             sampled_dmabuf_release: None,
+            sampled_dmabuf: None,
             y_inverted: flipped,
         }
     }
@@ -156,6 +161,7 @@ impl VulkanTexture {
     #[allow(dead_code)]
     pub(crate) fn from_dmabuf_sampled_image(
         context_id: ContextId<VulkanTexture>,
+        dmabuf: &Dmabuf,
         import: &VulkanDmabufImportState,
         sampled_image: VulkanSampledImage,
     ) -> Self {
@@ -164,6 +170,7 @@ impl VulkanTexture {
             image: dmabuf_import_image_state(import),
             sampled_image: Some(Arc::new(sampled_image)),
             sampled_dmabuf_release: None,
+            sampled_dmabuf: Some(dmabuf.weak()),
             y_inverted: import.y_inverted,
         }
     }
@@ -171,6 +178,7 @@ impl VulkanTexture {
     #[allow(dead_code)]
     pub(crate) fn from_acquired_dmabuf_sampled_image(
         context_id: ContextId<VulkanTexture>,
+        dmabuf: &Dmabuf,
         import: &VulkanDmabufImportState,
         sampled_image: VulkanSampledImage,
     ) -> Self {
@@ -179,6 +187,7 @@ impl VulkanTexture {
             image: dmabuf_acquired_image_state(import),
             sampled_image: Some(Arc::new(sampled_image)),
             sampled_dmabuf_release: None,
+            sampled_dmabuf: Some(dmabuf.weak()),
             y_inverted: import.y_inverted,
         }
     }
@@ -186,6 +195,7 @@ impl VulkanTexture {
     #[allow(dead_code)]
     pub(super) fn from_acquired_dmabuf_sampled_image_with_release(
         context_id: ContextId<VulkanTexture>,
+        dmabuf: &Dmabuf,
         import: &VulkanDmabufImportState,
         sampled_image: VulkanSampledImage,
         release: VulkanSampledDmabufRelease,
@@ -195,6 +205,7 @@ impl VulkanTexture {
             image: dmabuf_acquired_image_state(import),
             sampled_image: Some(Arc::new(sampled_image)),
             sampled_dmabuf_release: Some(release),
+            sampled_dmabuf: Some(dmabuf.weak()),
             y_inverted: import.y_inverted,
         }
     }

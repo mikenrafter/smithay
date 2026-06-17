@@ -141,6 +141,7 @@ fn texture_for_tests(size: Size<i32, BufferCoord>, format: Option<Fourcc>) -> Vu
         image: VulkanImageState::new_for_tests(size, format),
         sampled_image: None,
         sampled_dmabuf_release: None,
+        sampled_dmabuf: None,
         y_inverted: false,
     }
 }

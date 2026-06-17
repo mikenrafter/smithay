@@ -1064,6 +1064,7 @@ impl VulkanRenderer {
 
         Ok(Some(VulkanTexture::from_dmabuf_sampled_image(
             self.context_id.clone(),
+            dmabuf,
             &import,
             sampled_image,
         )))
@@ -1107,6 +1108,7 @@ impl VulkanRenderer {
 
         Ok(Some(VulkanTexture::from_acquired_dmabuf_sampled_image(
             self.context_id.clone(),
+            dmabuf,
             &import,
             sampled_image,
         )))
@@ -1153,6 +1155,7 @@ impl VulkanRenderer {
 
         Ok(Some(VulkanTexture::from_acquired_dmabuf_sampled_image(
             self.context_id.clone(),
+            dmabuf,
             &import,
             sampled_image,
         )))
@@ -1196,6 +1199,7 @@ impl VulkanRenderer {
         Ok(Some(
             VulkanTexture::from_acquired_dmabuf_sampled_image_with_release(
                 self.context_id.clone(),
+                dmabuf,
                 &import,
                 sampled_image,
                 release,
@@ -1385,6 +1389,9 @@ impl VulkanRenderer {
             device.release_sampled_dmabuf_to_foreign_general(sampled_image.image(), export_sync_file)?;
         if released {
             texture.signal_sampled_dmabuf_release_point(release_sync_file.as_ref().map(OwnedFd::as_fd))?;
+            if let Some(dmabuf) = texture.sampled_dmabuf.as_ref().and_then(WeakDmabuf::upgrade) {
+                self.record_sampled_dmabuf_released_to_foreign_general(&dmabuf);
+            }
         }
         Ok((released, release_sync_file))
     }
