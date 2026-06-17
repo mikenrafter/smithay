@@ -104,6 +104,14 @@ enum SampledDmabufLayoutEvidence {
     KnownForeignGeneral,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampledDmabufReleaseEvidence {
+    /// A Wayland DRM syncobj release point is present, but Vulkan still must release the sampled
+    /// image and signal that point only after GPU sampling is complete.
+    WaylandSyncobjReleasePoint,
+}
+
 /// Acquire options for binding a foreign dmabuf as a Vulkan render target.
 ///
 /// This is the development-fork API for the Vulkan-specific external target contract. It is explicit
@@ -502,6 +510,26 @@ impl VulkanRenderer {
         }
     }
 
+    /// Extract the Wayland release point needed for the sampled-dmabuf release lifecycle.
+    #[cfg(feature = "wayland_frontend")]
+    fn sampled_dmabuf_wayland_release_evidence(
+        &self,
+        #[cfg(feature = "backend_drm")] buffer: &super::utils::Buffer,
+        #[cfg(not(feature = "backend_drm"))] _buffer: &super::utils::Buffer,
+    ) -> Result<SampledDmabufReleaseEvidence, VulkanError> {
+        #[cfg(feature = "backend_drm")]
+        {
+            self.validate_sampled_dmabuf_wayland_release_point_contract(buffer.release_point().is_some())
+        }
+
+        #[cfg(not(feature = "backend_drm"))]
+        {
+            Err(VulkanError::MissingCapability(
+                "sampled dmabuf release point contract",
+            ))
+        }
+    }
+
     /// Validate the development-stage sampled dmabuf import subset before any Vulkan object work.
     ///
     /// This is intentionally separate from public [`ImportDma`] advertisement. It models the next
@@ -555,6 +583,24 @@ impl VulkanRenderer {
         }
     }
 
+    /// Validate that the Wayland commit provided a release point for sampled dmabuf import.
+    ///
+    /// The presence of a release point is only evidence that the compositor has a protocol object to
+    /// satisfy later. It does not by itself make the sampled dmabuf release lifecycle complete.
+    #[allow(dead_code)]
+    fn validate_sampled_dmabuf_wayland_release_point_contract(
+        &self,
+        has_release_point: bool,
+    ) -> Result<SampledDmabufReleaseEvidence, VulkanError> {
+        if has_release_point {
+            Ok(SampledDmabufReleaseEvidence::WaylandSyncobjReleasePoint)
+        } else {
+            Err(VulkanError::MissingCapability(
+                "sampled dmabuf release point contract",
+            ))
+        }
+    }
+
     /// Validate the external ownership and image-layout contract for sampled dmabuf import.
     ///
     /// A Wayland acquire point proves producer completion, but not Vulkan queue-family ownership or
@@ -578,8 +624,15 @@ impl VulkanRenderer {
     /// the Wayland/DRM syncobj release point until Vulkan has finished sampling and has released the
     /// image back to foreign ownership with an appropriate release dependency.
     #[allow(dead_code)]
-    fn validate_sampled_dmabuf_release_lifecycle_contract(&self) -> Result<(), VulkanError> {
-        Err(VulkanError::MissingCapability("sampled dmabuf release lifecycle"))
+    fn validate_sampled_dmabuf_release_lifecycle_contract(
+        &self,
+        evidence: SampledDmabufReleaseEvidence,
+    ) -> Result<(), VulkanError> {
+        match evidence {
+            SampledDmabufReleaseEvidence::WaylandSyncobjReleasePoint => {
+                Err(VulkanError::MissingCapability("sampled dmabuf release lifecycle"))
+            }
+        }
     }
 
     fn render_target_format_supported(&self, format: Fourcc) -> bool {
@@ -1309,6 +1362,7 @@ impl ImportDmaWl for VulkanRenderer {
         self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
 
         let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_point(buffer)?;
+        let release_evidence = self.sampled_dmabuf_wayland_release_evidence(buffer)?;
         self.validate_sampled_dmabuf_known_layout_contract(SampledDmabufLayoutEvidence::WaylandDmabuf)?;
 
         // Future implementation continuation point:
@@ -1318,7 +1372,7 @@ impl ImportDmaWl for VulkanRenderer {
         // - release back to foreign ownership after sampling completes,
         // - signal or satisfy the Wayland/DRM syncobj release point only after that release.
         let _ = acquire_sync;
-        self.validate_sampled_dmabuf_release_lifecycle_contract()?;
+        self.validate_sampled_dmabuf_release_lifecycle_contract(release_evidence)?;
 
         Err(VulkanError::MissingCapability("sampled dmabuf texture import"))
     }

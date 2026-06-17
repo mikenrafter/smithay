@@ -3685,7 +3685,16 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             .is_ok()
     );
     assert!(matches!(
-        renderer.validate_sampled_dmabuf_release_lifecycle_contract(),
+        renderer.validate_sampled_dmabuf_wayland_release_point_contract(false),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf release point contract"
+        ))
+    ));
+    let release_evidence = renderer
+        .validate_sampled_dmabuf_wayland_release_point_contract(true)
+        .unwrap();
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_release_lifecycle_contract(release_evidence),
         Err(VulkanError::MissingCapability("sampled dmabuf release lifecycle"))
     ));
 }

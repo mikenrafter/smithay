@@ -115,6 +115,12 @@ impl Buffer {
     pub(crate) fn acquire_point(&self) -> Option<&DrmSyncPoint> {
         self.inner.acquire_point.as_ref()
     }
+
+    #[cfg(feature = "backend_drm")]
+    #[allow(dead_code)]
+    pub(crate) fn release_point(&self) -> Option<&DrmSyncPoint> {
+        self.inner.release_point.as_ref()
+    }
 }
 
 impl std::ops::Deref for Buffer {
