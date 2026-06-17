@@ -11,7 +11,7 @@ use ash::{ext, khr, vk};
 use crate::backend::allocator::{
     Buffer, Format, Fourcc, Modifier,
     dmabuf::{AsDmabuf, Dmabuf, DmabufFlags},
-    vulkan::{ImageUsageFlags, VulkanAllocator},
+    vulkan::{ImageUsageFlags, VulkanAllocator, VulkanImage},
 };
 use crate::backend::renderer::sync::Interrupted;
 use crate::backend::renderer::{
@@ -3325,26 +3325,28 @@ fn dmabuf_loopback_evidence_is_identity_bound_and_not_public_advertised() {
     ));
 }
 
-#[test]
-#[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
-fn runtime_dmabuf_loopback_prerequisites_find_common_exportable_modifier() {
+struct RuntimeDmabufLoopbackCandidate {
+    renderer: VulkanRenderer,
+    dmabuf: Dmabuf,
+    format: Format,
+    image: VulkanImage,
+    allocator: VulkanAllocator,
+}
+
+fn runtime_dmabuf_loopback_candidate(test_name: &str) -> Option<RuntimeDmabufLoopbackCandidate> {
     let instance = match Instance::new(Version::VERSION_1_3, None) {
         Ok(instance) => instance,
         Err(err) => {
-            eprintln!(
-                "skipping Vulkan dmabuf loopback prerequisite test: failed to create instance: {err:?}"
-            );
-            return;
+            eprintln!("skipping {test_name}: failed to create instance: {err:?}");
+            return None;
         }
     };
 
     let devices = match PhysicalDevice::enumerate(&instance) {
         Ok(devices) => devices,
         Err(err) => {
-            eprintln!(
-                "skipping Vulkan dmabuf loopback prerequisite test: failed to enumerate devices: {err:?}"
-            );
-            return;
+            eprintln!("skipping {test_name}: failed to enumerate devices: {err:?}");
+            return None;
         }
     };
 
@@ -3461,15 +3463,20 @@ fn runtime_dmabuf_loopback_prerequisites_find_common_exportable_modifier() {
                 renderer.validate_sampled_dmabuf_public_advertisement_contract(),
                 Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
             ));
-            return;
+
+            return Some(RuntimeDmabufLoopbackCandidate {
+                renderer,
+                dmabuf,
+                format,
+                image,
+                allocator,
+            });
         }
     }
 
     if !found_extension_capable_device {
-        eprintln!(
-            "skipping Vulkan dmabuf loopback prerequisite test: no device supports allocator extensions"
-        );
-        return;
+        eprintln!("skipping {test_name}: no device supports allocator extensions");
+        return None;
     }
 
     if !created_renderer_allocator_pair {
@@ -3479,13 +3486,66 @@ fn runtime_dmabuf_loopback_prerequisites_find_common_exportable_modifier() {
     }
 
     if !setup_errors.is_empty() {
-        eprintln!(
-            "Vulkan loopback prerequisite setup/allocation/export errors while searching: {setup_errors:?}"
-        );
+        eprintln!("Vulkan loopback setup/allocation/export errors while searching: {setup_errors:?}");
     }
-    eprintln!(
-        "skipping Vulkan dmabuf loopback prerequisite test: no common exportable sampled/render-target modifier"
-    );
+    eprintln!("skipping {test_name}: no common exportable sampled/render-target modifier");
+    None
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
+fn runtime_dmabuf_loopback_prerequisites_find_common_exportable_modifier() {
+    let Some(candidate) = runtime_dmabuf_loopback_candidate("Vulkan dmabuf loopback prerequisite test")
+    else {
+        return;
+    };
+    assert_eq!(candidate.dmabuf.size(), Size::from((4, 4)));
+    assert_eq!(candidate.dmabuf.format(), candidate.format);
+    assert_eq!(candidate.image.size(), candidate.dmabuf.size());
+    assert_eq!(candidate.image.format(), candidate.format);
+    assert!(candidate.allocator.is_format_supported(
+        candidate.format,
+        ImageUsageFlags::COLOR_ATTACHMENT
+            | ImageUsageFlags::SAMPLED
+            | ImageUsageFlags::TRANSFER_SRC
+            | ImageUsageFlags::TRANSFER_DST,
+    ));
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
+fn runtime_dmabuf_loopback_stops_at_allocator_foreign_release_contract() {
+    let Some(candidate) =
+        runtime_dmabuf_loopback_candidate("Vulkan dmabuf loopback allocator release guard test")
+    else {
+        return;
+    };
+
+    assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
+    assert!(matches!(
+        candidate
+            .renderer
+            .validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
+    assert!(matches!(
+        validate_runtime_dmabuf_loopback_allocator_foreign_release_contract(&candidate),
+        Err(VulkanError::MissingCapability(
+            "Vulkan allocator dmabuf foreign release contract"
+        ))
+    ));
+}
+
+fn validate_runtime_dmabuf_loopback_allocator_foreign_release_contract(
+    _candidate: &RuntimeDmabufLoopbackCandidate,
+) -> Result<(), VulkanError> {
+    // The allocator-exported dmabuf is a valid runtime prerequisite for the intended loopback path,
+    // but this test must not call `bind_dmabuf_render_target` until the Vulkan allocator can provide
+    // evidence that the exported image was released to VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL layout
+    // or an explicitly modeled fresh-image discard acquire contract replaces that requirement.
+    Err(VulkanError::MissingCapability(
+        "Vulkan allocator dmabuf foreign release contract",
+    ))
 }
 
 #[test]
