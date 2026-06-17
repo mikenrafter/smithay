@@ -3533,7 +3533,7 @@ fn runtime_dmabuf_loopback_stops_at_allocator_foreign_release_contract() {
             .allocator
             .release_dmabuf_to_foreign_general(&candidate.image),
         Err(VulkanAllocatorForeignReleaseError::MissingCapability(
-            "Vulkan allocator dmabuf foreign release contract"
+            "Vulkan allocator dmabuf foreign release command pool"
         ))
     ));
 }

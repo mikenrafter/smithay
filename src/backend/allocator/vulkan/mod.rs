@@ -136,6 +136,9 @@ pub struct VulkanAllocator {
     #[cfg(feature = "backend_drm")]
     node: Option<DrmNode>,
     device: Arc<ash::Device>,
+    release_queue_family_index: u32,
+    release_queue: vk::Queue,
+    release_command_pool: Option<vk::CommandPool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +164,9 @@ impl fmt::Debug for VulkanAllocator {
             .field("dropped_recv", &self.dropped_recv)
             .field("dropped_sender", &self.dropped_sender)
             .field("phd", &self.phd)
+            .field("release_queue_family_index", &self.release_queue_family_index)
+            .field("release_queue", &self.release_queue)
+            .field("release_command_pool", &self.release_command_pool)
             .finish()
     }
 }
@@ -254,6 +260,9 @@ impl VulkanAllocator {
 
         let instance = phd.instance().handle();
         let device = unsafe { instance.create_device(phd.handle(), &create_info, None) }?;
+        // SAFETY: `queue_create_info` above creates one queue for `queue_family_index`, so queue
+        // index 0 is in range for this logical device.
+        let release_queue = unsafe { device.get_device_queue(queue_family_index as u32, 0) };
 
         // Load extension functions
         let extension_fns = ExtensionFns {
@@ -282,6 +291,9 @@ impl VulkanAllocator {
             #[cfg(feature = "backend_drm")]
             node,
             device: Arc::new(device),
+            release_queue_family_index: queue_family_index as u32,
+            release_queue,
+            release_command_pool: None,
         };
 
         allocator.init_formats();
@@ -388,8 +400,14 @@ impl VulkanAllocator {
             return Err(VulkanAllocatorForeignReleaseError::ForeignImage);
         }
 
+        let Some(_release_command_pool) = self.release_command_pool else {
+            return Err(VulkanAllocatorForeignReleaseError::MissingCapability(
+                "Vulkan allocator dmabuf foreign release command pool",
+            ));
+        };
+
         Err(VulkanAllocatorForeignReleaseError::MissingCapability(
-            "Vulkan allocator dmabuf foreign release contract",
+            "Vulkan allocator dmabuf foreign release command submission",
         ))
     }
 }
