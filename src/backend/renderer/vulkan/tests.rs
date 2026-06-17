@@ -3974,7 +3974,7 @@ fn public_dmabuf_import_gates_formats() {
     let known_layout_evidence = unsafe {
         // SAFETY: These unit tests only validate contract routing before device lookup; they perform
         // no Vulkan import, acquire, or sampling operation with the constructed evidence.
-        SampledDmabufKnownLayoutEvidence::foreign_general()
+        SampledDmabufKnownLayoutEvidence::foreign_general(dmabuf.weak())
     };
     assert!(matches!(
         // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
@@ -3982,7 +3982,7 @@ fn public_dmabuf_import_gates_formats() {
         unsafe {
             renderer.create_imported_dmabuf_texture_with_known_general_layout(
                 &dmabuf,
-                known_layout_evidence,
+                known_layout_evidence.clone(),
                 None,
             )
         },
@@ -3994,7 +3994,7 @@ fn public_dmabuf_import_gates_formats() {
         unsafe {
             renderer.create_imported_dmabuf_texture_with_known_general_layout_and_sync_point(
                 &dmabuf,
-                known_layout_evidence,
+                known_layout_evidence.clone(),
                 Some(&SyncPoint::signaled()),
             )
         },
@@ -4564,7 +4564,21 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     wayland_vulkan_contracts.foreign_general = Some(unsafe {
         // SAFETY: This unit test only validates contract routing; it performs no Vulkan import,
         // acquire, or sampling operation with the constructed evidence.
-        SampledDmabufKnownLayoutEvidence::foreign_general()
+        SampledDmabufKnownLayoutEvidence::foreign_general(unrelated_dmabuf.weak())
+    });
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
+            &policy_dmabuf,
+            &wayland_vulkan_contracts,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland foreign GENERAL identity"
+        ))
+    ));
+    wayland_vulkan_contracts.foreign_general = Some(unsafe {
+        // SAFETY: This unit test only validates contract routing; it performs no Vulkan import,
+        // acquire, or sampling operation with the constructed evidence.
+        SampledDmabufKnownLayoutEvidence::foreign_general(policy_dmabuf.weak())
     });
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
@@ -4674,6 +4688,11 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     unrelated_wayland_vulkan_contracts.layout = Some(SampledDmabufWaylandLayoutPolicy::Reacquire(
         SampledDmabufWaylandReacquireLayoutPolicy::new_for_tests(&unrelated_dmabuf),
     ));
+    unrelated_wayland_vulkan_contracts.foreign_general = Some(unsafe {
+        // SAFETY: This unit test only validates contract routing; it performs no Vulkan import,
+        // acquire, or sampling operation with the constructed evidence.
+        SampledDmabufKnownLayoutEvidence::foreign_general(unrelated_dmabuf.weak())
+    });
     unrelated_wayland_vulkan_contracts.queue_family_transfer = Some(
         SampledDmabufWaylandQueueFamilyPolicy::new_for_tests(&unrelated_dmabuf),
     );
@@ -4703,6 +4722,24 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland policy identity"
         ))
     ));
+    let mismatched_wayland_foreign_general_policy =
+        SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(SampledDmabufWaylandVulkanInteropPolicy {
+            dmabuf: policy_dmabuf.weak(),
+            foreign_general: unsafe {
+                // SAFETY: This unit test only validates contract routing; it performs no Vulkan
+                // import, acquire, or sampling operation with the constructed evidence.
+                SampledDmabufKnownLayoutEvidence::foreign_general(unrelated_dmabuf.weak())
+            },
+        });
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_known_layout_contract(
+            &policy_dmabuf,
+            mismatched_wayland_foreign_general_policy,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland foreign GENERAL identity"
+        ))
+    ));
     assert!(
         renderer
             .validate_sampled_dmabuf_known_layout_contract(&policy_dmabuf, smithay_wayland_policy)
@@ -4711,13 +4748,25 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     let known_layout_evidence = SampledDmabufLayoutEvidence::KnownForeignGeneral(unsafe {
         // SAFETY: This unit test only validates contract routing; it performs no Vulkan import,
         // acquire, or sampling operation with the constructed evidence.
-        SampledDmabufKnownLayoutEvidence::foreign_general()
+        SampledDmabufKnownLayoutEvidence::foreign_general(policy_dmabuf.weak())
     });
     assert!(
         renderer
             .validate_sampled_dmabuf_known_layout_contract(&policy_dmabuf, known_layout_evidence)
             .is_ok()
     );
+    let mismatched_known_layout_evidence = SampledDmabufLayoutEvidence::KnownForeignGeneral(unsafe {
+        // SAFETY: This unit test only validates contract routing; it performs no Vulkan import,
+        // acquire, or sampling operation with the constructed evidence.
+        SampledDmabufKnownLayoutEvidence::foreign_general(unrelated_dmabuf.weak())
+    });
+    assert!(matches!(
+        renderer
+            .validate_sampled_dmabuf_known_layout_contract(&policy_dmabuf, mismatched_known_layout_evidence),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf known-layout identity"
+        ))
+    ));
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_release_point_contract(&policy_dmabuf, false),
         Err(VulkanError::MissingCapability(

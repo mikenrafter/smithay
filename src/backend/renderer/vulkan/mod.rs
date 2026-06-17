@@ -104,9 +104,9 @@ pub use self::{
 };
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufKnownLayoutEvidence {
-    _private: (),
+    dmabuf: WeakDmabuf,
 }
 
 #[allow(dead_code)]
@@ -117,8 +117,12 @@ impl SampledDmabufKnownLayoutEvidence {
     ///
     /// The caller must ensure the producer released the image to `VK_QUEUE_FAMILY_FOREIGN_EXT` in
     /// `VK_IMAGE_LAYOUT_GENERAL` before this renderer acquires it.
-    unsafe fn foreign_general() -> Self {
-        Self { _private: () }
+    unsafe fn foreign_general(dmabuf: WeakDmabuf) -> Self {
+        Self { dmabuf }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
     }
 }
 
@@ -641,11 +645,11 @@ pub struct VulkanDmabufLoopbackImportEvidence {
 impl VulkanDmabufLoopbackImportEvidence {
     unsafe fn new(dmabuf: WeakDmabuf, acquire_sync: SyncPoint) -> Self {
         Self {
-            dmabuf,
+            dmabuf: dmabuf.clone(),
             acquire_sync,
             foreign_general: unsafe {
                 // SAFETY: Forwarded from this constructor's caller.
-                SampledDmabufKnownLayoutEvidence::foreign_general()
+                SampledDmabufKnownLayoutEvidence::foreign_general(dmabuf)
             },
         }
     }
@@ -892,7 +896,7 @@ impl VulkanRenderer {
             return Err(VulkanError::UnsupportedOperation("dmabuf loopback evidence"));
         }
 
-        Ok(evidence.foreign_general)
+        Ok(evidence.foreign_general.clone())
     }
 
     /// Check whether the sampled dmabuf path may be public-advertised through [`ImportDma`].
@@ -1161,7 +1165,7 @@ impl VulkanRenderer {
                     // evidence token for this dmabuf after renderer-local history records a previous
                     // release to FOREIGN ownership in GENERAL layout. That is exactly the
                     // validation-stage precondition used by the sampled-dmabuf known-layout helper.
-                    SampledDmabufKnownLayoutEvidence::foreign_general()
+                    SampledDmabufKnownLayoutEvidence::foreign_general(context.dmabuf.weak())
                 })
             }
         }
@@ -1337,11 +1341,16 @@ impl VulkanRenderer {
                 "sampled dmabuf Wayland layout identity",
             ));
         }
-        let Some(foreign_general) = contracts.foreign_general else {
+        let Some(foreign_general) = contracts.foreign_general.as_ref() else {
             return Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland Vulkan foreign GENERAL policy",
             ));
         };
+        if !foreign_general.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland foreign GENERAL identity",
+            ));
+        }
         let Some(queue_family_transfer) = contracts.queue_family_transfer.as_ref() else {
             return Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland Vulkan queue-family policy",
@@ -1385,7 +1394,7 @@ impl VulkanRenderer {
 
         Ok(SampledDmabufWaylandVulkanInteropPolicy {
             dmabuf: dmabuf.weak(),
-            foreign_general,
+            foreign_general: foreign_general.clone(),
         })
     }
 
@@ -1401,11 +1410,23 @@ impl VulkanRenderer {
         evidence: SampledDmabufLayoutEvidence,
     ) -> Result<SampledDmabufKnownLayoutEvidence, VulkanError> {
         match evidence {
-            SampledDmabufLayoutEvidence::KnownForeignGeneral(evidence) => Ok(evidence),
+            SampledDmabufLayoutEvidence::KnownForeignGeneral(evidence) => {
+                if !evidence.is_for_dmabuf(dmabuf) {
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf known-layout identity",
+                    ));
+                }
+                Ok(evidence)
+            }
             SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(policy) => {
                 if !policy.is_for_dmabuf(dmabuf) {
                     return Err(VulkanError::UnsupportedOperation(
                         "sampled dmabuf Wayland policy identity",
+                    ));
+                }
+                if !policy.foreign_general.is_for_dmabuf(dmabuf) {
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf Wayland foreign GENERAL identity",
                     ));
                 }
                 Ok(policy.foreign_general)
@@ -1803,7 +1824,7 @@ impl VulkanRenderer {
         let foreign_general = unsafe {
             // SAFETY: This public unsafe method requires its caller to prove the producer released
             // the dmabuf to FOREIGN ownership in GENERAL layout.
-            SampledDmabufKnownLayoutEvidence::foreign_general()
+            SampledDmabufKnownLayoutEvidence::foreign_general(dmabuf.weak())
         };
         // SAFETY: Forwarded from this public unsafe method's caller.
         unsafe {
