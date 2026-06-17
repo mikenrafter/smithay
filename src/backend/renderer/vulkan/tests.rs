@@ -3674,11 +3674,16 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             .is_ok()
     );
     assert!(matches!(
-        renderer.validate_sampled_dmabuf_known_layout_contract(),
+        renderer.validate_sampled_dmabuf_known_layout_contract(SampledDmabufLayoutEvidence::WaylandDmabuf),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf known-layout contract"
         ))
     ));
+    assert!(
+        renderer
+            .validate_sampled_dmabuf_known_layout_contract(SampledDmabufLayoutEvidence::KnownForeignGeneral)
+            .is_ok()
+    );
     assert!(matches!(
         renderer.validate_sampled_dmabuf_release_lifecycle_contract(),
         Err(VulkanError::MissingCapability("sampled dmabuf release lifecycle"))

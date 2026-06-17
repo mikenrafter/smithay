@@ -93,6 +93,17 @@ pub use self::{
     image::{VulkanFrame, VulkanMemoryMapping, VulkanRenderTarget, VulkanTexture},
 };
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampledDmabufLayoutEvidence {
+    /// A normal Wayland linux-dmabuf commit. Explicit acquire sync may prove producer completion,
+    /// but it does not prove Vulkan queue-family ownership or image layout.
+    WaylandDmabuf,
+    /// Caller-provided proof that the producer released the image to `FOREIGN` ownership in
+    /// `VK_IMAGE_LAYOUT_GENERAL`.
+    KnownForeignGeneral,
+}
+
 /// Acquire options for binding a foreign dmabuf as a Vulkan render target.
 ///
 /// This is the development-fork API for the Vulkan-specific external target contract. It is explicit
@@ -546,15 +557,19 @@ impl VulkanRenderer {
 
     /// Validate the external ownership and image-layout contract for sampled dmabuf import.
     ///
-    /// This is the next missing contract after explicit acquire synchronization. A Wayland acquire
-    /// point proves producer completion, but not Vulkan queue-family ownership or image layout. Keep
-    /// this guard until the normal Smithay path can prove or establish `VK_QUEUE_FAMILY_FOREIGN_EXT`
-    /// ownership and `VK_IMAGE_LAYOUT_GENERAL` before importing/sampling.
+    /// A Wayland acquire point proves producer completion, but not Vulkan queue-family ownership or
+    /// image layout. Only explicit known-layout evidence may pass this validation-stage contract.
     #[allow(dead_code)]
-    fn validate_sampled_dmabuf_known_layout_contract(&self) -> Result<(), VulkanError> {
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf known-layout contract",
-        ))
+    fn validate_sampled_dmabuf_known_layout_contract(
+        &self,
+        evidence: SampledDmabufLayoutEvidence,
+    ) -> Result<(), VulkanError> {
+        match evidence {
+            SampledDmabufLayoutEvidence::KnownForeignGeneral => Ok(()),
+            SampledDmabufLayoutEvidence::WaylandDmabuf => Err(VulkanError::MissingCapability(
+                "sampled dmabuf known-layout contract",
+            )),
+        }
     }
 
     /// Validate renderer-side release lifecycle for sampled dmabuf import.
@@ -631,6 +646,7 @@ impl VulkanRenderer {
         dmabuf: &Dmabuf,
         acquire_semaphore: Option<&VulkanSyncFileSemaphore>,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
+        self.validate_sampled_dmabuf_known_layout_contract(SampledDmabufLayoutEvidence::KnownForeignGeneral)?;
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
         let Some(sampled_image) = (unsafe {
@@ -671,6 +687,7 @@ impl VulkanRenderer {
         dmabuf: &Dmabuf,
         acquire_sync: Option<&SyncPoint>,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
+        self.validate_sampled_dmabuf_known_layout_contract(SampledDmabufLayoutEvidence::KnownForeignGeneral)?;
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
         let Some(sampled_image) = (unsafe {
@@ -1292,7 +1309,7 @@ impl ImportDmaWl for VulkanRenderer {
         self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
 
         let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_point(buffer)?;
-        self.validate_sampled_dmabuf_known_layout_contract()?;
+        self.validate_sampled_dmabuf_known_layout_contract(SampledDmabufLayoutEvidence::WaylandDmabuf)?;
 
         // Future implementation continuation point:
         // - import/acquire the dmabuf as a Vulkan sampled image using the known-layout helper,
