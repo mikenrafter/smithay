@@ -195,6 +195,31 @@ fn dmabuf_was_exported_from_image(exports: &[WeakDmabuf], dmabuf: &Dmabuf) -> bo
         .any(|export| export.upgrade().as_ref() == Some(dmabuf))
 }
 
+fn validate_allocator_release_dmabuf_metadata(
+    image_size: Size<i32, BufferCoord>,
+    image_format: DrmFormat,
+    image_plane_count: u32,
+    dmabuf: &Dmabuf,
+) -> Result<(), VulkanAllocatorForeignReleaseError> {
+    if image_plane_count != 1 {
+        return Err(VulkanAllocatorForeignReleaseError::MissingCapability(
+            "Vulkan allocator dmabuf foreign release planes",
+        ));
+    }
+    if dmabuf.num_planes() != image_plane_count as usize {
+        return Err(VulkanAllocatorForeignReleaseError::InvalidState(
+            "Vulkan allocator dmabuf foreign release planes",
+        ));
+    }
+    if image_size != dmabuf.size() || image_format != dmabuf.format() {
+        return Err(VulkanAllocatorForeignReleaseError::InvalidState(
+            "Vulkan allocator dmabuf foreign release identity",
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum VulkanAllocatorForeignReleaseError {
     #[error("foreign Vulkan allocator image")]
@@ -482,21 +507,12 @@ impl VulkanAllocator {
                 "Vulkan allocator dmabuf foreign release state",
             ));
         }
-        if image.format_plane_count != 1 {
-            return Err(VulkanAllocatorForeignReleaseError::MissingCapability(
-                "Vulkan allocator dmabuf foreign release planes",
-            ));
-        }
-        if dmabuf.num_planes() != image.format_plane_count as usize {
-            return Err(VulkanAllocatorForeignReleaseError::InvalidState(
-                "Vulkan allocator dmabuf foreign release planes",
-            ));
-        }
-        if image.size() != dmabuf.size() || image.format() != dmabuf.format() {
-            return Err(VulkanAllocatorForeignReleaseError::InvalidState(
-                "Vulkan allocator dmabuf foreign release identity",
-            ));
-        }
+        validate_allocator_release_dmabuf_metadata(
+            image.size(),
+            image.format(),
+            image.format_plane_count,
+            dmabuf,
+        )?;
         let exports = image.exports.lock().map_err(|_| {
             VulkanAllocatorForeignReleaseError::InvalidState(
                 "Vulkan allocator dmabuf foreign release identity",
@@ -1232,13 +1248,14 @@ impl VulkanAllocator {
 mod tests {
     use super::{
         Error, ImageInner, ImageUsageFlags, VulkanAllocator, VulkanAllocatorDmabufReleaseState,
-        dmabuf_plane_count, dmabuf_plane_layout, dmabuf_was_exported_from_image, ensure_allocation_available,
-        find_memory_type_index, image_format_properties_support_extent, image_release_state_index,
-        requires_dedicated_allocation, supports_dma_buf_export,
+        VulkanAllocatorForeignReleaseError, dmabuf_plane_count, dmabuf_plane_layout,
+        dmabuf_was_exported_from_image, ensure_allocation_available, find_memory_type_index,
+        image_format_properties_support_extent, image_release_state_index, requires_dedicated_allocation,
+        supports_dma_buf_export, validate_allocator_release_dmabuf_metadata,
     };
     use crate::backend::{
         allocator::{
-            Allocator, Buffer, Fourcc, Modifier,
+            Allocator, Buffer, Format, Fourcc, Modifier,
             dmabuf::{AsDmabuf, Dmabuf, DmabufFlags},
         },
         vulkan::{Instance, PhysicalDevice, version::Version},
@@ -1251,6 +1268,15 @@ mod tests {
         let fd = OwnedFd::from(File::open("/dev/null").unwrap());
         let mut builder = Dmabuf::builder((1, 1), Fourcc::Abgr8888, Modifier::Linear, DmabufFlags::empty());
         assert!(builder.add_plane(fd, 0, 0, 4));
+        builder.build().unwrap()
+    }
+
+    fn dmabuf_with_planes_for_identity_tests(planes: &[(u32, u32, u32)]) -> Dmabuf {
+        let mut builder = Dmabuf::builder((1, 1), Fourcc::Abgr8888, Modifier::Linear, DmabufFlags::empty());
+        for &(idx, offset, stride) in planes {
+            let fd = OwnedFd::from(File::open("/dev/null").unwrap());
+            assert!(builder.add_plane(fd, idx, offset, stride));
+        }
         builder.build().unwrap()
     }
 
@@ -1454,6 +1480,64 @@ mod tests {
             stale.weak()
         };
         assert!(!dmabuf_was_exported_from_image(&[stale_export], &exported));
+    }
+
+    #[test]
+    fn allocator_release_metadata_validates_planes_size_and_format() {
+        let exported = dmabuf_for_identity_tests();
+        assert!(
+            validate_allocator_release_dmabuf_metadata(exported.size(), exported.format(), 1, &exported,)
+                .is_ok()
+        );
+
+        let multi_plane = dmabuf_with_planes_for_identity_tests(&[(0, 0, 4), (1, 4, 4)]);
+        assert!(matches!(
+            validate_allocator_release_dmabuf_metadata(exported.size(), exported.format(), 1, &multi_plane),
+            Err(VulkanAllocatorForeignReleaseError::InvalidState(
+                "Vulkan allocator dmabuf foreign release planes"
+            ))
+        ));
+        assert!(matches!(
+            validate_allocator_release_dmabuf_metadata(exported.size(), exported.format(), 2, &exported),
+            Err(VulkanAllocatorForeignReleaseError::MissingCapability(
+                "Vulkan allocator dmabuf foreign release planes"
+            ))
+        ));
+
+        assert!(matches!(
+            validate_allocator_release_dmabuf_metadata((2, 1).into(), exported.format(), 1, &exported),
+            Err(VulkanAllocatorForeignReleaseError::InvalidState(
+                "Vulkan allocator dmabuf foreign release identity"
+            ))
+        ));
+        assert!(matches!(
+            validate_allocator_release_dmabuf_metadata(
+                exported.size(),
+                Format {
+                    code: Fourcc::Argb8888,
+                    modifier: Modifier::Linear,
+                },
+                1,
+                &exported,
+            ),
+            Err(VulkanAllocatorForeignReleaseError::InvalidState(
+                "Vulkan allocator dmabuf foreign release identity"
+            ))
+        ));
+        assert!(matches!(
+            validate_allocator_release_dmabuf_metadata(
+                exported.size(),
+                Format {
+                    code: Fourcc::Abgr8888,
+                    modifier: Modifier::Invalid,
+                },
+                1,
+                &exported,
+            ),
+            Err(VulkanAllocatorForeignReleaseError::InvalidState(
+                "Vulkan allocator dmabuf foreign release identity"
+            ))
+        ));
     }
 
     #[test]
