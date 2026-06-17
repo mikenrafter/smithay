@@ -4195,6 +4195,39 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         true,
         SampledDmabufWaylandLayoutHistory::NoRendererHistory,
     );
+    assert!(
+        renderer
+            .validate_sampled_dmabuf_wayland_context_metadata(&policy_context)
+            .is_ok()
+    );
+    let mismatched_import_dmabuf = dmabuf_with_planes_for_tests(
+        (8, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 32)],
+    );
+    let mismatched_import = VulkanDmabufImportState::from_dmabuf(&mismatched_import_dmabuf).unwrap();
+    let mismatched_import_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
+        &mismatched_import,
+        &explicit_acquire,
+        &policy_release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_context_metadata(&mismatched_import_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland import metadata"
+        ))
+    ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&mismatched_import_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland import metadata"
+        ))
+    ));
     assert!(matches!(
         renderer.validate_sampled_dmabuf_known_layout_contract(SampledDmabufLayoutEvidence::WaylandDmabuf),
         Err(VulkanError::MissingCapability(

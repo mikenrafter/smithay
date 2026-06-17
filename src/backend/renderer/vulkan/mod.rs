@@ -925,6 +925,7 @@ impl VulkanRenderer {
         &self,
         context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufLayoutEvidence, VulkanError> {
+        self.validate_sampled_dmabuf_wayland_context_metadata(context)?;
         let layout = self.validate_sampled_dmabuf_wayland_layout_policy(context)?;
         let foreign_general = self.validate_sampled_dmabuf_wayland_foreign_general_policy(context)?;
         let queue_family_transfer = self.validate_sampled_dmabuf_wayland_queue_family_policy(context)?;
@@ -942,6 +943,26 @@ impl VulkanRenderer {
             },
         )
         .map(SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy)
+    }
+
+    /// Validate that the policy context's parsed import metadata still describes the current dmabuf.
+    ///
+    /// The policy context intentionally carries both the Smithay dmabuf identity and the parsed Vulkan
+    /// import metadata. Future policy producers must not reuse metadata across commits or dmabuf
+    /// identities while constructing layout/ownership evidence.
+    #[allow(dead_code)]
+    fn validate_sampled_dmabuf_wayland_context_metadata(
+        &self,
+        context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
+    ) -> Result<(), VulkanError> {
+        let current_import = image::VulkanDmabufImportState::from_dmabuf(context.dmabuf)?;
+        if &current_import != context.import {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland import metadata",
+            ));
+        }
+
+        Ok(())
     }
 
     /// Validate the external image layout policy for this normal Wayland dmabuf commit.
