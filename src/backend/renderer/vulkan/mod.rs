@@ -2453,13 +2453,13 @@ impl ImportDmaWl for VulkanRenderer {
 
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
 
-        let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_evidence(dmabuf, buffer)?;
-        let release_evidence = self.sampled_dmabuf_wayland_release_evidence(dmabuf, buffer)?;
         let layout_history = self.sampled_dmabuf_layout_history(dmabuf);
         let first_import_layout =
             self.sampled_dmabuf_wayland_first_import_layout_evidence(dmabuf, layout_history)?;
         let current_reacquire_layout =
             self.sampled_dmabuf_wayland_current_reacquire_layout_evidence(dmabuf, layout_history)?;
+        let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_evidence(dmabuf, buffer)?;
+        let release_evidence = self.sampled_dmabuf_wayland_release_evidence(dmabuf, buffer)?;
         let mut policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
             dmabuf,
             &import,
