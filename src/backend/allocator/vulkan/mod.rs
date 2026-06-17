@@ -153,6 +153,7 @@ pub(crate) struct VulkanAllocatorDmabufForeignReleaseEvidence {
 }
 
 impl VulkanAllocatorDmabufForeignReleaseEvidence {
+    #[allow(dead_code)]
     pub(crate) fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
         self.dmabuf.upgrade().as_ref() == Some(dmabuf)
     }
@@ -162,6 +163,19 @@ impl VulkanAllocatorDmabufForeignReleaseEvidence {
 enum VulkanAllocatorDmabufReleaseState {
     FreshLocalUndefined,
     ReleasedForeignGeneral,
+}
+
+fn image_release_state_index(
+    states: &[(ImageInner, VulkanAllocatorDmabufReleaseState)],
+    image: ImageInner,
+) -> Option<usize> {
+    states.iter().position(|(inner, _state)| *inner == image)
+}
+
+fn dmabuf_was_exported_from_image(exports: &[WeakDmabuf], dmabuf: &Dmabuf) -> bool {
+    exports
+        .iter()
+        .any(|export| export.upgrade().as_ref() == Some(dmabuf))
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -443,10 +457,7 @@ impl VulkanAllocator {
                 "Vulkan allocator dmabuf foreign release submission state",
             ));
         }
-        let state_index = self
-            .image_release_states
-            .iter()
-            .position(|(inner, _state)| *inner == image.inner)
+        let state_index = image_release_state_index(&self.image_release_states, image.inner)
             .ok_or(VulkanAllocatorForeignReleaseError::ForeignImage)?;
         if self.image_release_states[state_index].1 != VulkanAllocatorDmabufReleaseState::FreshLocalUndefined
         {
@@ -469,16 +480,12 @@ impl VulkanAllocator {
                 "Vulkan allocator dmabuf foreign release identity",
             ));
         }
-        let exported_from_image = image
-            .exports
-            .lock()
-            .map_err(|_| {
-                VulkanAllocatorForeignReleaseError::InvalidState(
-                    "Vulkan allocator dmabuf foreign release identity",
-                )
-            })?
-            .iter()
-            .any(|export| export.upgrade().as_ref() == Some(dmabuf));
+        let exports = image.exports.lock().map_err(|_| {
+            VulkanAllocatorForeignReleaseError::InvalidState(
+                "Vulkan allocator dmabuf foreign release identity",
+            )
+        })?;
+        let exported_from_image = dmabuf_was_exported_from_image(&exports, dmabuf);
         if !exported_from_image {
             return Err(VulkanAllocatorForeignReleaseError::InvalidState(
                 "Vulkan allocator dmabuf foreign release identity",
@@ -1207,15 +1214,28 @@ impl VulkanAllocator {
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, ImageUsageFlags, VulkanAllocator, dmabuf_plane_count, dmabuf_plane_layout,
-        ensure_allocation_available, find_memory_type_index, image_format_properties_support_extent,
+        Error, ImageInner, ImageUsageFlags, VulkanAllocator, VulkanAllocatorDmabufReleaseState,
+        dmabuf_plane_count, dmabuf_plane_layout, dmabuf_was_exported_from_image, ensure_allocation_available,
+        find_memory_type_index, image_format_properties_support_extent, image_release_state_index,
         requires_dedicated_allocation, supports_dma_buf_export,
     };
     use crate::backend::{
-        allocator::{Allocator, Buffer, dmabuf::AsDmabuf},
+        allocator::{
+            Allocator, Buffer, Fourcc, Modifier,
+            dmabuf::{AsDmabuf, Dmabuf, DmabufFlags},
+        },
         vulkan::{Instance, PhysicalDevice, version::Version},
     };
     use ash::vk;
+    use ash::vk::Handle;
+    use std::{fs::File, os::fd::OwnedFd};
+
+    fn dmabuf_for_identity_tests() -> Dmabuf {
+        let fd = OwnedFd::from(File::open("/dev/null").unwrap());
+        let mut builder = Dmabuf::builder((1, 1), Fourcc::Abgr8888, Modifier::Linear, DmabufFlags::empty());
+        assert!(builder.add_plane(fd, 0, 0, 4));
+        builder.build().unwrap()
+    }
 
     fn memory_properties_for_tests(flags: &[vk::MemoryPropertyFlags]) -> vk::PhysicalDeviceMemoryProperties {
         let mut properties = vk::PhysicalDeviceMemoryProperties {
@@ -1401,6 +1421,51 @@ mod tests {
             ensure_allocation_available(0),
             Err(Error::Vk(vk::Result::ERROR_TOO_MANY_OBJECTS))
         ));
+    }
+
+    #[test]
+    fn dmabuf_export_identity_matches_only_tracked_live_exports() {
+        let exported = dmabuf_for_identity_tests();
+        let unrelated = dmabuf_for_identity_tests();
+        let exports = [exported.weak()];
+
+        assert!(dmabuf_was_exported_from_image(&exports, &exported));
+        assert!(!dmabuf_was_exported_from_image(&exports, &unrelated));
+
+        let stale_export = {
+            let stale = dmabuf_for_identity_tests();
+            stale.weak()
+        };
+        assert!(!dmabuf_was_exported_from_image(&[stale_export], &exported));
+    }
+
+    #[test]
+    fn image_release_state_lookup_is_exact_image_identity() {
+        let image_a = ImageInner {
+            image: vk::Image::from_raw(1),
+            memory: vk::DeviceMemory::from_raw(11),
+        };
+        let image_b = ImageInner {
+            image: vk::Image::from_raw(2),
+            memory: vk::DeviceMemory::from_raw(22),
+        };
+        let states = [
+            (image_a, VulkanAllocatorDmabufReleaseState::FreshLocalUndefined),
+            (image_b, VulkanAllocatorDmabufReleaseState::ReleasedForeignGeneral),
+        ];
+
+        assert_eq!(image_release_state_index(&states, image_a), Some(0));
+        assert_eq!(image_release_state_index(&states, image_b), Some(1));
+        assert_eq!(
+            image_release_state_index(
+                &states,
+                ImageInner {
+                    image: vk::Image::from_raw(1),
+                    memory: vk::DeviceMemory::from_raw(99),
+                },
+            ),
+            None,
+        );
     }
 
     #[test]
