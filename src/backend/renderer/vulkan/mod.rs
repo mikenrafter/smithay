@@ -908,12 +908,28 @@ impl VulkanRenderer {
         ))
     }
 
+    /// Validate that the current Wayland producer returned a reacquired dmabuf in the layout and
+    /// ownership required by the known-GENERAL Vulkan acquire path.
+    ///
+    /// Renderer-local release history is only prior-state evidence. The current commit needs its own
+    /// Smithay-owned contract before reacquire may use the same `FOREIGN` + `GENERAL` unsafe helper.
+    #[allow(dead_code)]
+    fn validate_sampled_dmabuf_wayland_current_reacquire_layout_policy(
+        &self,
+        context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
+    ) -> Result<SampledDmabufWaylandCurrentReacquireLayoutEvidence, VulkanError> {
+        context
+            .current_reacquire_layout
+            .ok_or(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan current reacquire layout policy",
+            ))
+    }
+
     /// Validate the reacquire external image layout policy for a normal Wayland dmabuf.
     ///
-    /// This token is only produced from renderer-local history established after this renderer
-    /// released the same Smithay [`Dmabuf`] identity to foreign ownership in `VK_IMAGE_LAYOUT_GENERAL`.
-    /// It does not rely on Wayland metadata or explicit sync as layout evidence, and it does not
-    /// cover first imports that have no renderer-local history.
+    /// This token is only produced from renderer-local history plus current-commit producer-return
+    /// evidence. Prior release history alone is not sufficient because Wayland metadata and explicit
+    /// sync do not prove the producer returned the image in `FOREIGN` ownership and `GENERAL` layout.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_reacquire_layout_policy(
         &self,
@@ -927,13 +943,8 @@ impl VulkanRenderer {
                 "sampled dmabuf Wayland Vulkan unreleased local acquire",
             )),
             SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => {
-                if context.current_reacquire_layout.is_some() {
-                    Ok(SampledDmabufWaylandReacquireLayoutPolicy { _private: () })
-                } else {
-                    Err(VulkanError::MissingCapability(
-                        "sampled dmabuf Wayland Vulkan current reacquire layout policy",
-                    ))
-                }
+                self.validate_sampled_dmabuf_wayland_current_reacquire_layout_policy(context)?;
+                Ok(SampledDmabufWaylandReacquireLayoutPolicy { _private: () })
             }
         }
     }

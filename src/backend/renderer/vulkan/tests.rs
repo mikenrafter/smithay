@@ -3800,6 +3800,14 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
     );
     assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_current_reacquire_layout_policy(
+            &renderer_release_history_context
+        ),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan current reacquire layout policy"
+        ))
+    ));
+    assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_reacquire_layout_policy(&renderer_release_history_context),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan current reacquire layout policy"
@@ -3833,6 +3841,11 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     );
     current_reacquire_context.current_reacquire_layout =
         Some(SampledDmabufWaylandCurrentReacquireLayoutEvidence { _private: () });
+    assert!(
+        renderer
+            .validate_sampled_dmabuf_wayland_current_reacquire_layout_policy(&current_reacquire_context)
+            .is_ok()
+    );
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_layout_policy(&current_reacquire_context),
         Ok(SampledDmabufWaylandLayoutPolicy::Reacquire(_))
