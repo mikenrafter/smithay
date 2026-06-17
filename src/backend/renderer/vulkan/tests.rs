@@ -4111,7 +4111,15 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     renderer.capabilities.formats.dmabuf_import = [advertised_format].into_iter().collect();
     assert!(matches!(
         renderer.validate_sampled_dmabuf_public_advertisement_contract(),
-        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan first-import layout policy"
+        ))
+    ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_public_external_state_contract(),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan first-import layout policy"
+        ))
     ));
 
     assert!(matches!(
@@ -4694,7 +4702,9 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     ));
     assert!(matches!(
         renderer.validate_sampled_dmabuf_public_advertisement_contract(),
-        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan first-import layout policy"
+        ))
     ));
     assert!(
         renderer

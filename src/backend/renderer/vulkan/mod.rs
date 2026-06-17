@@ -961,11 +961,25 @@ impl VulkanRenderer {
                 "sampled dmabuf advertised formats",
             ));
         }
+        self.validate_sampled_dmabuf_public_external_state_contract()?;
 
         // Final enablement marker: even if raw capability data is populated, public `ImportDma`
         // advertisement must stay fail-closed until import, acquire, sampling, release, and tests
         // are complete on the normal Smithay path.
         Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
+    }
+
+    /// Check whether the normal sampled-dmabuf external-state policy is ready for public import.
+    ///
+    /// Raw probed Vulkan formats are not enough for public [`ImportDma`] advertisement. The normal
+    /// path must also have Smithay-owned first-import and reacquire layout/ownership evidence sources
+    /// that can prove the external image state before the Vulkan acquire helper runs. Keep this as a
+    /// separate guard so enabling raw dmabuf import flags cannot skip the currently missing contracts.
+    #[allow(dead_code)]
+    fn validate_sampled_dmabuf_public_external_state_contract(&self) -> Result<(), VulkanError> {
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan first-import layout policy",
+        ))
     }
 
     /// Convert Wayland explicit-sync state into the renderer sync-point contract used by Vulkan.
