@@ -415,6 +415,7 @@ struct SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
     first_import_layout: Option<SampledDmabufWaylandFirstImportLayoutEvidence>,
     first_import_foreign_general: Option<SampledDmabufKnownLayoutEvidence>,
     current_reacquire_layout: Option<SampledDmabufWaylandCurrentReacquireLayoutEvidence>,
+    current_reacquire_foreign_general: Option<SampledDmabufKnownLayoutEvidence>,
 }
 
 #[allow(dead_code)]
@@ -437,6 +438,7 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
             first_import_layout: None,
             first_import_foreign_general: None,
             current_reacquire_layout: None,
+            current_reacquire_foreign_general: None,
         }
     }
 }
@@ -1196,13 +1198,16 @@ impl VulkanRenderer {
             )),
             SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => {
                 self.validate_sampled_dmabuf_wayland_current_reacquire_layout_policy(context)?;
-                Ok(unsafe {
-                    // SAFETY: The reacquire policy accepts only a current-commit producer-return
-                    // evidence token for this dmabuf after renderer-local history records a previous
-                    // release to FOREIGN ownership in GENERAL layout. That is exactly the
-                    // validation-stage precondition used by the sampled-dmabuf known-layout helper.
-                    SampledDmabufKnownLayoutEvidence::foreign_general(context.dmabuf.weak())
-                })
+                let evidence = context.current_reacquire_foreign_general.as_ref().ok_or(
+                    VulkanError::MissingCapability("sampled dmabuf Wayland Vulkan foreign GENERAL policy"),
+                )?;
+                if !evidence.is_for_dmabuf(context.dmabuf) {
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf Wayland foreign GENERAL identity",
+                    ));
+                }
+
+                Ok(evidence.clone())
             }
         }
     }
@@ -1336,6 +1341,45 @@ impl VulkanRenderer {
                 Err(VulkanError::MissingCapability(
                     "sampled dmabuf Wayland Vulkan current reacquire layout policy",
                 ))
+            }
+        }
+    }
+
+    /// Locate reacquire proof that the current Wayland producer returned the dmabuf in foreign
+    /// ownership with `VK_IMAGE_LAYOUT_GENERAL`.
+    ///
+    /// This is the known-state source used by the validation-stage sampled import helper for
+    /// reacquires. It is intentionally separate from renderer-local release history: the current
+    /// commit must carry same-dmabuf current-return evidence before this helper can produce the
+    /// known-layout token consumed by the Vulkan acquire path.
+    #[allow(dead_code)]
+    fn sampled_dmabuf_wayland_current_reacquire_foreign_general_evidence(
+        &self,
+        dmabuf: &Dmabuf,
+        layout_history: SampledDmabufWaylandLayoutHistory,
+        current_reacquire_layout: Option<&SampledDmabufWaylandCurrentReacquireLayoutEvidence>,
+    ) -> Result<Option<SampledDmabufKnownLayoutEvidence>, VulkanError> {
+        match layout_history {
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory => Ok(None),
+            SampledDmabufWaylandLayoutHistory::LocallyAcquired => Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan unreleased local acquire",
+            )),
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => {
+                let evidence = current_reacquire_layout.ok_or(VulkanError::MissingCapability(
+                    "sampled dmabuf Wayland Vulkan current reacquire layout policy",
+                ))?;
+                if !evidence.is_for_dmabuf(dmabuf) {
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf Wayland current reacquire identity",
+                    ));
+                }
+
+                Ok(Some(unsafe {
+                    // SAFETY: The same-dmabuf current-reacquire layout evidence is the
+                    // validation-stage contract that the current producer returned this dmabuf to
+                    // FOREIGN ownership in GENERAL layout after this renderer's prior release.
+                    SampledDmabufKnownLayoutEvidence::foreign_general(dmabuf.weak())
+                }))
             }
         }
     }
@@ -2495,6 +2539,12 @@ impl ImportDmaWl for VulkanRenderer {
             self.sampled_dmabuf_wayland_first_import_foreign_general_evidence(dmabuf, layout_history)?;
         let current_reacquire_layout =
             self.sampled_dmabuf_wayland_current_reacquire_layout_evidence(dmabuf, layout_history)?;
+        let current_reacquire_foreign_general = self
+            .sampled_dmabuf_wayland_current_reacquire_foreign_general_evidence(
+                dmabuf,
+                layout_history,
+                current_reacquire_layout.as_ref(),
+            )?;
         let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_evidence(dmabuf, buffer)?;
         let release_evidence = self.sampled_dmabuf_wayland_release_evidence(dmabuf, buffer)?;
         let mut policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
@@ -2508,6 +2558,7 @@ impl ImportDmaWl for VulkanRenderer {
         policy_context.first_import_layout = first_import_layout;
         policy_context.first_import_foreign_general = first_import_foreign_general;
         policy_context.current_reacquire_layout = current_reacquire_layout;
+        policy_context.current_reacquire_foreign_general = current_reacquire_foreign_general;
         let layout_evidence = self.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&policy_context)?;
         let foreign_general = self.validate_sampled_dmabuf_known_layout_contract(dmabuf, layout_evidence)?;
 

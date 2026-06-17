@@ -4243,6 +4243,14 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         Ok(None)
     ));
     assert!(matches!(
+        renderer.sampled_dmabuf_wayland_current_reacquire_foreign_general_evidence(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+            None,
+        ),
+        Ok(None)
+    ));
+    assert!(matches!(
         renderer.sampled_dmabuf_wayland_first_import_layout_evidence(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::NoRendererHistory,
@@ -4445,6 +4453,16 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         ))
     ));
     assert!(matches!(
+        renderer.sampled_dmabuf_wayland_current_reacquire_foreign_general_evidence(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            None,
+        ),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan current reacquire layout policy"
+        ))
+    ));
+    assert!(matches!(
         renderer.sampled_dmabuf_wayland_first_import_layout_evidence(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
@@ -4488,6 +4506,16 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.sampled_dmabuf_wayland_current_reacquire_layout_evidence(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::LocallyAcquired,
+        ),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan unreleased local acquire"
+        ))
+    ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_current_reacquire_foreign_general_evidence(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::LocallyAcquired,
+            None,
         ),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan unreleased local acquire"
@@ -4548,9 +4576,26 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland current reacquire identity"
         ))
     ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_current_reacquire_foreign_general_evidence(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            current_reacquire_context.current_reacquire_layout.as_ref(),
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland current reacquire identity"
+        ))
+    ));
     current_reacquire_context.current_reacquire_layout = Some(
         SampledDmabufWaylandCurrentReacquireLayoutEvidence::new_for_tests(&policy_dmabuf),
     );
+    current_reacquire_context.current_reacquire_foreign_general = renderer
+        .sampled_dmabuf_wayland_current_reacquire_foreign_general_evidence(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            current_reacquire_context.current_reacquire_layout.as_ref(),
+        )
+        .unwrap();
     assert!(
         renderer
             .validate_sampled_dmabuf_wayland_current_reacquire_layout_policy(&current_reacquire_context)
