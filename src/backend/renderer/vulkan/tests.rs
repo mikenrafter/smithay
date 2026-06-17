@@ -3783,10 +3783,15 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         true,
         SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
     );
+    assert!(
+        renderer
+            .validate_sampled_dmabuf_wayland_reacquire_layout_policy(&renderer_release_history_context)
+            .is_ok()
+    );
     assert!(matches!(
-        renderer.validate_sampled_dmabuf_wayland_reacquire_layout_policy(&renderer_release_history_context),
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&renderer_release_history_context),
         Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan reacquire layout policy"
+            "sampled dmabuf Wayland Vulkan first-import layout policy"
         ))
     ));
     assert!(matches!(

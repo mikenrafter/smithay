@@ -858,20 +858,24 @@ impl VulkanRenderer {
     }
 
     /// Validate the reacquire external image layout policy for a normal Wayland dmabuf.
+    ///
+    /// This token is only produced from renderer-local history established after this renderer
+    /// released the same Smithay [`Dmabuf`] identity to foreign ownership in `VK_IMAGE_LAYOUT_GENERAL`.
+    /// It does not rely on Wayland metadata or explicit sync as layout evidence, and it does not
+    /// cover first imports that have no renderer-local history.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_reacquire_layout_policy(
         &self,
         context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandReacquireLayoutPolicy, VulkanError> {
-        if context.layout_history == SampledDmabufWaylandLayoutHistory::NoRendererHistory {
-            return Err(VulkanError::MissingCapability(
+        match context.layout_history {
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory => Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland Vulkan reacquire layout history",
-            ));
+            )),
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => {
+                Ok(SampledDmabufWaylandReacquireLayoutPolicy { _private: () })
+            }
         }
-
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan reacquire layout policy",
-        ))
     }
 
     /// Validate queue-family ownership transfer policy for a normal Wayland dmabuf.
