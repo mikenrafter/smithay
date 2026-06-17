@@ -653,9 +653,9 @@ impl VulkanRenderer {
     /// dmabuf import.
     ///
     /// The obligation is satisfied by [`VulkanRenderer::release_imported_dmabuf_texture_to_foreign_general`]
-    /// after Vulkan has synchronously released the sampled image back to foreign ownership. Exported
-    /// release fences remain development-gated for Wayland release points until sync-file-to-syncobj
-    /// transfer is modeled.
+    /// after Vulkan releases the sampled image back to foreign ownership. Synchronous releases signal
+    /// the Wayland release point directly; exported release fences are imported into the Wayland DRM
+    /// syncobj timeline point.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_release_lifecycle_contract(
         &self,
@@ -1019,23 +1019,18 @@ impl VulkanRenderer {
         if texture.image.source != image::VulkanImageSource::DmabufImport {
             return Err(VulkanError::UnsupportedOperation("dmabuf texture"));
         }
-        if export_sync_file && texture.has_sampled_dmabuf_release_obligation() {
-            return Err(VulkanError::UnsupportedOperation(
-                "sampled dmabuf release point export",
-            ));
-        }
         let sampled_image = texture
             .sampled_image
             .as_ref()
             .ok_or(VulkanError::UnsupportedOperation("dmabuf texture sampled image"))?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
 
-        let release =
+        let (released, release_sync_file) =
             device.release_sampled_dmabuf_to_foreign_general(sampled_image.image(), export_sync_file)?;
-        if release.0 {
-            texture.signal_sampled_dmabuf_release_point()?;
+        if released {
+            texture.signal_sampled_dmabuf_release_point(release_sync_file.as_ref().map(OwnedFd::as_fd))?;
         }
-        Ok(release)
+        Ok((released, release_sync_file))
     }
 
     /// Release an acquired dmabuf texture and return the exported release fence as a [`SyncPoint`]

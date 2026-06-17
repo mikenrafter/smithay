@@ -1,4 +1,10 @@
-use std::{ffi::CStr, fs::File, marker::PhantomData, os::unix::io::OwnedFd, sync::Arc};
+use std::{
+    ffi::CStr,
+    fs::File,
+    marker::PhantomData,
+    os::unix::io::{AsFd, OwnedFd},
+    sync::Arc,
+};
 
 use ash::{ext, khr, vk};
 
@@ -3722,6 +3728,12 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     let release = VulkanSampledDmabufRelease::validation_stage_without_wayland_point();
     assert!(release.signal_wayland_release_once().is_ok());
     assert!(release.signal_wayland_release_once().is_ok());
+    let invalid_sync_file = File::open("/dev/null").unwrap();
+    assert!(
+        release
+            .satisfy_wayland_release_once(Some(invalid_sync_file.as_fd()))
+            .is_ok()
+    );
 }
 
 #[test]
@@ -3754,9 +3766,7 @@ fn internal_dmabuf_texture_release_rejects_preconditions_before_device_lookup() 
         Some(VulkanSampledDmabufRelease::validation_stage_without_wayland_point());
     assert!(matches!(
         renderer.release_imported_dmabuf_texture_to_foreign_general(&release_obligation_texture, true),
-        Err(VulkanError::UnsupportedOperation(
-            "sampled dmabuf release point export"
-        ))
+        Err(VulkanError::UnsupportedOperation("dmabuf texture sampled image"))
     ));
     assert!(matches!(
         renderer.release_imported_dmabuf_texture_to_foreign_general(&missing_sampled_image_texture, true),

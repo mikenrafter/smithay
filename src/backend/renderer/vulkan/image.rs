@@ -1,5 +1,6 @@
 use std::{
     marker::PhantomData,
+    os::fd::BorrowedFd,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -214,15 +215,14 @@ impl VulkanTexture {
         self.sampled_dmabuf_release.is_some()
     }
 
-    pub(super) fn signal_sampled_dmabuf_release_point(&self) -> Result<(), VulkanError> {
+    pub(super) fn signal_sampled_dmabuf_release_point(
+        &self,
+        _release_sync_file: Option<BorrowedFd<'_>>,
+    ) -> Result<(), VulkanError> {
         if let Some(release) = &self.sampled_dmabuf_release {
-            release.signal_wayland_release_once()?;
+            release.satisfy_wayland_release_once(_release_sync_file)?;
         }
         Ok(())
-    }
-
-    pub(super) fn has_sampled_dmabuf_release_obligation(&self) -> bool {
-        self.sampled_dmabuf_release.is_some()
     }
 
     fn sync_state(&self) -> Result<VulkanImageSyncState, VulkanError> {
@@ -271,6 +271,13 @@ impl VulkanSampledDmabufRelease {
     }
 
     pub(super) fn signal_wayland_release_once(&self) -> Result<(), VulkanError> {
+        self.satisfy_wayland_release_once(None)
+    }
+
+    pub(super) fn satisfy_wayland_release_once(
+        &self,
+        _release_sync_file: Option<BorrowedFd<'_>>,
+    ) -> Result<(), VulkanError> {
         #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
         {
             let mut inner = self
@@ -279,7 +286,14 @@ impl VulkanSampledDmabufRelease {
                 .map_err(|_| VulkanError::UnsupportedOperation("sampled dmabuf release point"))?;
 
             if let Some(release_point) = inner.wayland_release_point.take() {
-                if let Err(err) = release_point.signal() {
+                if let Some(release_sync_file) = _release_sync_file {
+                    if let Err(err) = release_point.import_sync_file(release_sync_file) {
+                        tracing::warn!(?err, "failed to import sampled dmabuf release sync file");
+                        return Err(VulkanError::UnsupportedOperation(
+                            "sampled dmabuf release point import sync file",
+                        ));
+                    }
+                } else if let Err(err) = release_point.signal() {
                     tracing::warn!(?err, "failed to signal sampled dmabuf Wayland release point");
                     return Err(VulkanError::UnsupportedOperation(
                         "sampled dmabuf release point signal",
