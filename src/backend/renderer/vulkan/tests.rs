@@ -4398,6 +4398,11 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         ))
     ));
     renderer.capabilities.external_memory.foreign_queue_family = true;
+    let validated_queue_policy = renderer
+        .validate_sampled_dmabuf_wayland_queue_family_policy(&policy_context)
+        .unwrap();
+    assert!(validated_queue_policy.is_for_dmabuf(&policy_dmabuf));
+    assert!(!validated_queue_policy.is_for_dmabuf(&unrelated_dmabuf));
     assert!(
         renderer
             .validate_sampled_dmabuf_wayland_queue_family_policy(&policy_context)
@@ -4516,8 +4521,21 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland Vulkan queue-family policy"
         ))
     ));
-    wayland_vulkan_contracts.queue_family_transfer =
-        Some(SampledDmabufWaylandQueueFamilyPolicy { _private: () });
+    wayland_vulkan_contracts.queue_family_transfer = Some(
+        SampledDmabufWaylandQueueFamilyPolicy::new_for_tests(&unrelated_dmabuf),
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
+            &policy_dmabuf,
+            &wayland_vulkan_contracts,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland queue-family identity"
+        ))
+    ));
+    wayland_vulkan_contracts.queue_family_transfer = Some(
+        SampledDmabufWaylandQueueFamilyPolicy::new_for_tests(&policy_dmabuf),
+    );
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
             &policy_dmabuf,
@@ -4561,6 +4579,9 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     unrelated_wayland_vulkan_contracts.layout = Some(SampledDmabufWaylandLayoutPolicy::Reacquire(
         SampledDmabufWaylandReacquireLayoutPolicy::new_for_tests(&unrelated_dmabuf),
     ));
+    unrelated_wayland_vulkan_contracts.queue_family_transfer = Some(
+        SampledDmabufWaylandQueueFamilyPolicy::new_for_tests(&unrelated_dmabuf),
+    );
     let mismatched_smithay_wayland_policy = SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(
         renderer
             .validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(

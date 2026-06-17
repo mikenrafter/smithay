@@ -249,9 +249,23 @@ impl SampledDmabufWaylandLayoutPolicy {
 
 /// Evidence for queue-family ownership transfers used by Smithay's Wayland/Vulkan dmabuf policy.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandQueueFamilyPolicy {
-    _private: (),
+    dmabuf: WeakDmabuf,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufWaylandQueueFamilyPolicy {
+    #[cfg(test)]
+    fn new_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+        }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
 }
 
 /// Evidence that Wayland acquire sync is mapped into the Vulkan sampled-dmabuf acquire operation.
@@ -1157,7 +1171,7 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_queue_family_policy(
         &self,
-        _context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
+        context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandQueueFamilyPolicy, VulkanError> {
         if !self.capabilities.external_memory.foreign_queue_family {
             return Err(VulkanError::MissingCapability(
@@ -1165,7 +1179,9 @@ impl VulkanRenderer {
             ));
         }
 
-        Ok(SampledDmabufWaylandQueueFamilyPolicy { _private: () })
+        Ok(SampledDmabufWaylandQueueFamilyPolicy {
+            dmabuf: context.dmabuf.weak(),
+        })
     }
 
     /// Validate acquire-sync import/wait policy for a normal Wayland dmabuf.
@@ -1255,9 +1271,14 @@ impl VulkanRenderer {
                 "sampled dmabuf Wayland Vulkan foreign GENERAL policy",
             ));
         };
-        if contracts.queue_family_transfer.is_none() {
+        let Some(queue_family_transfer) = contracts.queue_family_transfer.as_ref() else {
             return Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland Vulkan queue-family policy",
+            ));
+        };
+        if !queue_family_transfer.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland queue-family identity",
             ));
         }
         if contracts.acquire_sync.is_none() {
