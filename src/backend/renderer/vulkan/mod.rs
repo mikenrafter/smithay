@@ -192,6 +192,33 @@ struct SampledDmabufWaylandTextureCachePolicy {
     _private: (),
 }
 
+/// Validated normal-path inputs available to Smithay's Wayland/Vulkan sampled-dmabuf policy.
+///
+/// This deliberately separates protocol/import evidence from the opaque policy evidence tokens. The
+/// fields are necessary inputs for producing those tokens, but none of them alone proves Vulkan
+/// image layout, queue-family ownership, or release/cache correctness.
+#[allow(dead_code)]
+struct SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
+    import: &'a image::VulkanDmabufImportState,
+    acquire_sync: &'a SyncPoint,
+    release_evidence: &'a SampledDmabufReleaseEvidence,
+}
+
+#[allow(dead_code)]
+impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
+    fn new(
+        import: &'a image::VulkanDmabufImportState,
+        acquire_sync: &'a SyncPoint,
+        release_evidence: &'a SampledDmabufReleaseEvidence,
+    ) -> Self {
+        Self {
+            import,
+            acquire_sync,
+            release_evidence,
+        }
+    }
+}
+
 /// Validation evidence for Smithay's normal Wayland dmabuf -> Vulkan sampled-image policy.
 ///
 /// Each field names one contract that must be backed by implementation and tests before the normal
@@ -740,13 +767,14 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_vulkan_interop_policy(
         &self,
+        context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufLayoutEvidence, VulkanError> {
-        let first_import_layout = self.validate_sampled_dmabuf_wayland_first_import_layout_policy()?;
-        let reacquire_layout = self.validate_sampled_dmabuf_wayland_reacquire_layout_policy()?;
-        let queue_family_transfer = self.validate_sampled_dmabuf_wayland_queue_family_policy()?;
-        let acquire_sync = self.validate_sampled_dmabuf_wayland_acquire_sync_policy()?;
-        let release_sync = self.validate_sampled_dmabuf_wayland_release_sync_policy()?;
-        let texture_cache_reuse = self.validate_sampled_dmabuf_wayland_texture_cache_policy()?;
+        let first_import_layout = self.validate_sampled_dmabuf_wayland_first_import_layout_policy(context)?;
+        let reacquire_layout = self.validate_sampled_dmabuf_wayland_reacquire_layout_policy(context)?;
+        let queue_family_transfer = self.validate_sampled_dmabuf_wayland_queue_family_policy(context)?;
+        let acquire_sync = self.validate_sampled_dmabuf_wayland_acquire_sync_policy(context)?;
+        let release_sync = self.validate_sampled_dmabuf_wayland_release_sync_policy(context)?;
+        let texture_cache_reuse = self.validate_sampled_dmabuf_wayland_texture_cache_policy(context)?;
         self.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
             SampledDmabufWaylandVulkanInteropPolicyContracts {
                 first_import_layout: Some(first_import_layout),
@@ -767,6 +795,7 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_first_import_layout_policy(
         &self,
+        _context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandFirstImportLayoutPolicy, VulkanError> {
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan first-import layout policy",
@@ -777,6 +806,7 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_reacquire_layout_policy(
         &self,
+        _context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandReacquireLayoutPolicy, VulkanError> {
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan reacquire layout policy",
@@ -787,6 +817,7 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_queue_family_policy(
         &self,
+        _context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandQueueFamilyPolicy, VulkanError> {
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan queue-family policy",
@@ -797,7 +828,9 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_acquire_sync_policy(
         &self,
+        context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandAcquireSyncPolicy, VulkanError> {
+        self.validate_sampled_dmabuf_wayland_acquire_sync_contract(Some(context.acquire_sync))?;
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan acquire sync policy",
         ))
@@ -807,7 +840,9 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_release_sync_policy(
         &self,
+        context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandReleaseSyncPolicy, VulkanError> {
+        self.validate_sampled_dmabuf_release_lifecycle_contract(context.release_evidence.clone())?;
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan release sync policy",
         ))
@@ -817,6 +852,7 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_texture_cache_policy(
         &self,
+        _context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandTextureCachePolicy, VulkanError> {
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan texture-cache policy",
@@ -1686,11 +1722,13 @@ impl ImportDmaWl for VulkanRenderer {
         let dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
             .expect("import_dma_buffer_from_surface_state without checking buffer type?");
 
-        self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
+        let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
 
         let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_point(buffer)?;
         let release_evidence = self.sampled_dmabuf_wayland_release_evidence(buffer)?;
-        let layout_evidence = self.validate_sampled_dmabuf_wayland_vulkan_interop_policy()?;
+        let policy_context =
+            SampledDmabufWaylandVulkanInteropPolicyContext::new(&import, &acquire_sync, &release_evidence);
+        let layout_evidence = self.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&policy_context)?;
         self.validate_sampled_dmabuf_known_layout_contract(layout_evidence)?;
 
         let texture = unsafe {
