@@ -3710,6 +3710,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         &policy_import,
         &explicit_acquire,
         &policy_release_evidence,
+        true,
     );
     assert!(matches!(
         renderer.validate_sampled_dmabuf_known_layout_contract(SampledDmabufLayoutEvidence::WaylandDmabuf),
@@ -3761,6 +3762,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         &policy_import,
         &signaled_acquire,
         &policy_release_evidence,
+        true,
     );
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_acquire_sync_policy(&implicit_policy_context),
@@ -3771,12 +3773,23 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             .validate_sampled_dmabuf_wayland_release_sync_policy(&policy_context)
             .is_ok()
     );
+    let stale_cache_policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_import,
+        &explicit_acquire,
+        &policy_release_evidence,
+        false,
+    );
     assert!(matches!(
-        renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&policy_context),
+        renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&stale_cache_policy_context),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan texture-cache policy"
         ))
     ));
+    assert!(
+        renderer
+            .validate_sampled_dmabuf_wayland_texture_cache_policy(&policy_context)
+            .is_ok()
+    );
     let mut wayland_vulkan_contracts = SampledDmabufWaylandVulkanInteropPolicyContracts::default();
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(wayland_vulkan_contracts),

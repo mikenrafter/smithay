@@ -202,6 +202,7 @@ struct SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
     import: &'a image::VulkanDmabufImportState,
     acquire_sync: &'a SyncPoint,
     release_evidence: &'a SampledDmabufReleaseEvidence,
+    per_commit_texture_import: bool,
 }
 
 #[allow(dead_code)]
@@ -210,11 +211,13 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
         import: &'a image::VulkanDmabufImportState,
         acquire_sync: &'a SyncPoint,
         release_evidence: &'a SampledDmabufReleaseEvidence,
+        per_commit_texture_import: bool,
     ) -> Self {
         Self {
             import,
             acquire_sync,
             release_evidence,
+            per_commit_texture_import,
         }
     }
 }
@@ -860,14 +863,24 @@ impl VulkanRenderer {
     }
 
     /// Validate texture-cache reuse policy for a normal Wayland dmabuf.
+    ///
+    /// The validation-stage normal path imports a fresh sampled dmabuf texture for each explicit-sync
+    /// commit instead of reusing renderer-local image state across commit-specific acquire/release
+    /// points. Smithay's surface import cache clears renderer textures when explicit sync points are
+    /// present, and this renderer's `ImportDmaWl` implementation does not maintain a secondary
+    /// sampled-dmabuf texture cache.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_texture_cache_policy(
         &self,
-        _context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
+        context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandTextureCachePolicy, VulkanError> {
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan texture-cache policy",
-        ))
+        if !context.per_commit_texture_import {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan texture-cache policy",
+            ));
+        }
+
+        Ok(SampledDmabufWaylandTextureCachePolicy { _private: () })
     }
 
     /// Validate each named part of Smithay's Wayland/Vulkan sampled-dmabuf policy.
@@ -1737,8 +1750,12 @@ impl ImportDmaWl for VulkanRenderer {
 
         let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_point(buffer)?;
         let release_evidence = self.sampled_dmabuf_wayland_release_evidence(buffer)?;
-        let policy_context =
-            SampledDmabufWaylandVulkanInteropPolicyContext::new(&import, &acquire_sync, &release_evidence);
+        let policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+            &import,
+            &acquire_sync,
+            &release_evidence,
+            true,
+        );
         let layout_evidence = self.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&policy_context)?;
         self.validate_sampled_dmabuf_known_layout_contract(layout_evidence)?;
 
