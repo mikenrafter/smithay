@@ -333,7 +333,15 @@ struct SampledDmabufWaylandVulkanInteropPolicyContracts {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct SampledDmabufReleaseEvidence {
+    dmabuf: WeakDmabuf,
     release: image::VulkanSampledDmabufRelease,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufReleaseEvidence {
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
 }
 
 /// Acquire options for binding a foreign dmabuf as a Vulkan render target.
@@ -822,6 +830,7 @@ impl VulkanRenderer {
     #[cfg(feature = "wayland_frontend")]
     fn sampled_dmabuf_wayland_release_evidence(
         &self,
+        dmabuf: &Dmabuf,
         #[cfg(feature = "backend_drm")] buffer: &super::utils::Buffer,
         #[cfg(not(feature = "backend_drm"))] _buffer: &super::utils::Buffer,
     ) -> Result<SampledDmabufReleaseEvidence, VulkanError> {
@@ -834,12 +843,14 @@ impl VulkanRenderer {
             };
 
             Ok(SampledDmabufReleaseEvidence {
+                dmabuf: dmabuf.weak(),
                 release: image::VulkanSampledDmabufRelease::wayland_syncobj(release_point),
             })
         }
 
         #[cfg(not(feature = "backend_drm"))]
         {
+            let _ = dmabuf;
             Err(VulkanError::MissingCapability(
                 "sampled dmabuf release point contract",
             ))
@@ -906,10 +917,12 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_release_point_contract(
         &self,
+        dmabuf: &Dmabuf,
         has_release_point: bool,
     ) -> Result<SampledDmabufReleaseEvidence, VulkanError> {
         if has_release_point {
             Ok(SampledDmabufReleaseEvidence {
+                dmabuf: dmabuf.weak(),
                 release: image::VulkanSampledDmabufRelease::validation_stage_without_wayland_point(),
             })
         } else {
@@ -1119,7 +1132,10 @@ impl VulkanRenderer {
         &self,
         context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandReleaseSyncPolicy, VulkanError> {
-        self.validate_sampled_dmabuf_release_lifecycle_contract(context.release_evidence.clone())?;
+        self.validate_sampled_dmabuf_release_lifecycle_contract(
+            context.dmabuf,
+            context.release_evidence.clone(),
+        )?;
         Ok(SampledDmabufWaylandReleaseSyncPolicy { _private: () })
     }
 
@@ -1230,8 +1246,15 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_release_lifecycle_contract(
         &self,
+        dmabuf: &Dmabuf,
         evidence: SampledDmabufReleaseEvidence,
     ) -> Result<image::VulkanSampledDmabufRelease, VulkanError> {
+        if !evidence.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf release evidence identity",
+            ));
+        }
+
         Ok(evidence.release)
     }
 
@@ -1393,7 +1416,7 @@ impl VulkanRenderer {
             SampledDmabufLayoutEvidence::KnownForeignGeneral(foreign_general),
         )?;
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
-        let release = self.validate_sampled_dmabuf_release_lifecycle_contract(release_evidence)?;
+        let release = self.validate_sampled_dmabuf_release_lifecycle_contract(dmabuf, release_evidence)?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
         let Some(sampled_image) = (unsafe {
             // SAFETY: Forwarded from this method's caller.
@@ -2135,7 +2158,7 @@ impl ImportDmaWl for VulkanRenderer {
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
 
         let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_point(buffer)?;
-        let release_evidence = self.sampled_dmabuf_wayland_release_evidence(buffer)?;
+        let release_evidence = self.sampled_dmabuf_wayland_release_evidence(dmabuf, buffer)?;
         let layout_history = self.sampled_dmabuf_layout_history(dmabuf);
         let policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
             dmabuf,

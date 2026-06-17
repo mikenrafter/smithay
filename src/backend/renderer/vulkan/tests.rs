@@ -4001,7 +4001,7 @@ fn public_dmabuf_import_gates_formats() {
         Err(VulkanError::VulkanUnavailable)
     ));
     let release_evidence = renderer
-        .validate_sampled_dmabuf_wayland_release_point_contract(true)
+        .validate_sampled_dmabuf_wayland_release_point_contract(&dmabuf, true)
         .unwrap();
     assert!(matches!(
         // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
@@ -4137,7 +4137,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     );
     let policy_import = VulkanDmabufImportState::from_dmabuf(&policy_dmabuf).unwrap();
     let policy_release_evidence = renderer
-        .validate_sampled_dmabuf_wayland_release_point_contract(true)
+        .validate_sampled_dmabuf_wayland_release_point_contract(&policy_dmabuf, true)
         .unwrap();
     let mut history_renderer = VulkanRenderer::new_scaffold_for_tests();
     assert_eq!(
@@ -4164,6 +4164,23 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         history_renderer.sampled_dmabuf_layout_history(&unrelated_dmabuf),
         SampledDmabufWaylandLayoutHistory::NoRendererHistory
     );
+    let unrelated_release_evidence = renderer
+        .validate_sampled_dmabuf_wayland_release_point_contract(&unrelated_dmabuf, true)
+        .unwrap();
+    let mismatched_release_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
+        &policy_import,
+        &explicit_acquire,
+        &unrelated_release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_release_sync_policy(&mismatched_release_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf release evidence identity"
+        ))
+    ));
     history_renderer.record_sampled_dmabuf_locally_acquired(&policy_dmabuf);
     assert_eq!(
         history_renderer.sampled_dmabuf_layout_history(&policy_dmabuf),
@@ -4542,16 +4559,26 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             .is_ok()
     );
     assert!(matches!(
-        renderer.validate_sampled_dmabuf_wayland_release_point_contract(false),
+        renderer.validate_sampled_dmabuf_wayland_release_point_contract(&policy_dmabuf, false),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf release point contract"
         ))
     ));
     let release_evidence = renderer
-        .validate_sampled_dmabuf_wayland_release_point_contract(true)
+        .validate_sampled_dmabuf_wayland_release_point_contract(&policy_dmabuf, true)
         .unwrap();
+    let mismatched_release_evidence = renderer
+        .validate_sampled_dmabuf_wayland_release_point_contract(&unrelated_dmabuf, true)
+        .unwrap();
+    assert!(matches!(
+        renderer
+            .validate_sampled_dmabuf_release_lifecycle_contract(&policy_dmabuf, mismatched_release_evidence,),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf release evidence identity"
+        ))
+    ));
     let release_obligation = renderer
-        .validate_sampled_dmabuf_release_lifecycle_contract(release_evidence)
+        .validate_sampled_dmabuf_release_lifecycle_contract(&policy_dmabuf, release_evidence)
         .unwrap();
     assert!(release_obligation.signal_wayland_release_once().is_ok());
     assert!(release_obligation.signal_wayland_release_once().is_ok());
