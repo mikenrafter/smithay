@@ -52,7 +52,10 @@
 //! Every future feature should follow this pattern: capability flag first, test second, stub
 //! failure path third, real implementation fourth, enablement last.
 
-use std::os::fd::{AsFd, OwnedFd};
+use std::{
+    collections::HashMap,
+    os::fd::{AsFd, OwnedFd},
+};
 
 #[cfg(all(
     feature = "wayland_frontend",
@@ -65,7 +68,11 @@ use crate::backend::renderer::{ImportDmaWl, ImportMemWl};
 use crate::{
     backend::vulkan::PhysicalDevice,
     backend::{
-        allocator::{Format, Fourcc, Modifier, dmabuf::Dmabuf, format::FormatSet},
+        allocator::{
+            Format, Fourcc, Modifier,
+            dmabuf::{Dmabuf, WeakDmabuf},
+            format::FormatSet,
+        },
         renderer::{
             Bind, Color32F, ContextId, DebugFlags, ExportMem, ImportDma, ImportMem, Offscreen,
             RenderTargetLifecycle, Renderer, RendererSuper, Texture, TextureFilter,
@@ -513,6 +520,7 @@ pub struct VulkanRenderer {
     upscale_filter: TextureFilter,
     capabilities: VulkanRendererCapabilities,
     device: Option<VulkanDeviceState>,
+    sampled_dmabuf_layout_history: HashMap<WeakDmabuf, SampledDmabufWaylandLayoutHistory>,
 }
 
 /// Builder for explicit Vulkan renderer initialization.
@@ -554,6 +562,7 @@ impl VulkanRendererBuilder {
             upscale_filter: TextureFilter::Linear,
             capabilities,
             device: Some(device),
+            sampled_dmabuf_layout_history: HashMap::new(),
         })
     }
 }
@@ -589,6 +598,7 @@ impl VulkanRenderer {
             upscale_filter: TextureFilter::Linear,
             capabilities: VulkanRendererCapabilities::default(),
             device: None,
+            sampled_dmabuf_layout_history: HashMap::new(),
         }
     }
 
@@ -629,6 +639,30 @@ impl VulkanRenderer {
         } else {
             FormatSet::default()
         }
+    }
+
+    #[allow(dead_code)]
+    fn prune_sampled_dmabuf_layout_history(&mut self) {
+        self.sampled_dmabuf_layout_history
+            .retain(|dmabuf, _| !dmabuf.is_gone());
+    }
+
+    #[allow(dead_code)]
+    fn sampled_dmabuf_layout_history(&mut self, dmabuf: &Dmabuf) -> SampledDmabufWaylandLayoutHistory {
+        self.prune_sampled_dmabuf_layout_history();
+        self.sampled_dmabuf_layout_history
+            .get(&dmabuf.weak())
+            .copied()
+            .unwrap_or(SampledDmabufWaylandLayoutHistory::NoRendererHistory)
+    }
+
+    #[allow(dead_code)]
+    fn record_sampled_dmabuf_released_to_foreign_general(&mut self, dmabuf: &Dmabuf) {
+        self.prune_sampled_dmabuf_layout_history();
+        self.sampled_dmabuf_layout_history.insert(
+            dmabuf.weak(),
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+        );
     }
 
     /// Check whether the sampled dmabuf path may be public-advertised through [`ImportDma`].
@@ -1774,12 +1808,13 @@ impl ImportDmaWl for VulkanRenderer {
 
         let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_point(buffer)?;
         let release_evidence = self.sampled_dmabuf_wayland_release_evidence(buffer)?;
+        let layout_history = self.sampled_dmabuf_layout_history(dmabuf);
         let policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
             &import,
             &acquire_sync,
             &release_evidence,
             true,
-            SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+            layout_history,
         );
         let layout_evidence = self.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&policy_context)?;
         self.validate_sampled_dmabuf_known_layout_contract(layout_evidence)?;

@@ -3706,6 +3706,44 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     let policy_release_evidence = renderer
         .validate_sampled_dmabuf_wayland_release_point_contract(true)
         .unwrap();
+    let mut history_renderer = VulkanRenderer::new_scaffold_for_tests();
+    assert_eq!(
+        history_renderer.sampled_dmabuf_layout_history(&policy_dmabuf),
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory
+    );
+    history_renderer.record_sampled_dmabuf_released_to_foreign_general(&policy_dmabuf);
+    assert_eq!(
+        history_renderer.sampled_dmabuf_layout_history(&policy_dmabuf),
+        SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+    );
+    assert_eq!(
+        history_renderer.sampled_dmabuf_layout_history(&policy_dmabuf.clone()),
+        SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+    );
+    let unrelated_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    assert_eq!(
+        history_renderer.sampled_dmabuf_layout_history(&unrelated_dmabuf),
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory
+    );
+    {
+        let temporary_dmabuf = dmabuf_with_planes_for_tests(
+            (4, 3).into(),
+            Fourcc::Abgr8888,
+            Modifier::Linear,
+            DmabufFlags::empty(),
+            &[(0, 0, 16)],
+        );
+        history_renderer.record_sampled_dmabuf_released_to_foreign_general(&temporary_dmabuf);
+        assert_eq!(history_renderer.sampled_dmabuf_layout_history.len(), 2);
+    }
+    history_renderer.prune_sampled_dmabuf_layout_history();
+    assert_eq!(history_renderer.sampled_dmabuf_layout_history.len(), 1);
     let policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
         &policy_import,
         &explicit_acquire,
