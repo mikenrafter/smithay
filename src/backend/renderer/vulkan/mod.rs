@@ -145,11 +145,31 @@ struct SampledDmabufWaylandVulkanInteropPolicy {
     _private: (),
 }
 
-#[cfg(test)]
-impl SampledDmabufWaylandVulkanInteropPolicy {
-    fn validation_stage_for_tests() -> Self {
-        Self { _private: () }
-    }
+/// Validation checklist for Smithay's normal Wayland dmabuf -> Vulkan sampled-image policy.
+///
+/// Each field names one contract that must be backed by implementation and tests before the normal
+/// `ImportDmaWl` path may construct [`SampledDmabufWaylandVulkanInteropPolicy`]. The default value
+/// is deliberately all-false so production remains fail-closed at the first missing policy step.
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SampledDmabufWaylandVulkanInteropPolicyContracts {
+    /// Defines the external ownership and Vulkan image layout used for the first import of a client
+    /// Wayland dmabuf into this renderer.
+    first_import_layout: bool,
+    /// Defines the external ownership and Vulkan image layout used when a previously imported
+    /// Wayland dmabuf is committed again after Smithay released it.
+    reacquire_layout: bool,
+    /// Defines the queue-family ownership transfer to and from this renderer's Vulkan queue.
+    queue_family_transfer: bool,
+    /// Defines how the Wayland acquire point is converted into a Vulkan wait dependency for the
+    /// import/acquire transition.
+    acquire_sync: bool,
+    /// Defines how Vulkan sampling completion and foreign release are transferred to the Wayland
+    /// release point.
+    release_sync: bool,
+    /// Defines how texture-cache reuse observes per-commit acquire/release obligations and avoids
+    /// reusing stale host-side layout evidence.
+    texture_cache_reuse: bool,
 }
 
 /// Evidence that a Wayland release point exists for a sampled dmabuf.
@@ -674,9 +694,55 @@ impl VulkanRenderer {
     fn validate_sampled_dmabuf_wayland_vulkan_interop_policy(
         &self,
     ) -> Result<SampledDmabufLayoutEvidence, VulkanError> {
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan interop policy",
-        ))
+        self.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
+            SampledDmabufWaylandVulkanInteropPolicyContracts::default(),
+        )
+        .map(SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy)
+    }
+
+    /// Validate each named part of Smithay's Wayland/Vulkan sampled-dmabuf policy.
+    ///
+    /// The all-true path is only a validation-stage scaffold until each field is replaced or backed
+    /// by a concrete implementation predicate and test. Future work must produce evidence for each
+    /// contract instead of setting these markers from protocol metadata or another renderer's
+    /// assumptions.
+    #[allow(dead_code)]
+    fn validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
+        &self,
+        contracts: SampledDmabufWaylandVulkanInteropPolicyContracts,
+    ) -> Result<SampledDmabufWaylandVulkanInteropPolicy, VulkanError> {
+        if !contracts.first_import_layout {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan first-import layout policy",
+            ));
+        }
+        if !contracts.reacquire_layout {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan reacquire layout policy",
+            ));
+        }
+        if !contracts.queue_family_transfer {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan queue-family policy",
+            ));
+        }
+        if !contracts.acquire_sync {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan acquire sync policy",
+            ));
+        }
+        if !contracts.release_sync {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan release sync policy",
+            ));
+        }
+        if !contracts.texture_cache_reuse {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan texture-cache policy",
+            ));
+        }
+
+        Ok(SampledDmabufWaylandVulkanInteropPolicy { _private: () })
     }
 
     /// Validate the external ownership and image-layout contract for sampled dmabuf import.

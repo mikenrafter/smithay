@@ -3704,11 +3704,56 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy(),
         Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan interop policy"
+            "sampled dmabuf Wayland Vulkan first-import layout policy"
         ))
     ));
+    let mut wayland_vulkan_contracts = SampledDmabufWaylandVulkanInteropPolicyContracts::default();
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(wayland_vulkan_contracts),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan first-import layout policy"
+        ))
+    ));
+    wayland_vulkan_contracts.first_import_layout = true;
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(wayland_vulkan_contracts),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan reacquire layout policy"
+        ))
+    ));
+    wayland_vulkan_contracts.reacquire_layout = true;
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(wayland_vulkan_contracts),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan queue-family policy"
+        ))
+    ));
+    wayland_vulkan_contracts.queue_family_transfer = true;
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(wayland_vulkan_contracts),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan acquire sync policy"
+        ))
+    ));
+    wayland_vulkan_contracts.acquire_sync = true;
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(wayland_vulkan_contracts),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan release sync policy"
+        ))
+    ));
+    wayland_vulkan_contracts.release_sync = true;
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(wayland_vulkan_contracts),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan texture-cache policy"
+        ))
+    ));
+    wayland_vulkan_contracts.texture_cache_reuse = true;
     let smithay_wayland_policy = SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(
-        SampledDmabufWaylandVulkanInteropPolicy::validation_stage_for_tests(),
+        renderer
+            .validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(wayland_vulkan_contracts)
+            .unwrap(),
     );
     assert!(
         renderer
