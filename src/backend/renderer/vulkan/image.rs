@@ -76,6 +76,7 @@ pub struct VulkanRenderTarget<'buffer> {
     pub(super) context_id: ContextId<VulkanTexture>,
     pub(super) image: VulkanImageState,
     pub(super) color_image: Option<VulkanOwnedImage>,
+    pub(super) dmabuf: Option<WeakDmabuf>,
     pub(super) _target: PhantomData<&'buffer mut ()>,
 }
 
@@ -1086,6 +1087,7 @@ impl VulkanRenderTarget<'_> {
                 sync: VulkanImageSyncState::default(),
             },
             color_image: Some(color_image),
+            dmabuf: None,
             _target: PhantomData,
         }
     }
@@ -1093,6 +1095,7 @@ impl VulkanRenderTarget<'_> {
     #[allow(dead_code)]
     pub(crate) fn from_acquired_dmabuf_render_target(
         context_id: ContextId<VulkanTexture>,
+        dmabuf: &Dmabuf,
         import: &VulkanDmabufImportState,
         color_image: VulkanOwnedImage,
     ) -> Self {
@@ -1100,6 +1103,7 @@ impl VulkanRenderTarget<'_> {
             context_id,
             image: dmabuf_acquired_render_target_image_state(import),
             color_image: Some(color_image),
+            dmabuf: Some(dmabuf.weak()),
             _target: PhantomData,
         }
     }
@@ -1110,6 +1114,7 @@ impl VulkanRenderTarget<'_> {
             context_id: ContextId::new(),
             image: VulkanImageState::new_for_tests(size, format),
             color_image: None,
+            dmabuf: None,
             _target: PhantomData,
         }
     }

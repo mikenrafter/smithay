@@ -159,6 +159,7 @@ fn render_target_for_tests(
         context_id,
         image,
         color_image: None,
+        dmabuf: None,
         _target: PhantomData,
     }
 }
@@ -3241,6 +3242,85 @@ fn public_dmabuf_bind_uses_discard_acquire_path() {
             &mut owned_preserve_target,
         ),
         Err(VulkanError::VulkanUnavailable)
+    ));
+}
+
+#[test]
+fn dmabuf_loopback_evidence_is_identity_bound_and_not_public_advertised() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let unrelated_dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let evidence = unsafe {
+        // SAFETY: This unit test validates token routing only; no Vulkan acquire/import is reached
+        // with this token before the scaffold device lookup fails.
+        VulkanDmabufLoopbackImportEvidence::new(dmabuf.weak(), SyncPoint::signaled())
+    };
+
+    assert!(evidence.is_for_dmabuf(&dmabuf));
+    assert!(!evidence.is_for_dmabuf(&unrelated_dmabuf));
+    assert!(evidence.acquire_sync().is_reached());
+    assert!(
+        renderer
+            .validate_dmabuf_loopback_import_evidence(&dmabuf, &evidence)
+            .is_ok()
+    );
+    assert!(matches!(
+        renderer.validate_dmabuf_loopback_import_evidence(&unrelated_dmabuf, &evidence),
+        Err(VulkanError::UnsupportedOperation("dmabuf loopback evidence"))
+    ));
+    assert!(matches!(
+        // SAFETY: This test intentionally validates identity rejection before any Vulkan operation
+        // can use the evidence.
+        unsafe { renderer.import_dmabuf_texture_from_loopback(&unrelated_dmabuf, evidence) },
+        Err(VulkanError::UnsupportedOperation("dmabuf loopback evidence"))
+    ));
+
+    let evidence = unsafe {
+        // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
+        // Vulkan import or ownership-transfer operation can occur.
+        VulkanDmabufLoopbackImportEvidence::new(dmabuf.weak(), SyncPoint::signaled())
+    };
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
+    assert!(matches!(
+        // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
+        // Vulkan import or ownership-transfer operation can occur.
+        unsafe { renderer.import_dmabuf_texture_from_loopback(&dmabuf, evidence) },
+        Err(VulkanError::VulkanUnavailable)
+    ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+
+    let mut offscreen_target = render_target_for_tests(
+        renderer.context_id(),
+        VulkanImageSource::Offscreen,
+        (1, 1).into(),
+        Some(Fourcc::Abgr8888),
+    );
+    assert!(matches!(
+        renderer.release_dmabuf_render_target_for_sampled_loopback(&mut offscreen_target, false),
+        Err(VulkanError::UnsupportedOperation("dmabuf loopback render target"))
     ));
 }
 

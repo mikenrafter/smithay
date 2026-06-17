@@ -477,6 +477,43 @@ impl<'sync> VulkanOwnedDmabufRenderTarget<'sync> {
     }
 }
 
+/// Opaque evidence that a Smithay-controlled Vulkan dmabuf render target was released for sampled import.
+///
+/// This token is produced only after this renderer releases an acquired dmabuf render target to
+/// `VK_QUEUE_FAMILY_FOREIGN_EXT` in `VK_IMAGE_LAYOUT_GENERAL`. It is tied to the originating
+/// [`Dmabuf`] identity and is consumed by the validation-stage loopback sampled-import helper. This
+/// keeps the Smithay-controlled loopback path separate from arbitrary Wayland client dmabufs and does
+/// not public-advertise generic [`ImportDma`] support.
+#[derive(Debug)]
+pub struct VulkanDmabufLoopbackImportEvidence {
+    dmabuf: WeakDmabuf,
+    acquire_sync: SyncPoint,
+    foreign_general: SampledDmabufKnownLayoutEvidence,
+}
+
+impl VulkanDmabufLoopbackImportEvidence {
+    unsafe fn new(dmabuf: WeakDmabuf, acquire_sync: SyncPoint) -> Self {
+        Self {
+            dmabuf,
+            acquire_sync,
+            foreign_general: unsafe {
+                // SAFETY: Forwarded from this constructor's caller.
+                SampledDmabufKnownLayoutEvidence::foreign_general()
+            },
+        }
+    }
+
+    /// Returns the release dependency that must be satisfied before sampled reacquire uses this dmabuf.
+    pub fn acquire_sync(&self) -> &SyncPoint {
+        &self.acquire_sync
+    }
+
+    /// Returns whether this evidence is tied to `dmabuf`'s Smithay identity.
+    pub fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+}
+
 use self::{
     device::{
         VulkanDeviceState, VulkanSyncFileSemaphore, image_copy_buffer_offset, tightly_packed_image_size,
@@ -696,6 +733,19 @@ impl VulkanRenderer {
         self.prune_sampled_dmabuf_layout_history();
         self.sampled_dmabuf_layout_history
             .insert(dmabuf.weak(), SampledDmabufWaylandLayoutHistory::LocallyAcquired);
+    }
+
+    #[allow(dead_code)]
+    fn validate_dmabuf_loopback_import_evidence(
+        &self,
+        dmabuf: &Dmabuf,
+        evidence: &VulkanDmabufLoopbackImportEvidence,
+    ) -> Result<SampledDmabufKnownLayoutEvidence, VulkanError> {
+        if !evidence.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation("dmabuf loopback evidence"));
+        }
+
+        Ok(evidence.foreign_general)
     }
 
     /// Check whether the sampled dmabuf path may be public-advertised through [`ImportDma`].
@@ -1330,6 +1380,7 @@ impl VulkanRenderer {
 
         Ok(Some(VulkanRenderTarget::from_acquired_dmabuf_render_target(
             self.context_id.clone(),
+            dmabuf,
             &import,
             color_image,
         )))
@@ -1376,6 +1427,7 @@ impl VulkanRenderer {
 
         Ok(Some(VulkanRenderTarget::from_acquired_dmabuf_render_target(
             self.context_id.clone(),
+            dmabuf,
             &import,
             color_image,
         )))
@@ -1566,6 +1618,75 @@ impl VulkanRenderer {
         Ok((released, sync_point_from_sync_file(sync_file)))
     }
 
+    /// Release an acquired dmabuf render target and produce evidence for Smithay-controlled sampled loopback.
+    ///
+    /// This validation-stage helper is the bridge from the normal Vulkan dmabuf render-target path to
+    /// the known-layout sampled-import path. It returns evidence only after the render target was
+    /// released to foreign ownership in `VK_IMAGE_LAYOUT_GENERAL`, and the evidence is tied to the
+    /// original dmabuf identity recorded when the target was acquired. It does not make arbitrary
+    /// Wayland dmabufs public-advertised or supported through generic [`ImportDma`].
+    #[allow(dead_code)]
+    pub fn release_dmabuf_render_target_for_sampled_loopback(
+        &mut self,
+        target: &mut VulkanRenderTarget<'_>,
+        export_sync_file: bool,
+    ) -> Result<Option<VulkanDmabufLoopbackImportEvidence>, VulkanError> {
+        let dmabuf = target
+            .dmabuf
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("dmabuf loopback render target"))?
+            .clone();
+        let (released, acquire_sync) = self
+            .release_acquired_dmabuf_render_target_to_foreign_general_sync_point(target, export_sync_file)?;
+        if released {
+            Ok(Some(unsafe {
+                // SAFETY: `release_acquired_dmabuf_render_target_to_foreign_general_sync_point`
+                // returned `released == true`, so this renderer submitted/completed the release of
+                // the matching dmabuf render target to FOREIGN ownership in GENERAL layout. The
+                // returned sync point carries the release dependency for later sampled reacquire.
+                VulkanDmabufLoopbackImportEvidence::new(dmabuf, acquire_sync)
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Import a Smithay-controlled released dmabuf render target as a sampled texture.
+    ///
+    /// The consumed evidence must have been produced by
+    /// [`VulkanRenderer::release_dmabuf_render_target_for_sampled_loopback`] for the same Smithay
+    /// [`Dmabuf`] identity. This is a validation-stage loopback helper and does not advertise generic
+    /// sampled dmabuf import.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure there was no intervening access, acquire, release, or layout/ownership
+    /// transition of the dmabuf after the evidence was produced. The dmabuf must still be in
+    /// `VK_QUEUE_FAMILY_FOREIGN_EXT` ownership and `VK_IMAGE_LAYOUT_GENERAL`, with `evidence`'s
+    /// acquire sync point representing the release dependency for this sampled import.
+    #[allow(dead_code)]
+    pub unsafe fn import_dmabuf_texture_from_loopback(
+        &mut self,
+        dmabuf: &Dmabuf,
+        evidence: VulkanDmabufLoopbackImportEvidence,
+    ) -> Result<Option<VulkanTexture>, VulkanError> {
+        let foreign_general = self.validate_dmabuf_loopback_import_evidence(dmabuf, &evidence)?;
+        let acquire_sync = evidence.acquire_sync;
+        let texture = unsafe {
+            // SAFETY: Forwarded from this method's caller and validated against the consumed
+            // loopback evidence's dmabuf identity above.
+            self.create_imported_dmabuf_texture_with_known_general_layout_and_sync_point(
+                dmabuf,
+                foreign_general,
+                Some(&acquire_sync),
+            )?
+        };
+        if texture.is_some() {
+            self.record_sampled_dmabuf_locally_acquired(dmabuf);
+        }
+        Ok(texture)
+    }
+
     /// Release an explicitly acquired dmabuf render target after rendering failed before frame finish.
     ///
     /// This is the public error-cleanup counterpart to
@@ -1737,6 +1858,7 @@ impl<'target> Bind<VulkanRenderTarget<'target>> for VulkanRenderer {
             context_id: target.context_id.clone(),
             image: target.image.clone(),
             color_image: target.color_image.clone(),
+            dmabuf: target.dmabuf.clone(),
             _target: std::marker::PhantomData,
         })
     }
