@@ -819,9 +819,13 @@ impl VulkanRenderer {
         &self,
         _context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandQueueFamilyPolicy, VulkanError> {
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan queue-family policy",
-        ))
+        if !self.capabilities.external_memory.foreign_queue_family {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan queue-family capability",
+            ));
+        }
+
+        Ok(SampledDmabufWaylandQueueFamilyPolicy { _private: () })
     }
 
     /// Validate acquire-sync import/wait policy for a normal Wayland dmabuf.

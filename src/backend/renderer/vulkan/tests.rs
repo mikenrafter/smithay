@@ -3738,8 +3738,18 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_queue_family_policy(&policy_context),
         Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan queue-family policy"
+            "sampled dmabuf Wayland Vulkan queue-family capability"
         ))
+    ));
+    renderer.capabilities.external_memory.foreign_queue_family = true;
+    assert!(
+        renderer
+            .validate_sampled_dmabuf_wayland_queue_family_policy(&policy_context)
+            .is_ok()
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     ));
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_acquire_sync_policy(&policy_context),
