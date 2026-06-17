@@ -179,9 +179,23 @@ struct SampledDmabufWaylandReacquireLayoutPolicy {
 /// return state. This separate token keeps reacquire development-gated until the current-commit
 /// contract is modeled explicitly.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandCurrentReacquireLayoutEvidence {
-    _private: (),
+    dmabuf: WeakDmabuf,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufWaylandCurrentReacquireLayoutEvidence {
+    #[cfg(test)]
+    fn new_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+        }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
 }
 
 /// Evidence for the layout/ownership contract used by a normal Wayland sampled-dmabuf commit.
@@ -246,6 +260,7 @@ enum SampledDmabufWaylandLayoutHistory {
 /// image layout, queue-family ownership, or release/cache correctness.
 #[allow(dead_code)]
 struct SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
+    dmabuf: &'a Dmabuf,
     import: &'a image::VulkanDmabufImportState,
     acquire_sync: &'a SyncPoint,
     release_evidence: &'a SampledDmabufReleaseEvidence,
@@ -257,6 +272,7 @@ struct SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
 #[allow(dead_code)]
 impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
     fn new(
+        dmabuf: &'a Dmabuf,
         import: &'a image::VulkanDmabufImportState,
         acquire_sync: &'a SyncPoint,
         release_evidence: &'a SampledDmabufReleaseEvidence,
@@ -264,6 +280,7 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
         layout_history: SampledDmabufWaylandLayoutHistory,
     ) -> Self {
         Self {
+            dmabuf,
             import,
             acquire_sync,
             release_evidence,
@@ -991,11 +1008,19 @@ impl VulkanRenderer {
         &self,
         context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandCurrentReacquireLayoutEvidence, VulkanError> {
-        context
+        let evidence = context
             .current_reacquire_layout
+            .as_ref()
             .ok_or(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland Vulkan current reacquire layout policy",
-            ))
+            ))?;
+        if !evidence.is_for_dmabuf(context.dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland current reacquire identity",
+            ));
+        }
+
+        Ok(evidence.clone())
     }
 
     /// Validate the reacquire external image layout policy for a normal Wayland dmabuf.
@@ -2068,6 +2093,7 @@ impl ImportDmaWl for VulkanRenderer {
         let release_evidence = self.sampled_dmabuf_wayland_release_evidence(buffer)?;
         let layout_history = self.sampled_dmabuf_layout_history(dmabuf);
         let policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+            dmabuf,
             &import,
             &acquire_sync,
             &release_evidence,

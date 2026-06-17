@@ -4188,6 +4188,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     history_renderer.prune_sampled_dmabuf_layout_history();
     assert_eq!(history_renderer.sampled_dmabuf_layout_history.len(), 1);
     let policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
         &policy_import,
         &explicit_acquire,
         &policy_release_evidence,
@@ -4225,6 +4226,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         ))
     ));
     let renderer_release_history_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
         &policy_import,
         &explicit_acquire,
         &policy_release_evidence,
@@ -4252,6 +4254,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         ))
     ));
     let local_acquire_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
         &policy_import,
         &explicit_acquire,
         &policy_release_evidence,
@@ -4265,14 +4268,37 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         ))
     ));
     let mut current_reacquire_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
         &policy_import,
         &explicit_acquire,
         &policy_release_evidence,
         true,
         SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
     );
-    current_reacquire_context.current_reacquire_layout =
-        Some(SampledDmabufWaylandCurrentReacquireLayoutEvidence { _private: () });
+    current_reacquire_context.current_reacquire_layout = Some(
+        SampledDmabufWaylandCurrentReacquireLayoutEvidence::new_for_tests(&unrelated_dmabuf),
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_current_reacquire_layout_policy(&current_reacquire_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland current reacquire identity"
+        ))
+    ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_layout_policy(&current_reacquire_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland current reacquire identity"
+        ))
+    ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&current_reacquire_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland current reacquire identity"
+        ))
+    ));
+    current_reacquire_context.current_reacquire_layout = Some(
+        SampledDmabufWaylandCurrentReacquireLayoutEvidence::new_for_tests(&policy_dmabuf),
+    );
     assert!(
         renderer
             .validate_sampled_dmabuf_wayland_current_reacquire_layout_policy(&current_reacquire_context)
@@ -4335,6 +4361,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     );
     let signaled_acquire = SyncPoint::signaled();
     let implicit_policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
         &policy_import,
         &signaled_acquire,
         &policy_release_evidence,
@@ -4351,6 +4378,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             .is_ok()
     );
     let stale_cache_policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
         &policy_import,
         &explicit_acquire,
         &policy_release_evidence,
