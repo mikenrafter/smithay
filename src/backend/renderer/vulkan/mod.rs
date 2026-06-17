@@ -95,21 +95,42 @@ pub use self::{
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SampledDmabufKnownLayoutEvidence {
+    _private: (),
+}
+
+#[allow(dead_code)]
+impl SampledDmabufKnownLayoutEvidence {
+    /// Create evidence that a sampled dmabuf is in foreign ownership with GENERAL layout.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the producer released the image to `VK_QUEUE_FAMILY_FOREIGN_EXT` in
+    /// `VK_IMAGE_LAYOUT_GENERAL` before this renderer acquires it.
+    unsafe fn foreign_general() -> Self {
+        Self { _private: () }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SampledDmabufLayoutEvidence {
     /// A normal Wayland linux-dmabuf commit. Explicit acquire sync may prove producer completion,
     /// but it does not prove Vulkan queue-family ownership or image layout.
     WaylandDmabuf,
     /// Caller-provided proof that the producer released the image to `FOREIGN` ownership in
     /// `VK_IMAGE_LAYOUT_GENERAL`.
-    KnownForeignGeneral,
+    KnownForeignGeneral(SampledDmabufKnownLayoutEvidence),
 }
 
+/// Evidence that a Wayland release point exists for a sampled dmabuf.
+///
+/// This is only protocol-handle evidence. It does not prove Vulkan has finished sampling, released
+/// the image back to foreign ownership, or signaled/satisfied the Wayland release point.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SampledDmabufReleaseEvidence {
-    /// A Wayland DRM syncobj release point is present, but Vulkan still must release the sampled
-    /// image and signal that point only after GPU sampling is complete.
-    WaylandSyncobjReleasePoint,
+struct SampledDmabufReleaseEvidence {
+    _private: (),
 }
 
 /// Acquire options for binding a foreign dmabuf as a Vulkan render target.
@@ -593,7 +614,7 @@ impl VulkanRenderer {
         has_release_point: bool,
     ) -> Result<SampledDmabufReleaseEvidence, VulkanError> {
         if has_release_point {
-            Ok(SampledDmabufReleaseEvidence::WaylandSyncobjReleasePoint)
+            Ok(SampledDmabufReleaseEvidence { _private: () })
         } else {
             Err(VulkanError::MissingCapability(
                 "sampled dmabuf release point contract",
@@ -611,7 +632,7 @@ impl VulkanRenderer {
         evidence: SampledDmabufLayoutEvidence,
     ) -> Result<(), VulkanError> {
         match evidence {
-            SampledDmabufLayoutEvidence::KnownForeignGeneral => Ok(()),
+            SampledDmabufLayoutEvidence::KnownForeignGeneral(_) => Ok(()),
             SampledDmabufLayoutEvidence::WaylandDmabuf => Err(VulkanError::MissingCapability(
                 "sampled dmabuf known-layout contract",
             )),
@@ -626,13 +647,9 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_release_lifecycle_contract(
         &self,
-        evidence: SampledDmabufReleaseEvidence,
+        _evidence: SampledDmabufReleaseEvidence,
     ) -> Result<(), VulkanError> {
-        match evidence {
-            SampledDmabufReleaseEvidence::WaylandSyncobjReleasePoint => {
-                Err(VulkanError::MissingCapability("sampled dmabuf release lifecycle"))
-            }
-        }
+        Err(VulkanError::MissingCapability("sampled dmabuf release lifecycle"))
     }
 
     fn render_target_format_supported(&self, format: Fourcc) -> bool {
@@ -699,7 +716,12 @@ impl VulkanRenderer {
         dmabuf: &Dmabuf,
         acquire_semaphore: Option<&VulkanSyncFileSemaphore>,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
-        self.validate_sampled_dmabuf_known_layout_contract(SampledDmabufLayoutEvidence::KnownForeignGeneral)?;
+        let layout_evidence = SampledDmabufLayoutEvidence::KnownForeignGeneral(unsafe {
+            // SAFETY: This helper is unsafe and forwards the same known-layout contract to its
+            // caller: the producer must have released to FOREIGN ownership in GENERAL layout.
+            SampledDmabufKnownLayoutEvidence::foreign_general()
+        });
+        self.validate_sampled_dmabuf_known_layout_contract(layout_evidence)?;
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
         let Some(sampled_image) = (unsafe {
@@ -740,7 +762,12 @@ impl VulkanRenderer {
         dmabuf: &Dmabuf,
         acquire_sync: Option<&SyncPoint>,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
-        self.validate_sampled_dmabuf_known_layout_contract(SampledDmabufLayoutEvidence::KnownForeignGeneral)?;
+        let layout_evidence = SampledDmabufLayoutEvidence::KnownForeignGeneral(unsafe {
+            // SAFETY: This helper is unsafe and forwards the same known-layout contract to its
+            // caller: the producer must have released to FOREIGN ownership in GENERAL layout.
+            SampledDmabufKnownLayoutEvidence::foreign_general()
+        });
+        self.validate_sampled_dmabuf_known_layout_contract(layout_evidence)?;
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
         let Some(sampled_image) = (unsafe {

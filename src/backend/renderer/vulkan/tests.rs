@@ -3679,9 +3679,14 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf known-layout contract"
         ))
     ));
+    let known_layout_evidence = SampledDmabufLayoutEvidence::KnownForeignGeneral(unsafe {
+        // SAFETY: This unit test only validates contract routing; it performs no Vulkan import,
+        // acquire, or sampling operation with the constructed evidence.
+        SampledDmabufKnownLayoutEvidence::foreign_general()
+    });
     assert!(
         renderer
-            .validate_sampled_dmabuf_known_layout_contract(SampledDmabufLayoutEvidence::KnownForeignGeneral)
+            .validate_sampled_dmabuf_known_layout_contract(known_layout_evidence)
             .is_ok()
     );
     assert!(matches!(
