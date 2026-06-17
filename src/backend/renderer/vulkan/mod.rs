@@ -72,6 +72,7 @@ use crate::{
             Format, Fourcc, Modifier,
             dmabuf::{Dmabuf, WeakDmabuf},
             format::FormatSet,
+            vulkan::VulkanAllocatorDmabufForeignReleaseEvidence,
         },
         renderer::{
             Bind, Color32F, ContextId, DebugFlags, ExportMem, ImportDma, ImportMem, Offscreen,
@@ -1471,6 +1472,34 @@ impl VulkanRenderer {
                 acquire.acquire_sync,
             )
         }
+    }
+
+    /// Bind a dmabuf render target after consuming allocator-owned FOREIGN/GENERAL release evidence.
+    ///
+    /// This is a validation-stage bridge from the Vulkan allocator export/release path to the normal
+    /// Vulkan dmabuf render-target acquire path. It does not advertise generic dmabuf target support
+    /// beyond the existing development-gated capability surface.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure there was no intervening access, acquire, release, or layout/ownership
+    /// transition of the dmabuf after `evidence` was produced by the Vulkan allocator. This helper
+    /// consumes the evidence, checks it is tied to this Smithay dmabuf identity, and acquires from the
+    /// known foreign `GENERAL` layout.
+    #[allow(dead_code)]
+    pub(crate) unsafe fn bind_allocator_released_dmabuf_render_target<'target>(
+        &mut self,
+        dmabuf: &'target mut Dmabuf,
+        evidence: VulkanAllocatorDmabufForeignReleaseEvidence,
+    ) -> Result<Option<VulkanRenderTarget<'target>>, VulkanError> {
+        if !evidence.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "allocator dmabuf release evidence",
+            ));
+        }
+
+        // SAFETY: Forwarded from this helper's caller and backed by the consumed allocator evidence.
+        unsafe { self.bind_dmabuf_render_target(dmabuf, VulkanDmabufRenderTargetAcquire::preserve(None)) }
     }
 
     /// Import a dmabuf as a sampled texture when the producer's Vulkan external state is known.

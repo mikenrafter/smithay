@@ -3514,10 +3514,8 @@ fn runtime_dmabuf_loopback_prerequisites_find_common_exportable_modifier() {
 
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
-fn runtime_dmabuf_loopback_stops_at_allocator_foreign_release_contract() {
-    let Some(mut candidate) =
-        runtime_dmabuf_loopback_candidate("Vulkan dmabuf loopback allocator release guard test")
-    else {
+fn runtime_dmabuf_loopback_imports_released_render_target_as_sampled_texture() {
+    let Some(mut candidate) = runtime_dmabuf_loopback_candidate("Vulkan dmabuf loopback import test") else {
         return;
     };
 
@@ -3528,14 +3526,90 @@ fn runtime_dmabuf_loopback_stops_at_allocator_foreign_release_contract() {
             .validate_sampled_dmabuf_public_advertisement_contract(),
         Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
     ));
-    assert!(matches!(
+    let allocator_release = unsafe {
+        // SAFETY: The dmabuf was just exported from `candidate.image`, and this ignored runtime test
+        // does not hand it to any other API before asking the allocator to release the fresh image to
+        // FOREIGN/GENERAL for the renderer acquire below.
         candidate
             .allocator
-            .release_dmabuf_to_foreign_general(&candidate.image),
-        Err(VulkanAllocatorForeignReleaseError::MissingCapability(
-            "Vulkan allocator dmabuf foreign release command submission"
+            .release_dmabuf_to_foreign_general(&candidate.image, &candidate.dmabuf)
+    }
+    .expect("release allocator dmabuf to foreign GENERAL");
+    assert!(matches!(
+        unsafe {
+            // SAFETY: Same no-intervening-use condition as above; this call must fail on allocator
+            // release state before recording a second Vulkan release.
+            candidate
+                .allocator
+                .release_dmabuf_to_foreign_general(&candidate.image, &candidate.dmabuf)
+        },
+        Err(VulkanAllocatorForeignReleaseError::InvalidState(
+            "Vulkan allocator dmabuf foreign release state"
         ))
     ));
+
+    let mut target = unsafe {
+        // SAFETY: `allocator_release` proves that the allocator-owned image backing this exported
+        // dmabuf was released to VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL layout. There is no
+        // intervening access before this renderer acquire.
+        candidate
+            .renderer
+            .bind_allocator_released_dmabuf_render_target(&mut candidate.dmabuf, allocator_release)
+    }
+    .expect("bind allocator-released dmabuf as Vulkan render target")
+    .expect("renderer should advertise the selected dmabuf render-target modifier");
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = candidate
+            .renderer
+            .render(&mut target, (4, 4).into(), Transform::Normal)
+            .expect("render into loopback dmabuf target");
+        frame
+            .clear(Color32F::new(0.25, 0.5, 0.75, 1.0), &full_damage)
+            .expect("clear loopback dmabuf render target");
+    }
+    assert_eq!(target.image.layout, VulkanImageLayoutState::ColorAttachment);
+
+    let evidence = candidate
+        .renderer
+        .release_dmabuf_render_target_for_sampled_loopback(&mut target, false)
+        .expect("release loopback render target to foreign GENERAL")
+        .expect("released loopback render target should produce sampled import evidence");
+    assert_eq!(target.image.layout, VulkanImageLayoutState::Undefined);
+    drop(target);
+    assert!(evidence.is_for_dmabuf(&candidate.dmabuf));
+    assert!(evidence.acquire_sync().is_reached());
+
+    let texture = unsafe {
+        // SAFETY: `evidence` was produced by releasing the same Smithay dmabuf identity immediately
+        // above, and there is no intervening access, acquire, release, or layout/ownership transition
+        // before this sampled loopback import.
+        candidate
+            .renderer
+            .import_dmabuf_texture_from_loopback(&candidate.dmabuf, evidence)
+    }
+    .expect("import released loopback dmabuf as sampled texture")
+    .expect("selected modifier should support sampled dmabuf import");
+
+    assert_eq!(texture.width(), 4);
+    assert_eq!(texture.height(), 4);
+    assert_eq!(texture.format(), Some(candidate.format.code));
+    assert!(texture.has_sampled_image_for_tests());
+    assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
+    assert!(matches!(
+        candidate
+            .renderer
+            .validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
+
+    let (released, release_sync) = candidate
+        .renderer
+        .release_imported_dmabuf_texture_to_foreign_general_sync_point(&texture, false)
+        .expect("release sampled loopback texture back to foreign GENERAL");
+    assert!(released);
+    assert!(release_sync.is_reached());
 }
 
 #[test]

@@ -22,7 +22,7 @@ use std::{
     ffi::CStr,
     fmt,
     os::unix::io::{FromRawFd, OwnedFd},
-    sync::{Arc, Weak, mpsc},
+    sync::{Arc, Mutex, Weak, mpsc},
 };
 
 use ash::{ext, khr, vk};
@@ -42,7 +42,7 @@ use crate::{
 
 use super::{
     Allocator, Buffer,
-    dmabuf::{AsDmabuf, Dmabuf, MAX_PLANES},
+    dmabuf::{AsDmabuf, Dmabuf, MAX_PLANES, WeakDmabuf},
 };
 
 bitflags! {
@@ -127,6 +127,7 @@ pub enum Error {
 pub struct VulkanAllocator {
     formats: Vec<FormatEntry>,
     images: Vec<ImageInner>,
+    image_release_states: Vec<(ImageInner, VulkanAllocatorDmabufReleaseState)>,
     default_usage: ImageUsageFlags,
     remaining_allocations: u32,
     extension_fns: ExtensionFns,
@@ -136,20 +137,39 @@ pub struct VulkanAllocator {
     #[cfg(feature = "backend_drm")]
     node: Option<DrmNode>,
     device: Arc<ash::Device>,
+    foreign_queue_family_enabled: bool,
     release_queue_family_index: u32,
     release_queue: vk::Queue,
     release_command_pool: Option<vk::CommandPool>,
+    release_submission_failed: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanAllocatorDmabufForeignReleaseEvidence {
+    image: ImageInner,
+    dmabuf: WeakDmabuf,
+    _private: (),
+}
+
+impl VulkanAllocatorDmabufForeignReleaseEvidence {
+    pub(crate) fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VulkanAllocatorDmabufForeignReleaseEvidence {
-    _private: (),
+enum VulkanAllocatorDmabufReleaseState {
+    FreshLocalUndefined,
+    ReleasedForeignGeneral,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum VulkanAllocatorForeignReleaseError {
     #[error("foreign Vulkan allocator image")]
     ForeignImage,
+    #[error("invalid allocator image release state: {0}")]
+    InvalidState(&'static str),
     #[error("missing capability: {0}")]
     MissingCapability(&'static str),
     #[error(transparent)]
@@ -161,14 +181,17 @@ impl fmt::Debug for VulkanAllocator {
         f.debug_struct("VulkanAllocator")
             .field("formats", &self.formats)
             .field("images", &self.images)
+            .field("image_release_states", &self.image_release_states)
             .field("default_usage", &self.default_usage)
             .field("remaining_allocations", &self.remaining_allocations)
             .field("dropped_recv", &self.dropped_recv)
             .field("dropped_sender", &self.dropped_sender)
             .field("phd", &self.phd)
+            .field("foreign_queue_family_enabled", &self.foreign_queue_family_enabled)
             .field("release_queue_family_index", &self.release_queue_family_index)
             .field("release_queue", &self.release_queue)
             .field("release_command_pool", &self.release_command_pool)
+            .field("release_submission_failed", &self.release_submission_failed)
             .finish()
     }
 }
@@ -229,7 +252,11 @@ impl VulkanAllocator {
         }
 
         // Get required extensions
-        let extensions = Self::required_extensions(phd);
+        let mut extensions = Self::required_extensions(phd);
+        let foreign_queue_family_enabled = phd.has_device_extension(ext::queue_family_foreign::NAME);
+        if foreign_queue_family_enabled {
+            extensions.push(ext::queue_family_foreign::NAME);
+        }
         let extension_pointers = extensions.iter().copied().map(CStr::as_ptr).collect::<Vec<_>>();
 
         // We don't actually submit any commands to the queue, but Vulkan requires that we create devices with
@@ -284,6 +311,7 @@ impl VulkanAllocator {
         let mut allocator = VulkanAllocator {
             formats: Vec::new(),
             images: Vec::new(),
+            image_release_states: Vec::new(),
             default_usage,
             remaining_allocations: phd.limits().max_memory_allocation_count,
             extension_fns,
@@ -293,9 +321,11 @@ impl VulkanAllocator {
             #[cfg(feature = "backend_drm")]
             node,
             device: Arc::new(device),
+            foreign_queue_family_enabled,
             release_queue_family_index: queue_family_index as u32,
             release_queue,
             release_command_pool: None,
+            release_submission_failed: false,
         };
 
         allocator.init_formats();
@@ -385,21 +415,79 @@ impl VulkanAllocator {
 
     /// Release an allocator-owned dmabuf image to foreign ownership in `GENERAL` layout.
     ///
-    /// This is a validation-stage contract marker for renderer loopback development. The allocator
-    /// currently creates an allocation/export device but does not own the queue/command-buffer state
-    /// needed to submit a Vulkan image ownership/layout release. Until that implementation exists,
-    /// callers must not treat allocator-exported dmabufs as valid input for Vulkan render-target
-    /// acquire paths that require `VK_QUEUE_FAMILY_FOREIGN_EXT` ownership and `GENERAL` layout.
+    /// This validation-stage helper is used by renderer loopback development to establish the first
+    /// Vulkan ownership/layout contract for a fresh allocator image. It only succeeds once for an
+    /// allocator-owned single-plane image that has not been released before. The returned evidence is
+    /// not public API and does not advertise generic dmabuf import or render-target support.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no foreign consumer has accessed, acquired, released, or otherwise
+    /// transitioned the exported dmabuf between [`VulkanImage::export`] and this call. This helper
+    /// records a release from the allocator's fresh local `UNDEFINED` state; that is only valid while
+    /// the exported image has not been used through another API or queue-family owner.
     #[allow(dead_code)]
-    pub(crate) fn release_dmabuf_to_foreign_general(
+    pub(crate) unsafe fn release_dmabuf_to_foreign_general(
         &mut self,
         image: &VulkanImage,
+        dmabuf: &Dmabuf,
     ) -> Result<VulkanAllocatorDmabufForeignReleaseEvidence, VulkanAllocatorForeignReleaseError> {
         let Some(device) = image.device.upgrade() else {
             return Err(VulkanAllocatorForeignReleaseError::ForeignImage);
         };
         if !Arc::ptr_eq(&device, &self.device) || !self.images.contains(&image.inner) {
             return Err(VulkanAllocatorForeignReleaseError::ForeignImage);
+        }
+        if self.release_submission_failed {
+            return Err(VulkanAllocatorForeignReleaseError::InvalidState(
+                "Vulkan allocator dmabuf foreign release submission state",
+            ));
+        }
+        let state_index = self
+            .image_release_states
+            .iter()
+            .position(|(inner, _state)| *inner == image.inner)
+            .ok_or(VulkanAllocatorForeignReleaseError::ForeignImage)?;
+        if self.image_release_states[state_index].1 != VulkanAllocatorDmabufReleaseState::FreshLocalUndefined
+        {
+            return Err(VulkanAllocatorForeignReleaseError::InvalidState(
+                "Vulkan allocator dmabuf foreign release state",
+            ));
+        }
+        if image.format_plane_count != 1 {
+            return Err(VulkanAllocatorForeignReleaseError::MissingCapability(
+                "Vulkan allocator dmabuf foreign release planes",
+            ));
+        }
+        if dmabuf.num_planes() != image.format_plane_count as usize {
+            return Err(VulkanAllocatorForeignReleaseError::InvalidState(
+                "Vulkan allocator dmabuf foreign release planes",
+            ));
+        }
+        if image.size() != dmabuf.size() || image.format() != dmabuf.format() {
+            return Err(VulkanAllocatorForeignReleaseError::InvalidState(
+                "Vulkan allocator dmabuf foreign release identity",
+            ));
+        }
+        let exported_from_image = image
+            .exports
+            .lock()
+            .map_err(|_| {
+                VulkanAllocatorForeignReleaseError::InvalidState(
+                    "Vulkan allocator dmabuf foreign release identity",
+                )
+            })?
+            .iter()
+            .any(|export| export.upgrade().as_ref() == Some(dmabuf));
+        if !exported_from_image {
+            return Err(VulkanAllocatorForeignReleaseError::InvalidState(
+                "Vulkan allocator dmabuf foreign release identity",
+            ));
+        }
+        if !self.foreign_queue_family_enabled {
+            return Err(VulkanAllocatorForeignReleaseError::MissingCapability(
+                "Vulkan allocator dmabuf foreign queue family",
+            ));
         }
 
         if self.release_command_pool.is_none() {
@@ -414,10 +502,120 @@ impl VulkanAllocator {
                 self.device.create_command_pool(&command_pool_info, None)?
             });
         }
+        let release_command_pool =
+            self.release_command_pool
+                .ok_or(VulkanAllocatorForeignReleaseError::MissingCapability(
+                    "Vulkan allocator dmabuf foreign release command pool",
+                ))?;
 
-        Err(VulkanAllocatorForeignReleaseError::MissingCapability(
-            "Vulkan allocator dmabuf foreign release command submission",
-        ))
+        self.submit_dmabuf_foreign_release(image.inner.image, release_command_pool)?;
+        self.image_release_states[state_index].1 = VulkanAllocatorDmabufReleaseState::ReleasedForeignGeneral;
+
+        Ok(VulkanAllocatorDmabufForeignReleaseEvidence {
+            image: image.inner,
+            dmabuf: dmabuf.weak(),
+            _private: (),
+        })
+    }
+
+    fn submit_dmabuf_foreign_release(
+        &mut self,
+        image: vk::Image,
+        command_pool: vk::CommandPool,
+    ) -> Result<(), VulkanAllocatorForeignReleaseError> {
+        let allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let command_buffers = unsafe {
+            // SAFETY: `command_pool` was created from this logical device and is owned by this
+            // allocator. The allocation request asks for one primary command buffer.
+            self.device.allocate_command_buffers(&allocate_info)?
+        };
+        let command_buffer = command_buffers[0];
+        let mut free_command_buffer = true;
+        let mut submitted = false;
+
+        let result = (|| {
+            let begin_info =
+                vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            unsafe {
+                // SAFETY: `command_buffer` was allocated from `command_pool` above and is in the
+                // initial state. The command pool is allocator-private.
+                self.device.begin_command_buffer(command_buffer, &begin_info)?;
+            }
+
+            let barrier = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::empty())
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(self.release_queue_family_index)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            unsafe {
+                // SAFETY: `command_buffer` is recording. The barrier releases this allocator-owned,
+                // single-plane color image from the allocator queue family to FOREIGN ownership and
+                // transitions it from its fresh `UNDEFINED` layout to `GENERAL` for the renderer-side
+                // acquire contract. No memory dependencies are required for previous writes because
+                // this allocator path has not submitted writes to the image.
+                self.device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+                // SAFETY: `command_buffer` is recording and all commands have been recorded.
+                self.device.end_command_buffer(command_buffer)?;
+            }
+
+            let command_buffers = [command_buffer];
+            let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+            unsafe {
+                // SAFETY: `release_queue` belongs to `release_queue_family_index`, and
+                // `command_buffer` was allocated from a command pool for the same family. The submit
+                // has no semaphore waits/signals and uses no fence; completion is made synchronous by
+                // `queue_wait_idle` below before the command buffer is freed.
+                self.device
+                    .queue_submit(self.release_queue, &submit_info, vk::Fence::null())?;
+                submitted = true;
+                if let Err(err) = self.device.queue_wait_idle(self.release_queue) {
+                    self.release_submission_failed = true;
+                    return Err(VulkanAllocatorForeignReleaseError::from(err));
+                }
+            }
+
+            Ok(())
+        })();
+
+        if result.is_ok() {
+            unsafe {
+                // SAFETY: Queue completion was observed before freeing this command buffer. The
+                // command buffer was allocated from `command_pool` above.
+                self.device.free_command_buffers(command_pool, &[command_buffer]);
+            }
+            free_command_buffer = false;
+        }
+
+        if free_command_buffer && !submitted {
+            unsafe {
+                // SAFETY: On errors before a successful submit, the command buffer cannot be in
+                // flight. The command buffer was allocated from `command_pool` above.
+                self.device.free_command_buffers(command_pool, &[command_buffer]);
+            }
+        }
+
+        result
     }
 }
 
@@ -477,10 +675,15 @@ fn requires_dedicated_allocation(properties: vk::ExternalMemoryProperties) -> bo
 impl Drop for VulkanAllocator {
     fn drop(&mut self) {
         unsafe {
+            if self.release_submission_failed {
+                let _ = self.device.device_wait_idle();
+            }
             if let Some(command_pool) = self.release_command_pool.take() {
-                // SAFETY: The allocator release path is still fail-closed before command-buffer
-                // allocation/submission, so no command buffers from this pool can be in flight. No
-                // allocation callbacks were used when creating the pool.
+                // SAFETY: Successful allocator release submissions wait for queue idle before
+                // freeing their command buffer. If a submitted wait failed, the allocator is marked
+                // invalid for later release evidence and teardown first attempts device idle; if
+                // that also fails, this is treated as device-lost teardown. No allocation callbacks
+                // were used when creating the pool.
                 self.device.destroy_command_pool(command_pool, None);
             }
 
@@ -509,6 +712,7 @@ pub struct VulkanImage {
     khr_external_memory_fd: khr::external_memory_fd::Device,
     dropped_sender: mpsc::Sender<ImageInner>,
     device: Weak<ash::Device>,
+    exports: Arc<Mutex<Vec<WeakDmabuf>>>,
 }
 
 impl fmt::Debug for VulkanImage {
@@ -595,7 +799,13 @@ impl AsDmabuf for VulkanImage {
             builder.set_node(node);
         }
 
-        Ok(builder.build().unwrap())
+        let dmabuf = builder.build().unwrap();
+        self.exports
+            .lock()
+            .map_err(|_| ExportError::Failed)?
+            .push(dmabuf.weak());
+
+        Ok(dmabuf)
     }
 }
 
@@ -935,6 +1145,8 @@ impl VulkanAllocator {
 
         // Track the image for destruction.
         self.images.push(inner);
+        self.image_release_states
+            .push((inner, VulkanAllocatorDmabufReleaseState::FreshLocalUndefined));
 
         self.remaining_allocations -= 1;
 
@@ -947,6 +1159,7 @@ impl VulkanAllocator {
             khr_external_memory_fd: self.extension_fns.khr_external_memory_fd.clone(),
             dropped_sender: self.dropped_sender.clone(),
             device: Arc::downgrade(&self.device),
+            exports: Arc::new(Mutex::new(Vec::new())),
             #[cfg(feature = "backend_drm")]
             node: self.node,
         })
@@ -954,6 +1167,8 @@ impl VulkanAllocator {
 
     fn cleanup(&mut self) {
         let dropped = self.dropped_recv.try_iter().collect::<Vec<_>>();
+        self.image_release_states
+            .retain(|(image, _state)| !dropped.contains(image));
 
         self.images.retain(|image| {
             // Only drop if the
