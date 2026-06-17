@@ -145,6 +145,18 @@ struct SampledDmabufWaylandVulkanInteropPolicy {
     _private: (),
 }
 
+/// Evidence for Smithay's chosen first-import external image state for a Wayland dmabuf.
+///
+/// This must eventually prove the Vulkan `oldLayout` and source queue family used when importing a
+/// Wayland dmabuf that has no renderer-local history yet. It is intentionally separate from
+/// acquire-sync evidence: synchronization orders producer completion, but does not identify the
+/// image's current Vulkan layout or ownership.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SampledDmabufWaylandFirstImportLayoutPolicy {
+    _private: (),
+}
+
 /// Validation checklist for Smithay's normal Wayland dmabuf -> Vulkan sampled-image policy.
 ///
 /// Each field names one contract that must be backed by implementation and tests before the normal
@@ -155,7 +167,7 @@ struct SampledDmabufWaylandVulkanInteropPolicy {
 struct SampledDmabufWaylandVulkanInteropPolicyContracts {
     /// Defines the external ownership and Vulkan image layout used for the first import of a client
     /// Wayland dmabuf into this renderer.
-    first_import_layout: bool,
+    first_import_layout: Option<SampledDmabufWaylandFirstImportLayoutPolicy>,
     /// Defines the external ownership and Vulkan image layout used when a previously imported
     /// Wayland dmabuf is committed again after Smithay released it.
     reacquire_layout: bool,
@@ -694,24 +706,41 @@ impl VulkanRenderer {
     fn validate_sampled_dmabuf_wayland_vulkan_interop_policy(
         &self,
     ) -> Result<SampledDmabufLayoutEvidence, VulkanError> {
+        let first_import_layout = self.validate_sampled_dmabuf_wayland_first_import_layout_policy()?;
         self.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
-            SampledDmabufWaylandVulkanInteropPolicyContracts::default(),
+            SampledDmabufWaylandVulkanInteropPolicyContracts {
+                first_import_layout: Some(first_import_layout),
+                ..SampledDmabufWaylandVulkanInteropPolicyContracts::default()
+            },
         )
         .map(SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy)
     }
 
+    /// Validate the first-import external image layout policy for a normal Wayland dmabuf.
+    ///
+    /// This is the first Smithay-owned policy item that must be implemented before the normal
+    /// `ImportDmaWl` path can acquire an arbitrary client dmabuf as a sampled Vulkan image.
+    #[allow(dead_code)]
+    fn validate_sampled_dmabuf_wayland_first_import_layout_policy(
+        &self,
+    ) -> Result<SampledDmabufWaylandFirstImportLayoutPolicy, VulkanError> {
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan first-import layout policy",
+        ))
+    }
+
     /// Validate each named part of Smithay's Wayland/Vulkan sampled-dmabuf policy.
     ///
-    /// The all-true path is only a validation-stage scaffold until each field is replaced or backed
-    /// by a concrete implementation predicate and test. Future work must produce evidence for each
-    /// contract instead of setting these markers from protocol metadata or another renderer's
+    /// The fully satisfied path is only a validation-stage scaffold until each field is replaced or
+    /// backed by a concrete implementation predicate and test. Future work must produce evidence for
+    /// each contract instead of setting these markers from protocol metadata or another renderer's
     /// assumptions.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
         &self,
         contracts: SampledDmabufWaylandVulkanInteropPolicyContracts,
     ) -> Result<SampledDmabufWaylandVulkanInteropPolicy, VulkanError> {
-        if !contracts.first_import_layout {
+        if contracts.first_import_layout.is_none() {
             return Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland Vulkan first-import layout policy",
             ));

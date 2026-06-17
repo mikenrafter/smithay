@@ -3707,6 +3707,12 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland Vulkan first-import layout policy"
         ))
     ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_first_import_layout_policy(),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan first-import layout policy"
+        ))
+    ));
     let mut wayland_vulkan_contracts = SampledDmabufWaylandVulkanInteropPolicyContracts::default();
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(wayland_vulkan_contracts),
@@ -3714,7 +3720,8 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland Vulkan first-import layout policy"
         ))
     ));
-    wayland_vulkan_contracts.first_import_layout = true;
+    wayland_vulkan_contracts.first_import_layout =
+        Some(SampledDmabufWaylandFirstImportLayoutPolicy { _private: () });
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(wayland_vulkan_contracts),
         Err(VulkanError::MissingCapability(
