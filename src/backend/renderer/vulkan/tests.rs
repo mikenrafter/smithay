@@ -3518,6 +3518,20 @@ fn public_dmabuf_import_gates_formats() {
     );
     assert!(renderer.dmabuf_formats().iter().next().is_none());
     assert!(!renderer.has_dmabuf_format(format));
+
+    renderer.capabilities.import.dmabuf = true;
+    assert!(
+        renderer
+            .capabilities
+            .formats
+            .dmabuf_import
+            .iter()
+            .next()
+            .is_some()
+    );
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+    assert!(!renderer.has_dmabuf_format(format));
+
     assert!(matches!(
         renderer.import_dmabuf(&dmabuf, None),
         Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
@@ -3617,6 +3631,52 @@ fn sampled_dmabuf_import_validation_guards_metadata_before_device_lookup() {
     assert!(matches!(
         renderer.validate_sampled_dmabuf_import_metadata(&unsupported_format),
         Err(VulkanError::UnsupportedFormat(Fourcc::Yuyv))
+    ));
+}
+
+#[test]
+fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let advertised_format = Format {
+        code: Fourcc::Abgr8888,
+        modifier: Modifier::Linear,
+    };
+
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
+    renderer.capabilities.import.dmabuf = true;
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf advertised formats"
+        ))
+    ));
+    renderer.capabilities.formats.dmabuf_import = [advertised_format].into_iter().collect();
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
+    ));
+
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_acquire_contract(false),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf implicit sync"))
+    ));
+    assert!(
+        renderer
+            .validate_sampled_dmabuf_wayland_acquire_contract(true)
+            .is_ok()
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_known_layout_contract(),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf known-layout contract"
+        ))
+    ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_release_lifecycle_contract(),
+        Err(VulkanError::MissingCapability("sampled dmabuf release lifecycle"))
     ));
 }
 

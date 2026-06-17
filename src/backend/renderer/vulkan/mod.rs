@@ -20,8 +20,9 @@
 //! target abstraction as the other renderers once the validation-stage gate is true. Generic
 //! `ImportDma`, texture `ExportMem`, `ExportDma`, broad explicit sync, blit/copy, and full
 //! presentation remain unsupported until their corresponding capability bits can become true with
-//! coverage. Sampled dmabuf import is validation-reachable only through the explicit known-layout
-//! development helper; it is not public-advertised through `ImportDma` yet.
+//! coverage. Sampled dmabuf import is validation-reachable through the explicit known-layout
+//! development helper and the normal `ImportDmaWl` path's staged guards; it is not
+//! public-advertised through `ImportDma` yet.
 //!
 //! Intended implementation order:
 //!
@@ -436,10 +437,55 @@ impl VulkanRenderer {
     }
 
     fn public_dmabuf_import_formats(&self) -> FormatSet {
-        if self.capabilities.import.dmabuf {
+        if self
+            .validate_sampled_dmabuf_public_advertisement_contract()
+            .is_ok()
+        {
             self.capabilities.formats.dmabuf_import.clone()
         } else {
             FormatSet::default()
+        }
+    }
+
+    /// Check whether the sampled dmabuf path may be public-advertised through [`ImportDma`].
+    ///
+    /// This is intentionally stricter than raw Vulkan probing. Future implementation work should
+    /// make this pass only after metadata validation, acquire synchronization, ownership/layout
+    /// transitions, sampled rendering, release synchronization, and tests all pass through the normal
+    /// Smithay renderer path.
+    fn validate_sampled_dmabuf_public_advertisement_contract(&self) -> Result<(), VulkanError> {
+        if !self.capabilities.import.dmabuf {
+            return Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"));
+        }
+        if self.capabilities.formats.dmabuf_import.iter().next().is_none() {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf advertised formats",
+            ));
+        }
+
+        // Final enablement marker: even if raw capability data is populated, public `ImportDma`
+        // advertisement must stay fail-closed until import, acquire, sampling, release, and tests
+        // are complete on the normal Smithay path.
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
+    }
+
+    /// Validate the Wayland explicit-sync plumbing needed before sampled dmabuf import can proceed.
+    #[cfg(feature = "wayland_frontend")]
+    fn validate_sampled_dmabuf_wayland_explicit_sync_contract(
+        &self,
+        #[cfg(feature = "backend_drm")] buffer: &super::utils::Buffer,
+        #[cfg(not(feature = "backend_drm"))] _buffer: &super::utils::Buffer,
+    ) -> Result<(), VulkanError> {
+        #[cfg(feature = "backend_drm")]
+        {
+            self.validate_sampled_dmabuf_wayland_acquire_contract(buffer.acquire_point().is_some())
+        }
+
+        #[cfg(not(feature = "backend_drm"))]
+        {
+            Err(VulkanError::MissingCapability(
+                "sampled dmabuf explicit sync contract",
+            ))
         }
     }
 
@@ -476,6 +522,47 @@ impl VulkanRenderer {
         }
 
         Ok(import)
+    }
+
+    /// Validate the Wayland acquire synchronization part of sampled dmabuf import.
+    ///
+    /// `linux-dmabuf` alone implies implicit synchronization. Vulkan sampled import remains
+    /// not public-advertised for that case until a tested implicit-sync policy exists. The current
+    /// validation-stage path accepts only commits that carry explicit acquire synchronization through
+    /// Smithay's renderer-managed surface-state buffer.
+    #[allow(dead_code)]
+    fn validate_sampled_dmabuf_wayland_acquire_contract(
+        &self,
+        has_explicit_acquire: bool,
+    ) -> Result<(), VulkanError> {
+        if has_explicit_acquire {
+            Ok(())
+        } else {
+            Err(VulkanError::NotPublicAdvertised("sampled dmabuf implicit sync"))
+        }
+    }
+
+    /// Validate the external ownership and image-layout contract for sampled dmabuf import.
+    ///
+    /// This is the next missing contract after explicit acquire synchronization. A Wayland acquire
+    /// point proves producer completion, but not Vulkan queue-family ownership or image layout. Keep
+    /// this guard until the normal Smithay path can prove or establish `VK_QUEUE_FAMILY_FOREIGN_EXT`
+    /// ownership and `VK_IMAGE_LAYOUT_GENERAL` before importing/sampling.
+    #[allow(dead_code)]
+    fn validate_sampled_dmabuf_known_layout_contract(&self) -> Result<(), VulkanError> {
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf known-layout contract",
+        ))
+    }
+
+    /// Validate renderer-side release lifecycle for sampled dmabuf import.
+    ///
+    /// This guard documents the follow-up after import/sampling works: the compositor must not signal
+    /// the Wayland/DRM syncobj release point until Vulkan has finished sampling and has released the
+    /// image back to foreign ownership with an appropriate release dependency.
+    #[allow(dead_code)]
+    fn validate_sampled_dmabuf_release_lifecycle_contract(&self) -> Result<(), VulkanError> {
+        Err(VulkanError::MissingCapability("sampled dmabuf release lifecycle"))
     }
 
     fn render_target_format_supported(&self, format: Fourcc) -> bool {
@@ -1202,28 +1289,17 @@ impl ImportDmaWl for VulkanRenderer {
 
         self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
 
-        #[cfg(feature = "backend_drm")]
-        {
-            if buffer.acquire_point().is_none() {
-                return Err(VulkanError::NotPublicAdvertised("sampled dmabuf implicit sync"));
-            }
+        self.validate_sampled_dmabuf_wayland_explicit_sync_contract(buffer)?;
+        self.validate_sampled_dmabuf_known_layout_contract()?;
 
-            // The Wayland explicit-sync acquire point proves when the producer's writes are
-            // complete, but it does not by itself prove the Vulkan external-memory image is in
-            // `VK_QUEUE_FAMILY_FOREIGN_EXT` ownership and `VK_IMAGE_LAYOUT_GENERAL`. Keep the
-            // intended Smithay `ImportDmaWl` path reachable, but stop at that exact missing
-            // validation-stage contract until the acquire/layout/release lifecycle is modeled.
-            Err(VulkanError::MissingCapability(
-                "sampled dmabuf known-layout contract",
-            ))
-        }
+        // Future implementation continuation point:
+        // - import/acquire the dmabuf as a Vulkan sampled image using the known-layout helper,
+        // - store renderer-side release state with the imported texture/frame use,
+        // - release back to foreign ownership after sampling completes,
+        // - signal or satisfy the Wayland/DRM syncobj release point only after that release.
+        self.validate_sampled_dmabuf_release_lifecycle_contract()?;
 
-        #[cfg(not(feature = "backend_drm"))]
-        {
-            Err(VulkanError::MissingCapability(
-                "sampled dmabuf explicit sync contract",
-            ))
-        }
+        Err(VulkanError::MissingCapability("sampled dmabuf texture import"))
     }
 }
 
