@@ -152,6 +152,8 @@ pub(crate) enum VulkanAllocatorForeignReleaseError {
     ForeignImage,
     #[error("missing capability: {0}")]
     MissingCapability(&'static str),
+    #[error(transparent)]
+    Vk(#[from] vk::Result),
 }
 
 impl fmt::Debug for VulkanAllocator {
@@ -400,11 +402,18 @@ impl VulkanAllocator {
             return Err(VulkanAllocatorForeignReleaseError::ForeignImage);
         }
 
-        let Some(_release_command_pool) = self.release_command_pool else {
-            return Err(VulkanAllocatorForeignReleaseError::MissingCapability(
-                "Vulkan allocator dmabuf foreign release command pool",
-            ));
-        };
+        if self.release_command_pool.is_none() {
+            let command_pool_info = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(self.release_queue_family_index)
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            self.release_command_pool = Some(unsafe {
+                // SAFETY: `release_queue_family_index` was selected from this physical device's
+                // queue-family properties and included in this logical device's queue creation. The
+                // resulting command buffers are reserved for this allocator's release queue. No
+                // allocation callbacks are used.
+                self.device.create_command_pool(&command_pool_info, None)?
+            });
+        }
 
         Err(VulkanAllocatorForeignReleaseError::MissingCapability(
             "Vulkan allocator dmabuf foreign release command submission",
@@ -468,6 +477,13 @@ fn requires_dedicated_allocation(properties: vk::ExternalMemoryProperties) -> bo
 impl Drop for VulkanAllocator {
     fn drop(&mut self) {
         unsafe {
+            if let Some(command_pool) = self.release_command_pool.take() {
+                // SAFETY: The allocator release path is still fail-closed before command-buffer
+                // allocation/submission, so no command buffers from this pool can be in flight. No
+                // allocation callbacks were used when creating the pool.
+                self.device.destroy_command_pool(command_pool, None);
+            }
+
             for image in &self.images {
                 self.device.destroy_image(image.image, None);
                 self.device.free_memory(image.memory, None);
