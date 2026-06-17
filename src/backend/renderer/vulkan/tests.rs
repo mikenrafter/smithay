@@ -3701,6 +3701,20 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf known-layout contract"
         ))
     ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy(),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan interop policy"
+        ))
+    ));
+    let smithay_wayland_policy = SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(
+        SampledDmabufWaylandVulkanInteropPolicy::validation_stage_for_tests(),
+    );
+    assert!(
+        renderer
+            .validate_sampled_dmabuf_known_layout_contract(smithay_wayland_policy)
+            .is_ok()
+    );
     let known_layout_evidence = SampledDmabufLayoutEvidence::KnownForeignGeneral(unsafe {
         // SAFETY: This unit test only validates contract routing; it performs no Vulkan import,
         // acquire, or sampling operation with the constructed evidence.

@@ -21,8 +21,10 @@
 //! `ImportDma`, texture `ExportMem`, `ExportDma`, broad explicit sync, blit/copy, and full
 //! presentation remain unsupported until their corresponding capability bits can become true with
 //! coverage. Sampled dmabuf import is validation-reachable through the explicit known-layout
-//! development helper and the normal `ImportDmaWl` path's staged guards; it is not
-//! public-advertised through `ImportDma` yet.
+//! development helper and the normal `ImportDmaWl` path's staged guards. The normal Wayland path
+//! intentionally stops at Smithay's own Wayland/Vulkan interop policy guard until this fork models
+//! the initial external ownership/layout contract directly; it is not public-advertised through
+//! `ImportDma` yet.
 //!
 //! Intended implementation order:
 //!
@@ -118,9 +120,36 @@ enum SampledDmabufLayoutEvidence {
     /// A normal Wayland linux-dmabuf commit. Explicit acquire sync may prove producer completion,
     /// but it does not prove Vulkan queue-family ownership or image layout.
     WaylandDmabuf,
+    /// Smithay-owned Wayland/Vulkan interop policy evidence for normal linux-dmabuf commits.
+    ///
+    /// This token is the intended continuation point for the normal `ImportDmaWl` path once this
+    /// fork defines and tests its own initial external ownership/layout policy. It must only be
+    /// produced by the Wayland/Vulkan policy guard, not by copying another renderer's assumptions.
+    SmithayWaylandVulkanPolicy(SampledDmabufWaylandVulkanInteropPolicy),
     /// Caller-provided proof that the producer released the image to `FOREIGN` ownership in
     /// `VK_IMAGE_LAYOUT_GENERAL`.
     KnownForeignGeneral(SampledDmabufKnownLayoutEvidence),
+}
+
+/// Opaque evidence that a normal Wayland dmabuf commit satisfies Smithay's Vulkan interop policy.
+///
+/// This is deliberately private and currently unconstructable in production code. The future policy
+/// must define, at minimum, the first-import external image layout, subsequent reacquire layout,
+/// queue-family ownership transfer, acquire synchronization, release synchronization, and texture
+/// cache invalidation rules for Wayland dmabufs. Keeping this as a separate evidence token prevents
+/// future work from treating `linux-dmabuf` protocol metadata or explicit sync alone as a Vulkan
+/// layout/ownership proof.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SampledDmabufWaylandVulkanInteropPolicy {
+    _private: (),
+}
+
+#[cfg(test)]
+impl SampledDmabufWaylandVulkanInteropPolicy {
+    fn validation_stage_for_tests() -> Self {
+        Self { _private: () }
+    }
 }
 
 /// Evidence that a Wayland release point exists for a sampled dmabuf.
@@ -632,17 +661,37 @@ impl VulkanRenderer {
         }
     }
 
+    /// Validate Smithay's own Wayland/Vulkan sampled-dmabuf interop policy.
+    ///
+    /// `linux-dmabuf` metadata plus explicit acquire/release sync is enough to identify memory,
+    /// format/modifier, and producer/compositor ordering, but it is not by itself a Vulkan
+    /// queue-family ownership or image-layout contract. This guard is the named development-gated
+    /// continuation point for the normal `ImportDmaWl` path. Future implementation must replace
+    /// this fail-closed marker with a Smithay-owned policy that defines how initial import,
+    /// subsequent reacquire, sampling, release, and texture-cache reuse map onto Vulkan external
+    /// image state.
+    #[allow(dead_code)]
+    fn validate_sampled_dmabuf_wayland_vulkan_interop_policy(
+        &self,
+    ) -> Result<SampledDmabufLayoutEvidence, VulkanError> {
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan interop policy",
+        ))
+    }
+
     /// Validate the external ownership and image-layout contract for sampled dmabuf import.
     ///
     /// A Wayland acquire point proves producer completion, but not Vulkan queue-family ownership or
-    /// image layout. Only explicit known-layout evidence may pass this validation-stage contract.
+    /// image layout. Explicit known-layout evidence may pass directly. The normal Wayland path may
+    /// pass only after Smithay's own Wayland/Vulkan interop policy evidence exists.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_known_layout_contract(
         &self,
         evidence: SampledDmabufLayoutEvidence,
     ) -> Result<(), VulkanError> {
         match evidence {
-            SampledDmabufLayoutEvidence::KnownForeignGeneral(_) => Ok(()),
+            SampledDmabufLayoutEvidence::KnownForeignGeneral(_)
+            | SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(_) => Ok(()),
             SampledDmabufLayoutEvidence::WaylandDmabuf => Err(VulkanError::MissingCapability(
                 "sampled dmabuf known-layout contract",
             )),
@@ -1452,13 +1501,14 @@ impl ImportDmaWl for VulkanRenderer {
 
         let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_point(buffer)?;
         let release_evidence = self.sampled_dmabuf_wayland_release_evidence(buffer)?;
-        self.validate_sampled_dmabuf_known_layout_contract(SampledDmabufLayoutEvidence::WaylandDmabuf)?;
+        let layout_evidence = self.validate_sampled_dmabuf_wayland_vulkan_interop_policy()?;
+        self.validate_sampled_dmabuf_known_layout_contract(layout_evidence)?;
 
         let texture = unsafe {
             // SAFETY: The validation-stage Wayland path above currently fails closed at the
-            // known-layout contract. When that guard is replaced by real Wayland dmabuf
-            // ownership/layout evidence, the same evidence must satisfy this helper's unsafe
-            // precondition before the import can run.
+            // Smithay Wayland/Vulkan interop policy contract. When that guard is replaced by real
+            // Wayland dmabuf ownership/layout evidence, the same policy must satisfy this helper's
+            // unsafe precondition before the import can run.
             self.create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
                 dmabuf,
                 Some(&acquire_sync),
