@@ -168,16 +168,37 @@ impl SampledDmabufWaylandVulkanInteropPolicy {
 /// acquire-sync evidence: synchronization orders producer completion, but does not identify the
 /// image's current Vulkan layout or ownership.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandFirstImportLayoutPolicy {
-    _private: (),
+    dmabuf: WeakDmabuf,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufWaylandFirstImportLayoutPolicy {
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
 }
 
 /// Evidence for Smithay's reacquire layout policy for a previously imported Wayland dmabuf.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandReacquireLayoutPolicy {
-    _private: (),
+    dmabuf: WeakDmabuf,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufWaylandReacquireLayoutPolicy {
+    #[cfg(test)]
+    fn new_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+        }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
 }
 
 /// Evidence that the current Wayland producer returned a previously released dmabuf in the layout
@@ -208,12 +229,22 @@ impl SampledDmabufWaylandCurrentReacquireLayoutEvidence {
 
 /// Evidence for the layout/ownership contract used by a normal Wayland sampled-dmabuf commit.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SampledDmabufWaylandLayoutPolicy {
     /// First import of a dmabuf with no renderer-local layout history.
     FirstImport(SampledDmabufWaylandFirstImportLayoutPolicy),
     /// Reacquire of a dmabuf this renderer previously released to foreign GENERAL ownership.
     Reacquire(SampledDmabufWaylandReacquireLayoutPolicy),
+}
+
+#[allow(dead_code)]
+impl SampledDmabufWaylandLayoutPolicy {
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        match self {
+            SampledDmabufWaylandLayoutPolicy::FirstImport(policy) => policy.is_for_dmabuf(dmabuf),
+            SampledDmabufWaylandLayoutPolicy::Reacquire(policy) => policy.is_for_dmabuf(dmabuf),
+        }
+    }
 }
 
 /// Evidence for queue-family ownership transfers used by Smithay's Wayland/Vulkan dmabuf policy.
@@ -331,7 +362,7 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
 /// `ImportDmaWl` path may construct [`SampledDmabufWaylandVulkanInteropPolicy`]. The default value
 /// is deliberately all-`None` so production remains fail-closed at the first missing policy step.
 #[allow(dead_code)]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandVulkanInteropPolicyContracts {
     /// Defines the external ownership and Vulkan image layout used for this commit, either through
     /// first-import policy or renderer-local reacquire history.
@@ -985,7 +1016,7 @@ impl VulkanRenderer {
         let texture_cache_reuse = self.validate_sampled_dmabuf_wayland_texture_cache_policy(context)?;
         self.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
             context.dmabuf,
-            SampledDmabufWaylandVulkanInteropPolicyContracts {
+            &SampledDmabufWaylandVulkanInteropPolicyContracts {
                 layout: Some(layout),
                 foreign_general: Some(foreign_general),
                 queue_family_transfer: Some(queue_family_transfer),
@@ -1115,7 +1146,9 @@ impl VulkanRenderer {
             )),
             SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => {
                 self.validate_sampled_dmabuf_wayland_current_reacquire_layout_policy(context)?;
-                Ok(SampledDmabufWaylandReacquireLayoutPolicy { _private: () })
+                Ok(SampledDmabufWaylandReacquireLayoutPolicy {
+                    dmabuf: context.dmabuf.weak(),
+                })
             }
         }
     }
@@ -1205,11 +1238,16 @@ impl VulkanRenderer {
     fn validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
         &self,
         dmabuf: &Dmabuf,
-        contracts: SampledDmabufWaylandVulkanInteropPolicyContracts,
+        contracts: &SampledDmabufWaylandVulkanInteropPolicyContracts,
     ) -> Result<SampledDmabufWaylandVulkanInteropPolicy, VulkanError> {
-        if contracts.layout.is_none() {
+        let Some(layout) = contracts.layout.as_ref() else {
             return Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland Vulkan layout policy",
+            ));
+        };
+        if !layout.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland layout identity",
             ));
         }
         let Some(foreign_general) = contracts.foreign_general else {

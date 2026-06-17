@@ -4472,19 +4472,31 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
             &policy_dmabuf,
-            wayland_vulkan_contracts,
+            &wayland_vulkan_contracts,
         ),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan layout policy"
         ))
     ));
     wayland_vulkan_contracts.layout = Some(SampledDmabufWaylandLayoutPolicy::Reacquire(
-        SampledDmabufWaylandReacquireLayoutPolicy { _private: () },
+        SampledDmabufWaylandReacquireLayoutPolicy::new_for_tests(&unrelated_dmabuf),
     ));
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
             &policy_dmabuf,
-            wayland_vulkan_contracts,
+            &wayland_vulkan_contracts,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland layout identity"
+        ))
+    ));
+    wayland_vulkan_contracts.layout = Some(SampledDmabufWaylandLayoutPolicy::Reacquire(
+        SampledDmabufWaylandReacquireLayoutPolicy::new_for_tests(&policy_dmabuf),
+    ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
+            &policy_dmabuf,
+            &wayland_vulkan_contracts,
         ),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan foreign GENERAL policy"
@@ -4498,7 +4510,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
             &policy_dmabuf,
-            wayland_vulkan_contracts,
+            &wayland_vulkan_contracts,
         ),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan queue-family policy"
@@ -4509,7 +4521,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
             &policy_dmabuf,
-            wayland_vulkan_contracts,
+            &wayland_vulkan_contracts,
         ),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan acquire sync policy"
@@ -4519,7 +4531,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
             &policy_dmabuf,
-            wayland_vulkan_contracts,
+            &wayland_vulkan_contracts,
         ),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan release sync policy"
@@ -4529,7 +4541,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
             &policy_dmabuf,
-            wayland_vulkan_contracts,
+            &wayland_vulkan_contracts,
         ),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan texture-cache policy"
@@ -4541,15 +4553,19 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer
             .validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
                 &policy_dmabuf,
-                wayland_vulkan_contracts,
+                &wayland_vulkan_contracts,
             )
             .unwrap(),
     );
+    let mut unrelated_wayland_vulkan_contracts = wayland_vulkan_contracts.clone();
+    unrelated_wayland_vulkan_contracts.layout = Some(SampledDmabufWaylandLayoutPolicy::Reacquire(
+        SampledDmabufWaylandReacquireLayoutPolicy::new_for_tests(&unrelated_dmabuf),
+    ));
     let mismatched_smithay_wayland_policy = SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(
         renderer
             .validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
                 &unrelated_dmabuf,
-                wayland_vulkan_contracts,
+                &unrelated_wayland_vulkan_contracts,
             )
             .unwrap(),
     );
