@@ -149,7 +149,7 @@ enum SampledDmabufLayoutEvidence {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SampledDmabufWaylandVulkanInteropPolicy {
-    _private: (),
+    foreign_general: SampledDmabufKnownLayoutEvidence,
 }
 
 /// Evidence for Smithay's chosen first-import external image state for a Wayland dmabuf.
@@ -284,6 +284,9 @@ struct SampledDmabufWaylandVulkanInteropPolicyContracts {
     /// Defines the external ownership and Vulkan image layout used for this commit, either through
     /// first-import policy or renderer-local reacquire history.
     layout: Option<SampledDmabufWaylandLayoutPolicy>,
+    /// Proves the policy's layout path is specifically foreign ownership with GENERAL image layout,
+    /// matching the validation-stage unsafe import helper's precondition.
+    foreign_general: Option<SampledDmabufKnownLayoutEvidence>,
     /// Defines the queue-family ownership transfer to and from this renderer's Vulkan queue.
     queue_family_transfer: Option<SampledDmabufWaylandQueueFamilyPolicy>,
     /// Defines how the Wayland acquire point is converted into a Vulkan wait dependency for the
@@ -855,6 +858,7 @@ impl VulkanRenderer {
         context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufLayoutEvidence, VulkanError> {
         let layout = self.validate_sampled_dmabuf_wayland_layout_policy(context)?;
+        let foreign_general = self.validate_sampled_dmabuf_wayland_foreign_general_policy(context)?;
         let queue_family_transfer = self.validate_sampled_dmabuf_wayland_queue_family_policy(context)?;
         let acquire_sync = self.validate_sampled_dmabuf_wayland_acquire_sync_policy(context)?;
         let release_sync = self.validate_sampled_dmabuf_wayland_release_sync_policy(context)?;
@@ -862,6 +866,7 @@ impl VulkanRenderer {
         self.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
             SampledDmabufWaylandVulkanInteropPolicyContracts {
                 layout: Some(layout),
+                foreign_general: Some(foreign_general),
                 queue_family_transfer: Some(queue_family_transfer),
                 acquire_sync: Some(acquire_sync),
                 release_sync: Some(release_sync),
@@ -892,6 +897,23 @@ impl VulkanRenderer {
                 .validate_sampled_dmabuf_wayland_reacquire_layout_policy(context)
                 .map(SampledDmabufWaylandLayoutPolicy::Reacquire),
         }
+    }
+
+    /// Validate that Smithay's Wayland/Vulkan policy has specifically established foreign ownership
+    /// and `VK_IMAGE_LAYOUT_GENERAL` for the current sampled-dmabuf acquire.
+    ///
+    /// This is intentionally separate from the higher-level layout-path token. The validation-stage
+    /// import helper uses a `FOREIGN` -> local acquire barrier with `GENERAL` as `oldLayout`; a future
+    /// policy that selects a different initial layout must use a matching helper instead of satisfying
+    /// this guard.
+    #[allow(dead_code)]
+    fn validate_sampled_dmabuf_wayland_foreign_general_policy(
+        &self,
+        _context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
+    ) -> Result<SampledDmabufKnownLayoutEvidence, VulkanError> {
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan foreign GENERAL policy",
+        ))
     }
 
     /// Validate the first-import external image layout policy for a normal Wayland dmabuf.
@@ -1032,6 +1054,11 @@ impl VulkanRenderer {
                 "sampled dmabuf Wayland Vulkan layout policy",
             ));
         }
+        let Some(foreign_general) = contracts.foreign_general else {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan foreign GENERAL policy",
+            ));
+        };
         if contracts.queue_family_transfer.is_none() {
             return Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland Vulkan queue-family policy",
@@ -1053,7 +1080,7 @@ impl VulkanRenderer {
             ));
         }
 
-        Ok(SampledDmabufWaylandVulkanInteropPolicy { _private: () })
+        Ok(SampledDmabufWaylandVulkanInteropPolicy { foreign_general })
     }
 
     /// Validate the external ownership and image-layout contract for sampled dmabuf import.
@@ -1065,10 +1092,10 @@ impl VulkanRenderer {
     fn validate_sampled_dmabuf_known_layout_contract(
         &self,
         evidence: SampledDmabufLayoutEvidence,
-    ) -> Result<(), VulkanError> {
+    ) -> Result<SampledDmabufKnownLayoutEvidence, VulkanError> {
         match evidence {
-            SampledDmabufLayoutEvidence::KnownForeignGeneral(_)
-            | SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(_) => Ok(()),
+            SampledDmabufLayoutEvidence::KnownForeignGeneral(evidence) => Ok(evidence),
+            SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(policy) => Ok(policy.foreign_general),
             SampledDmabufLayoutEvidence::WaylandDmabuf => Err(VulkanError::MissingCapability(
                 "sampled dmabuf known-layout contract",
             )),
@@ -1153,14 +1180,12 @@ impl VulkanRenderer {
     unsafe fn create_imported_dmabuf_texture_with_known_general_layout(
         &mut self,
         dmabuf: &Dmabuf,
+        foreign_general: SampledDmabufKnownLayoutEvidence,
         acquire_semaphore: Option<&VulkanSyncFileSemaphore>,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
-        let layout_evidence = SampledDmabufLayoutEvidence::KnownForeignGeneral(unsafe {
-            // SAFETY: This helper is unsafe and forwards the same known-layout contract to its
-            // caller: the producer must have released to FOREIGN ownership in GENERAL layout.
-            SampledDmabufKnownLayoutEvidence::foreign_general()
-        });
-        self.validate_sampled_dmabuf_known_layout_contract(layout_evidence)?;
+        self.validate_sampled_dmabuf_known_layout_contract(
+            SampledDmabufLayoutEvidence::KnownForeignGeneral(foreign_general),
+        )?;
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
         let Some(sampled_image) = (unsafe {
@@ -1200,14 +1225,12 @@ impl VulkanRenderer {
     unsafe fn create_imported_dmabuf_texture_with_known_general_layout_and_sync_point(
         &mut self,
         dmabuf: &Dmabuf,
+        foreign_general: SampledDmabufKnownLayoutEvidence,
         acquire_sync: Option<&SyncPoint>,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
-        let layout_evidence = SampledDmabufLayoutEvidence::KnownForeignGeneral(unsafe {
-            // SAFETY: This helper is unsafe and forwards the same known-layout contract to its
-            // caller: the producer must have released to FOREIGN ownership in GENERAL layout.
-            SampledDmabufKnownLayoutEvidence::foreign_general()
-        });
-        self.validate_sampled_dmabuf_known_layout_contract(layout_evidence)?;
+        self.validate_sampled_dmabuf_known_layout_contract(
+            SampledDmabufLayoutEvidence::KnownForeignGeneral(foreign_general),
+        )?;
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
         let Some(sampled_image) = (unsafe {
@@ -1241,15 +1264,13 @@ impl VulkanRenderer {
     unsafe fn create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
         &mut self,
         dmabuf: &Dmabuf,
+        foreign_general: SampledDmabufKnownLayoutEvidence,
         acquire_sync: Option<&SyncPoint>,
         release_evidence: SampledDmabufReleaseEvidence,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
-        let layout_evidence = SampledDmabufLayoutEvidence::KnownForeignGeneral(unsafe {
-            // SAFETY: This helper is unsafe and forwards the same known-layout contract to its
-            // caller: the producer must have released to FOREIGN ownership in GENERAL layout.
-            SampledDmabufKnownLayoutEvidence::foreign_general()
-        });
-        self.validate_sampled_dmabuf_known_layout_contract(layout_evidence)?;
+        self.validate_sampled_dmabuf_known_layout_contract(
+            SampledDmabufLayoutEvidence::KnownForeignGeneral(foreign_general),
+        )?;
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
         let release = self.validate_sampled_dmabuf_release_lifecycle_contract(release_evidence)?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
@@ -1425,9 +1446,18 @@ impl VulkanRenderer {
         dmabuf: &Dmabuf,
         acquire_sync: Option<&SyncPoint>,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
+        let foreign_general = unsafe {
+            // SAFETY: This public unsafe method requires its caller to prove the producer released
+            // the dmabuf to FOREIGN ownership in GENERAL layout.
+            SampledDmabufKnownLayoutEvidence::foreign_general()
+        };
         // SAFETY: Forwarded from this public unsafe method's caller.
         unsafe {
-            self.create_imported_dmabuf_texture_with_known_general_layout_and_sync_point(dmabuf, acquire_sync)
+            self.create_imported_dmabuf_texture_with_known_general_layout_and_sync_point(
+                dmabuf,
+                foreign_general,
+                acquire_sync,
+            )
         }
     }
 
@@ -1894,7 +1924,7 @@ impl ImportDmaWl for VulkanRenderer {
             layout_history,
         );
         let layout_evidence = self.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&policy_context)?;
-        self.validate_sampled_dmabuf_known_layout_contract(layout_evidence)?;
+        let foreign_general = self.validate_sampled_dmabuf_known_layout_contract(layout_evidence)?;
 
         let texture = unsafe {
             // SAFETY: The validation-stage Wayland path above only produces layout evidence from
@@ -1903,6 +1933,7 @@ impl ImportDmaWl for VulkanRenderer {
             // producer return policy in addition to renderer-local release history.
             self.create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
                 dmabuf,
+                foreign_general,
                 Some(&acquire_sync),
                 release_evidence,
             )?

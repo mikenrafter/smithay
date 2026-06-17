@@ -3552,10 +3552,21 @@ fn public_dmabuf_import_gates_formats() {
         unsafe { renderer.import_dmabuf_texture_with_known_general_layout(&dmabuf, None) },
         Err(VulkanError::VulkanUnavailable)
     ));
+    let known_layout_evidence = unsafe {
+        // SAFETY: These unit tests only validate contract routing before device lookup; they perform
+        // no Vulkan import, acquire, or sampling operation with the constructed evidence.
+        SampledDmabufKnownLayoutEvidence::foreign_general()
+    };
     assert!(matches!(
         // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
         // Vulkan import or ownership-transfer operation can occur.
-        unsafe { renderer.create_imported_dmabuf_texture_with_known_general_layout(&dmabuf, None) },
+        unsafe {
+            renderer.create_imported_dmabuf_texture_with_known_general_layout(
+                &dmabuf,
+                known_layout_evidence,
+                None,
+            )
+        },
         Err(VulkanError::VulkanUnavailable)
     ));
     assert!(matches!(
@@ -3564,6 +3575,7 @@ fn public_dmabuf_import_gates_formats() {
         unsafe {
             renderer.create_imported_dmabuf_texture_with_known_general_layout_and_sync_point(
                 &dmabuf,
+                known_layout_evidence,
                 Some(&SyncPoint::signaled()),
             )
         },
@@ -3578,6 +3590,7 @@ fn public_dmabuf_import_gates_formats() {
         unsafe {
             renderer.create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
                 &dmabuf,
+                known_layout_evidence,
                 Some(&SyncPoint::from(SignaledExportableFence)),
                 release_evidence,
             )
@@ -3853,7 +3866,13 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&current_reacquire_context),
         Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan queue-family capability"
+            "sampled dmabuf Wayland Vulkan foreign GENERAL policy"
+        ))
+    ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_foreign_general_policy(&current_reacquire_context),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan foreign GENERAL policy"
         ))
     ));
     assert!(matches!(
@@ -3868,11 +3887,12 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             .validate_sampled_dmabuf_wayland_queue_family_policy(&policy_context)
             .is_ok()
     );
-    assert!(
-        renderer
-            .validate_sampled_dmabuf_wayland_vulkan_interop_policy(&current_reacquire_context)
-            .is_ok()
-    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&current_reacquire_context),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan foreign GENERAL policy"
+        ))
+    ));
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&renderer_release_history_context),
         Err(VulkanError::MissingCapability(
@@ -3939,6 +3959,17 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     wayland_vulkan_contracts.layout = Some(SampledDmabufWaylandLayoutPolicy::Reacquire(
         SampledDmabufWaylandReacquireLayoutPolicy { _private: () },
     ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(wayland_vulkan_contracts),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan foreign GENERAL policy"
+        ))
+    ));
+    wayland_vulkan_contracts.foreign_general = Some(unsafe {
+        // SAFETY: This unit test only validates contract routing; it performs no Vulkan import,
+        // acquire, or sampling operation with the constructed evidence.
+        SampledDmabufKnownLayoutEvidence::foreign_general()
+    });
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(wayland_vulkan_contracts),
         Err(VulkanError::MissingCapability(
