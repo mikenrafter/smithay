@@ -649,17 +649,19 @@ impl VulkanRenderer {
         }
     }
 
-    /// Validate renderer-side release lifecycle for sampled dmabuf import.
+    /// Convert release-point evidence into the renderer-owned release obligation for a sampled
+    /// dmabuf import.
     ///
-    /// This guard documents the follow-up after import/sampling works: the compositor must not signal
-    /// the Wayland/DRM syncobj release point until Vulkan has finished sampling and has released the
-    /// image back to foreign ownership with an appropriate release dependency.
+    /// The obligation is satisfied by [`VulkanRenderer::release_imported_dmabuf_texture_to_foreign_general`]
+    /// after Vulkan has synchronously released the sampled image back to foreign ownership. Exported
+    /// release fences remain development-gated for Wayland release points until sync-file-to-syncobj
+    /// transfer is modeled.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_release_lifecycle_contract(
         &self,
-        _evidence: SampledDmabufReleaseEvidence,
-    ) -> Result<(), VulkanError> {
-        Err(VulkanError::MissingCapability("sampled dmabuf release lifecycle"))
+        evidence: SampledDmabufReleaseEvidence,
+    ) -> Result<image::VulkanSampledDmabufRelease, VulkanError> {
+        Ok(evidence.release)
     }
 
     fn render_target_format_supported(&self, format: Fourcc) -> bool {
@@ -798,6 +800,51 @@ impl VulkanRenderer {
             &import,
             sampled_image,
         )))
+    }
+
+    /// Import a known-layout dmabuf and attach the Wayland release obligation to the texture.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy the same known-layout and acquire-sync requirements as
+    /// [`VulkanRenderer::create_imported_dmabuf_texture_with_known_general_layout_and_sync_point`].
+    #[allow(dead_code)]
+    unsafe fn create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
+        &mut self,
+        dmabuf: &Dmabuf,
+        acquire_sync: Option<&SyncPoint>,
+        release_evidence: SampledDmabufReleaseEvidence,
+    ) -> Result<Option<VulkanTexture>, VulkanError> {
+        let layout_evidence = SampledDmabufLayoutEvidence::KnownForeignGeneral(unsafe {
+            // SAFETY: This helper is unsafe and forwards the same known-layout contract to its
+            // caller: the producer must have released to FOREIGN ownership in GENERAL layout.
+            SampledDmabufKnownLayoutEvidence::foreign_general()
+        });
+        self.validate_sampled_dmabuf_known_layout_contract(layout_evidence)?;
+        let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
+        let release = self.validate_sampled_dmabuf_release_lifecycle_contract(release_evidence)?;
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+        let Some(sampled_image) = (unsafe {
+            // SAFETY: Forwarded from this method's caller.
+            device.create_acquired_dmabuf_sampled_image_resources_with_known_general_layout_and_sync_point(
+                dmabuf,
+                self.downscale_filter,
+                self.upscale_filter,
+                acquire_sync,
+            )
+        })?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(
+            VulkanTexture::from_acquired_dmabuf_sampled_image_with_release(
+                self.context_id.clone(),
+                &import,
+                sampled_image,
+                release,
+            ),
+        ))
     }
 
     /// Import a dmabuf as a render target and acquire it for color-attachment rendering.
@@ -1412,16 +1459,19 @@ impl ImportDmaWl for VulkanRenderer {
         let release_evidence = self.sampled_dmabuf_wayland_release_evidence(buffer)?;
         self.validate_sampled_dmabuf_known_layout_contract(SampledDmabufLayoutEvidence::WaylandDmabuf)?;
 
-        // Future implementation continuation point:
-        // - import/acquire the dmabuf as a Vulkan sampled image using the known-layout helper,
-        //   passing `acquire_sync` as the producer-completion dependency,
-        // - store renderer-side release state with the imported texture/frame use,
-        // - release back to foreign ownership after sampling completes,
-        // - signal or satisfy the Wayland/DRM syncobj release point only after that release.
-        let _ = acquire_sync;
-        self.validate_sampled_dmabuf_release_lifecycle_contract(release_evidence)?;
+        let texture = unsafe {
+            // SAFETY: The validation-stage Wayland path above currently fails closed at the
+            // known-layout contract. When that guard is replaced by real Wayland dmabuf
+            // ownership/layout evidence, the same evidence must satisfy this helper's unsafe
+            // precondition before the import can run.
+            self.create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
+                dmabuf,
+                Some(&acquire_sync),
+                release_evidence,
+            )?
+        };
 
-        Err(VulkanError::MissingCapability("sampled dmabuf texture import"))
+        texture.ok_or(VulkanError::MissingCapability("sampled dmabuf texture import"))
     }
 }
 

@@ -3562,6 +3562,21 @@ fn public_dmabuf_import_gates_formats() {
         },
         Err(VulkanError::VulkanUnavailable)
     ));
+    let release_evidence = renderer
+        .validate_sampled_dmabuf_wayland_release_point_contract(true)
+        .unwrap();
+    assert!(matches!(
+        // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
+        // Vulkan import, fd import, ownership-transfer, or release signaling operation can occur.
+        unsafe {
+            renderer.create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
+                &dmabuf,
+                Some(&SyncPoint::from(SignaledExportableFence)),
+                release_evidence,
+            )
+        },
+        Err(VulkanError::VulkanUnavailable)
+    ));
 }
 
 #[test]
@@ -3699,15 +3714,14 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     let release_evidence = renderer
         .validate_sampled_dmabuf_wayland_release_point_contract(true)
         .unwrap();
-    assert!(release_evidence.release.signal_wayland_release_once().is_ok());
-    assert!(release_evidence.release.signal_wayland_release_once().is_ok());
+    let release_obligation = renderer
+        .validate_sampled_dmabuf_release_lifecycle_contract(release_evidence)
+        .unwrap();
+    assert!(release_obligation.signal_wayland_release_once().is_ok());
+    assert!(release_obligation.signal_wayland_release_once().is_ok());
     let release = VulkanSampledDmabufRelease::validation_stage_without_wayland_point();
     assert!(release.signal_wayland_release_once().is_ok());
     assert!(release.signal_wayland_release_once().is_ok());
-    assert!(matches!(
-        renderer.validate_sampled_dmabuf_release_lifecycle_contract(release_evidence),
-        Err(VulkanError::MissingCapability("sampled dmabuf release lifecycle"))
-    ));
 }
 
 #[test]
