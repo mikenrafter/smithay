@@ -37,9 +37,9 @@ use super::image::{
     VulkanDmabufImportState, VulkanDmabufPlane, VulkanExternalImageAcquireKind, VulkanExternalImageOwnership,
     VulkanExternalImageReleaseKind, VulkanExternalMemoryHandleType, VulkanExternalMemoryState,
     VulkanImageLayoutState, VulkanImageSource, VulkanImageState, VulkanImageSyncState, VulkanImageUsage,
-    clear_damage_to_clear_areas, clip_render_texture_draw_area, damage_to_scissor_areas,
-    dmabuf_acquired_image_state, dmabuf_acquired_render_target_image_state, dmabuf_import_image_state,
-    dmabuf_render_target_image_state, draw_solid_damage_to_clear_areas,
+    VulkanSampledDmabufRelease, clear_damage_to_clear_areas, clip_render_texture_draw_area,
+    damage_to_scissor_areas, dmabuf_acquired_image_state, dmabuf_acquired_render_target_image_state,
+    dmabuf_import_image_state, dmabuf_render_target_image_state, draw_solid_damage_to_clear_areas,
     render_texture_damage_to_scissor_areas, source_to_uv_rect,
 };
 use super::*;
@@ -134,6 +134,7 @@ fn texture_for_tests(size: Size<i32, BufferCoord>, format: Option<Fourcc>) -> Vu
         context_id: ContextId::new(),
         image: VulkanImageState::new_for_tests(size, format),
         sampled_image: None,
+        sampled_dmabuf_release: None,
         y_inverted: false,
     }
 }
@@ -3698,6 +3699,11 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     let release_evidence = renderer
         .validate_sampled_dmabuf_wayland_release_point_contract(true)
         .unwrap();
+    assert!(release_evidence.release.signal_wayland_release_once().is_ok());
+    assert!(release_evidence.release.signal_wayland_release_once().is_ok());
+    let release = VulkanSampledDmabufRelease::validation_stage_without_wayland_point();
+    assert!(release.signal_wayland_release_once().is_ok());
+    assert!(release.signal_wayland_release_once().is_ok());
     assert!(matches!(
         renderer.validate_sampled_dmabuf_release_lifecycle_contract(release_evidence),
         Err(VulkanError::MissingCapability("sampled dmabuf release lifecycle"))
@@ -3728,6 +3734,15 @@ fn internal_dmabuf_texture_release_rejects_preconditions_before_device_lookup() 
     assert!(matches!(
         renderer.release_imported_dmabuf_texture_to_foreign_general(&memory_texture, false),
         Err(VulkanError::UnsupportedOperation("dmabuf texture"))
+    ));
+    let mut release_obligation_texture = missing_sampled_image_texture.clone();
+    release_obligation_texture.sampled_dmabuf_release =
+        Some(VulkanSampledDmabufRelease::validation_stage_without_wayland_point());
+    assert!(matches!(
+        renderer.release_imported_dmabuf_texture_to_foreign_general(&release_obligation_texture, true),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf release point export"
+        ))
     ));
     assert!(matches!(
         renderer.release_imported_dmabuf_texture_to_foreign_general(&missing_sampled_image_texture, true),

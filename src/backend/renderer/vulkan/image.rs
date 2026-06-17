@@ -1,13 +1,15 @@
 use std::{
     marker::PhantomData,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
 
 use ash::vk;
 
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+use crate::wayland::drm_syncobj::DrmSyncPoint;
 use crate::{
     backend::{
         allocator::{Buffer, Fourcc, Modifier, dmabuf::Dmabuf},
@@ -43,8 +45,23 @@ pub struct VulkanTexture {
     pub(super) context_id: ContextId<VulkanTexture>,
     pub(super) image: VulkanImageState,
     pub(super) sampled_image: Option<Arc<VulkanSampledImage>>,
+    pub(super) sampled_dmabuf_release: Option<VulkanSampledDmabufRelease>,
     #[allow(dead_code)]
     pub(super) y_inverted: bool,
+}
+
+/// Release obligation attached to a sampled dmabuf texture imported from a Wayland commit.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(super) struct VulkanSampledDmabufRelease {
+    inner: Arc<Mutex<VulkanSampledDmabufReleaseInner>>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+struct VulkanSampledDmabufReleaseInner {
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    wayland_release_point: Option<DrmSyncPoint>,
 }
 
 /// Vulkan render target tracked by the renderer.
@@ -130,6 +147,7 @@ impl VulkanTexture {
                 sync: VulkanImageSyncState::default(),
             },
             sampled_image: Some(Arc::new(sampled_image)),
+            sampled_dmabuf_release: None,
             y_inverted: flipped,
         }
     }
@@ -144,6 +162,7 @@ impl VulkanTexture {
             context_id,
             image: dmabuf_import_image_state(import),
             sampled_image: Some(Arc::new(sampled_image)),
+            sampled_dmabuf_release: None,
             y_inverted: import.y_inverted,
         }
     }
@@ -158,6 +177,23 @@ impl VulkanTexture {
             context_id,
             image: dmabuf_acquired_image_state(import),
             sampled_image: Some(Arc::new(sampled_image)),
+            sampled_dmabuf_release: None,
+            y_inverted: import.y_inverted,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn from_acquired_dmabuf_sampled_image_with_release(
+        context_id: ContextId<VulkanTexture>,
+        import: &VulkanDmabufImportState,
+        sampled_image: VulkanSampledImage,
+        release: VulkanSampledDmabufRelease,
+    ) -> Self {
+        Self {
+            context_id,
+            image: dmabuf_acquired_image_state(import),
+            sampled_image: Some(Arc::new(sampled_image)),
+            sampled_dmabuf_release: Some(release),
             y_inverted: import.y_inverted,
         }
     }
@@ -170,6 +206,23 @@ impl VulkanTexture {
     #[cfg(test)]
     pub(super) fn is_y_inverted_for_tests(&self) -> bool {
         self.y_inverted
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(super) fn has_sampled_dmabuf_release_for_tests(&self) -> bool {
+        self.sampled_dmabuf_release.is_some()
+    }
+
+    pub(super) fn signal_sampled_dmabuf_release_point(&self) -> Result<(), VulkanError> {
+        if let Some(release) = &self.sampled_dmabuf_release {
+            release.signal_wayland_release_once()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn has_sampled_dmabuf_release_obligation(&self) -> bool {
+        self.sampled_dmabuf_release.is_some()
     }
 
     fn sync_state(&self) -> Result<VulkanImageSyncState, VulkanError> {
@@ -194,6 +247,48 @@ impl VulkanTexture {
             .ok_or(VulkanError::UnsupportedOperation("sampled image sync"))?
             .image()
             .set_sync_state(sync)
+    }
+}
+
+#[allow(dead_code)]
+impl VulkanSampledDmabufRelease {
+    pub(super) fn validation_stage_without_wayland_point() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VulkanSampledDmabufReleaseInner {
+                #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+                wayland_release_point: None,
+            })),
+        }
+    }
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    pub(super) fn wayland_syncobj(release_point: DrmSyncPoint) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VulkanSampledDmabufReleaseInner {
+                wayland_release_point: Some(release_point),
+            })),
+        }
+    }
+
+    pub(super) fn signal_wayland_release_once(&self) -> Result<(), VulkanError> {
+        #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| VulkanError::UnsupportedOperation("sampled dmabuf release point"))?;
+
+            if let Some(release_point) = inner.wayland_release_point.take() {
+                if let Err(err) = release_point.signal() {
+                    tracing::warn!(?err, "failed to signal sampled dmabuf Wayland release point");
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf release point signal",
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

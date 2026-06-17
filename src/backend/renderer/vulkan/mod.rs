@@ -128,9 +128,9 @@ enum SampledDmabufLayoutEvidence {
 /// This is only protocol-handle evidence. It does not prove Vulkan has finished sampling, released
 /// the image back to foreign ownership, or signaled/satisfied the Wayland release point.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct SampledDmabufReleaseEvidence {
-    _private: (),
+    release: image::VulkanSampledDmabufRelease,
 }
 
 /// Acquire options for binding a foreign dmabuf as a Vulkan render target.
@@ -540,7 +540,15 @@ impl VulkanRenderer {
     ) -> Result<SampledDmabufReleaseEvidence, VulkanError> {
         #[cfg(feature = "backend_drm")]
         {
-            self.validate_sampled_dmabuf_wayland_release_point_contract(buffer.release_point().is_some())
+            let Some(release_point) = buffer.release_point().cloned() else {
+                return Err(VulkanError::MissingCapability(
+                    "sampled dmabuf release point contract",
+                ));
+            };
+
+            Ok(SampledDmabufReleaseEvidence {
+                release: image::VulkanSampledDmabufRelease::wayland_syncobj(release_point),
+            })
         }
 
         #[cfg(not(feature = "backend_drm"))]
@@ -614,7 +622,9 @@ impl VulkanRenderer {
         has_release_point: bool,
     ) -> Result<SampledDmabufReleaseEvidence, VulkanError> {
         if has_release_point {
-            Ok(SampledDmabufReleaseEvidence { _private: () })
+            Ok(SampledDmabufReleaseEvidence {
+                release: image::VulkanSampledDmabufRelease::validation_stage_without_wayland_point(),
+            })
         } else {
             Err(VulkanError::MissingCapability(
                 "sampled dmabuf release point contract",
@@ -962,13 +972,23 @@ impl VulkanRenderer {
         if texture.image.source != image::VulkanImageSource::DmabufImport {
             return Err(VulkanError::UnsupportedOperation("dmabuf texture"));
         }
+        if export_sync_file && texture.has_sampled_dmabuf_release_obligation() {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf release point export",
+            ));
+        }
         let sampled_image = texture
             .sampled_image
             .as_ref()
             .ok_or(VulkanError::UnsupportedOperation("dmabuf texture sampled image"))?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
 
-        device.release_sampled_dmabuf_to_foreign_general(sampled_image.image(), export_sync_file)
+        let release =
+            device.release_sampled_dmabuf_to_foreign_general(sampled_image.image(), export_sync_file)?;
+        if release.0 {
+            texture.signal_sampled_dmabuf_release_point()?;
+        }
+        Ok(release)
     }
 
     /// Release an acquired dmabuf texture and return the exported release fence as a [`SyncPoint`]
