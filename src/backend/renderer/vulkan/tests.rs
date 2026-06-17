@@ -11,7 +11,10 @@ use ash::{ext, khr, vk};
 use crate::backend::allocator::{
     Buffer, Format, Fourcc, Modifier,
     dmabuf::{AsDmabuf, Dmabuf, DmabufFlags},
-    vulkan::{ImageUsageFlags, VulkanAllocator, VulkanAllocatorForeignReleaseError, VulkanImage},
+    vulkan::{
+        ImageUsageFlags, VulkanAllocator, VulkanAllocatorDmabufForeignReleaseEvidence,
+        VulkanAllocatorForeignReleaseError, VulkanImage,
+    },
 };
 use crate::backend::renderer::sync::Interrupted;
 use crate::backend::renderer::{
@@ -3322,6 +3325,54 @@ fn dmabuf_loopback_evidence_is_identity_bound_and_not_public_advertised() {
     assert!(matches!(
         renderer.release_dmabuf_render_target_for_sampled_loopback(&mut offscreen_target, false),
         Err(VulkanError::UnsupportedOperation("dmabuf loopback render target"))
+    ));
+}
+
+#[test]
+fn allocator_release_evidence_is_consumed_and_identity_bound_before_device_lookup() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let mut unrelated_dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+
+    let evidence = unsafe {
+        // SAFETY: This unit test validates identity routing only. It uses the evidence only with a
+        // scaffold renderer and expects rejection before any Vulkan operation can occur.
+        VulkanAllocatorDmabufForeignReleaseEvidence::new_for_tests(&dmabuf)
+    };
+    assert!(matches!(
+        unsafe {
+            // SAFETY: The helper must reject the mismatched dmabuf identity before reaching Vulkan.
+            renderer.bind_allocator_released_dmabuf_render_target(&mut unrelated_dmabuf, evidence)
+        },
+        Err(VulkanError::UnsupportedOperation(
+            "allocator dmabuf release evidence"
+        ))
+    ));
+
+    let evidence = unsafe {
+        // SAFETY: This scaffold renderer has no Vulkan device, so a matching evidence token can only
+        // route as far as device lookup.
+        VulkanAllocatorDmabufForeignReleaseEvidence::new_for_tests(&dmabuf)
+    };
+    assert!(matches!(
+        unsafe {
+            // SAFETY: This test validates that matching evidence is consumed by the intended helper
+            // and then reaches the normal Vulkan render-target bind path, which fails at device lookup.
+            renderer.bind_allocator_released_dmabuf_render_target(&mut dmabuf, evidence)
+        },
+        Err(VulkanError::VulkanUnavailable)
     ));
 }
 

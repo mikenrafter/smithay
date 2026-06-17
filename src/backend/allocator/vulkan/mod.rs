@@ -157,6 +157,23 @@ impl VulkanAllocatorDmabufForeignReleaseEvidence {
     pub(crate) fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
         self.dmabuf.upgrade().as_ref() == Some(dmabuf)
     }
+
+    /// # Safety
+    ///
+    /// The returned evidence is for unit-test routing only and must not be used for a real Vulkan
+    /// acquire/import operation.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) unsafe fn new_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self {
+            image: ImageInner {
+                image: vk::Image::null(),
+                memory: vk::DeviceMemory::null(),
+            },
+            dmabuf: dmabuf.weak(),
+            _private: (),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
