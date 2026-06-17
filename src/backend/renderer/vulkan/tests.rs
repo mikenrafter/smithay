@@ -3751,12 +3751,11 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.validate_sampled_dmabuf_public_advertisement_contract(),
         Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     ));
-    assert!(matches!(
-        renderer.validate_sampled_dmabuf_wayland_acquire_sync_policy(&policy_context),
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan acquire sync policy"
-        ))
-    ));
+    assert!(
+        renderer
+            .validate_sampled_dmabuf_wayland_acquire_sync_policy(&policy_context)
+            .is_ok()
+    );
     let signaled_acquire = SyncPoint::signaled();
     let implicit_policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
         &policy_import,

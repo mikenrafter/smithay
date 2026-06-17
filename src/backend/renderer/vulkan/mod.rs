@@ -829,15 +829,19 @@ impl VulkanRenderer {
     }
 
     /// Validate acquire-sync import/wait policy for a normal Wayland dmabuf.
+    ///
+    /// The normal Wayland path requires an explicit acquire fence. The known-layout import helper
+    /// then maps that [`SyncPoint`] into the Vulkan acquire submission by importing a sync-file wait
+    /// semaphore when the device supports it and the sync point exports a suitable sync-file fd, or
+    /// by waiting on the CPU before submitting the acquire barrier. This token does not prove image
+    /// layout or queue-family ownership; those remain separate policy contracts.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_acquire_sync_policy(
         &self,
         context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandAcquireSyncPolicy, VulkanError> {
         self.validate_sampled_dmabuf_wayland_acquire_sync_contract(Some(context.acquire_sync))?;
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan acquire sync policy",
-        ))
+        Ok(SampledDmabufWaylandAcquireSyncPolicy { _private: () })
     }
 
     /// Validate release-sync export/transfer policy for a normal Wayland dmabuf.
