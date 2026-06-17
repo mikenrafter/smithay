@@ -419,6 +419,15 @@ struct SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
 }
 
 #[allow(dead_code)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SampledDmabufWaylandExternalStateEvidenceSources {
+    first_import_layout: Option<SampledDmabufWaylandFirstImportLayoutEvidence>,
+    first_import_foreign_general: Option<SampledDmabufKnownLayoutEvidence>,
+    current_reacquire_layout: Option<SampledDmabufWaylandCurrentReacquireLayoutEvidence>,
+    current_reacquire_foreign_general: Option<SampledDmabufKnownLayoutEvidence>,
+}
+
+#[allow(dead_code)]
 impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
     fn new(
         dmabuf: &'a Dmabuf,
@@ -440,6 +449,17 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
             current_reacquire_layout: None,
             current_reacquire_foreign_general: None,
         }
+    }
+
+    fn with_external_state_sources(
+        mut self,
+        sources: SampledDmabufWaylandExternalStateEvidenceSources,
+    ) -> Self {
+        self.first_import_layout = sources.first_import_layout;
+        self.first_import_foreign_general = sources.first_import_foreign_general;
+        self.current_reacquire_layout = sources.current_reacquire_layout;
+        self.current_reacquire_foreign_general = sources.current_reacquire_foreign_general;
+        self
     }
 }
 
@@ -1382,6 +1402,39 @@ impl VulkanRenderer {
                 }))
             }
         }
+    }
+
+    /// Gather the external-state evidence sources used by the normal Wayland sampled-dmabuf path.
+    ///
+    /// This preserves the production fail-closed order before sync evidence is considered: first the
+    /// first-import layout and known-state sources, then the current-reacquire layout and known-state
+    /// sources. The helper is intentionally still validation-stage; production first-import and
+    /// reacquire evidence sources remain development-gated at their exact missing contracts.
+    #[allow(dead_code)]
+    fn sampled_dmabuf_wayland_external_state_evidence_sources(
+        &self,
+        dmabuf: &Dmabuf,
+        layout_history: SampledDmabufWaylandLayoutHistory,
+    ) -> Result<SampledDmabufWaylandExternalStateEvidenceSources, VulkanError> {
+        let first_import_layout =
+            self.sampled_dmabuf_wayland_first_import_layout_evidence(dmabuf, layout_history)?;
+        let first_import_foreign_general =
+            self.sampled_dmabuf_wayland_first_import_foreign_general_evidence(dmabuf, layout_history)?;
+        let current_reacquire_layout =
+            self.sampled_dmabuf_wayland_current_reacquire_layout_evidence(dmabuf, layout_history)?;
+        let current_reacquire_foreign_general = self
+            .sampled_dmabuf_wayland_current_reacquire_foreign_general_evidence(
+                dmabuf,
+                layout_history,
+                current_reacquire_layout.as_ref(),
+            )?;
+
+        Ok(SampledDmabufWaylandExternalStateEvidenceSources {
+            first_import_layout,
+            first_import_foreign_general,
+            current_reacquire_layout,
+            current_reacquire_foreign_general,
+        })
     }
 
     /// Validate the reacquire external image layout policy for a normal Wayland dmabuf.
@@ -2533,32 +2586,19 @@ impl ImportDmaWl for VulkanRenderer {
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
 
         let layout_history = self.sampled_dmabuf_layout_history(dmabuf);
-        let first_import_layout =
-            self.sampled_dmabuf_wayland_first_import_layout_evidence(dmabuf, layout_history)?;
-        let first_import_foreign_general =
-            self.sampled_dmabuf_wayland_first_import_foreign_general_evidence(dmabuf, layout_history)?;
-        let current_reacquire_layout =
-            self.sampled_dmabuf_wayland_current_reacquire_layout_evidence(dmabuf, layout_history)?;
-        let current_reacquire_foreign_general = self
-            .sampled_dmabuf_wayland_current_reacquire_foreign_general_evidence(
-                dmabuf,
-                layout_history,
-                current_reacquire_layout.as_ref(),
-            )?;
+        let external_state_sources =
+            self.sampled_dmabuf_wayland_external_state_evidence_sources(dmabuf, layout_history)?;
         let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_evidence(dmabuf, buffer)?;
         let release_evidence = self.sampled_dmabuf_wayland_release_evidence(dmabuf, buffer)?;
-        let mut policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        let policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
             dmabuf,
             &import,
             &acquire_sync,
             &release_evidence,
             true,
             layout_history,
-        );
-        policy_context.first_import_layout = first_import_layout;
-        policy_context.first_import_foreign_general = first_import_foreign_general;
-        policy_context.current_reacquire_layout = current_reacquire_layout;
-        policy_context.current_reacquire_foreign_general = current_reacquire_foreign_general;
+        )
+        .with_external_state_sources(external_state_sources);
         let layout_evidence = self.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&policy_context)?;
         let foreign_general = self.validate_sampled_dmabuf_known_layout_contract(dmabuf, layout_evidence)?;
 
