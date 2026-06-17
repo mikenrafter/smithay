@@ -171,6 +171,28 @@ struct SampledDmabufWaylandReacquireLayoutPolicy {
     _private: (),
 }
 
+/// Evidence that the current Wayland producer returned a previously released dmabuf in the layout
+/// and ownership expected by Smithay's Vulkan reacquire path.
+///
+/// Renderer-local release history proves Smithay's previous release state, not the current producer's
+/// return state. This separate token keeps reacquire development-gated until the current-commit
+/// contract is modeled explicitly.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SampledDmabufWaylandCurrentReacquireLayoutEvidence {
+    _private: (),
+}
+
+/// Evidence for the layout/ownership contract used by a normal Wayland sampled-dmabuf commit.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampledDmabufWaylandLayoutPolicy {
+    /// First import of a dmabuf with no renderer-local layout history.
+    FirstImport(SampledDmabufWaylandFirstImportLayoutPolicy),
+    /// Reacquire of a dmabuf this renderer previously released to foreign GENERAL ownership.
+    Reacquire(SampledDmabufWaylandReacquireLayoutPolicy),
+}
+
 /// Evidence for queue-family ownership transfers used by Smithay's Wayland/Vulkan dmabuf policy.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,7 +232,9 @@ struct SampledDmabufWaylandTextureCachePolicy {
 enum SampledDmabufWaylandLayoutHistory {
     /// The renderer has no local proof of the dmabuf's previous Vulkan layout/ownership.
     NoRendererHistory,
-    /// Future marker for dmabufs this renderer previously released to foreign ownership in GENERAL.
+    /// The renderer locally acquired the dmabuf and has not yet recorded a matching foreign release.
+    LocallyAcquired,
+    /// The renderer previously released this dmabuf to foreign ownership in GENERAL.
     ReleasedByRendererToForeignGeneral,
 }
 
@@ -226,6 +250,7 @@ struct SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
     release_evidence: &'a SampledDmabufReleaseEvidence,
     per_commit_texture_import: bool,
     layout_history: SampledDmabufWaylandLayoutHistory,
+    current_reacquire_layout: Option<SampledDmabufWaylandCurrentReacquireLayoutEvidence>,
 }
 
 #[allow(dead_code)]
@@ -243,6 +268,7 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
             release_evidence,
             per_commit_texture_import,
             layout_history,
+            current_reacquire_layout: None,
         }
     }
 }
@@ -255,12 +281,9 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
 #[allow(dead_code)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SampledDmabufWaylandVulkanInteropPolicyContracts {
-    /// Defines the external ownership and Vulkan image layout used for the first import of a client
-    /// Wayland dmabuf into this renderer.
-    first_import_layout: Option<SampledDmabufWaylandFirstImportLayoutPolicy>,
-    /// Defines the external ownership and Vulkan image layout used when a previously imported
-    /// Wayland dmabuf is committed again after Smithay released it.
-    reacquire_layout: Option<SampledDmabufWaylandReacquireLayoutPolicy>,
+    /// Defines the external ownership and Vulkan image layout used for this commit, either through
+    /// first-import policy or renderer-local reacquire history.
+    layout: Option<SampledDmabufWaylandLayoutPolicy>,
     /// Defines the queue-family ownership transfer to and from this renderer's Vulkan queue.
     queue_family_transfer: Option<SampledDmabufWaylandQueueFamilyPolicy>,
     /// Defines how the Wayland acquire point is converted into a Vulkan wait dependency for the
@@ -665,6 +688,13 @@ impl VulkanRenderer {
         );
     }
 
+    #[allow(dead_code)]
+    fn record_sampled_dmabuf_locally_acquired(&mut self, dmabuf: &Dmabuf) {
+        self.prune_sampled_dmabuf_layout_history();
+        self.sampled_dmabuf_layout_history
+            .insert(dmabuf.weak(), SampledDmabufWaylandLayoutHistory::LocallyAcquired);
+    }
+
     /// Check whether the sampled dmabuf path may be public-advertised through [`ImportDma`].
     ///
     /// This is intentionally stricter than raw Vulkan probing. Future implementation work should
@@ -824,16 +854,14 @@ impl VulkanRenderer {
         &self,
         context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufLayoutEvidence, VulkanError> {
-        let first_import_layout = self.validate_sampled_dmabuf_wayland_first_import_layout_policy(context)?;
-        let reacquire_layout = self.validate_sampled_dmabuf_wayland_reacquire_layout_policy(context)?;
+        let layout = self.validate_sampled_dmabuf_wayland_layout_policy(context)?;
         let queue_family_transfer = self.validate_sampled_dmabuf_wayland_queue_family_policy(context)?;
         let acquire_sync = self.validate_sampled_dmabuf_wayland_acquire_sync_policy(context)?;
         let release_sync = self.validate_sampled_dmabuf_wayland_release_sync_policy(context)?;
         let texture_cache_reuse = self.validate_sampled_dmabuf_wayland_texture_cache_policy(context)?;
         self.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
             SampledDmabufWaylandVulkanInteropPolicyContracts {
-                first_import_layout: Some(first_import_layout),
-                reacquire_layout: Some(reacquire_layout),
+                layout: Some(layout),
                 queue_family_transfer: Some(queue_family_transfer),
                 acquire_sync: Some(acquire_sync),
                 release_sync: Some(release_sync),
@@ -841,6 +869,29 @@ impl VulkanRenderer {
             },
         )
         .map(SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy)
+    }
+
+    /// Validate the external image layout policy for this normal Wayland dmabuf commit.
+    ///
+    /// First imports and reacquires are alternative states. A dmabuf with no renderer-local history
+    /// must satisfy the first-import policy; a dmabuf this renderer previously released to foreign
+    /// GENERAL ownership may satisfy the narrower reacquire policy instead.
+    #[allow(dead_code)]
+    fn validate_sampled_dmabuf_wayland_layout_policy(
+        &self,
+        context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
+    ) -> Result<SampledDmabufWaylandLayoutPolicy, VulkanError> {
+        match context.layout_history {
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory => self
+                .validate_sampled_dmabuf_wayland_first_import_layout_policy(context)
+                .map(SampledDmabufWaylandLayoutPolicy::FirstImport),
+            SampledDmabufWaylandLayoutHistory::LocallyAcquired => Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan unreleased local acquire",
+            )),
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => self
+                .validate_sampled_dmabuf_wayland_reacquire_layout_policy(context)
+                .map(SampledDmabufWaylandLayoutPolicy::Reacquire),
+        }
     }
 
     /// Validate the first-import external image layout policy for a normal Wayland dmabuf.
@@ -872,8 +923,17 @@ impl VulkanRenderer {
             SampledDmabufWaylandLayoutHistory::NoRendererHistory => Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland Vulkan reacquire layout history",
             )),
+            SampledDmabufWaylandLayoutHistory::LocallyAcquired => Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan unreleased local acquire",
+            )),
             SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => {
-                Ok(SampledDmabufWaylandReacquireLayoutPolicy { _private: () })
+                if context.current_reacquire_layout.is_some() {
+                    Ok(SampledDmabufWaylandReacquireLayoutPolicy { _private: () })
+                } else {
+                    Err(VulkanError::MissingCapability(
+                        "sampled dmabuf Wayland Vulkan current reacquire layout policy",
+                    ))
+                }
             }
         }
     }
@@ -956,14 +1016,9 @@ impl VulkanRenderer {
         &self,
         contracts: SampledDmabufWaylandVulkanInteropPolicyContracts,
     ) -> Result<SampledDmabufWaylandVulkanInteropPolicy, VulkanError> {
-        if contracts.first_import_layout.is_none() {
+        if contracts.layout.is_none() {
             return Err(VulkanError::MissingCapability(
-                "sampled dmabuf Wayland Vulkan first-import layout policy",
-            ));
-        }
-        if contracts.reacquire_layout.is_none() {
-            return Err(VulkanError::MissingCapability(
-                "sampled dmabuf Wayland Vulkan reacquire layout policy",
+                "sampled dmabuf Wayland Vulkan layout policy",
             ));
         }
         if contracts.queue_family_transfer.is_none() {
@@ -1831,10 +1886,10 @@ impl ImportDmaWl for VulkanRenderer {
         self.validate_sampled_dmabuf_known_layout_contract(layout_evidence)?;
 
         let texture = unsafe {
-            // SAFETY: The validation-stage Wayland path above currently fails closed at the
-            // Smithay Wayland/Vulkan interop policy contract. When that guard is replaced by real
-            // Wayland dmabuf ownership/layout evidence, the same policy must satisfy this helper's
-            // unsafe precondition before the import can run.
+            // SAFETY: The validation-stage Wayland path above only produces layout evidence from
+            // Smithay's Wayland/Vulkan interop policy. First imports still fail closed until their
+            // ownership/layout policy is implemented; reacquires also require a current-commit
+            // producer return policy in addition to renderer-local release history.
             self.create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
                 dmabuf,
                 Some(&acquire_sync),
@@ -1842,7 +1897,12 @@ impl ImportDmaWl for VulkanRenderer {
             )?
         };
 
-        texture.ok_or(VulkanError::MissingCapability("sampled dmabuf texture import"))
+        if let Some(texture) = texture {
+            self.record_sampled_dmabuf_locally_acquired(dmabuf);
+            Ok(texture)
+        } else {
+            Err(VulkanError::MissingCapability("sampled dmabuf texture import"))
+        }
     }
 }
 
