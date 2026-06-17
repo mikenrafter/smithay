@@ -10,7 +10,8 @@ use ash::{ext, khr, vk};
 
 use crate::backend::allocator::{
     Buffer, Format, Fourcc, Modifier,
-    dmabuf::{Dmabuf, DmabufFlags},
+    dmabuf::{AsDmabuf, Dmabuf, DmabufFlags},
+    vulkan::{ImageUsageFlags, VulkanAllocator},
 };
 use crate::backend::renderer::sync::Interrupted;
 use crate::backend::renderer::{
@@ -3322,6 +3323,169 @@ fn dmabuf_loopback_evidence_is_identity_bound_and_not_public_advertised() {
         renderer.release_dmabuf_render_target_for_sampled_loopback(&mut offscreen_target, false),
         Err(VulkanError::UnsupportedOperation("dmabuf loopback render target"))
     ));
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
+fn runtime_dmabuf_loopback_prerequisites_find_common_exportable_modifier() {
+    let instance = match Instance::new(Version::VERSION_1_3, None) {
+        Ok(instance) => instance,
+        Err(err) => {
+            eprintln!(
+                "skipping Vulkan dmabuf loopback prerequisite test: failed to create instance: {err:?}"
+            );
+            return;
+        }
+    };
+
+    let devices = match PhysicalDevice::enumerate(&instance) {
+        Ok(devices) => devices,
+        Err(err) => {
+            eprintln!(
+                "skipping Vulkan dmabuf loopback prerequisite test: failed to enumerate devices: {err:?}"
+            );
+            return;
+        }
+    };
+
+    let usage = ImageUsageFlags::COLOR_ATTACHMENT
+        | ImageUsageFlags::SAMPLED
+        | ImageUsageFlags::TRANSFER_SRC
+        | ImageUsageFlags::TRANSFER_DST;
+    let mut found_extension_capable_device = false;
+    let mut created_renderer_allocator_pair = false;
+    let mut setup_errors = Vec::new();
+
+    for physical_device in devices {
+        if !VulkanAllocator::required_extensions(&physical_device)
+            .into_iter()
+            .all(|extension| physical_device.has_device_extension(extension))
+        {
+            continue;
+        }
+        found_extension_capable_device = true;
+
+        let renderer = match VulkanRenderer::builder()
+            .with_physical_device(physical_device.clone())
+            .build()
+        {
+            Ok(renderer) => renderer,
+            Err(err) => {
+                setup_errors.push(format!("{} renderer: {err:?}", physical_device.name()));
+                continue;
+            }
+        };
+        let mut allocator = match VulkanAllocator::new(&physical_device, usage) {
+            Ok(allocator) => allocator,
+            Err(err) => {
+                setup_errors.push(format!("{} allocator: {err:?}", physical_device.name()));
+                continue;
+            }
+        };
+        created_renderer_allocator_pair = true;
+
+        let candidates = renderer
+            .capabilities()
+            .formats
+            .modifier_records
+            .iter()
+            .filter(|record| {
+                record.plane_count == 1
+                    && record.usages.sampled
+                    && record.usages.color_attachment
+                    && record.usages.color_attachment_blend
+                    && get_format_info(record.format)
+                        .map(|info| !info.is_10bit)
+                        .unwrap_or(false)
+            })
+            .map(|record| Format {
+                code: record.format,
+                modifier: record.modifier,
+            })
+            .collect::<Vec<_>>();
+
+        for format in candidates {
+            if !allocator.is_format_supported(format, usage) {
+                continue;
+            }
+            if !renderer
+                .capabilities()
+                .formats
+                .dmabuf_render_target
+                .contains(&format)
+            {
+                continue;
+            }
+
+            let image = match allocator.create_buffer_with_usage(4, 4, format.code, &[format.modifier], usage)
+            {
+                Ok(image) => image,
+                Err(err) => {
+                    setup_errors.push(format!(
+                        "{} {:?} {:?} allocation: {err:?}",
+                        physical_device.name(),
+                        format.code,
+                        format.modifier
+                    ));
+                    continue;
+                }
+            };
+            let dmabuf = match image.export() {
+                Ok(dmabuf) => dmabuf,
+                Err(err) => {
+                    setup_errors.push(format!(
+                        "{} {:?} {:?} export: {err:?}",
+                        physical_device.name(),
+                        format.code,
+                        format.modifier
+                    ));
+                    continue;
+                }
+            };
+
+            assert_eq!(dmabuf.format(), format);
+            assert!(validate_dmabuf_render_target_metadata(&dmabuf).is_ok());
+            assert!(renderer.validate_sampled_dmabuf_import_metadata(&dmabuf).is_ok());
+            assert!(!renderer.capabilities().import.dmabuf);
+            assert!(
+                renderer
+                    .capabilities()
+                    .formats
+                    .dmabuf_import
+                    .iter()
+                    .next()
+                    .is_none()
+            );
+            assert!(renderer.dmabuf_formats().iter().next().is_none());
+            assert!(matches!(
+                renderer.validate_sampled_dmabuf_public_advertisement_contract(),
+                Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+            ));
+            return;
+        }
+    }
+
+    if !found_extension_capable_device {
+        eprintln!(
+            "skipping Vulkan dmabuf loopback prerequisite test: no device supports allocator extensions"
+        );
+        return;
+    }
+
+    if !created_renderer_allocator_pair {
+        panic!(
+            "failed to create Vulkan renderer/allocator pair for extension-capable devices: {setup_errors:?}"
+        );
+    }
+
+    if !setup_errors.is_empty() {
+        eprintln!(
+            "Vulkan loopback prerequisite setup/allocation/export errors while searching: {setup_errors:?}"
+        );
+    }
+    eprintln!(
+        "skipping Vulkan dmabuf loopback prerequisite test: no common exportable sampled/render-target modifier"
+    );
 }
 
 #[test]
