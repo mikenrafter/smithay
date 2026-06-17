@@ -1142,11 +1142,29 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_foreign_general_policy(
         &self,
-        _context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
+        context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufKnownLayoutEvidence, VulkanError> {
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan foreign GENERAL policy",
-        ))
+        match context.layout_history {
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory => {
+                self.validate_sampled_dmabuf_wayland_first_import_layout_policy(context)?;
+                Err(VulkanError::MissingCapability(
+                    "sampled dmabuf Wayland Vulkan foreign GENERAL policy",
+                ))
+            }
+            SampledDmabufWaylandLayoutHistory::LocallyAcquired => Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan unreleased local acquire",
+            )),
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => {
+                self.validate_sampled_dmabuf_wayland_current_reacquire_layout_policy(context)?;
+                Ok(unsafe {
+                    // SAFETY: The reacquire policy accepts only a current-commit producer-return
+                    // evidence token for this dmabuf after renderer-local history records a previous
+                    // release to FOREIGN ownership in GENERAL layout. That is exactly the
+                    // validation-stage precondition used by the sampled-dmabuf known-layout helper.
+                    SampledDmabufKnownLayoutEvidence::foreign_general()
+                })
+            }
+        }
     }
 
     /// Validate the first-import external image layout policy for a normal Wayland dmabuf.
