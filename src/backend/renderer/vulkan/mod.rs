@@ -270,9 +270,23 @@ impl SampledDmabufWaylandQueueFamilyPolicy {
 
 /// Evidence that Wayland acquire sync is mapped into the Vulkan sampled-dmabuf acquire operation.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandAcquireSyncPolicy {
-    _private: (),
+    dmabuf: WeakDmabuf,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufWaylandAcquireSyncPolicy {
+    #[cfg(test)]
+    fn new_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+        }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
 }
 
 /// Evidence that a Wayland acquire sync point is tied to a sampled dmabuf identity.
@@ -303,16 +317,44 @@ impl SampledDmabufAcquireSyncEvidence {
 
 /// Evidence that Vulkan sampled-dmabuf release is mapped to the Wayland release point.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandReleaseSyncPolicy {
-    _private: (),
+    dmabuf: WeakDmabuf,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufWaylandReleaseSyncPolicy {
+    #[cfg(test)]
+    fn new_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+        }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
 }
 
 /// Evidence that texture-cache reuse preserves per-commit Wayland/Vulkan dmabuf contracts.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandTextureCachePolicy {
-    _private: (),
+    dmabuf: WeakDmabuf,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufWaylandTextureCachePolicy {
+    #[cfg(test)]
+    fn new_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+        }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
 }
 
 /// Renderer-local layout history available for a normal Wayland sampled-dmabuf commit.
@@ -1202,7 +1244,9 @@ impl VulkanRenderer {
             ));
         }
         self.validate_sampled_dmabuf_wayland_acquire_sync_contract(Some(context.acquire_sync.sync()))?;
-        Ok(SampledDmabufWaylandAcquireSyncPolicy { _private: () })
+        Ok(SampledDmabufWaylandAcquireSyncPolicy {
+            dmabuf: context.dmabuf.weak(),
+        })
     }
 
     /// Validate release-sync export/transfer policy for a normal Wayland dmabuf.
@@ -1220,7 +1264,9 @@ impl VulkanRenderer {
             context.dmabuf,
             context.release_evidence.clone(),
         )?;
-        Ok(SampledDmabufWaylandReleaseSyncPolicy { _private: () })
+        Ok(SampledDmabufWaylandReleaseSyncPolicy {
+            dmabuf: context.dmabuf.weak(),
+        })
     }
 
     /// Validate texture-cache reuse policy for a normal Wayland dmabuf.
@@ -1241,7 +1287,9 @@ impl VulkanRenderer {
             ));
         }
 
-        Ok(SampledDmabufWaylandTextureCachePolicy { _private: () })
+        Ok(SampledDmabufWaylandTextureCachePolicy {
+            dmabuf: context.dmabuf.weak(),
+        })
     }
 
     /// Validate each named part of Smithay's Wayland/Vulkan sampled-dmabuf policy.
@@ -1281,19 +1329,34 @@ impl VulkanRenderer {
                 "sampled dmabuf Wayland queue-family identity",
             ));
         }
-        if contracts.acquire_sync.is_none() {
+        let Some(acquire_sync) = contracts.acquire_sync.as_ref() else {
             return Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland Vulkan acquire sync policy",
             ));
+        };
+        if !acquire_sync.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland acquire sync identity",
+            ));
         }
-        if contracts.release_sync.is_none() {
+        let Some(release_sync) = contracts.release_sync.as_ref() else {
             return Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland Vulkan release sync policy",
             ));
+        };
+        if !release_sync.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland release sync identity",
+            ));
         }
-        if contracts.texture_cache_reuse.is_none() {
+        let Some(texture_cache_reuse) = contracts.texture_cache_reuse.as_ref() else {
             return Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland Vulkan texture-cache policy",
+            ));
+        };
+        if !texture_cache_reuse.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland texture-cache identity",
             ));
         }
 

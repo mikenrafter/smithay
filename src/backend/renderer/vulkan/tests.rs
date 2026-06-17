@@ -4435,6 +4435,11 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             .validate_sampled_dmabuf_wayland_acquire_sync_policy(&policy_context)
             .is_ok()
     );
+    let validated_acquire_policy = renderer
+        .validate_sampled_dmabuf_wayland_acquire_sync_policy(&policy_context)
+        .unwrap();
+    assert!(validated_acquire_policy.is_for_dmabuf(&policy_dmabuf));
+    assert!(!validated_acquire_policy.is_for_dmabuf(&unrelated_dmabuf));
     let signaled_acquire = SyncPoint::signaled();
     let signaled_acquire_evidence = SampledDmabufAcquireSyncEvidence::new(&policy_dmabuf, signaled_acquire);
     let implicit_policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
@@ -4454,6 +4459,11 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             .validate_sampled_dmabuf_wayland_release_sync_policy(&policy_context)
             .is_ok()
     );
+    let validated_release_policy = renderer
+        .validate_sampled_dmabuf_wayland_release_sync_policy(&policy_context)
+        .unwrap();
+    assert!(validated_release_policy.is_for_dmabuf(&policy_dmabuf));
+    assert!(!validated_release_policy.is_for_dmabuf(&unrelated_dmabuf));
     let stale_cache_policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
         &policy_dmabuf,
         &policy_import,
@@ -4473,6 +4483,11 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             .validate_sampled_dmabuf_wayland_texture_cache_policy(&policy_context)
             .is_ok()
     );
+    let validated_cache_policy = renderer
+        .validate_sampled_dmabuf_wayland_texture_cache_policy(&policy_context)
+        .unwrap();
+    assert!(validated_cache_policy.is_for_dmabuf(&policy_dmabuf));
+    assert!(!validated_cache_policy.is_for_dmabuf(&unrelated_dmabuf));
     let mut wayland_vulkan_contracts = SampledDmabufWaylandVulkanInteropPolicyContracts::default();
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
@@ -4545,7 +4560,21 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland Vulkan acquire sync policy"
         ))
     ));
-    wayland_vulkan_contracts.acquire_sync = Some(SampledDmabufWaylandAcquireSyncPolicy { _private: () });
+    wayland_vulkan_contracts.acquire_sync = Some(SampledDmabufWaylandAcquireSyncPolicy::new_for_tests(
+        &unrelated_dmabuf,
+    ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
+            &policy_dmabuf,
+            &wayland_vulkan_contracts,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland acquire sync identity"
+        ))
+    ));
+    wayland_vulkan_contracts.acquire_sync = Some(SampledDmabufWaylandAcquireSyncPolicy::new_for_tests(
+        &policy_dmabuf,
+    ));
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
             &policy_dmabuf,
@@ -4555,7 +4584,21 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland Vulkan release sync policy"
         ))
     ));
-    wayland_vulkan_contracts.release_sync = Some(SampledDmabufWaylandReleaseSyncPolicy { _private: () });
+    wayland_vulkan_contracts.release_sync = Some(SampledDmabufWaylandReleaseSyncPolicy::new_for_tests(
+        &unrelated_dmabuf,
+    ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
+            &policy_dmabuf,
+            &wayland_vulkan_contracts,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland release sync identity"
+        ))
+    ));
+    wayland_vulkan_contracts.release_sync = Some(SampledDmabufWaylandReleaseSyncPolicy::new_for_tests(
+        &policy_dmabuf,
+    ));
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
             &policy_dmabuf,
@@ -4565,8 +4608,21 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland Vulkan texture-cache policy"
         ))
     ));
-    wayland_vulkan_contracts.texture_cache_reuse =
-        Some(SampledDmabufWaylandTextureCachePolicy { _private: () });
+    wayland_vulkan_contracts.texture_cache_reuse = Some(
+        SampledDmabufWaylandTextureCachePolicy::new_for_tests(&unrelated_dmabuf),
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
+            &policy_dmabuf,
+            &wayland_vulkan_contracts,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland texture-cache identity"
+        ))
+    ));
+    wayland_vulkan_contracts.texture_cache_reuse = Some(
+        SampledDmabufWaylandTextureCachePolicy::new_for_tests(&policy_dmabuf),
+    );
     let smithay_wayland_policy = SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(
         renderer
             .validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
@@ -4581,6 +4637,15 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     ));
     unrelated_wayland_vulkan_contracts.queue_family_transfer = Some(
         SampledDmabufWaylandQueueFamilyPolicy::new_for_tests(&unrelated_dmabuf),
+    );
+    unrelated_wayland_vulkan_contracts.acquire_sync = Some(
+        SampledDmabufWaylandAcquireSyncPolicy::new_for_tests(&unrelated_dmabuf),
+    );
+    unrelated_wayland_vulkan_contracts.release_sync = Some(
+        SampledDmabufWaylandReleaseSyncPolicy::new_for_tests(&unrelated_dmabuf),
+    );
+    unrelated_wayland_vulkan_contracts.texture_cache_reuse = Some(
+        SampledDmabufWaylandTextureCachePolicy::new_for_tests(&unrelated_dmabuf),
     );
     let mismatched_smithay_wayland_policy = SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(
         renderer
