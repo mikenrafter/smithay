@@ -173,6 +173,27 @@ impl SampledDmabufWaylandVulkanInteropPolicy {
 /// image's current Vulkan layout or ownership.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SampledDmabufWaylandFirstImportLayoutEvidence {
+    dmabuf: WeakDmabuf,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufWaylandFirstImportLayoutEvidence {
+    #[cfg(test)]
+    fn new_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+        }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+}
+
+/// Evidence for Smithay's first-import layout policy for a normal Wayland dmabuf.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandFirstImportLayoutPolicy {
     dmabuf: WeakDmabuf,
 }
@@ -391,6 +412,7 @@ struct SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
     release_evidence: &'a SampledDmabufReleaseEvidence,
     per_commit_texture_import: bool,
     layout_history: SampledDmabufWaylandLayoutHistory,
+    first_import_layout: Option<SampledDmabufWaylandFirstImportLayoutEvidence>,
     current_reacquire_layout: Option<SampledDmabufWaylandCurrentReacquireLayoutEvidence>,
 }
 
@@ -411,6 +433,7 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
             release_evidence,
             per_commit_texture_import,
             layout_history,
+            first_import_layout: None,
             current_reacquire_layout: None,
         }
     }
@@ -1178,11 +1201,58 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_first_import_layout_policy(
         &self,
-        _context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
+        context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandFirstImportLayoutPolicy, VulkanError> {
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan first-import layout policy",
-        ))
+        match context.layout_history {
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory => {}
+            SampledDmabufWaylandLayoutHistory::LocallyAcquired => {
+                return Err(VulkanError::MissingCapability(
+                    "sampled dmabuf Wayland Vulkan unreleased local acquire",
+                ));
+            }
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => {
+                return Err(VulkanError::MissingCapability(
+                    "sampled dmabuf Wayland Vulkan first-import layout history",
+                ));
+            }
+        }
+
+        let evidence = context
+            .first_import_layout
+            .as_ref()
+            .ok_or(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan first-import layout policy",
+            ))?;
+        if !evidence.is_for_dmabuf(context.dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland first-import identity",
+            ));
+        }
+
+        Ok(SampledDmabufWaylandFirstImportLayoutPolicy {
+            dmabuf: context.dmabuf.weak(),
+        })
+    }
+
+    /// Locate first-import layout/ownership evidence for a normal Wayland dmabuf.
+    ///
+    /// A dmabuf with no renderer-local history needs a Smithay-owned policy for the imported image's
+    /// initial external ownership and layout before Vulkan can acquire it. `linux-dmabuf` metadata and
+    /// explicit acquire sync do not provide that proof, so production `ImportDmaWl` remains
+    /// development-gated at this evidence source for first imports.
+    #[allow(dead_code)]
+    fn sampled_dmabuf_wayland_first_import_layout_evidence(
+        &self,
+        _dmabuf: &Dmabuf,
+        layout_history: SampledDmabufWaylandLayoutHistory,
+    ) -> Result<Option<SampledDmabufWaylandFirstImportLayoutEvidence>, VulkanError> {
+        match layout_history {
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory => Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan first-import layout policy",
+            )),
+            SampledDmabufWaylandLayoutHistory::LocallyAcquired
+            | SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => Ok(None),
+        }
     }
 
     /// Validate that the current Wayland producer returned a reacquired dmabuf in the layout and
@@ -2386,6 +2456,8 @@ impl ImportDmaWl for VulkanRenderer {
         let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_evidence(dmabuf, buffer)?;
         let release_evidence = self.sampled_dmabuf_wayland_release_evidence(dmabuf, buffer)?;
         let layout_history = self.sampled_dmabuf_layout_history(dmabuf);
+        let first_import_layout =
+            self.sampled_dmabuf_wayland_first_import_layout_evidence(dmabuf, layout_history)?;
         let current_reacquire_layout =
             self.sampled_dmabuf_wayland_current_reacquire_layout_evidence(dmabuf, layout_history)?;
         let mut policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
@@ -2396,6 +2468,7 @@ impl ImportDmaWl for VulkanRenderer {
             true,
             layout_history,
         );
+        policy_context.first_import_layout = first_import_layout;
         policy_context.current_reacquire_layout = current_reacquire_layout;
         let layout_evidence = self.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&policy_context)?;
         let foreign_general = self.validate_sampled_dmabuf_known_layout_contract(dmabuf, layout_evidence)?;
