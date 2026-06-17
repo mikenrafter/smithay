@@ -138,6 +138,19 @@ pub struct VulkanAllocator {
     device: Arc<ash::Device>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VulkanAllocatorDmabufForeignReleaseEvidence {
+    _private: (),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum VulkanAllocatorForeignReleaseError {
+    #[error("foreign Vulkan allocator image")]
+    ForeignImage,
+    #[error("missing capability: {0}")]
+    MissingCapability(&'static str),
+}
+
 impl fmt::Debug for VulkanAllocator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VulkanAllocator")
@@ -354,6 +367,30 @@ impl VulkanAllocator {
     /// Returns the [`PhysicalDevice`] this allocator was created with.
     pub fn physical_device(&self) -> &PhysicalDevice {
         &self.phd
+    }
+
+    /// Release an allocator-owned dmabuf image to foreign ownership in `GENERAL` layout.
+    ///
+    /// This is a validation-stage contract marker for renderer loopback development. The allocator
+    /// currently creates an allocation/export device but does not own the queue/command-buffer state
+    /// needed to submit a Vulkan image ownership/layout release. Until that implementation exists,
+    /// callers must not treat allocator-exported dmabufs as valid input for Vulkan render-target
+    /// acquire paths that require `VK_QUEUE_FAMILY_FOREIGN_EXT` ownership and `GENERAL` layout.
+    #[allow(dead_code)]
+    pub(crate) fn release_dmabuf_to_foreign_general(
+        &mut self,
+        image: &VulkanImage,
+    ) -> Result<VulkanAllocatorDmabufForeignReleaseEvidence, VulkanAllocatorForeignReleaseError> {
+        let Some(device) = image.device.upgrade() else {
+            return Err(VulkanAllocatorForeignReleaseError::ForeignImage);
+        };
+        if !Arc::ptr_eq(&device, &self.device) || !self.images.contains(&image.inner) {
+            return Err(VulkanAllocatorForeignReleaseError::ForeignImage);
+        }
+
+        Err(VulkanAllocatorForeignReleaseError::MissingCapability(
+            "Vulkan allocator dmabuf foreign release contract",
+        ))
     }
 }
 

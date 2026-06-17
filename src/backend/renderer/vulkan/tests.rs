@@ -11,7 +11,7 @@ use ash::{ext, khr, vk};
 use crate::backend::allocator::{
     Buffer, Format, Fourcc, Modifier,
     dmabuf::{AsDmabuf, Dmabuf, DmabufFlags},
-    vulkan::{ImageUsageFlags, VulkanAllocator, VulkanImage},
+    vulkan::{ImageUsageFlags, VulkanAllocator, VulkanAllocatorForeignReleaseError, VulkanImage},
 };
 use crate::backend::renderer::sync::Interrupted;
 use crate::backend::renderer::{
@@ -3515,7 +3515,7 @@ fn runtime_dmabuf_loopback_prerequisites_find_common_exportable_modifier() {
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
 fn runtime_dmabuf_loopback_stops_at_allocator_foreign_release_contract() {
-    let Some(candidate) =
+    let Some(mut candidate) =
         runtime_dmabuf_loopback_candidate("Vulkan dmabuf loopback allocator release guard test")
     else {
         return;
@@ -3529,23 +3529,13 @@ fn runtime_dmabuf_loopback_stops_at_allocator_foreign_release_contract() {
         Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
     ));
     assert!(matches!(
-        validate_runtime_dmabuf_loopback_allocator_foreign_release_contract(&candidate),
-        Err(VulkanError::MissingCapability(
+        candidate
+            .allocator
+            .release_dmabuf_to_foreign_general(&candidate.image),
+        Err(VulkanAllocatorForeignReleaseError::MissingCapability(
             "Vulkan allocator dmabuf foreign release contract"
         ))
     ));
-}
-
-fn validate_runtime_dmabuf_loopback_allocator_foreign_release_contract(
-    _candidate: &RuntimeDmabufLoopbackCandidate,
-) -> Result<(), VulkanError> {
-    // The allocator-exported dmabuf is a valid runtime prerequisite for the intended loopback path,
-    // but this test must not call `bind_dmabuf_render_target` until the Vulkan allocator can provide
-    // evidence that the exported image was released to VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL layout
-    // or an explicitly modeled fresh-image discard acquire contract replaces that requirement.
-    Err(VulkanError::MissingCapability(
-        "Vulkan allocator dmabuf foreign release contract",
-    ))
 }
 
 #[test]
