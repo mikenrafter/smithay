@@ -3766,12 +3766,11 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.validate_sampled_dmabuf_wayland_acquire_sync_policy(&implicit_policy_context),
         Err(VulkanError::NotPublicAdvertised("sampled dmabuf implicit sync"))
     ));
-    assert!(matches!(
-        renderer.validate_sampled_dmabuf_wayland_release_sync_policy(&policy_context),
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan release sync policy"
-        ))
-    ));
+    assert!(
+        renderer
+            .validate_sampled_dmabuf_wayland_release_sync_policy(&policy_context)
+            .is_ok()
+    );
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&policy_context),
         Err(VulkanError::MissingCapability(

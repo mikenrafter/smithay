@@ -845,15 +845,18 @@ impl VulkanRenderer {
     }
 
     /// Validate release-sync export/transfer policy for a normal Wayland dmabuf.
+    ///
+    /// The release evidence carries the renderer-owned obligation to satisfy the Wayland release
+    /// point only after Vulkan releases the sampled image back to foreign ownership. The release
+    /// helper transfers an exported release sync-file into that release point when available, or
+    /// signals it directly only after synchronous release completion.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_release_sync_policy(
         &self,
         context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandReleaseSyncPolicy, VulkanError> {
         self.validate_sampled_dmabuf_release_lifecycle_contract(context.release_evidence.clone())?;
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan release sync policy",
-        ))
+        Ok(SampledDmabufWaylandReleaseSyncPolicy { _private: () })
     }
 
     /// Validate texture-cache reuse policy for a normal Wayland dmabuf.
