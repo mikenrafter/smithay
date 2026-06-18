@@ -2269,9 +2269,9 @@ impl VulkanRenderer {
     /// Release a cached Wayland texture before renderer surface-state drops it.
     ///
     /// Ordinary textures do not carry a sampled-dmabuf release obligation and can be dropped by the
-    /// generic cache. Textures imported through the intended Wayland sampled-dmabuf path must be
-    /// released back to foreign ownership before drop so the Wayland release point can be satisfied
-    /// only after Vulkan sampling is complete.
+    /// generic cache. Textures imported through the intended Wayland sampled-dmabuf path remain
+    /// development-gated here until the cache hook can represent the difference between a
+    /// retry-safe failure and a failure after Vulkan release side effects have occurred.
     #[allow(dead_code)]
     fn release_retired_wayland_texture_for_cache(
         &mut self,
@@ -2281,17 +2281,9 @@ impl VulkanRenderer {
             return Ok(());
         }
 
-        let export_sync_file = self
-            .device
-            .as_ref()
-            .is_some_and(VulkanDeviceState::can_export_sync_file);
-        let (released, _) =
-            self.release_imported_dmabuf_texture_to_foreign_general(texture, export_sync_file)?;
-        if released {
-            Ok(())
-        } else {
-            Err(VulkanError::UnsupportedOperation("sampled dmabuf cache release"))
-        }
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan texture-cache release retry contract",
+        ))
     }
 
     /// Release an acquired dmabuf texture and return the exported release fence as a [`SyncPoint`]
@@ -2578,6 +2570,13 @@ impl Renderer for VulkanRenderer {
 
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), Self::Error> {
         sync.wait().map_err(|_| VulkanError::SyncInterrupted)
+    }
+
+    fn release_imported_texture_for_surface_cache(
+        &mut self,
+        texture: &Self::TextureId,
+    ) -> Result<(), Self::Error> {
+        self.release_retired_wayland_texture_for_cache(texture)
     }
 
     fn cleanup_texture_cache(&mut self) -> Result<(), Self::Error> {

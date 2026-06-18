@@ -227,7 +227,7 @@ impl RendererSurfaceState {
                 #[cfg(not(feature = "backend_drm"))]
                 let has_explicit_sync_points = false;
 
-                self.textures.clear();
+                self.retire_textures();
 
                 // Explicit sync points are per commit, not per wl_buffer object. If the same
                 // wl_buffer is attached again with fresh sync points, refresh the renderer-managed
@@ -431,6 +431,7 @@ impl RendererSurfaceState {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn drop_retired_textures<T>(&mut self, id: ContextId<T>)
     where
         T: Texture + 'static,
@@ -625,7 +626,9 @@ where
         let mut data_ref = data.lock().unwrap();
         let data = &mut *data_ref;
 
-        data.drop_retired_textures(context_id);
+        data.drain_retired_textures(context_id, |texture| {
+            renderer.release_imported_texture_for_surface_cache(texture)
+        })?;
 
         let last_commit = data.renderer_seen.get(&erased_context_id);
         let buffer_damage = data.damage_since(last_commit.copied());
@@ -816,9 +819,14 @@ mod tests {
     #[cfg(feature = "backend_drm")]
     use super::ReleasePointSlot;
     use super::{RendererSurfaceState, should_replace_renderer_buffer};
-    use crate::backend::renderer::{ContextId, Texture};
+    use crate::backend::renderer::sync::SyncPoint;
+    use crate::backend::renderer::{Color32F, ContextId, Frame, ImportAll, Renderer, RendererSuper, Texture};
+    use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
+    use crate::wayland::compositor::{MultiCache, SurfaceData};
     #[cfg(feature = "backend_drm")]
     use crate::wayland::drm_syncobj::DrmSyncPoint;
+    use std::{error::Error, fmt, sync::Mutex};
+    use wayland_server::protocol::wl_buffer::WlBuffer;
 
     #[derive(Debug)]
     struct TestTexture(u32);
@@ -833,6 +841,160 @@ mod tests {
         }
 
         fn format(&self) -> Option<crate::backend::allocator::Fourcc> {
+            None
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TestError {
+        ReleaseFailed,
+    }
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                TestError::ReleaseFailed => f.write_str("release failed"),
+            }
+        }
+    }
+
+    impl Error for TestError {}
+
+    #[derive(Debug)]
+    struct TestFrame;
+
+    impl Frame for TestFrame {
+        type Error = TestError;
+        type TextureId = TestTexture;
+
+        fn context_id(&self) -> ContextId<Self::TextureId> {
+            unreachable!()
+        }
+
+        fn clear(&mut self, _color: Color32F, _at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn draw_solid(
+            &mut self,
+            _dst: Rectangle<i32, Physical>,
+            _damage: &[Rectangle<i32, Physical>],
+            _color: Color32F,
+        ) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn render_texture_from_to(
+            &mut self,
+            _texture: &Self::TextureId,
+            _src: Rectangle<f64, BufferCoord>,
+            _dst: Rectangle<i32, Physical>,
+            _damage: &[Rectangle<i32, Physical>],
+            _opaque_regions: &[Rectangle<i32, Physical>],
+            _src_transform: Transform,
+            _alpha: f32,
+        ) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn transformation(&self) -> Transform {
+            unreachable!()
+        }
+
+        fn output_size(&self) -> Size<i32, Physical> {
+            unreachable!()
+        }
+
+        fn wait(&mut self, _sync: &SyncPoint) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn finish(self) -> Result<SyncPoint, Self::Error> {
+            unreachable!()
+        }
+    }
+
+    #[derive(Debug)]
+    struct HookRenderer {
+        context_id: ContextId<TestTexture>,
+        fail_release: bool,
+        released: Vec<u32>,
+    }
+
+    impl RendererSuper for HookRenderer {
+        type Error = TestError;
+        type TextureId = TestTexture;
+        type Framebuffer<'buffer> = TestTexture;
+        type Frame<'frame, 'buffer>
+            = TestFrame
+        where
+            'buffer: 'frame,
+            Self: 'frame;
+    }
+
+    impl Renderer for HookRenderer {
+        fn context_id(&self) -> ContextId<Self::TextureId> {
+            self.context_id.clone()
+        }
+
+        fn downscale_filter(
+            &mut self,
+            _filter: crate::backend::renderer::TextureFilter,
+        ) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn upscale_filter(
+            &mut self,
+            _filter: crate::backend::renderer::TextureFilter,
+        ) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn set_debug_flags(&mut self, _flags: crate::backend::renderer::DebugFlags) {
+            unreachable!()
+        }
+
+        fn debug_flags(&self) -> crate::backend::renderer::DebugFlags {
+            unreachable!()
+        }
+
+        fn render<'frame, 'buffer>(
+            &'frame mut self,
+            _framebuffer: &'frame mut Self::Framebuffer<'buffer>,
+            _output_size: Size<i32, Physical>,
+            _dst_transform: Transform,
+        ) -> Result<Self::Frame<'frame, 'buffer>, Self::Error>
+        where
+            'buffer: 'frame,
+        {
+            unreachable!()
+        }
+
+        fn wait(&mut self, _sync: &SyncPoint) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn release_imported_texture_for_surface_cache(
+            &mut self,
+            texture: &Self::TextureId,
+        ) -> Result<(), Self::Error> {
+            self.released.push(texture.0);
+            if self.fail_release {
+                Err(TestError::ReleaseFailed)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ImportAll for HookRenderer {
+        fn import_buffer(
+            &mut self,
+            _buffer: &WlBuffer,
+            _surface: Option<&SurfaceData>,
+            _damage: &[Rectangle<i32, BufferCoord>],
+        ) -> Option<Result<Self::TextureId, Self::Error>> {
             None
         }
     }
@@ -912,6 +1074,59 @@ mod tests {
             .unwrap();
         assert_eq!(released, vec![9, 10]);
         assert!(!state.retired_textures.contains_key(&context_id.erased()));
+    }
+
+    #[test]
+    fn import_surface_drains_retired_textures_through_renderer_hook() {
+        let context_id = ContextId::<TestTexture>::new();
+        let mut state = RendererSurfaceState::default();
+        state
+            .textures
+            .insert(context_id.erased(), Box::new(TestTexture(12)));
+        state.retire_textures();
+
+        let states = SurfaceData {
+            role: None,
+            data_map: Default::default(),
+            cached_state: MultiCache::new(),
+        };
+        states.data_map.insert_if_missing_threadsafe(|| Mutex::new(state));
+
+        let mut renderer = HookRenderer {
+            context_id: context_id.clone(),
+            fail_release: true,
+            released: Vec::new(),
+        };
+
+        assert_eq!(
+            super::import_surface(&mut renderer, &states),
+            Err(TestError::ReleaseFailed)
+        );
+        assert_eq!(renderer.released, vec![12]);
+        let retained = states
+            .data_map
+            .get::<super::RendererSurfaceStateUserData>()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .retired_textures
+            .get(&context_id.erased())
+            .map(Vec::len);
+        assert_eq!(retained, Some(1));
+
+        renderer.fail_release = false;
+        super::import_surface(&mut renderer, &states).unwrap();
+        assert_eq!(renderer.released, vec![12, 12]);
+        assert!(
+            !states
+                .data_map
+                .get::<super::RendererSurfaceStateUserData>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .retired_textures
+                .contains_key(&context_id.erased())
+        );
     }
 
     #[cfg(feature = "backend_drm")]

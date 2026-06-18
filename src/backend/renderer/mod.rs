@@ -483,6 +483,21 @@ pub trait Renderer: RendererSuper {
     /// Wait for a [`SyncPoint`] to be signaled
     fn wait(&mut self, sync: &sync::SyncPoint) -> Result<(), Self::Error>;
 
+    /// Release a texture retired from renderer-managed Wayland surface-state caching.
+    ///
+    /// This hook runs while a renderer is available, before the generic surface cache drops a
+    /// superseded texture. Renderers with additional external release obligations may override it;
+    /// ordinary textures can use the default no-op behavior.
+    ///
+    /// Returning an error must be retry-safe: the surface cache keeps the texture retired and may
+    /// call this hook again later.
+    fn release_imported_texture_for_surface_cache(
+        &mut self,
+        _texture: &Self::TextureId,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Forcibly clean up the renderer internal texture cache
     ///
     /// Note: Resources used by the renderer will be implicitly cleaned-up after finishing
