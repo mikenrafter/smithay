@@ -62,6 +62,25 @@ pub(super) struct VulkanSolidColorDrawConstants {
     pub(super) color: [f32; 4],
 }
 
+/// Error classification for releasing a sampled dmabuf image to foreign ownership.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum VulkanSampledDmabufForeignReleaseError {
+    /// The release was not submitted; renderer-local ownership state may be retried.
+    RetrySafe(VulkanError),
+    /// Queue release submission was accepted; the same texture must not be retried as locally owned.
+    ReleaseSubmitted(VulkanError),
+}
+
+impl VulkanSampledDmabufForeignReleaseError {
+    pub(crate) fn into_inner(self) -> VulkanError {
+        match self {
+            VulkanSampledDmabufForeignReleaseError::RetrySafe(err)
+            | VulkanSampledDmabufForeignReleaseError::ReleaseSubmitted(err) => err,
+        }
+    }
+}
+
 pub(super) struct VulkanExternalMemoryDeviceFunctions {
     #[allow(dead_code)]
     pub(super) image_drm_format_modifier: ext::image_drm_format_modifier::Device,
@@ -1520,14 +1539,31 @@ impl VulkanDeviceState {
         image: &VulkanOwnedImage,
         release_semaphore: Option<&VulkanSyncFileSemaphore>,
     ) -> Result<bool, VulkanError> {
-        let mut command_buffer = self.allocate_graphics_command_buffer()?;
-        self.begin_command_buffer(&mut command_buffer)?;
-        if !self.record_sampled_dmabuf_foreign_release_barrier(&mut command_buffer, image)? {
+        self.submit_sampled_dmabuf_foreign_release_classified(image, release_semaphore)
+            .map_err(VulkanSampledDmabufForeignReleaseError::into_inner)
+    }
+
+    #[allow(dead_code)]
+    fn submit_sampled_dmabuf_foreign_release_classified(
+        &self,
+        image: &VulkanOwnedImage,
+        release_semaphore: Option<&VulkanSyncFileSemaphore>,
+    ) -> Result<bool, VulkanSampledDmabufForeignReleaseError> {
+        let mut command_buffer = self
+            .allocate_graphics_command_buffer()
+            .map_err(VulkanSampledDmabufForeignReleaseError::RetrySafe)?;
+        self.begin_command_buffer(&mut command_buffer)
+            .map_err(VulkanSampledDmabufForeignReleaseError::RetrySafe)?;
+        if !self
+            .record_sampled_dmabuf_foreign_release_barrier(&mut command_buffer, image)
+            .map_err(VulkanSampledDmabufForeignReleaseError::RetrySafe)?
+        {
             return Ok(false);
         }
-        self.end_command_buffer(&mut command_buffer)?;
+        self.end_command_buffer(&mut command_buffer)
+            .map_err(VulkanSampledDmabufForeignReleaseError::RetrySafe)?;
 
-        if let Some(release_semaphore) = release_semaphore {
+        let release_result = if let Some(release_semaphore) = release_semaphore {
             let synchronization = VulkanSubmitSynchronization::default().signal_sync_file(release_semaphore);
             // SAFETY: This submit has no semaphore waits, and `submit_command_buffer_and_wait`
             // validates that the signal semaphore belongs to this device, is not duplicated in the
@@ -1536,11 +1572,14 @@ impl VulkanDeviceState {
                 self.submit_graphics_command_buffer_and_wait_with_synchronization(
                     &mut command_buffer,
                     &synchronization,
-                )?
-            };
+                )
+            }
         } else {
-            self.submit_graphics_command_buffer_and_wait(&mut command_buffer)?;
-        }
+            self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
+        };
+
+        release_result
+            .map_err(|err| classify_sampled_dmabuf_release_submit_error(command_buffer.state, err))?;
 
         Ok(true)
     }
@@ -1726,20 +1765,35 @@ impl VulkanDeviceState {
         image: &VulkanOwnedImage,
         export_sync_file: bool,
     ) -> Result<(bool, Option<OwnedFd>), VulkanError> {
-        ensure_dmabuf_external_image(image)?;
+        self.release_sampled_dmabuf_to_foreign_general_classified(image, export_sync_file)
+            .map_err(VulkanSampledDmabufForeignReleaseError::into_inner)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn release_sampled_dmabuf_to_foreign_general_classified(
+        &self,
+        image: &VulkanOwnedImage,
+        export_sync_file: bool,
+    ) -> Result<(bool, Option<OwnedFd>), VulkanSampledDmabufForeignReleaseError> {
+        ensure_dmabuf_external_image(image).map_err(VulkanSampledDmabufForeignReleaseError::RetrySafe)?;
         let release_semaphore = if export_sync_file {
-            Some(self.create_exportable_sync_file_semaphore()?)
+            Some(
+                self.create_exportable_sync_file_semaphore()
+                    .map_err(VulkanSampledDmabufForeignReleaseError::RetrySafe)?,
+            )
         } else {
             None
         };
         let Some(release_semaphore) = release_semaphore else {
-            if !self.submit_sampled_dmabuf_foreign_release(image, None)? {
+            if !self.submit_sampled_dmabuf_foreign_release_classified(image, None)? {
                 return Ok((false, None));
             }
             return Ok((true, None));
         };
 
-        let Some(submission) = self.submit_sampled_dmabuf_foreign_release_async(image, &release_semaphore)?
+        let Some(submission) = self
+            .submit_sampled_dmabuf_foreign_release_async(image, &release_semaphore)
+            .map_err(VulkanSampledDmabufForeignReleaseError::RetrySafe)?
         else {
             return Ok((false, None));
         };
@@ -1751,13 +1805,18 @@ impl VulkanDeviceState {
         // do not observe an unfenced pending release as complete.
         let release_sync_file = match unsafe { self.export_sync_file_semaphore(&release_semaphore) } {
             Ok(sync_file) => {
-                self.retain_graphics_submission(submission)?;
+                self.retain_graphics_submission(submission)
+                    .map_err(VulkanSampledDmabufForeignReleaseError::ReleaseSubmitted)?;
                 sync_file
             }
-            Err(err) if vulkan_error_invalidates_context(&err) => return Err(err),
+            Err(err) if vulkan_error_invalidates_context(&err) => {
+                return Err(VulkanSampledDmabufForeignReleaseError::ReleaseSubmitted(err));
+            }
             Err(err) => {
                 tracing::warn!(?err, "failed to export sampled dmabuf release fence");
-                submission.wait_complete()?;
+                submission
+                    .wait_complete()
+                    .map_err(VulkanSampledDmabufForeignReleaseError::ReleaseSubmitted)?;
                 None
             }
         };
@@ -5695,6 +5754,35 @@ enum VulkanCommandBufferState {
     /// completion and device loss was not reported. The command buffer handle must not be freed.
     SubmitCompletionUnknown,
     Invalid,
+}
+
+fn classify_sampled_dmabuf_release_submit_error(
+    state: VulkanCommandBufferState,
+    err: VulkanError,
+) -> VulkanSampledDmabufForeignReleaseError {
+    match state {
+        VulkanCommandBufferState::Submitted | VulkanCommandBufferState::SubmitCompletionUnknown => {
+            VulkanSampledDmabufForeignReleaseError::ReleaseSubmitted(err)
+        }
+        VulkanCommandBufferState::Initial
+        | VulkanCommandBufferState::Recording
+        | VulkanCommandBufferState::Executable
+        | VulkanCommandBufferState::Invalid => VulkanSampledDmabufForeignReleaseError::RetrySafe(err),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn classify_sampled_dmabuf_release_submit_error_for_tests(
+    submitted: bool,
+    completion_unknown: bool,
+    err: VulkanError,
+) -> VulkanSampledDmabufForeignReleaseError {
+    let state = match (submitted, completion_unknown) {
+        (_, true) => VulkanCommandBufferState::SubmitCompletionUnknown,
+        (true, false) => VulkanCommandBufferState::Submitted,
+        (false, false) => VulkanCommandBufferState::Executable,
+    };
+    classify_sampled_dmabuf_release_submit_error(state, err)
 }
 
 #[allow(dead_code)]

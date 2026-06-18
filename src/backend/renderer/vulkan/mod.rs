@@ -2293,8 +2293,8 @@ impl VulkanRenderer {
     ///
     /// Ordinary textures do not carry a sampled-dmabuf release obligation and can be dropped by the
     /// generic cache. Textures imported through the intended Wayland sampled-dmabuf path remain
-    /// development-gated here until the Vulkan device release helper can classify errors before and
-    /// after queue-release side effects under the surface-cache release outcome contract.
+    /// development-gated here until this hook is wired to the Vulkan device release helper's
+    /// queue-release classification under the surface-cache release outcome contract.
     #[allow(dead_code)]
     fn release_retired_wayland_texture_for_cache(
         &mut self,

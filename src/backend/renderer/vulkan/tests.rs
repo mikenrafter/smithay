@@ -33,16 +33,17 @@ use super::capabilities::{
     should_query_modifier_properties,
 };
 use super::device::{
-    VulkanDeviceState, VulkanDmabufExternalImageFormatProperties, VulkanSampledTexturePipelineShaders,
-    VulkanShaderSpirv, VulkanSharedImageSyncState, VulkanSubmitSynchronization, VulkanSyncFileImport,
-    VulkanSyncFileSemaphorePayloadState, dmabuf_import_memory_type_bits, dmabuf_plane_layouts,
-    dmabuf_render_target_foreign_acquire_barrier, dmabuf_render_target_foreign_release_barrier,
-    find_memory_type_index, image_copy_buffer_offset, image_copy_required_size, image_layout_transition,
-    plan_dmabuf_render_target_foreign_acquire_barrier, plan_dmabuf_render_target_foreign_release_barrier,
-    plan_sampled_dmabuf_foreign_acquire_barrier, plan_sampled_dmabuf_foreign_release_barrier,
-    project_dmabuf_render_target_sync_after_pending_acquire, sampled_dmabuf_foreign_acquire_barrier,
-    sampled_dmabuf_foreign_release_barrier, select_queue_families, tightly_packed_image_size,
-    validate_submit_wait_stage, vulkan_filter,
+    VulkanDeviceState, VulkanDmabufExternalImageFormatProperties, VulkanSampledDmabufForeignReleaseError,
+    VulkanSampledTexturePipelineShaders, VulkanShaderSpirv, VulkanSharedImageSyncState,
+    VulkanSubmitSynchronization, VulkanSyncFileImport, VulkanSyncFileSemaphorePayloadState,
+    classify_sampled_dmabuf_release_submit_error_for_tests, dmabuf_import_memory_type_bits,
+    dmabuf_plane_layouts, dmabuf_render_target_foreign_acquire_barrier,
+    dmabuf_render_target_foreign_release_barrier, find_memory_type_index, image_copy_buffer_offset,
+    image_copy_required_size, image_layout_transition, plan_dmabuf_render_target_foreign_acquire_barrier,
+    plan_dmabuf_render_target_foreign_release_barrier, plan_sampled_dmabuf_foreign_acquire_barrier,
+    plan_sampled_dmabuf_foreign_release_barrier, project_dmabuf_render_target_sync_after_pending_acquire,
+    sampled_dmabuf_foreign_acquire_barrier, sampled_dmabuf_foreign_release_barrier, select_queue_families,
+    tightly_packed_image_size, validate_submit_wait_stage, vulkan_filter,
 };
 use super::error::vulkan_api_result_invalidates_context;
 use super::format::is_10bit;
@@ -5270,6 +5271,34 @@ fn sampled_cache_release_point_failure_is_committed_side_effect() {
         Err(SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(
             VulkanError::UnsupportedOperation("sampled dmabuf release point signal")
         ))
+    ));
+}
+
+#[test]
+fn sampled_release_submit_errors_are_classified_by_queue_acceptance() {
+    assert!(matches!(
+        classify_sampled_dmabuf_release_submit_error_for_tests(
+            false,
+            false,
+            VulkanError::UnsupportedOperation("submit")
+        ),
+        VulkanSampledDmabufForeignReleaseError::RetrySafe(VulkanError::UnsupportedOperation("submit"))
+    ));
+    assert!(matches!(
+        classify_sampled_dmabuf_release_submit_error_for_tests(
+            true,
+            false,
+            VulkanError::UnsupportedOperation("submit")
+        ),
+        VulkanSampledDmabufForeignReleaseError::ReleaseSubmitted(VulkanError::UnsupportedOperation("submit"))
+    ));
+    assert!(matches!(
+        classify_sampled_dmabuf_release_submit_error_for_tests(
+            false,
+            true,
+            VulkanError::UnsupportedOperation("submit")
+        ),
+        VulkanSampledDmabufForeignReleaseError::ReleaseSubmitted(VulkanError::UnsupportedOperation("submit"))
     ));
 }
 
