@@ -2,8 +2,8 @@
 use crate::wayland::drm_syncobj::{DrmSyncPoint, DrmSyncobjCachedState};
 use crate::{
     backend::renderer::{
-        ContextId, ErasedContextId, ImportAll, Renderer, Texture, buffer_dimensions, buffer_has_alpha,
-        element::RenderElement,
+        ContextId, ErasedContextId, ImportAll, Renderer, SurfaceCacheTextureReleaseError, Texture,
+        buffer_dimensions, buffer_has_alpha, element::RenderElement,
     },
     utils::{Buffer as BufferCoord, Coordinate, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::{
@@ -397,7 +397,7 @@ impl RendererSurfaceState {
     ) -> Result<(), E>
     where
         T: Texture + 'static,
-        F: FnMut(&T) -> Result<(), E>,
+        F: FnMut(&T) -> Result<(), SurfaceCacheTextureReleaseError<E>>,
     {
         let erased = id.erased();
         let Some(textures) = self.retired_textures.remove(&erased) else {
@@ -408,15 +408,23 @@ impl RendererSurfaceState {
         let mut textures = textures.into_iter();
         while let Some(texture) = textures.next() {
             match texture.downcast::<T>() {
-                Ok(texture) => {
-                    if let Err(err) = release_texture(&texture) {
+                Ok(texture) => match release_texture(&texture) {
+                    Ok(()) => {}
+                    Err(SurfaceCacheTextureReleaseError::RetrySafe(err)) => {
                         let texture: Box<dyn Any> = texture;
                         retained.push(texture);
                         retained.extend(textures);
                         self.retired_textures.insert(erased, retained);
                         return Err(err);
                     }
-                }
+                    Err(SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(err)) => {
+                        retained.extend(textures);
+                        if !retained.is_empty() {
+                            self.retired_textures.insert(erased, retained);
+                        }
+                        return Err(err);
+                    }
+                },
                 Err(texture) => {
                     error!("Retired renderer texture did not match its context type");
                     retained.push(texture);
@@ -436,7 +444,9 @@ impl RendererSurfaceState {
     where
         T: Texture + 'static,
     {
-        if let Err(err) = self.drain_retired_textures(id, |_| Ok::<(), Infallible>(())) {
+        if let Err(err) =
+            self.drain_retired_textures(id, |_| Ok::<(), SurfaceCacheTextureReleaseError<Infallible>>(()))
+        {
             match err {}
         }
     }
@@ -820,7 +830,10 @@ mod tests {
     use super::ReleasePointSlot;
     use super::{RendererSurfaceState, should_replace_renderer_buffer};
     use crate::backend::renderer::sync::SyncPoint;
-    use crate::backend::renderer::{Color32F, ContextId, Frame, ImportAll, Renderer, RendererSuper, Texture};
+    use crate::backend::renderer::{
+        Color32F, ContextId, Frame, ImportAll, Renderer, RendererSuper, SurfaceCacheTextureReleaseError,
+        Texture,
+    };
     use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
     use crate::wayland::compositor::{MultiCache, SurfaceData};
     #[cfg(feature = "backend_drm")]
@@ -978,10 +991,12 @@ mod tests {
         fn release_imported_texture_for_surface_cache(
             &mut self,
             texture: &Self::TextureId,
-        ) -> Result<(), Self::Error> {
+        ) -> Result<(), SurfaceCacheTextureReleaseError<Self::Error>> {
             self.released.push(texture.0);
             if self.fail_release {
-                Err(TestError::ReleaseFailed)
+                Err(SurfaceCacheTextureReleaseError::RetrySafe(
+                    TestError::ReleaseFailed,
+                ))
             } else {
                 Ok(())
             }
@@ -1023,7 +1038,7 @@ mod tests {
         state
             .drain_retired_textures(context_id.clone(), |texture: &TestTexture| {
                 released.push(texture.0);
-                Ok::<(), ()>(())
+                Ok::<(), SurfaceCacheTextureReleaseError<()>>(())
             })
             .unwrap();
         assert_eq!(released, vec![7]);
@@ -1031,7 +1046,7 @@ mod tests {
         state
             .drain_retired_textures(context_id, |texture: &TestTexture| {
                 released.push(texture.0);
-                Ok::<(), ()>(())
+                Ok::<(), SurfaceCacheTextureReleaseError<()>>(())
             })
             .unwrap();
         assert_eq!(released, vec![7]);
@@ -1055,7 +1070,7 @@ mod tests {
             state.drain_retired_textures(context_id.clone(), |texture: &TestTexture| {
                 attempts += 1;
                 assert_eq!(texture.0, 9);
-                Err("release failed")
+                Err(SurfaceCacheTextureReleaseError::RetrySafe("release failed"))
             }),
             Err("release failed")
         );
@@ -1069,10 +1084,51 @@ mod tests {
         state
             .drain_retired_textures(context_id.clone(), |texture: &TestTexture| {
                 released.push(texture.0);
-                Ok::<(), ()>(())
+                Ok::<(), SurfaceCacheTextureReleaseError<()>>(())
             })
             .unwrap();
         assert_eq!(released, vec![9, 10]);
+        assert!(!state.retired_textures.contains_key(&context_id.erased()));
+    }
+
+    #[test]
+    fn retired_texture_release_side_effect_failure_drops_current_texture() {
+        let context_id = ContextId::<TestTexture>::new();
+        let mut state = RendererSurfaceState::default();
+        state
+            .textures
+            .insert(context_id.erased(), Box::new(TestTexture(21)));
+        state.retire_textures();
+        state
+            .textures
+            .insert(context_id.erased(), Box::new(TestTexture(22)));
+        state.retire_textures();
+
+        let mut attempts = 0;
+        assert_eq!(
+            state.drain_retired_textures(context_id.clone(), |texture: &TestTexture| {
+                attempts += 1;
+                assert_eq!(texture.0, 21);
+                Err(SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(
+                    "release side effects committed",
+                ))
+            }),
+            Err("release side effects committed")
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            state.retired_textures.get(&context_id.erased()).map(Vec::len),
+            Some(1)
+        );
+
+        let mut released = Vec::new();
+        state
+            .drain_retired_textures(context_id.clone(), |texture: &TestTexture| {
+                released.push(texture.0);
+                Ok::<(), SurfaceCacheTextureReleaseError<()>>(())
+            })
+            .unwrap();
+        assert_eq!(released, vec![22]);
         assert!(!state.retired_textures.contains_key(&context_id.erased()));
     }
 

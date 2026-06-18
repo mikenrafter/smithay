@@ -79,7 +79,8 @@ use crate::{
         },
         renderer::{
             Bind, Color32F, ContextId, DebugFlags, ExportMem, ImportDma, ImportMem, Offscreen,
-            RenderTargetLifecycle, Renderer, RendererSuper, Texture, TextureFilter,
+            RenderTargetLifecycle, Renderer, RendererSuper, SurfaceCacheTextureReleaseError, Texture,
+            TextureFilter,
             sync::{Fence, Interrupted, SyncPoint},
         },
     },
@@ -2270,31 +2271,45 @@ impl VulkanRenderer {
     ///
     /// Ordinary textures do not carry a sampled-dmabuf release obligation and can be dropped by the
     /// generic cache. Textures imported through the intended Wayland sampled-dmabuf path remain
-    /// development-gated here until the cache hook can represent the difference between a
-    /// retry-safe failure and a failure after Vulkan release side effects have occurred.
+    /// development-gated here until the Vulkan release helper can classify errors before and after
+    /// release side effects under the surface-cache release outcome contract.
     #[allow(dead_code)]
     fn release_retired_wayland_texture_for_cache(
         &mut self,
         texture: &VulkanTexture,
-    ) -> Result<(), VulkanError> {
+    ) -> Result<(), SurfaceCacheTextureReleaseError<VulkanError>> {
         if texture.sampled_dmabuf_release.is_none() {
             return Ok(());
         }
 
         if texture.context_id != self.context_id {
-            return Err(VulkanError::UnsupportedOperation("foreign dmabuf texture"));
+            return Err(SurfaceCacheTextureReleaseError::RetrySafe(
+                VulkanError::UnsupportedOperation("foreign dmabuf texture"),
+            ));
         }
         if texture.image.source != image::VulkanImageSource::DmabufImport {
-            return Err(VulkanError::UnsupportedOperation("dmabuf texture"));
+            return Err(SurfaceCacheTextureReleaseError::RetrySafe(
+                VulkanError::UnsupportedOperation("dmabuf texture"),
+            ));
         }
-        let _sampled_image = texture
-            .sampled_image
+        let _sampled_image =
+            texture
+                .sampled_image
+                .as_ref()
+                .ok_or(SurfaceCacheTextureReleaseError::RetrySafe(
+                    VulkanError::UnsupportedOperation("dmabuf texture sampled image"),
+                ))?;
+        let _device = self
+            .device
             .as_ref()
-            .ok_or(VulkanError::UnsupportedOperation("dmabuf texture sampled image"))?;
-        let _device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+            .ok_or(SurfaceCacheTextureReleaseError::RetrySafe(
+                VulkanError::VulkanUnavailable,
+            ))?;
 
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan texture-cache release retry contract",
+        Err(SurfaceCacheTextureReleaseError::RetrySafe(
+            VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan texture-cache release retry contract",
+            ),
         ))
     }
 
@@ -2587,7 +2602,7 @@ impl Renderer for VulkanRenderer {
     fn release_imported_texture_for_surface_cache(
         &mut self,
         texture: &Self::TextureId,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), SurfaceCacheTextureReleaseError<Self::Error>> {
         self.release_retired_wayland_texture_for_cache(texture)
     }
 

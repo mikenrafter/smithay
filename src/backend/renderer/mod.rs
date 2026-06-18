@@ -489,12 +489,13 @@ pub trait Renderer: RendererSuper {
     /// superseded texture. Renderers with additional external release obligations may override it;
     /// ordinary textures can use the default no-op behavior.
     ///
-    /// Returning an error must be retry-safe: the surface cache keeps the texture retired and may
-    /// call this hook again later.
+    /// Retry-safe errors keep the texture retired for a later attempt. Errors reported after release
+    /// side effects have committed drop the current retired texture and retain only later unprocessed
+    /// textures.
     fn release_imported_texture_for_surface_cache(
         &mut self,
         _texture: &Self::TextureId,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), SurfaceCacheTextureReleaseError<Self::Error>> {
         Ok(())
     }
 
@@ -522,6 +523,41 @@ pub trait Renderer: RendererSuper {
         self.cleanup_texture_cache()
     }
 }
+
+/// Error classification for releasing retired textures from renderer-managed Wayland surface caches.
+///
+/// The generic cache retains textures after retry-safe failures. If a renderer has already committed
+/// external release side effects before detecting an error, it must report that through
+/// [`SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted`] so the cache does not retry the
+/// same texture with stale ownership/layout state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceCacheTextureReleaseError<E> {
+    /// No release side effects occurred; the retired texture may be retained and retried later.
+    RetrySafe(E),
+    /// Release side effects may already have occurred; the current retired texture must not be retried.
+    ReleaseSideEffectsCommitted(E),
+}
+
+impl<E> SurfaceCacheTextureReleaseError<E> {
+    /// Return the wrapped renderer error.
+    pub fn into_inner(self) -> E {
+        match self {
+            SurfaceCacheTextureReleaseError::RetrySafe(err)
+            | SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(err) => err,
+        }
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for SurfaceCacheTextureReleaseError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SurfaceCacheTextureReleaseError::RetrySafe(err) => err.fmt(f),
+            SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(err) => err.fmt(f),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for SurfaceCacheTextureReleaseError<E> {}
 
 /// Trait for renderers that support creating offscreen framebuffers to render into.
 ///
