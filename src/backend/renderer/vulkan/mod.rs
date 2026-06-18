@@ -800,10 +800,24 @@ impl VulkanDmabufLoopbackImportEvidence {
 
 use self::{
     device::{
-        VulkanDeviceState, VulkanSyncFileSemaphore, image_copy_buffer_offset, tightly_packed_image_size,
+        VulkanDeviceState, VulkanSampledDmabufForeignReleaseError, VulkanSyncFileSemaphore,
+        image_copy_buffer_offset, tightly_packed_image_size,
     },
     format::{get_format_info, get_render_vk_format},
 };
+
+fn sampled_dmabuf_cache_device_release_error(
+    err: VulkanSampledDmabufForeignReleaseError,
+) -> SurfaceCacheTextureReleaseError<VulkanError> {
+    match err {
+        VulkanSampledDmabufForeignReleaseError::RetrySafe(err) => {
+            SurfaceCacheTextureReleaseError::RetrySafe(err)
+        }
+        VulkanSampledDmabufForeignReleaseError::ReleaseSubmitted(err) => {
+            SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(err)
+        }
+    }
+}
 
 #[derive(Debug)]
 struct VulkanSyncFileFence {
@@ -2293,8 +2307,10 @@ impl VulkanRenderer {
     ///
     /// Ordinary textures do not carry a sampled-dmabuf release obligation and can be dropped by the
     /// generic cache. Textures imported through the intended Wayland sampled-dmabuf path remain
-    /// development-gated here until this hook is wired to the Vulkan device release helper's
-    /// queue-release classification under the surface-cache release outcome contract.
+    /// development-gated by the same image ownership/layout preconditions as the explicit sampled
+    /// dmabuf release helper. Queue-release side effects are mapped into the generic surface-cache
+    /// release outcome contract so retry-safe failures retain the texture while accepted release
+    /// submissions are not retried as locally owned.
     #[allow(dead_code)]
     fn release_retired_wayland_texture_for_cache(
         &mut self,
@@ -2314,25 +2330,33 @@ impl VulkanRenderer {
                 VulkanError::UnsupportedOperation("dmabuf texture"),
             ));
         }
-        let _sampled_image =
+        let sampled_image =
             texture
                 .sampled_image
                 .as_ref()
                 .ok_or(SurfaceCacheTextureReleaseError::RetrySafe(
                     VulkanError::UnsupportedOperation("dmabuf texture sampled image"),
                 ))?;
-        let _device = self
+        let device = self
             .device
             .as_ref()
             .ok_or(SurfaceCacheTextureReleaseError::RetrySafe(
                 VulkanError::VulkanUnavailable,
             ))?;
 
-        Err(SurfaceCacheTextureReleaseError::RetrySafe(
-            VulkanError::MissingCapability(
-                "sampled dmabuf Wayland Vulkan texture-cache release retry contract",
-            ),
-        ))
+        let (released, release_sync_file) = device
+            .release_sampled_dmabuf_to_foreign_general_classified(sampled_image.image(), false)
+            .map_err(sampled_dmabuf_cache_device_release_error)?;
+        if !released {
+            return Err(SurfaceCacheTextureReleaseError::RetrySafe(
+                VulkanError::MissingCapability("sampled dmabuf Wayland Vulkan texture-cache release state"),
+            ));
+        }
+
+        self.complete_sampled_dmabuf_cache_release_after_device_release(
+            texture,
+            release_sync_file.as_ref().map(OwnedFd::as_fd),
+        )
     }
 
     /// Release an acquired dmabuf texture and return the exported release fence as a [`SyncPoint`]

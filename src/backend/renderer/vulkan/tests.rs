@@ -5303,6 +5303,24 @@ fn sampled_release_submit_errors_are_classified_by_queue_acceptance() {
 }
 
 #[test]
+fn sampled_cache_release_maps_device_release_classification() {
+    assert!(matches!(
+        sampled_dmabuf_cache_device_release_error(VulkanSampledDmabufForeignReleaseError::RetrySafe(
+            VulkanError::UnsupportedOperation("release")
+        )),
+        SurfaceCacheTextureReleaseError::RetrySafe(VulkanError::UnsupportedOperation("release"))
+    ));
+    assert!(matches!(
+        sampled_dmabuf_cache_device_release_error(VulkanSampledDmabufForeignReleaseError::ReleaseSubmitted(
+            VulkanError::UnsupportedOperation("release")
+        )),
+        SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(VulkanError::UnsupportedOperation(
+            "release"
+        ))
+    ));
+}
+
+#[test]
 fn public_export_mem_rejects_invalid_vulkan_targets_before_device_lookup() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let foreign_target = render_target_for_tests(
