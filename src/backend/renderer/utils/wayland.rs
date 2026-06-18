@@ -26,6 +26,47 @@ use super::{CommitCounter, DamageBag, DamageSet, DamageSnapshot, SurfaceView};
 use tracing::{error, instrument, warn};
 use wayland_server::protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface};
 
+#[cfg(feature = "backend_drm")]
+#[derive(Debug, Default)]
+struct ReleasePointSlot(Mutex<Option<DrmSyncPoint>>);
+
+#[cfg(feature = "backend_drm")]
+impl ReleasePointSlot {
+    fn new(release_point: Option<DrmSyncPoint>) -> Self {
+        Self(Mutex::new(release_point))
+    }
+
+    fn get(&self) -> Option<DrmSyncPoint> {
+        self.0
+            .lock()
+            .map(|release_point| release_point.as_ref().cloned())
+            .unwrap_or_else(|_| {
+                tracing::error!("Failed to lock syncobj release point");
+                None
+            })
+    }
+
+    fn take_for_renderer(&self) -> Option<DrmSyncPoint> {
+        self.0
+            .lock()
+            .map(|mut release_point| release_point.take())
+            .unwrap_or_else(|_| {
+                tracing::error!("Failed to lock syncobj release point");
+                None
+            })
+    }
+
+    fn signal_on_drop(&self) {
+        let Some(release_point) = self.take_for_renderer() else {
+            return;
+        };
+
+        if let Err(err) = release_point.signal() {
+            tracing::error!("Failed to signal syncobj release point: {}", err);
+        }
+    }
+}
+
 /// Type stored in WlSurface states data_map
 ///
 /// ```rs
@@ -62,7 +103,7 @@ struct InnerBuffer {
     #[cfg(feature = "backend_drm")]
     acquire_point: Option<DrmSyncPoint>,
     #[cfg(feature = "backend_drm")]
-    release_point: Option<DrmSyncPoint>,
+    release_point: ReleasePointSlot,
 }
 
 impl Drop for InnerBuffer {
@@ -70,11 +111,7 @@ impl Drop for InnerBuffer {
     fn drop(&mut self) {
         self.buffer.release();
         #[cfg(feature = "backend_drm")]
-        if let Some(release_point) = &self.release_point {
-            if let Err(err) = release_point.signal() {
-                tracing::error!("Failed to signal syncobj release point: {}", err);
-            }
-        }
+        self.release_point.signal_on_drop();
     }
 }
 
@@ -93,7 +130,7 @@ impl Buffer {
                 #[cfg(feature = "backend_drm")]
                 acquire_point: None,
                 #[cfg(feature = "backend_drm")]
-                release_point: None,
+                release_point: ReleasePointSlot::new(None),
             }),
         }
     }
@@ -105,7 +142,7 @@ impl Buffer {
             inner: Arc::new(InnerBuffer {
                 buffer,
                 acquire_point: Some(acquire_point),
-                release_point: Some(release_point),
+                release_point: ReleasePointSlot::new(Some(release_point)),
             }),
         }
     }
@@ -118,8 +155,14 @@ impl Buffer {
 
     #[cfg(feature = "backend_drm")]
     #[allow(dead_code)]
-    pub(crate) fn release_point(&self) -> Option<&DrmSyncPoint> {
-        self.inner.release_point.as_ref()
+    pub(crate) fn release_point(&self) -> Option<DrmSyncPoint> {
+        self.inner.release_point.get()
+    }
+
+    #[cfg(feature = "backend_drm")]
+    #[allow(dead_code)]
+    pub(crate) fn take_release_point_for_renderer(&self) -> Option<DrmSyncPoint> {
+        self.inner.release_point.take_for_renderer()
     }
 }
 
@@ -194,7 +237,7 @@ impl RendererSurfaceState {
                             #[cfg(feature = "backend_drm")]
                             acquire_point: syncobj_state.acquire_point.take(),
                             #[cfg(feature = "backend_drm")]
-                            release_point: syncobj_state.release_point.take(),
+                            release_point: ReleasePointSlot::new(syncobj_state.release_point.take()),
                         }),
                     });
                 }
@@ -707,7 +750,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "backend_drm")]
+    use super::ReleasePointSlot;
     use super::should_replace_renderer_buffer;
+    #[cfg(feature = "backend_drm")]
+    use crate::wayland::drm_syncobj::DrmSyncPoint;
 
     #[test]
     fn explicit_sync_points_refresh_same_renderer_buffer() {
@@ -715,5 +762,18 @@ mod tests {
         assert!(should_replace_renderer_buffer(true, false));
         assert!(should_replace_renderer_buffer(false, true));
         assert!(should_replace_renderer_buffer(true, true));
+    }
+
+    #[cfg(feature = "backend_drm")]
+    #[test]
+    fn release_point_slot_take_transfers_drop_responsibility() {
+        let slot = ReleasePointSlot::new(Some(DrmSyncPoint::invalid_for_tests(1).unwrap()));
+
+        assert!(slot.get().is_some());
+        let renderer_owned_release_point = slot.take_for_renderer().unwrap();
+        assert!(slot.get().is_none());
+
+        slot.signal_on_drop();
+        assert!(renderer_owned_release_point.signal().is_err());
     }
 }

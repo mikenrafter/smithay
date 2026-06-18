@@ -21,10 +21,11 @@
 //! `ImportDma`, texture `ExportMem`, `ExportDma`, broad explicit sync, blit/copy, and full
 //! presentation remain unsupported until their corresponding capability bits can become true with
 //! coverage. Sampled dmabuf import is validation-reachable through the explicit known-layout
-//! development helper and the normal `ImportDmaWl` path's staged guards. The normal Wayland path
-//! intentionally stops at Smithay's own Wayland/Vulkan interop policy guard until this fork models
-//! the initial external ownership/layout contract directly; it is not public-advertised through
-//! `ImportDma` yet.
+//! development helper and the normal `ImportDmaWl` path's staged guards. The normal Wayland path now
+//! models the policy context, explicit acquire/release sync evidence, first-import vs. reacquire
+//! history, and known-layout evidence identity, but production evidence sources remain
+//! development-gated and the Wayland release-point/cache lifecycle still needs an explicit Smithay
+//! ownership hook before this can be public-advertised through `ImportDma`.
 //!
 //! Intended implementation order:
 //!
@@ -145,12 +146,12 @@ enum SampledDmabufLayoutEvidence {
 
 /// Opaque evidence that a normal Wayland dmabuf commit satisfies Smithay's Vulkan interop policy.
 ///
-/// This is deliberately private and currently unconstructable in production code. The future policy
-/// must define, at minimum, the first-import external image layout, subsequent reacquire layout,
-/// queue-family ownership transfer, acquire synchronization, release synchronization, and texture
-/// cache invalidation rules for Wayland dmabufs. Keeping this as a separate evidence token prevents
-/// future work from treating `linux-dmabuf` protocol metadata or explicit sync alone as a Vulkan
-/// layout/ownership proof.
+/// This is deliberately private and currently unconstructable in production code. The surrounding
+/// scaffold already models the policy inputs separately: first-import/reacquire external state,
+/// queue-family ownership, acquire synchronization, release synchronization, and per-commit texture
+/// cache behavior. Keeping this as a separate evidence token prevents future work from treating
+/// `linux-dmabuf` protocol metadata or explicit sync alone as a Vulkan layout/ownership proof, and
+/// keeps the remaining production evidence sources and release lifecycle hooks explicit.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandVulkanInteropPolicy {
@@ -1018,7 +1019,7 @@ impl VulkanRenderer {
     ) -> Result<SampledDmabufReleaseEvidence, VulkanError> {
         #[cfg(feature = "backend_drm")]
         {
-            let Some(release_point) = buffer.release_point().cloned() else {
+            let Some(release_point) = buffer.release_point() else {
                 return Err(VulkanError::MissingCapability(
                     "sampled dmabuf release point contract",
                 ));
@@ -2618,9 +2619,9 @@ impl ImportDmaWl for VulkanRenderer {
 
         let texture = unsafe {
             // SAFETY: The validation-stage Wayland path above only produces layout evidence from
-            // Smithay's Wayland/Vulkan interop policy. First imports still fail closed until their
-            // ownership/layout policy is implemented; reacquires also require a current-commit
-            // producer return policy in addition to renderer-local release history.
+            // Smithay's Wayland/Vulkan interop policy. Production first-import and reacquire
+            // evidence sources still fail closed until the current Wayland/Vulkan external-state
+            // contract and release lifecycle hooks are implemented for the normal Smithay path.
             self.create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
                 dmabuf,
                 foreign_general,

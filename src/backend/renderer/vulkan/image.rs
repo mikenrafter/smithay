@@ -297,7 +297,7 @@ impl VulkanSampledDmabufRelease {
                 .lock()
                 .map_err(|_| VulkanError::UnsupportedOperation("sampled dmabuf release point"))?;
 
-            if let Some(release_point) = inner.wayland_release_point.take() {
+            if let Some(release_point) = inner.wayland_release_point.as_ref() {
                 if let Some(release_sync_file) = _release_sync_file {
                     if let Err(err) = release_point.import_sync_file(release_sync_file) {
                         tracing::warn!(?err, "failed to import sampled dmabuf release sync file");
@@ -311,6 +311,8 @@ impl VulkanSampledDmabufRelease {
                         "sampled dmabuf release point signal",
                     ));
                 }
+
+                inner.wayland_release_point = None;
             }
         }
 

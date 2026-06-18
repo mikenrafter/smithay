@@ -24,6 +24,8 @@ use crate::backend::renderer::{
 };
 use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
 use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+use crate::wayland::drm_syncobj::DrmSyncPoint;
 
 use super::capabilities::{
     format_usage_from_features, linear_tiling_supported, modifier_record_from_properties,
@@ -5037,6 +5039,40 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             .satisfy_wayland_release_once(Some(invalid_sync_file.as_fd()))
             .is_ok()
     );
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn sampled_dmabuf_release_keeps_wayland_point_after_failed_satisfaction() {
+    let release = VulkanSampledDmabufRelease::wayland_syncobj(DrmSyncPoint::invalid_for_tests(1).unwrap());
+
+    assert!(matches!(
+        release.signal_wayland_release_once(),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf release point signal"
+        ))
+    ));
+    assert!(matches!(
+        release.signal_wayland_release_once(),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf release point signal"
+        ))
+    ));
+
+    let release = VulkanSampledDmabufRelease::wayland_syncobj(DrmSyncPoint::invalid_for_tests(2).unwrap());
+    let invalid_sync_file = File::open("/dev/null").unwrap();
+    assert!(matches!(
+        release.satisfy_wayland_release_once(Some(invalid_sync_file.as_fd())),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf release point import sync file"
+        ))
+    ));
+    assert!(matches!(
+        release.satisfy_wayland_release_once(Some(invalid_sync_file.as_fd())),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf release point import sync file"
+        ))
+    ));
 }
 
 #[test]

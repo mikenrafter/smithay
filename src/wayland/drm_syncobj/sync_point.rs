@@ -123,6 +123,22 @@ impl DrmSyncPoint {
         self.point
     }
 
+    #[cfg(test)]
+    pub(crate) fn invalid_for_tests(point: u64) -> io::Result<Self> {
+        let timeline_fd = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)?;
+        let syncobj = drm::control::from_u32(1).expect("non-zero syncobj handle");
+        let dev_ctx = Mutex::new(DrmTimelineDeviceSpecific {
+            device: WeakDrmDeviceFd::new(),
+            syncobj,
+            event_fds: Vec::new(),
+        });
+
+        Ok(Self {
+            timeline: DrmTimeline(Arc::new(DrmTimelineInner { timeline_fd, dev_ctx })),
+            point,
+        })
+    }
+
     /// Create an eventfd that will be signaled by the syncpoint
     pub fn eventfd(&self) -> io::Result<Arc<OwnedFd>> {
         let fd = rustix::event::eventfd(
