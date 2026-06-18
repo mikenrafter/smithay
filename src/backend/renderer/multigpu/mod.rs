@@ -1094,8 +1094,9 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
     #[instrument(level = "trace", parent = &self.span, skip(self))]
@@ -1133,8 +1134,9 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
     #[instrument(level = "trace", parent = &self.span, skip(self, bind))]
@@ -1190,8 +1192,9 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
     fn target_age(&self, bind: &Target, age: usize) -> usize {
@@ -1265,7 +1268,7 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
@@ -1286,7 +1289,8 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
@@ -1975,7 +1979,7 @@ impl MultiTexture {
         Some(multi)
     }
 
-    fn release_direct_texture_for_renderer<A: GraphicsApi + 'static, E, F>(
+    fn release_direct_texture_for_renderer<A: GraphicsApi, E, F>(
         &self,
         render_id: &ContextId<<<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>,
         mut release: F,
@@ -2217,7 +2221,7 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
@@ -2331,8 +2335,9 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
     #[instrument(level = "trace", parent = &self.span, skip(self))]
@@ -2379,8 +2384,9 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
     #[instrument(level = "trace", parent = &self.span, skip(self))]
@@ -2442,7 +2448,7 @@ where
     R: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
@@ -2485,7 +2491,7 @@ where
     R: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
@@ -3252,8 +3258,9 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
     type TextureMapping = MultiTextureMapping<T, R>;
@@ -3356,7 +3363,7 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
@@ -3449,8 +3456,9 @@ where
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
     #[instrument(level = "trace", parent = &self.span, skip(self, from, to))]
@@ -3514,9 +3522,10 @@ where
     R::Error: 'static,
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: ExportMem + ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Frame<'frame, 'buffer>:
         FrameContext<'a, 'frame, 'buffer, <R::Device as ApiDevice>::Renderer> + 'a,
@@ -3642,9 +3651,10 @@ where
     R::Error: 'static,
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: ExportMem + ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Frame<'frame, 'buffer>:
         FrameContext<'a, 'frame, 'buffer, <R::Device as ApiDevice>::Renderer>,
@@ -3667,9 +3677,10 @@ where
     R::Error: 'static,
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: ExportMem + ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Frame<'frame, 'buffer>:
         FrameContext<'a, 'frame, 'buffer, <R::Device as ApiDevice>::Renderer>,
@@ -3794,7 +3805,7 @@ where
     R::Error: 'static,
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: ExportMem + ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -3823,7 +3834,7 @@ where
     R::Error: 'static,
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: ExportMem + ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -3855,7 +3866,7 @@ where
     R::Error: 'static,
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: ExportMem + ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -3905,7 +3916,7 @@ where
     R::Error: 'static,
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: ExportMem + ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -3967,7 +3978,7 @@ where
     R::Error: 'static,
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: ExportMem + ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -4011,7 +4022,7 @@ where
     R::Error: 'static,
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: ExportMem + ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -4053,7 +4064,7 @@ where
     R::Error: 'static,
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: ExportMem + ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -4122,7 +4133,7 @@ where
     R::Error: 'static,
     T::Error: 'static,
     <R::Device as ApiDevice>::Renderer: ExportMem + ImportDma + ImportMem,
-    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -4147,5 +4158,291 @@ where
             .as_mut()
             .blit(from_fb, to_fb, src, dst, filter)
             .map_err(Error::Render)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::allocator::Modifier;
+    use crate::backend::renderer::{DebugFlags, Frame, SurfaceCacheTextureReleaseError};
+    use std::error::Error as StdError;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestTexture(u32);
+
+    impl Texture for TestTexture {
+        fn size(&self) -> Size<i32, BufferCoords> {
+            (1, 1).into()
+        }
+
+        fn width(&self) -> u32 {
+            1
+        }
+
+        fn height(&self) -> u32 {
+            1
+        }
+
+        fn format(&self) -> Option<Fourcc> {
+            Some(Fourcc::Argb8888)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TestError {
+        Release,
+    }
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "test release error")
+        }
+    }
+
+    impl StdError for TestError {}
+
+    #[derive(Debug)]
+    struct TestFrame {
+        context_id: ContextId<TestTexture>,
+    }
+
+    impl Frame for TestFrame {
+        type Error = TestError;
+        type TextureId = TestTexture;
+
+        fn context_id(&self) -> ContextId<Self::TextureId> {
+            self.context_id.clone()
+        }
+
+        fn clear(&mut self, _color: Color32F, _at: &[Rectangle<i32, Physical>]) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn draw_solid(
+            &mut self,
+            _dst: Rectangle<i32, Physical>,
+            _damage: &[Rectangle<i32, Physical>],
+            _color: Color32F,
+        ) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn render_texture_from_to(
+            &mut self,
+            _texture: &Self::TextureId,
+            _src: Rectangle<f64, BufferCoords>,
+            _dst: Rectangle<i32, Physical>,
+            _damage: &[Rectangle<i32, Physical>],
+            _opaque_regions: &[Rectangle<i32, Physical>],
+            _src_transform: Transform,
+            _alpha: f32,
+        ) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn transformation(&self) -> Transform {
+            Transform::Normal
+        }
+
+        fn output_size(&self) -> Size<i32, Physical> {
+            (1, 1).into()
+        }
+
+        fn wait(&mut self, _sync: &SyncPoint) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn finish(self) -> Result<SyncPoint, Self::Error> {
+            Ok(SyncPoint::signaled())
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestRenderer {
+        context_id: ContextId<TestTexture>,
+    }
+
+    impl RendererSuper for TestRenderer {
+        type Error = TestError;
+        type TextureId = TestTexture;
+        type Framebuffer<'buffer> = TestTexture;
+        type Frame<'frame, 'buffer>
+            = TestFrame
+        where
+            'buffer: 'frame,
+            Self: 'frame;
+    }
+
+    impl Renderer for TestRenderer {
+        fn context_id(&self) -> ContextId<Self::TextureId> {
+            self.context_id.clone()
+        }
+
+        fn downscale_filter(&mut self, _filter: TextureFilter) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn upscale_filter(&mut self, _filter: TextureFilter) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn set_debug_flags(&mut self, _flags: DebugFlags) {
+            unreachable!()
+        }
+
+        fn debug_flags(&self) -> DebugFlags {
+            DebugFlags::empty()
+        }
+
+        fn render<'frame, 'buffer>(
+            &'frame mut self,
+            _framebuffer: &'frame mut Self::Framebuffer<'buffer>,
+            _output_size: Size<i32, Physical>,
+            _dst_transform: Transform,
+        ) -> Result<Self::Frame<'frame, 'buffer>, Self::Error>
+        where
+            'buffer: 'frame,
+        {
+            Ok(TestFrame {
+                context_id: self.context_id.clone(),
+            })
+        }
+
+        fn wait(&mut self, _sync: &SyncPoint) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestDevice {
+        renderer: TestRenderer,
+        node: DrmNode,
+    }
+
+    impl ApiDevice for TestDevice {
+        type Renderer = TestRenderer;
+
+        fn renderer(&self) -> &Self::Renderer {
+            &self.renderer
+        }
+
+        fn renderer_mut(&mut self) -> &mut Self::Renderer {
+            &mut self.renderer
+        }
+
+        fn allocator(&mut self) -> &mut dyn Allocator<Buffer = Dmabuf, Error = AnyError> {
+            unreachable!()
+        }
+
+        fn node(&self) -> &DrmNode {
+            &self.node
+        }
+
+        fn can_do_cross_device_imports(&self) -> bool {
+            false
+        }
+    }
+
+    struct TestApi;
+
+    impl GraphicsApi for TestApi {
+        type Device = TestDevice;
+        type Error = TestError;
+
+        fn enumerate(&self, _list: &mut Vec<Self::Device>) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn identifier() -> &'static str {
+            "test"
+        }
+    }
+
+    fn test_format() -> Format {
+        Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::Linear,
+        }
+    }
+
+    #[test]
+    fn direct_release_removes_entry_on_success() {
+        let context_id = ContextId::<TestTexture>::new();
+        let mut texture = MultiTexture::new((1, 1).into(), test_format());
+        texture.insert_texture::<TestApi>(&context_id, TestTexture(7));
+
+        let mut released = Vec::new();
+        texture
+            .release_direct_texture_for_renderer::<TestApi, TestError, _>(&context_id, |texture| {
+                released.push(texture.0);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(released, vec![7]);
+        assert_eq!(texture.get::<TestApi>(&context_id), None);
+    }
+
+    #[test]
+    fn direct_release_reinserts_entry_on_retry_safe_failure() {
+        let context_id = ContextId::<TestTexture>::new();
+        let mut texture = MultiTexture::new((1, 1).into(), test_format());
+        texture.insert_texture::<TestApi>(&context_id, TestTexture(9));
+
+        let err = texture
+            .release_direct_texture_for_renderer::<TestApi, TestError, _>(&context_id, |_| {
+                Err(SurfaceCacheTextureReleaseError::RetrySafe(TestError::Release))
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            SurfaceCacheTextureReleaseError::RetrySafe(TestError::Release)
+        ));
+        assert_eq!(texture.get::<TestApi>(&context_id), Some(TestTexture(9)));
+    }
+
+    #[test]
+    fn direct_release_drops_entry_after_committed_side_effect_failure() {
+        let context_id = ContextId::<TestTexture>::new();
+        let mut texture = MultiTexture::new((1, 1).into(), test_format());
+        texture.insert_texture::<TestApi>(&context_id, TestTexture(11));
+
+        let err = texture
+            .release_direct_texture_for_renderer::<TestApi, TestError, _>(&context_id, |_| {
+                Err(SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(
+                    TestError::Release,
+                ))
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(TestError::Release)
+        ));
+        assert_eq!(texture.get::<TestApi>(&context_id), None);
+    }
+
+    #[test]
+    fn non_direct_release_entry_is_not_forwarded() {
+        let context_id = ContextId::<TestTexture>::new();
+        let texture = MultiTexture::new((1, 1).into(), test_format());
+        texture.0.lock().unwrap().textures.insert(
+            context_id.erased(),
+            GpuSingleTexture::Mem {
+                external_shadow: None,
+                texture: Some(Box::new(TestTexture(13))),
+                mappings: None,
+            },
+        );
+
+        texture
+            .release_direct_texture_for_renderer::<TestApi, TestError, _>(&context_id, |_| {
+                panic!("non-direct texture release should not be forwarded")
+            })
+            .unwrap();
+
+        assert_eq!(texture.get::<TestApi>(&context_id), Some(TestTexture(13)));
     }
 }
