@@ -5216,9 +5216,18 @@ fn internal_dmabuf_texture_release_rejects_preconditions_before_device_lookup() 
         renderer.release_imported_dmabuf_texture_to_foreign_general(&memory_texture, false),
         Err(VulkanError::UnsupportedOperation("dmabuf texture"))
     ));
+    assert!(
+        renderer
+            .release_retired_wayland_texture_for_cache(&memory_texture)
+            .is_ok()
+    );
     let mut release_obligation_texture = missing_sampled_image_texture.clone();
     release_obligation_texture.sampled_dmabuf_release =
         Some(VulkanSampledDmabufRelease::validation_stage_without_wayland_point());
+    assert!(matches!(
+        renderer.release_retired_wayland_texture_for_cache(&release_obligation_texture),
+        Err(VulkanError::UnsupportedOperation("dmabuf texture sampled image"))
+    ));
     assert!(matches!(
         renderer.release_imported_dmabuf_texture_to_foreign_general(&release_obligation_texture, true),
         Err(VulkanError::UnsupportedOperation("dmabuf texture sampled image"))

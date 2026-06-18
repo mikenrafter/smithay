@@ -2266,6 +2266,34 @@ impl VulkanRenderer {
         Ok((released, release_sync_file))
     }
 
+    /// Release a cached Wayland texture before renderer surface-state drops it.
+    ///
+    /// Ordinary textures do not carry a sampled-dmabuf release obligation and can be dropped by the
+    /// generic cache. Textures imported through the intended Wayland sampled-dmabuf path must be
+    /// released back to foreign ownership before drop so the Wayland release point can be satisfied
+    /// only after Vulkan sampling is complete.
+    #[allow(dead_code)]
+    fn release_retired_wayland_texture_for_cache(
+        &mut self,
+        texture: &VulkanTexture,
+    ) -> Result<(), VulkanError> {
+        if texture.sampled_dmabuf_release.is_none() {
+            return Ok(());
+        }
+
+        let export_sync_file = self
+            .device
+            .as_ref()
+            .is_some_and(VulkanDeviceState::can_export_sync_file);
+        let (released, _) =
+            self.release_imported_dmabuf_texture_to_foreign_general(texture, export_sync_file)?;
+        if released {
+            Ok(())
+        } else {
+            Err(VulkanError::UnsupportedOperation("sampled dmabuf cache release"))
+        }
+    }
+
     /// Release an acquired dmabuf texture and return the exported release fence as a [`SyncPoint`]
     /// when available.
     ///
