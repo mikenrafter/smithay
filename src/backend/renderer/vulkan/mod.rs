@@ -55,7 +55,7 @@
 
 use std::{
     collections::HashMap,
-    os::fd::{AsFd, OwnedFd},
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
 };
 
 #[cfg(all(
@@ -2267,12 +2267,34 @@ impl VulkanRenderer {
         Ok((released, release_sync_file))
     }
 
+    /// Complete sampled-dmabuf cache release after Vulkan image release side effects occurred.
+    ///
+    /// Once the device release helper reports that the sampled image has been released to foreign
+    /// ownership in `GENERAL`, failures while satisfying the Wayland release point are no longer
+    /// retry-safe for the same texture. The generic surface cache must drop that retired texture and
+    /// retain only later unprocessed entries.
+    #[allow(dead_code)]
+    fn complete_sampled_dmabuf_cache_release_after_device_release(
+        &mut self,
+        texture: &VulkanTexture,
+        release_sync_file: Option<BorrowedFd<'_>>,
+    ) -> Result<(), SurfaceCacheTextureReleaseError<VulkanError>> {
+        texture
+            .signal_sampled_dmabuf_release_point(release_sync_file)
+            .map_err(SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted)?;
+        if let Some(dmabuf) = texture.sampled_dmabuf.as_ref().and_then(WeakDmabuf::upgrade) {
+            self.record_sampled_dmabuf_released_to_foreign_general(&dmabuf);
+        }
+
+        Ok(())
+    }
+
     /// Release a cached Wayland texture before renderer surface-state drops it.
     ///
     /// Ordinary textures do not carry a sampled-dmabuf release obligation and can be dropped by the
     /// generic cache. Textures imported through the intended Wayland sampled-dmabuf path remain
-    /// development-gated here until the Vulkan release helper can classify errors before and after
-    /// release side effects under the surface-cache release outcome contract.
+    /// development-gated here until the Vulkan device release helper can classify errors before and
+    /// after queue-release side effects under the surface-cache release outcome contract.
     #[allow(dead_code)]
     fn release_retired_wayland_texture_for_cache(
         &mut self,

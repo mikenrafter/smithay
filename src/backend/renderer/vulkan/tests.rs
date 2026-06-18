@@ -5254,6 +5254,25 @@ fn internal_dmabuf_texture_release_rejects_preconditions_before_device_lookup() 
     ));
 }
 
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn sampled_cache_release_point_failure_is_committed_side_effect() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let mut texture = texture_for_tests((1, 1).into(), Some(Fourcc::Abgr8888));
+    texture.context_id = renderer.context_id();
+    texture.image.source = VulkanImageSource::DmabufImport;
+    texture.sampled_dmabuf_release = Some(VulkanSampledDmabufRelease::wayland_syncobj(
+        DrmSyncPoint::invalid_for_tests(1).unwrap(),
+    ));
+
+    assert!(matches!(
+        renderer.complete_sampled_dmabuf_cache_release_after_device_release(&texture, None),
+        Err(SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(
+            VulkanError::UnsupportedOperation("sampled dmabuf release point signal")
+        ))
+    ));
+}
+
 #[test]
 fn public_export_mem_rejects_invalid_vulkan_targets_before_device_lookup() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
