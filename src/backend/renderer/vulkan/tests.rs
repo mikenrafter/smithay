@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     ffi::CStr,
     fs::File,
     marker::PhantomData,
@@ -4002,9 +4003,11 @@ fn public_dmabuf_import_gates_formats() {
         },
         Err(VulkanError::VulkanUnavailable)
     ));
-    let release_evidence = renderer
-        .validate_sampled_dmabuf_wayland_release_point_contract(&dmabuf, true)
-        .unwrap();
+    let release_ownership_called = Cell::new(false);
+    let release_ownership = || {
+        release_ownership_called.set(true);
+        panic!("release ownership must not be consumed before device lookup succeeds")
+    };
     assert!(matches!(
         // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
         // Vulkan import, fd import, ownership-transfer, or release signaling operation can occur.
@@ -4013,11 +4016,12 @@ fn public_dmabuf_import_gates_formats() {
                 &dmabuf,
                 known_layout_evidence,
                 Some(&SyncPoint::from(SignaledExportableFence)),
-                release_evidence,
+                release_ownership,
             )
         },
         Err(VulkanError::VulkanUnavailable)
     ));
+    assert!(!release_ownership_called.get());
 }
 
 #[test]
@@ -5125,22 +5129,21 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf release point contract"
         ))
     ));
-    let release_evidence = renderer
-        .validate_sampled_dmabuf_wayland_release_point_contract(&policy_dmabuf, true)
-        .unwrap();
-    let mismatched_release_evidence = renderer
-        .validate_sampled_dmabuf_wayland_release_point_contract(&unrelated_dmabuf, true)
-        .unwrap();
+    let release_ownership = SampledDmabufReleaseOwnership::new_for_tests(&policy_dmabuf);
+    let mismatched_release_ownership = SampledDmabufReleaseOwnership::new_for_tests(&unrelated_dmabuf);
     assert!(matches!(
-        renderer
-            .validate_sampled_dmabuf_release_lifecycle_contract(&policy_dmabuf, mismatched_release_evidence,),
+        renderer.validate_sampled_dmabuf_release_lifecycle_contract(
+            &policy_dmabuf,
+            &mismatched_release_ownership,
+        ),
         Err(VulkanError::UnsupportedOperation(
-            "sampled dmabuf release evidence identity"
+            "sampled dmabuf release ownership identity"
         ))
     ));
-    let release_obligation = renderer
-        .validate_sampled_dmabuf_release_lifecycle_contract(&policy_dmabuf, release_evidence)
+    renderer
+        .validate_sampled_dmabuf_release_lifecycle_contract(&policy_dmabuf, &release_ownership)
         .unwrap();
+    let release_obligation = release_ownership.into_release();
     assert!(release_obligation.signal_wayland_release_once().is_ok());
     assert!(release_obligation.signal_wayland_release_once().is_ok());
     let release = VulkanSampledDmabufRelease::validation_stage_without_wayland_point();

@@ -66,6 +66,8 @@ use std::{
 use crate::backend::renderer::ImportAll;
 #[cfg(feature = "wayland_frontend")]
 use crate::backend::renderer::{ImportDmaWl, ImportMemWl};
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+use crate::wayland::drm_syncobj::DrmSyncPoint;
 use crate::{
     backend::vulkan::PhysicalDevice,
     backend::{
@@ -495,7 +497,7 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
 /// `ImportDmaWl` path may construct [`SampledDmabufWaylandVulkanInteropPolicy`]. The default value
 /// is deliberately all-`None` so production remains fail-closed at the first missing policy step.
 #[allow(dead_code)]
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone)]
 struct SampledDmabufWaylandVulkanInteropPolicyContracts {
     /// Defines the external ownership and Vulkan image layout used for this commit, either through
     /// first-import policy or renderer-local reacquire history.
@@ -526,7 +528,6 @@ struct SampledDmabufWaylandVulkanInteropPolicyContracts {
 #[derive(Debug, Clone)]
 struct SampledDmabufReleaseEvidence {
     dmabuf: WeakDmabuf,
-    release: image::VulkanSampledDmabufRelease,
 }
 
 #[allow(dead_code)]
@@ -538,7 +539,7 @@ impl SampledDmabufReleaseEvidence {
 
 /// Evidence that the renderer, not generic Wayland buffer drop, owns the release point.
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct SampledDmabufReleaseOwnershipEvidence {
     dmabuf: WeakDmabuf,
 }
@@ -554,6 +555,41 @@ impl SampledDmabufReleaseOwnershipEvidence {
 
     fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
         self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+}
+
+/// Renderer-owned sampled dmabuf release obligation.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct SampledDmabufReleaseOwnership {
+    dmabuf: WeakDmabuf,
+    release: image::VulkanSampledDmabufRelease,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufReleaseOwnership {
+    #[cfg(test)]
+    fn new_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+            release: image::VulkanSampledDmabufRelease::validation_stage_without_wayland_point(),
+        }
+    }
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    fn wayland_syncobj(dmabuf: &Dmabuf, release_point: DrmSyncPoint) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+            release: image::VulkanSampledDmabufRelease::wayland_syncobj(release_point),
+        }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+
+    fn into_release(self) -> image::VulkanSampledDmabufRelease {
+        self.release
     }
 }
 
@@ -1067,15 +1103,14 @@ impl VulkanRenderer {
     ) -> Result<SampledDmabufReleaseEvidence, VulkanError> {
         #[cfg(feature = "backend_drm")]
         {
-            let Some(release_point) = buffer.release_point() else {
+            if buffer.release_point().is_none() {
                 return Err(VulkanError::MissingCapability(
                     "sampled dmabuf release point contract",
                 ));
-            };
+            }
 
             Ok(SampledDmabufReleaseEvidence {
                 dmabuf: dmabuf.weak(),
-                release: image::VulkanSampledDmabufRelease::wayland_syncobj(release_point),
             })
         }
 
@@ -1154,7 +1189,6 @@ impl VulkanRenderer {
         if has_release_point {
             Ok(SampledDmabufReleaseEvidence {
                 dmabuf: dmabuf.weak(),
-                release: image::VulkanSampledDmabufRelease::validation_stage_without_wayland_point(),
             })
         } else {
             Err(VulkanError::MissingCapability(
@@ -1578,10 +1612,11 @@ impl VulkanRenderer {
         &self,
         context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
     ) -> Result<SampledDmabufWaylandReleaseSyncPolicy, VulkanError> {
-        self.validate_sampled_dmabuf_release_lifecycle_contract(
-            context.dmabuf,
-            context.release_evidence.clone(),
-        )?;
+        if !context.release_evidence.is_for_dmabuf(context.dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf release evidence identity",
+            ));
+        }
         Ok(SampledDmabufWaylandReleaseSyncPolicy {
             dmabuf: context.dmabuf.weak(),
         })
@@ -1608,6 +1643,27 @@ impl VulkanRenderer {
             ));
         }
         Ok(release_ownership.clone())
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    fn sampled_dmabuf_take_wayland_release_ownership(
+        dmabuf: &Dmabuf,
+        #[cfg(feature = "backend_drm")] buffer: &super::utils::Buffer,
+        #[cfg(not(feature = "backend_drm"))] _buffer: &super::utils::Buffer,
+    ) -> SampledDmabufReleaseOwnership {
+        #[cfg(feature = "backend_drm")]
+        {
+            let release_point = buffer
+                .take_release_point_for_renderer()
+                .expect("sampled dmabuf release ownership validated before transfer");
+            SampledDmabufReleaseOwnership::wayland_syncobj(dmabuf, release_point)
+        }
+
+        #[cfg(not(feature = "backend_drm"))]
+        {
+            let _ = dmabuf;
+            unreachable!("sampled dmabuf release ownership requires backend_drm")
+        }
     }
 
     /// Validate texture-cache reuse policy for a normal Wayland dmabuf.
@@ -1773,26 +1829,24 @@ impl VulkanRenderer {
         }
     }
 
-    /// Convert release-point evidence into the renderer-owned release obligation for a sampled
-    /// dmabuf import.
+    /// Validate a move-only renderer-owned release obligation for a sampled dmabuf import.
     ///
-    /// The obligation is satisfied by [`VulkanRenderer::release_imported_dmabuf_texture_to_foreign_general`]
-    /// after Vulkan releases the sampled image back to foreign ownership. Synchronous releases signal
-    /// the Wayland release point directly; exported release fences are imported into the Wayland DRM
-    /// syncobj timeline point.
+    /// The ownership transfer itself is intentionally separate from cloneable release-point evidence.
+    /// This validator only checks that the already-owned obligation belongs to the same dmabuf before
+    /// texture construction moves it into [`VulkanTexture`].
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_release_lifecycle_contract(
         &self,
         dmabuf: &Dmabuf,
-        evidence: SampledDmabufReleaseEvidence,
-    ) -> Result<image::VulkanSampledDmabufRelease, VulkanError> {
+        evidence: &SampledDmabufReleaseOwnership,
+    ) -> Result<(), VulkanError> {
         if !evidence.is_for_dmabuf(dmabuf) {
             return Err(VulkanError::UnsupportedOperation(
-                "sampled dmabuf release evidence identity",
+                "sampled dmabuf release ownership identity",
             ));
         }
 
-        Ok(evidence.release)
+        Ok(())
     }
 
     fn render_target_format_supported(&self, format: Fourcc) -> bool {
@@ -1941,19 +1995,21 @@ impl VulkanRenderer {
     /// The caller must satisfy the same known-layout and acquire-sync requirements as
     /// [`VulkanRenderer::create_imported_dmabuf_texture_with_known_general_layout_and_sync_point`].
     #[allow(dead_code)]
-    unsafe fn create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
+    unsafe fn create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point<F>(
         &mut self,
         dmabuf: &Dmabuf,
         foreign_general: SampledDmabufKnownLayoutEvidence,
         acquire_sync: Option<&SyncPoint>,
-        release_evidence: SampledDmabufReleaseEvidence,
-    ) -> Result<Option<VulkanTexture>, VulkanError> {
+        release_ownership: F,
+    ) -> Result<Option<VulkanTexture>, VulkanError>
+    where
+        F: FnOnce() -> SampledDmabufReleaseOwnership,
+    {
         self.validate_sampled_dmabuf_known_layout_contract(
             dmabuf,
             SampledDmabufLayoutEvidence::KnownForeignGeneral(foreign_general),
         )?;
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
-        let release = self.validate_sampled_dmabuf_release_lifecycle_contract(dmabuf, release_evidence)?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
         let Some(sampled_image) = (unsafe {
             // SAFETY: Forwarded from this method's caller.
@@ -1967,6 +2023,9 @@ impl VulkanRenderer {
         else {
             return Ok(None);
         };
+        let release_ownership = release_ownership();
+        self.validate_sampled_dmabuf_release_lifecycle_contract(dmabuf, &release_ownership)?;
+        let release = release_ownership.into_release();
 
         Ok(Some(
             VulkanTexture::from_acquired_dmabuf_sampled_image_with_release(
@@ -2720,7 +2779,7 @@ impl ImportDmaWl for VulkanRenderer {
                 dmabuf,
                 foreign_general,
                 Some(acquire_sync.sync()),
-                release_evidence,
+                || Self::sampled_dmabuf_take_wayland_release_ownership(dmabuf, buffer),
             )?
         };
 
