@@ -383,6 +383,27 @@ impl SampledDmabufWaylandTextureCachePolicy {
     }
 }
 
+/// Evidence that texture-cache eviction/reset paths can release sampled dmabuf textures before drop.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SampledDmabufWaylandTextureCacheReleaseLifecycle {
+    dmabuf: WeakDmabuf,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufWaylandTextureCacheReleaseLifecycle {
+    #[cfg(test)]
+    fn new_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+        }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+}
+
 /// Renderer-local layout history available for a normal Wayland sampled-dmabuf commit.
 ///
 /// Wayland explicit sync can order producer completion, but it does not describe Vulkan image
@@ -417,6 +438,7 @@ struct SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
     first_import_foreign_general: Option<SampledDmabufKnownLayoutEvidence>,
     current_reacquire_layout: Option<SampledDmabufWaylandCurrentReacquireLayoutEvidence>,
     current_reacquire_foreign_general: Option<SampledDmabufKnownLayoutEvidence>,
+    texture_cache_release_lifecycle: Option<SampledDmabufWaylandTextureCacheReleaseLifecycle>,
 }
 
 #[allow(dead_code)]
@@ -449,6 +471,7 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
             first_import_foreign_general: None,
             current_reacquire_layout: None,
             current_reacquire_foreign_general: None,
+            texture_cache_release_lifecycle: None,
         }
     }
 
@@ -1542,9 +1565,10 @@ impl VulkanRenderer {
     ///
     /// The validation-stage normal path imports a fresh sampled dmabuf texture for each explicit-sync
     /// commit instead of reusing renderer-local image state across commit-specific acquire/release
-    /// points. Smithay's surface import cache clears renderer textures when explicit sync points are
-    /// present, and this renderer's `ImportDmaWl` implementation does not maintain a secondary
-    /// sampled-dmabuf texture cache.
+    /// points. That is not sufficient by itself: eviction, reset, and destruction paths must also be
+    /// able to release imported Vulkan sampled dmabuf textures before drop. Keep that lifecycle as a
+    /// separate token so the generic renderer-surface cache hook cannot be mistaken for a completed
+    /// Vulkan release path.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_texture_cache_policy(
         &self,
@@ -1553,6 +1577,17 @@ impl VulkanRenderer {
         if !context.per_commit_texture_import {
             return Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland Vulkan texture-cache policy",
+            ));
+        }
+
+        let Some(release_lifecycle) = context.texture_cache_release_lifecycle.as_ref() else {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan texture-cache release lifecycle",
+            ));
+        };
+        if !release_lifecycle.is_for_dmabuf(context.dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland texture-cache release lifecycle identity",
             ));
         }
 

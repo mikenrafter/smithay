@@ -4421,6 +4421,9 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             .validate_sampled_dmabuf_wayland_foreign_general_policy(&first_import_context)
             .is_ok()
     );
+    first_import_context.texture_cache_release_lifecycle = Some(
+        SampledDmabufWaylandTextureCacheReleaseLifecycle::new_for_tests(&policy_dmabuf),
+    );
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&first_import_context),
         Err(VulkanError::MissingCapability(
@@ -4633,6 +4636,9 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             current_reacquire_context.current_reacquire_layout.as_ref(),
         )
         .unwrap();
+    current_reacquire_context.texture_cache_release_lifecycle = Some(
+        SampledDmabufWaylandTextureCacheReleaseLifecycle::new_for_tests(&policy_dmabuf),
+    );
     assert!(
         renderer
             .validate_sampled_dmabuf_wayland_current_reacquire_layout_policy(&current_reacquire_context)
@@ -4756,13 +4762,47 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland Vulkan texture-cache policy"
         ))
     ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&policy_context),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan texture-cache release lifecycle"
+        ))
+    ));
+    let mut mismatched_cache_lifecycle_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
+        &policy_import,
+        &policy_acquire_evidence,
+        &policy_release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    mismatched_cache_lifecycle_context.texture_cache_release_lifecycle = Some(
+        SampledDmabufWaylandTextureCacheReleaseLifecycle::new_for_tests(&unrelated_dmabuf),
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&mismatched_cache_lifecycle_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland texture-cache release lifecycle identity"
+        ))
+    ));
+    let mut cache_lifecycle_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
+        &policy_import,
+        &policy_acquire_evidence,
+        &policy_release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    cache_lifecycle_context.texture_cache_release_lifecycle = Some(
+        SampledDmabufWaylandTextureCacheReleaseLifecycle::new_for_tests(&policy_dmabuf),
+    );
     assert!(
         renderer
-            .validate_sampled_dmabuf_wayland_texture_cache_policy(&policy_context)
+            .validate_sampled_dmabuf_wayland_texture_cache_policy(&cache_lifecycle_context)
             .is_ok()
     );
     let validated_cache_policy = renderer
-        .validate_sampled_dmabuf_wayland_texture_cache_policy(&policy_context)
+        .validate_sampled_dmabuf_wayland_texture_cache_policy(&cache_lifecycle_context)
         .unwrap();
     assert!(validated_cache_policy.is_for_dmabuf(&policy_dmabuf));
     assert!(!validated_cache_policy.is_for_dmabuf(&unrelated_dmabuf));
