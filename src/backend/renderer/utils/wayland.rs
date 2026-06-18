@@ -87,6 +87,7 @@ pub struct RendererSurfaceState {
     pub(crate) damage: DamageBag<i32, BufferCoord>,
     pub(crate) renderer_seen: HashMap<ErasedContextId, CommitCounter>,
     pub(crate) textures: HashMap<ErasedContextId, Box<dyn Any>>,
+    retired_textures: HashMap<ErasedContextId, Vec<Box<dyn Any>>>,
     pub(crate) surface_view: Option<SurfaceView>,
     pub(crate) opaque_regions: Vec<Rectangle<i32, Logical>>,
 }
@@ -388,6 +389,32 @@ impl RendererSurfaceState {
         self.textures.get(&id.erased()).and_then(|e| e.downcast_ref())
     }
 
+    pub(crate) fn drain_retired_textures<T, F>(&mut self, id: ContextId<T>, mut release_texture: F)
+    where
+        T: Texture + 'static,
+        F: FnMut(T),
+    {
+        let erased = id.erased();
+        let Some(textures) = self.retired_textures.remove(&erased) else {
+            return;
+        };
+
+        let mut retained = Vec::new();
+        for texture in textures {
+            match texture.downcast::<T>() {
+                Ok(texture) => release_texture(*texture),
+                Err(texture) => {
+                    error!("Retired renderer texture did not match its context type");
+                    retained.push(texture);
+                }
+            }
+        }
+
+        if !retained.is_empty() {
+            self.retired_textures.insert(erased, retained);
+        }
+    }
+
     /// Gets the opaque regions of this surface
     pub fn opaque_regions(&self) -> Option<&[Rectangle<i32, Logical>]> {
         // If the surface is unmapped there can be no opaque regions
@@ -416,6 +443,13 @@ impl RendererSurfaceState {
         self.surface_view = None;
         self.buffer_has_alpha = None;
         self.opaque_regions.clear();
+    }
+
+    #[allow(dead_code)]
+    fn retire_textures(&mut self) {
+        for (context_id, texture) in self.textures.drain() {
+            self.retired_textures.entry(context_id).or_default().push(texture);
+        }
     }
 }
 
@@ -561,13 +595,16 @@ where
     R::TextureId: 'static,
 {
     if let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() {
-        let context_id = renderer.context_id().erased();
+        let context_id = renderer.context_id();
+        let erased_context_id = context_id.erased();
         let mut data_ref = data.lock().unwrap();
         let data = &mut *data_ref;
 
-        let last_commit = data.renderer_seen.get(&context_id);
+        data.drain_retired_textures(context_id, drop);
+
+        let last_commit = data.renderer_seen.get(&erased_context_id);
         let buffer_damage = data.damage_since(last_commit.copied());
-        if let Entry::Vacant(e) = data.textures.entry(context_id.clone()) {
+        if let Entry::Vacant(e) = data.textures.entry(erased_context_id.clone()) {
             if let Some(buffer) = data.buffer.as_ref() {
                 // There is no point in importing a single pixel buffer
                 if matches!(
@@ -580,7 +617,8 @@ where
                 match renderer.import_buffer_from_surface_state(buffer, Some(states), &buffer_damage) {
                     Some(Ok(m)) => {
                         e.insert(Box::new(m));
-                        data.renderer_seen.insert(context_id, data.current_commit());
+                        data.renderer_seen
+                            .insert(erased_context_id, data.current_commit());
                     }
                     Some(Err(err)) => {
                         warn!("Error loading buffer: {}", err);
@@ -752,9 +790,27 @@ where
 mod tests {
     #[cfg(feature = "backend_drm")]
     use super::ReleasePointSlot;
-    use super::should_replace_renderer_buffer;
+    use super::{RendererSurfaceState, should_replace_renderer_buffer};
+    use crate::backend::renderer::{ContextId, Texture};
     #[cfg(feature = "backend_drm")]
     use crate::wayland::drm_syncobj::DrmSyncPoint;
+
+    #[derive(Debug)]
+    struct TestTexture(u32);
+
+    impl Texture for TestTexture {
+        fn width(&self) -> u32 {
+            1
+        }
+
+        fn height(&self) -> u32 {
+            1
+        }
+
+        fn format(&self) -> Option<crate::backend::allocator::Fourcc> {
+            None
+        }
+    }
 
     #[test]
     fn explicit_sync_points_refresh_same_renderer_buffer() {
@@ -762,6 +818,28 @@ mod tests {
         assert!(should_replace_renderer_buffer(true, false));
         assert!(should_replace_renderer_buffer(false, true));
         assert!(should_replace_renderer_buffer(true, true));
+    }
+
+    #[test]
+    fn retired_textures_are_drained_through_release_hook() {
+        let context_id = ContextId::<TestTexture>::new();
+        let mut state = RendererSurfaceState::default();
+        state
+            .textures
+            .insert(context_id.erased(), Box::new(TestTexture(7)));
+
+        state.retire_textures();
+        assert!(state.textures.is_empty());
+        assert!(state.texture(context_id.clone()).is_none());
+
+        let mut released = Vec::new();
+        state.drain_retired_textures(context_id.clone(), |texture: TestTexture| {
+            released.push(texture.0)
+        });
+        assert_eq!(released, vec![7]);
+
+        state.drain_retired_textures(context_id, |texture: TestTexture| released.push(texture.0));
+        assert_eq!(released, vec![7]);
     }
 
     #[cfg(feature = "backend_drm")]
