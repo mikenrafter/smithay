@@ -514,6 +514,8 @@ struct SampledDmabufWaylandVulkanInteropPolicyContracts {
     /// Defines how texture-cache reuse observes per-commit acquire/release obligations and avoids
     /// reusing stale host-side layout evidence.
     texture_cache_reuse: Option<SampledDmabufWaylandTextureCachePolicy>,
+    /// Proves the renderer owns the release point before a sampled dmabuf texture can be created.
+    release_ownership: Option<SampledDmabufReleaseOwnershipEvidence>,
 }
 
 /// Evidence that a Wayland release point exists for a sampled dmabuf.
@@ -1198,6 +1200,7 @@ impl VulkanRenderer {
             acquire_sync: Some(self.validate_sampled_dmabuf_wayland_acquire_sync_policy(context)?),
             release_sync: Some(self.validate_sampled_dmabuf_wayland_release_sync_policy(context)?),
             texture_cache_reuse: Some(self.validate_sampled_dmabuf_wayland_texture_cache_policy(context)?),
+            release_ownership: Some(self.validate_sampled_dmabuf_wayland_release_ownership_policy(context)?),
         })
     }
 
@@ -1567,9 +1570,9 @@ impl VulkanRenderer {
     /// Validate release-sync export/transfer policy for a normal Wayland dmabuf.
     ///
     /// The release evidence proves that a Wayland release point exists for this dmabuf. It is not an
-    /// ownership transfer by itself: the release-sync policy is produced only when same-dmabuf
-    /// ownership evidence also proves generic Wayland buffer drop will not signal that point while
-    /// Vulkan owns the sampled image release obligation.
+    /// ownership transfer by itself; the ownership-transfer policy is deliberately validated later,
+    /// after cache release lifecycle evidence, so the eventual `take_release_point_for_renderer()`
+    /// operation happens only after all earlier guards pass.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_release_sync_policy(
         &self,
@@ -1579,6 +1582,21 @@ impl VulkanRenderer {
             context.dmabuf,
             context.release_evidence.clone(),
         )?;
+        Ok(SampledDmabufWaylandReleaseSyncPolicy {
+            dmabuf: context.dmabuf.weak(),
+        })
+    }
+
+    /// Validate renderer ownership of the Wayland release point for a normal Wayland dmabuf.
+    ///
+    /// This is the final validation-stage ownership guard before the intended path may create a
+    /// sampled dmabuf texture with a release obligation. Production must replace this test-only token
+    /// with an actual `Buffer::take_release_point_for_renderer()` transfer at the same late point.
+    #[allow(dead_code)]
+    fn validate_sampled_dmabuf_wayland_release_ownership_policy(
+        &self,
+        context: &SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
+    ) -> Result<SampledDmabufReleaseOwnershipEvidence, VulkanError> {
         let Some(release_ownership) = context.release_ownership.as_ref() else {
             return Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland release ownership transfer",
@@ -1589,9 +1607,7 @@ impl VulkanRenderer {
                 "sampled dmabuf Wayland release ownership identity",
             ));
         }
-        Ok(SampledDmabufWaylandReleaseSyncPolicy {
-            dmabuf: context.dmabuf.weak(),
-        })
+        Ok(release_ownership.clone())
     }
 
     /// Validate texture-cache reuse policy for a normal Wayland dmabuf.
@@ -1699,6 +1715,16 @@ impl VulkanRenderer {
         if !texture_cache_reuse.is_for_dmabuf(dmabuf) {
             return Err(VulkanError::UnsupportedOperation(
                 "sampled dmabuf Wayland texture-cache identity",
+            ));
+        }
+        let Some(release_ownership) = contracts.release_ownership.as_ref() else {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland release ownership transfer",
+            ));
+        };
+        if !release_ownership.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland release ownership identity",
             ));
         }
 

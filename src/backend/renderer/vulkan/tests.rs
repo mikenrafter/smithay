@@ -4744,8 +4744,18 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.validate_sampled_dmabuf_wayland_acquire_sync_policy(&implicit_policy_context),
         Err(VulkanError::NotPublicAdvertised("sampled dmabuf implicit sync"))
     ));
+    assert!(
+        renderer
+            .validate_sampled_dmabuf_wayland_release_sync_policy(&policy_context)
+            .is_ok()
+    );
+    let validated_release_policy = renderer
+        .validate_sampled_dmabuf_wayland_release_sync_policy(&policy_context)
+        .unwrap();
+    assert!(validated_release_policy.is_for_dmabuf(&policy_dmabuf));
+    assert!(!validated_release_policy.is_for_dmabuf(&unrelated_dmabuf));
     assert!(matches!(
-        renderer.validate_sampled_dmabuf_wayland_release_sync_policy(&policy_context),
+        renderer.validate_sampled_dmabuf_wayland_release_ownership_policy(&policy_context),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland release ownership transfer"
         ))
@@ -4762,7 +4772,8 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         SampledDmabufReleaseOwnershipEvidence::new_for_tests(&unrelated_dmabuf),
     );
     assert!(matches!(
-        renderer.validate_sampled_dmabuf_wayland_release_sync_policy(&mismatched_release_ownership_context),
+        renderer
+            .validate_sampled_dmabuf_wayland_release_ownership_policy(&mismatched_release_ownership_context),
         Err(VulkanError::UnsupportedOperation(
             "sampled dmabuf Wayland release ownership identity"
         ))
@@ -4780,14 +4791,9 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     ));
     assert!(
         renderer
-            .validate_sampled_dmabuf_wayland_release_sync_policy(&release_ownership_context)
+            .validate_sampled_dmabuf_wayland_release_ownership_policy(&release_ownership_context)
             .is_ok()
     );
-    let validated_release_policy = renderer
-        .validate_sampled_dmabuf_wayland_release_sync_policy(&release_ownership_context)
-        .unwrap();
-    assert!(validated_release_policy.is_for_dmabuf(&policy_dmabuf));
-    assert!(!validated_release_policy.is_for_dmabuf(&unrelated_dmabuf));
     let stale_cache_policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
         &policy_dmabuf,
         &policy_import,
@@ -4995,6 +5001,30 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     wayland_vulkan_contracts.texture_cache_reuse = Some(
         SampledDmabufWaylandTextureCachePolicy::new_for_tests(&policy_dmabuf),
     );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
+            &policy_dmabuf,
+            &wayland_vulkan_contracts,
+        ),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland release ownership transfer"
+        ))
+    ));
+    wayland_vulkan_contracts.release_ownership = Some(SampledDmabufReleaseOwnershipEvidence::new_for_tests(
+        &unrelated_dmabuf,
+    ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
+            &policy_dmabuf,
+            &wayland_vulkan_contracts,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland release ownership identity"
+        ))
+    ));
+    wayland_vulkan_contracts.release_ownership = Some(SampledDmabufReleaseOwnershipEvidence::new_for_tests(
+        &policy_dmabuf,
+    ));
     let smithay_wayland_policy = SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(
         renderer
             .validate_sampled_dmabuf_wayland_vulkan_interop_policy_contracts(
@@ -5023,6 +5053,9 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     );
     unrelated_wayland_vulkan_contracts.texture_cache_reuse = Some(
         SampledDmabufWaylandTextureCachePolicy::new_for_tests(&unrelated_dmabuf),
+    );
+    unrelated_wayland_vulkan_contracts.release_ownership = Some(
+        SampledDmabufReleaseOwnershipEvidence::new_for_tests(&unrelated_dmabuf),
     );
     let mismatched_smithay_wayland_policy = SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(
         renderer
