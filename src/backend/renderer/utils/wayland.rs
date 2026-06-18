@@ -19,6 +19,7 @@ use crate::{
 use std::{
     any::Any,
     collections::{HashMap, hash_map::Entry},
+    convert::Infallible,
     sync::{Arc, Mutex},
 };
 
@@ -389,20 +390,33 @@ impl RendererSurfaceState {
         self.textures.get(&id.erased()).and_then(|e| e.downcast_ref())
     }
 
-    pub(crate) fn drain_retired_textures<T, F>(&mut self, id: ContextId<T>, mut release_texture: F)
+    pub(crate) fn drain_retired_textures<T, E, F>(
+        &mut self,
+        id: ContextId<T>,
+        mut release_texture: F,
+    ) -> Result<(), E>
     where
         T: Texture + 'static,
-        F: FnMut(T),
+        F: FnMut(&T) -> Result<(), E>,
     {
         let erased = id.erased();
         let Some(textures) = self.retired_textures.remove(&erased) else {
-            return;
+            return Ok(());
         };
 
-        let mut retained = Vec::new();
-        for texture in textures {
+        let mut retained: Vec<Box<dyn Any>> = Vec::new();
+        let mut textures = textures.into_iter();
+        while let Some(texture) = textures.next() {
             match texture.downcast::<T>() {
-                Ok(texture) => release_texture(*texture),
+                Ok(texture) => {
+                    if let Err(err) = release_texture(&texture) {
+                        let texture: Box<dyn Any> = texture;
+                        retained.push(texture);
+                        retained.extend(textures);
+                        self.retired_textures.insert(erased, retained);
+                        return Err(err);
+                    }
+                }
                 Err(texture) => {
                     error!("Retired renderer texture did not match its context type");
                     retained.push(texture);
@@ -412,6 +426,17 @@ impl RendererSurfaceState {
 
         if !retained.is_empty() {
             self.retired_textures.insert(erased, retained);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn drop_retired_textures<T>(&mut self, id: ContextId<T>)
+    where
+        T: Texture + 'static,
+    {
+        if let Err(err) = self.drain_retired_textures(id, |_| Ok::<(), Infallible>(())) {
+            match err {}
         }
     }
 
@@ -600,7 +625,7 @@ where
         let mut data_ref = data.lock().unwrap();
         let data = &mut *data_ref;
 
-        data.drain_retired_textures(context_id, drop);
+        data.drop_retired_textures(context_id);
 
         let last_commit = data.renderer_seen.get(&erased_context_id);
         let buffer_damage = data.damage_since(last_commit.copied());
@@ -833,13 +858,60 @@ mod tests {
         assert!(state.texture(context_id.clone()).is_none());
 
         let mut released = Vec::new();
-        state.drain_retired_textures(context_id.clone(), |texture: TestTexture| {
-            released.push(texture.0)
-        });
+        state
+            .drain_retired_textures(context_id.clone(), |texture: &TestTexture| {
+                released.push(texture.0);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
         assert_eq!(released, vec![7]);
 
-        state.drain_retired_textures(context_id, |texture: TestTexture| released.push(texture.0));
+        state
+            .drain_retired_textures(context_id, |texture: &TestTexture| {
+                released.push(texture.0);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
         assert_eq!(released, vec![7]);
+    }
+
+    #[test]
+    fn retired_texture_release_failure_keeps_texture_retired() {
+        let context_id = ContextId::<TestTexture>::new();
+        let mut state = RendererSurfaceState::default();
+        state
+            .textures
+            .insert(context_id.erased(), Box::new(TestTexture(9)));
+        state.retire_textures();
+        state
+            .textures
+            .insert(context_id.erased(), Box::new(TestTexture(10)));
+        state.retire_textures();
+
+        let mut attempts = 0;
+        assert_eq!(
+            state.drain_retired_textures(context_id.clone(), |texture: &TestTexture| {
+                attempts += 1;
+                assert_eq!(texture.0, 9);
+                Err("release failed")
+            }),
+            Err("release failed")
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            state.retired_textures.get(&context_id.erased()).map(Vec::len),
+            Some(2)
+        );
+
+        let mut released = Vec::new();
+        state
+            .drain_retired_textures(context_id.clone(), |texture: &TestTexture| {
+                released.push(texture.0);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        assert_eq!(released, vec![9, 10]);
+        assert!(!state.retired_textures.contains_key(&context_id.erased()));
     }
 
     #[cfg(feature = "backend_drm")]
