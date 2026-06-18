@@ -49,8 +49,8 @@ use std::{
 
 use super::{
     Bind, Blit, BlitFrame, Color32F, ContextId, DebugFlags, ErasedContextId, ExportMem, Frame, ImportDma,
-    ImportMem, Offscreen, RenderTargetLifecycle, Renderer, RendererSuper, Texture, TextureFilter,
-    TextureMapping,
+    ImportMem, Offscreen, RenderTargetLifecycle, Renderer, RendererSuper, SurfaceCacheTextureReleaseError,
+    Texture, TextureFilter, TextureMapping,
     sync::{self, SyncPoint},
 };
 #[cfg(feature = "wayland_frontend")]
@@ -140,6 +140,20 @@ impl<R: GraphicsApi, T: GraphicsApi> Error<R, T> {
             Error::DeviceMissing => Error::DeviceMissing,
             Error::ImportFailed => Error::ImportFailed,
             Error::AllocatorError(a) => Error::AllocatorError(a),
+        }
+    }
+}
+
+fn map_surface_cache_release_error<E, F>(
+    err: SurfaceCacheTextureReleaseError<E>,
+    map: impl FnOnce(E) -> F,
+) -> SurfaceCacheTextureReleaseError<F> {
+    match err {
+        SurfaceCacheTextureReleaseError::RetrySafe(err) => {
+            SurfaceCacheTextureReleaseError::RetrySafe(map(err))
+        }
+        SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(err) => {
+            SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(map(err))
         }
     }
 }
@@ -1465,6 +1479,42 @@ where
         self.render.renderer_mut().wait(sync).map_err(Error::Render)
     }
 
+    fn release_imported_texture_for_surface_cache(
+        &mut self,
+        texture: &Self::TextureId,
+    ) -> Result<(), SurfaceCacheTextureReleaseError<Self::Error>> {
+        let render_context_id = self.render.renderer().context_id();
+        texture.release_direct_texture_for_renderer::<R, _, _>(&render_context_id, |texture| {
+            self.render
+                .renderer_mut()
+                .release_imported_texture_for_surface_cache(texture)
+                .map_err(|err| map_surface_cache_release_error(err, Error::Render))
+        })?;
+
+        if let Some(target) = self.target.as_mut() {
+            let target_context_id = target.device.renderer().context_id();
+            texture.release_direct_texture_for_renderer::<T, _, _>(&target_context_id, |texture| {
+                target
+                    .device
+                    .renderer_mut()
+                    .release_imported_texture_for_surface_cache(texture)
+                    .map_err(|err| map_surface_cache_release_error(err, Error::Target))
+            })?;
+        }
+
+        for other in &mut self.other_renderers {
+            let other_context_id = other.renderer().context_id();
+            texture.release_direct_texture_for_renderer::<R, _, _>(&other_context_id, |texture| {
+                other
+                    .renderer_mut()
+                    .release_imported_texture_for_surface_cache(texture)
+                    .map_err(|err| map_surface_cache_release_error(err, Error::Render))
+            })?;
+        }
+
+        Ok(())
+    }
+
     #[profiling::function]
     fn cleanup_texture_cache(&mut self) -> Result<(), Self::Error> {
         let mut result = Ok(());
@@ -1923,6 +1973,61 @@ impl MultiTexture {
         multi.0.lock().unwrap().format = texture.format();
         multi.insert_texture::<A>(render_id, texture);
         Some(multi)
+    }
+
+    fn release_direct_texture_for_renderer<A: GraphicsApi + 'static, E, F>(
+        &self,
+        render_id: &ContextId<<<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>,
+        mut release: F,
+    ) -> Result<(), SurfaceCacheTextureReleaseError<E>>
+    where
+        <<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
+        F: FnMut(
+            &<<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
+        ) -> Result<(), SurfaceCacheTextureReleaseError<E>>,
+    {
+        let render_id = render_id.erased();
+        let texture = {
+            let mut texture_ref = self.0.lock().unwrap();
+            match texture_ref.textures.remove(&render_id) {
+                Some(GpuSingleTexture::Direct(texture)) => texture,
+                Some(texture) => {
+                    texture_ref.textures.insert(render_id, texture);
+                    return Ok(());
+                }
+                None => return Ok(()),
+            }
+        };
+
+        let Some(texture_ref) =
+            texture.downcast_ref::<<<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>()
+        else {
+            warn!(
+                ?render_id,
+                "MultiTexture direct entry did not match renderer context type"
+            );
+            self.0
+                .lock()
+                .unwrap()
+                .textures
+                .insert(render_id, GpuSingleTexture::Direct(texture));
+            return Ok(());
+        };
+
+        match release(texture_ref) {
+            Ok(()) => Ok(()),
+            Err(SurfaceCacheTextureReleaseError::RetrySafe(err)) => {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .textures
+                    .insert(render_id, GpuSingleTexture::Direct(texture));
+                Err(SurfaceCacheTextureReleaseError::RetrySafe(err))
+            }
+            Err(SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(err)) => {
+                Err(SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(err))
+            }
+        }
     }
 
     /// Attempt to get a texture of type `T: Renderer::TextureId` given the renderer type `A` for the given `DrmNode`.
@@ -3633,6 +3738,41 @@ where
 
     fn wait(&mut self, sync: &sync::SyncPoint) -> Result<(), Self::Error> {
         self.guard.as_mut().wait(sync).map_err(Error::Render)
+    }
+
+    fn release_imported_texture_for_surface_cache(
+        &mut self,
+        texture: &Self::TextureId,
+    ) -> Result<(), SurfaceCacheTextureReleaseError<Self::Error>> {
+        let render_context_id = self.guard.as_ref().context_id();
+        texture.release_direct_texture_for_renderer::<R, _, _>(&render_context_id, |texture| {
+            self.guard
+                .as_mut()
+                .release_imported_texture_for_surface_cache(texture)
+                .map_err(|err| map_surface_cache_release_error(err, Error::Render))
+        })?;
+
+        if let Some(target) = self.target.as_mut() {
+            let target_context_id = target.renderer().context_id();
+            texture.release_direct_texture_for_renderer::<T, _, _>(&target_context_id, |texture| {
+                target
+                    .renderer_mut()
+                    .release_imported_texture_for_surface_cache(texture)
+                    .map_err(|err| map_surface_cache_release_error(err, Error::Target))
+            })?;
+        }
+
+        for other in &mut *self.other_renderers {
+            let other_context_id = other.renderer().context_id();
+            texture.release_direct_texture_for_renderer::<R, _, _>(&other_context_id, |texture| {
+                other
+                    .renderer_mut()
+                    .release_imported_texture_for_surface_cache(texture)
+                    .map_err(|err| map_surface_cache_release_error(err, Error::Render))
+            })?;
+        }
+
+        Ok(())
     }
 
     fn cleanup_texture_cache(&mut self) -> Result<(), Self::Error> {
