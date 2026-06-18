@@ -504,6 +504,11 @@ impl RendererSurfaceState {
 /// not be accessible anymore, but [`draw_render_elements`] and other
 /// `draw_*` helpers of the [desktop module](`crate::desktop`) will
 /// become usable for surfaces handled this way.
+///
+/// If a renderer needs explicit release work before cached surface textures are dropped, call
+/// [`retire_and_release_surface_tree_textures`] while that renderer is still available and before a
+/// known no-next-import teardown/reset point. The destruction hook installed by this function cannot
+/// do renderer-specific cleanup because it has no renderer access.
 #[profiling::function]
 pub fn on_commit_buffer_handler<D: 'static>(surface: &WlSurface) {
     if !is_sync_subsurface(surface) {
@@ -749,6 +754,64 @@ where
             Err(err)
         }
     }
+}
+
+/// Retire and release renderer-managed textures for every surface in a tree.
+///
+/// This is an explicit renderer-available lifecycle hook for compositors that know a surface tree
+/// will not be imported/rendered again with this renderer before it is unmapped, destroyed, or
+/// otherwise reset through [`on_commit_buffer_handler`]. It is intentionally generic: renderers with
+/// external release obligations use [`Renderer::release_imported_texture_for_surface_cache`], while
+/// renderers without such obligations keep the default no-op release hook.
+///
+/// Unlike [`render_elements_from_surface_tree`](crate::backend::renderer::element::surface::render_elements_from_surface_tree),
+/// this helper traverses through unmapped or no-buffer surfaces. That makes it suitable for a
+/// compositor-controlled no-next-import/teardown point, but it also means it must not be called for a
+/// surface tree that is about to be rendered normally in the same frame: cached textures for this
+/// renderer are retired unconditionally and a later render will have to import them again.
+/// Callers must also ensure no already-created render elements, active frame, or other renderer-local
+/// texture users will sample these cached textures after this helper returns.
+///
+/// If this helper returns an error, cleanup may be partial: the surface that failed may already have
+/// had its texture retired, and later children or siblings may not have been visited. Callers that
+/// require renderer-specific release before teardown should retry or avoid resetting/dropping the
+/// affected surface state until this helper succeeds, unless they explicitly accept the remaining
+/// renderer obligations.
+///
+/// This helper cannot make surface destruction cleanup automatic, because destruction hooks do not
+/// have access to a renderer. Callers that need renderer-specific release before teardown must invoke
+/// this while the renderer is still available and before the generic surface state is reset.
+#[instrument(level = "trace", skip(renderer, surface))]
+#[profiling::function]
+pub fn retire_and_release_surface_tree_textures<R>(
+    renderer: &mut R,
+    surface: &WlSurface,
+) -> Result<(), R::Error>
+where
+    R: Renderer,
+    R::TextureId: 'static,
+{
+    let mut result = Ok(());
+    with_surface_tree_downward(
+        surface,
+        (),
+        |_surface, states, _| {
+            if result.is_err() {
+                return TraversalAction::SkipChildren;
+            }
+
+            if let Err(err) = retire_and_release_surface_textures(renderer, states) {
+                result = Err(err);
+                TraversalAction::SkipChildren
+            } else {
+                TraversalAction::DoChildren(())
+            }
+        },
+        |_, _, _| {},
+        |_, _, _| true,
+    );
+
+    result
 }
 
 /// Imports buffers of a surface using a given [`Renderer`]
