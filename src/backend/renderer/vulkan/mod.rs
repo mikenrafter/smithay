@@ -2281,6 +2281,18 @@ impl VulkanRenderer {
             return Ok(());
         }
 
+        if texture.context_id != self.context_id {
+            return Err(VulkanError::UnsupportedOperation("foreign dmabuf texture"));
+        }
+        if texture.image.source != image::VulkanImageSource::DmabufImport {
+            return Err(VulkanError::UnsupportedOperation("dmabuf texture"));
+        }
+        let _sampled_image = texture
+            .sampled_image
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("dmabuf texture sampled image"))?;
+        let _device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan texture-cache release retry contract",
         ))

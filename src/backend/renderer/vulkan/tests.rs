@@ -5227,15 +5227,11 @@ fn internal_dmabuf_texture_release_rejects_preconditions_before_device_lookup() 
         Some(VulkanSampledDmabufRelease::validation_stage_without_wayland_point());
     assert!(matches!(
         renderer.release_retired_wayland_texture_for_cache(&release_obligation_texture),
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan texture-cache release retry contract"
-        ))
+        Err(VulkanError::UnsupportedOperation("dmabuf texture sampled image"))
     ));
     assert!(matches!(
         Renderer::release_imported_texture_for_surface_cache(&mut renderer, &release_obligation_texture),
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan texture-cache release retry contract"
-        ))
+        Err(VulkanError::UnsupportedOperation("dmabuf texture sampled image"))
     ));
     assert!(matches!(
         renderer.release_imported_dmabuf_texture_to_foreign_general(&release_obligation_texture, true),
