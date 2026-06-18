@@ -487,6 +487,12 @@ impl RendererSurfaceState {
             self.retired_textures.entry(context_id).or_default().push(texture);
         }
     }
+
+    fn retire_texture_for_context(&mut self, context_id: ErasedContextId) {
+        if let Some(texture) = self.textures.remove(&context_id) {
+            self.retired_textures.entry(context_id).or_default().push(texture);
+        }
+    }
 }
 
 /// Handler to let smithay take over buffer management.
@@ -616,6 +622,135 @@ where
     })
 }
 
+fn release_retired_textures<T, E, F>(
+    textures: Vec<Box<dyn Any>>,
+    mut release_texture: F,
+) -> Result<Vec<Box<dyn Any>>, (E, Vec<Box<dyn Any>>)>
+where
+    T: Texture + 'static,
+    F: FnMut(&T) -> Result<(), SurfaceCacheTextureReleaseError<E>>,
+{
+    let mut retained: Vec<Box<dyn Any>> = Vec::new();
+    let mut textures = textures.into_iter();
+    while let Some(texture) = textures.next() {
+        match texture.downcast::<T>() {
+            Ok(texture) => match release_texture(&texture) {
+                Ok(()) => {}
+                Err(SurfaceCacheTextureReleaseError::RetrySafe(err)) => {
+                    let texture: Box<dyn Any> = texture;
+                    retained.push(texture);
+                    retained.extend(textures);
+                    return Err((err, retained));
+                }
+                Err(SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(err)) => {
+                    retained.extend(textures);
+                    return Err((err, retained));
+                }
+            },
+            Err(texture) => {
+                error!("Retired renderer texture did not match its context type");
+                retained.push(texture);
+            }
+        }
+    }
+
+    Ok(retained)
+}
+
+fn prepend_retained_retired_textures(
+    data: &mut RendererSurfaceState,
+    context_id: ErasedContextId,
+    mut retained: Vec<Box<dyn Any>>,
+) {
+    if retained.is_empty() {
+        return;
+    }
+
+    if let Some(existing) = data.retired_textures.remove(&context_id) {
+        retained.extend(existing);
+    }
+    data.retired_textures.insert(context_id, retained);
+}
+
+/// Release textures that were retired from a renderer-managed Wayland surface cache.
+///
+/// This helper is intentionally renderer-available only: it does not run from the surface destruction
+/// hook and it does not make renderer-unavailable cleanup automatic. It models the normal Smithay
+/// path for renderers that need to return externally-owned imported resources before the generic
+/// cache drops them. Retry-safe release failures keep the retired texture for a later call; failures
+/// after release side effects have committed drop only that texture and retain later entries.
+#[profiling::function]
+pub fn release_retired_surface_textures<R>(renderer: &mut R, states: &SurfaceData) -> Result<(), R::Error>
+where
+    R: Renderer,
+    R::TextureId: 'static,
+{
+    let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() else {
+        return Ok(());
+    };
+
+    let context_id = renderer.context_id();
+    let erased_context_id = context_id.erased();
+    let Some(textures) = data.lock().unwrap().retired_textures.remove(&erased_context_id) else {
+        return Ok(());
+    };
+
+    match release_retired_textures::<R::TextureId, R::Error, _>(textures, |texture| {
+        renderer.release_imported_texture_for_surface_cache(texture)
+    }) {
+        Ok(retained) => {
+            prepend_retained_retired_textures(&mut data.lock().unwrap(), erased_context_id, retained);
+            Ok(())
+        }
+        Err((err, retained)) => {
+            prepend_retained_retired_textures(&mut data.lock().unwrap(), erased_context_id, retained);
+            Err(err)
+        }
+    }
+}
+
+/// Retire the currently cached texture for this renderer and release all retired textures.
+///
+/// Use this before a known no-next-import or teardown point while a renderer is still available. It
+/// is a generic lifecycle hook, not a Vulkan-specific side channel: renderers express any external
+/// release obligation through [`Renderer::release_imported_texture_for_surface_cache`]. The Wayland
+/// surface destruction hook still cannot call this because it has no renderer. Renderer-specific
+/// capability advertisement should remain fail-closed until users of the intended path have a tested
+/// call site for this lifecycle.
+#[profiling::function]
+pub fn retire_and_release_surface_textures<R>(renderer: &mut R, states: &SurfaceData) -> Result<(), R::Error>
+where
+    R: Renderer,
+    R::TextureId: 'static,
+{
+    let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() else {
+        return Ok(());
+    };
+
+    let context_id = renderer.context_id();
+    let erased_context_id = context_id.erased();
+    let mut state = data.lock().unwrap();
+    state.retire_texture_for_context(erased_context_id.clone());
+    state.renderer_seen.remove(&erased_context_id);
+    let Some(textures) = state.retired_textures.remove(&erased_context_id) else {
+        return Ok(());
+    };
+    drop(state);
+
+    match release_retired_textures::<R::TextureId, R::Error, _>(textures, |texture| {
+        renderer.release_imported_texture_for_surface_cache(texture)
+    }) {
+        Ok(retained) => {
+            prepend_retained_retired_textures(&mut data.lock().unwrap(), erased_context_id, retained);
+            Ok(())
+        }
+        Err((err, retained)) => {
+            prepend_retained_retired_textures(&mut data.lock().unwrap(), erased_context_id, retained);
+            Err(err)
+        }
+    }
+}
+
 /// Imports buffers of a surface using a given [`Renderer`]
 ///
 /// This (or `import_surface_tree`) need to be called before`draw_render_elements`, if used later.
@@ -631,14 +766,12 @@ where
     R::TextureId: 'static,
 {
     if let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() {
+        release_retired_surface_textures(renderer, states)?;
+
         let context_id = renderer.context_id();
         let erased_context_id = context_id.erased();
         let mut data_ref = data.lock().unwrap();
         let data = &mut *data_ref;
-
-        data.drain_retired_textures(context_id, |texture| {
-            renderer.release_imported_texture_for_surface_cache(texture)
-        })?;
 
         let last_commit = data.renderer_seen.get(&erased_context_id);
         let buffer_damage = data.damage_since(last_commit.copied());
@@ -1182,6 +1315,198 @@ mod tests {
                 .unwrap()
                 .retired_textures
                 .contains_key(&context_id.erased())
+        );
+    }
+
+    #[test]
+    fn release_retired_surface_textures_uses_renderer_hook() {
+        let context_id = ContextId::<TestTexture>::new();
+        let mut state = RendererSurfaceState::default();
+        state
+            .textures
+            .insert(context_id.erased(), Box::new(TestTexture(51)));
+        state.retire_textures();
+
+        let states = SurfaceData {
+            role: None,
+            data_map: Default::default(),
+            cached_state: MultiCache::new(),
+        };
+        states.data_map.insert_if_missing_threadsafe(|| Mutex::new(state));
+
+        let mut renderer = HookRenderer {
+            context_id: context_id.clone(),
+            fail_release: false,
+            released: Vec::new(),
+        };
+
+        super::release_retired_surface_textures(&mut renderer, &states).unwrap();
+        assert_eq!(renderer.released, vec![51]);
+        assert!(
+            !states
+                .data_map
+                .get::<super::RendererSurfaceStateUserData>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .retired_textures
+                .contains_key(&context_id.erased())
+        );
+    }
+
+    #[test]
+    fn release_retired_surface_textures_retry_safe_failure_keeps_texture() {
+        let context_id = ContextId::<TestTexture>::new();
+        let mut state = RendererSurfaceState::default();
+        state
+            .textures
+            .insert(context_id.erased(), Box::new(TestTexture(61)));
+        state.retire_textures();
+
+        let states = SurfaceData {
+            role: None,
+            data_map: Default::default(),
+            cached_state: MultiCache::new(),
+        };
+        states.data_map.insert_if_missing_threadsafe(|| Mutex::new(state));
+
+        let mut renderer = HookRenderer {
+            context_id: context_id.clone(),
+            fail_release: true,
+            released: Vec::new(),
+        };
+
+        assert_eq!(
+            super::release_retired_surface_textures(&mut renderer, &states),
+            Err(TestError::ReleaseFailed)
+        );
+        assert_eq!(renderer.released, vec![61]);
+        assert_eq!(
+            states
+                .data_map
+                .get::<super::RendererSurfaceStateUserData>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .retired_textures
+                .get(&context_id.erased())
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn retire_and_release_surface_textures_releases_active_texture() {
+        let context_id = ContextId::<TestTexture>::new();
+        let mut state = RendererSurfaceState::default();
+        state
+            .textures
+            .insert(context_id.erased(), Box::new(TestTexture(71)));
+        state
+            .renderer_seen
+            .insert(context_id.erased(), state.current_commit());
+
+        let states = SurfaceData {
+            role: None,
+            data_map: Default::default(),
+            cached_state: MultiCache::new(),
+        };
+        states.data_map.insert_if_missing_threadsafe(|| Mutex::new(state));
+
+        let mut renderer = HookRenderer {
+            context_id: context_id.clone(),
+            fail_release: false,
+            released: Vec::new(),
+        };
+
+        super::retire_and_release_surface_textures(&mut renderer, &states).unwrap();
+        assert_eq!(renderer.released, vec![71]);
+        let state = states
+            .data_map
+            .get::<super::RendererSurfaceStateUserData>()
+            .unwrap()
+            .lock()
+            .unwrap();
+        assert!(state.textures.is_empty());
+        assert!(!state.renderer_seen.contains_key(&context_id.erased()));
+        assert!(!state.retired_textures.contains_key(&context_id.erased()));
+    }
+
+    #[test]
+    fn retire_and_release_surface_textures_only_retires_renderer_context() {
+        let context_id = ContextId::<TestTexture>::new();
+        let other_context_id = ContextId::<TestTexture>::new();
+        let mut state = RendererSurfaceState::default();
+        state
+            .textures
+            .insert(context_id.erased(), Box::new(TestTexture(91)));
+        state
+            .textures
+            .insert(other_context_id.erased(), Box::new(TestTexture(92)));
+
+        let states = SurfaceData {
+            role: None,
+            data_map: Default::default(),
+            cached_state: MultiCache::new(),
+        };
+        states.data_map.insert_if_missing_threadsafe(|| Mutex::new(state));
+
+        let mut renderer = HookRenderer {
+            context_id: context_id.clone(),
+            fail_release: false,
+            released: Vec::new(),
+        };
+
+        super::retire_and_release_surface_textures(&mut renderer, &states).unwrap();
+        assert_eq!(renderer.released, vec![91]);
+        let state = states
+            .data_map
+            .get::<super::RendererSurfaceStateUserData>()
+            .unwrap()
+            .lock()
+            .unwrap();
+        assert!(state.texture(context_id.clone()).is_none());
+        assert!(state.texture(other_context_id.clone()).is_some());
+        assert!(!state.retired_textures.contains_key(&context_id.erased()));
+        assert!(!state.retired_textures.contains_key(&other_context_id.erased()));
+    }
+
+    #[test]
+    fn retire_and_release_surface_textures_retry_safe_failure_keeps_texture_retired() {
+        let context_id = ContextId::<TestTexture>::new();
+        let mut state = RendererSurfaceState::default();
+        state
+            .textures
+            .insert(context_id.erased(), Box::new(TestTexture(81)));
+
+        let states = SurfaceData {
+            role: None,
+            data_map: Default::default(),
+            cached_state: MultiCache::new(),
+        };
+        states.data_map.insert_if_missing_threadsafe(|| Mutex::new(state));
+
+        let mut renderer = HookRenderer {
+            context_id: context_id.clone(),
+            fail_release: true,
+            released: Vec::new(),
+        };
+
+        assert_eq!(
+            super::retire_and_release_surface_textures(&mut renderer, &states),
+            Err(TestError::ReleaseFailed)
+        );
+        assert_eq!(renderer.released, vec![81]);
+        let state = states
+            .data_map
+            .get::<super::RendererSurfaceStateUserData>()
+            .unwrap()
+            .lock()
+            .unwrap();
+        assert!(state.textures.is_empty());
+        assert_eq!(
+            state.retired_textures.get(&context_id.erased()).map(Vec::len),
+            Some(1)
         );
     }
 

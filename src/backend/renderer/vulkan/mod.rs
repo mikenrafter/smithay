@@ -1686,9 +1686,11 @@ impl VulkanRenderer {
     /// The validation-stage normal path imports a fresh sampled dmabuf texture for each explicit-sync
     /// commit instead of reusing renderer-local image state across commit-specific acquire/release
     /// points. That is not sufficient by itself: eviction, reset, and destruction paths must also be
-    /// able to release imported Vulkan sampled dmabuf textures before drop. Keep that lifecycle as a
-    /// separate token so the generic renderer-surface cache hook cannot be mistaken for a completed
-    /// Vulkan release path.
+    /// able to release imported Vulkan sampled dmabuf textures before drop. The generic
+    /// renderer-surface helpers model the renderer-available part of that cleanup, but they do not
+    /// make renderer-unavailable destruction automatic and do not prove that every no-next-import
+    /// path has a tested call site. Keep that lifecycle as a separate token so the generic cache hook
+    /// cannot be mistaken for a completed Vulkan release path.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_texture_cache_policy(
         &self,
