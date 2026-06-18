@@ -432,6 +432,7 @@ struct SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
     import: &'a image::VulkanDmabufImportState,
     acquire_sync: &'a SampledDmabufAcquireSyncEvidence,
     release_evidence: &'a SampledDmabufReleaseEvidence,
+    release_ownership: Option<SampledDmabufReleaseOwnershipEvidence>,
     per_commit_texture_import: bool,
     layout_history: SampledDmabufWaylandLayoutHistory,
     first_import_layout: Option<SampledDmabufWaylandFirstImportLayoutEvidence>,
@@ -465,6 +466,7 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
             import,
             acquire_sync,
             release_evidence,
+            release_ownership: None,
             per_commit_texture_import,
             layout_history,
             first_import_layout: None,
@@ -527,6 +529,27 @@ struct SampledDmabufReleaseEvidence {
 
 #[allow(dead_code)]
 impl SampledDmabufReleaseEvidence {
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+}
+
+/// Evidence that the renderer, not generic Wayland buffer drop, owns the release point.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SampledDmabufReleaseOwnershipEvidence {
+    dmabuf: WeakDmabuf,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufReleaseOwnershipEvidence {
+    #[cfg(test)]
+    fn new_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+        }
+    }
+
     fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
         self.dmabuf.upgrade().as_ref() == Some(dmabuf)
     }
@@ -1543,10 +1566,10 @@ impl VulkanRenderer {
 
     /// Validate release-sync export/transfer policy for a normal Wayland dmabuf.
     ///
-    /// The release evidence carries the renderer-owned obligation to satisfy the Wayland release
-    /// point only after Vulkan releases the sampled image back to foreign ownership. The release
-    /// helper transfers an exported release sync-file into that release point when available, or
-    /// signals it directly only after synchronous release completion.
+    /// The release evidence proves that a Wayland release point exists for this dmabuf. It is not an
+    /// ownership transfer by itself: the release-sync policy is produced only when same-dmabuf
+    /// ownership evidence also proves generic Wayland buffer drop will not signal that point while
+    /// Vulkan owns the sampled image release obligation.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_release_sync_policy(
         &self,
@@ -1556,6 +1579,16 @@ impl VulkanRenderer {
             context.dmabuf,
             context.release_evidence.clone(),
         )?;
+        let Some(release_ownership) = context.release_ownership.as_ref() else {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland release ownership transfer",
+            ));
+        };
+        if !release_ownership.is_for_dmabuf(context.dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland release ownership identity",
+            ));
+        }
         Ok(SampledDmabufWaylandReleaseSyncPolicy {
             dmabuf: context.dmabuf.weak(),
         })
