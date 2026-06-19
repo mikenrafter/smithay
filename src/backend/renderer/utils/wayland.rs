@@ -283,6 +283,7 @@ impl RendererSurfaceState {
                 if self.buffer_dimensions.is_none() {
                     // This results in us rendering nothing (can happen e.g. for failed egl-buffer-calls),
                     // but it is better than crashing the compositor for a bad buffer
+                    self.retire_textures();
                     self.reset();
                     return;
                 }
@@ -316,6 +317,7 @@ impl RendererSurfaceState {
                 }
             }
             Some(BufferAssignment::Removed) => {
+                self.retire_textures();
                 self.reset();
                 return;
             }
@@ -1103,7 +1105,7 @@ mod tests {
         Texture,
     };
     use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
-    use crate::wayland::compositor::{MultiCache, SurfaceData};
+    use crate::wayland::compositor::{BufferAssignment, MultiCache, SurfaceAttributes, SurfaceData};
     #[cfg(feature = "backend_drm")]
     use crate::wayland::drm_syncobj::DrmSyncPoint;
     use std::{error::Error, fmt, sync::Mutex};
@@ -1664,6 +1666,53 @@ mod tests {
             state.retired_textures.get(&context_id.erased()).map(Vec::len),
             Some(1)
         );
+    }
+
+    #[test]
+    fn removed_buffer_commit_retires_texture_for_later_release() {
+        let context_id = ContextId::<TestTexture>::new();
+        let mut state = RendererSurfaceState::default();
+        state
+            .textures
+            .insert(context_id.erased(), Box::new(TestTexture(101)));
+        state
+            .renderer_seen
+            .insert(context_id.erased(), state.current_commit());
+
+        let states = SurfaceData {
+            role: None,
+            data_map: Default::default(),
+            cached_state: MultiCache::new(),
+        };
+        {
+            let mut guard = states.cached_state.get::<SurfaceAttributes>();
+            guard.current().buffer = Some(BufferAssignment::Removed);
+        }
+
+        state.update_buffer(&states);
+        assert!(state.textures.is_empty());
+        assert!(state.buffer().is_none());
+        assert_eq!(
+            state.retired_textures.get(&context_id.erased()).map(Vec::len),
+            Some(1)
+        );
+
+        states.data_map.insert_if_missing_threadsafe(|| Mutex::new(state));
+        let mut renderer = HookRenderer {
+            context_id: context_id.clone(),
+            fail_release: false,
+            released: Vec::new(),
+        };
+
+        super::release_retired_surface_textures(&mut renderer, &states).unwrap();
+        assert_eq!(renderer.released, vec![101]);
+        let state = states
+            .data_map
+            .get::<super::RendererSurfaceStateUserData>()
+            .unwrap()
+            .lock()
+            .unwrap();
+        assert!(!state.retired_textures.contains_key(&context_id.erased()));
     }
 
     #[cfg(feature = "backend_drm")]
