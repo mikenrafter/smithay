@@ -4429,6 +4429,9 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     first_import_context.release_ownership = Some(SampledDmabufReleaseOwnershipEvidence::new_for_tests(
         &policy_dmabuf,
     ));
+    first_import_context.texture_cache_release_hook = Some(
+        SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(&policy_dmabuf),
+    );
     first_import_context.texture_cache_release_lifecycle = Some(
         SampledDmabufWaylandTextureCacheReleaseLifecycle::new_for_tests(&policy_dmabuf),
     );
@@ -4647,6 +4650,9 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     current_reacquire_context.release_ownership = Some(SampledDmabufReleaseOwnershipEvidence::new_for_tests(
         &policy_dmabuf,
     ));
+    current_reacquire_context.texture_cache_release_hook = Some(
+        SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(&policy_dmabuf),
+    );
     current_reacquire_context.texture_cache_release_lifecycle = Some(
         SampledDmabufWaylandTextureCacheReleaseLifecycle::new_for_tests(&policy_dmabuf),
     );
@@ -4816,7 +4822,41 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&policy_context),
         Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan texture-cache release lifecycle"
+            "sampled dmabuf Wayland Vulkan texture-cache release hook"
+        ))
+    ));
+    let mut mismatched_cache_hook_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
+        &policy_import,
+        &policy_acquire_evidence,
+        &policy_release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    mismatched_cache_hook_context.texture_cache_release_hook = Some(
+        SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(&unrelated_dmabuf),
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&mismatched_cache_hook_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland texture-cache release hook identity"
+        ))
+    ));
+    let mut missing_cache_lifecycle_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
+        &policy_import,
+        &policy_acquire_evidence,
+        &policy_release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    missing_cache_lifecycle_context.texture_cache_release_hook = Some(
+        SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(&policy_dmabuf),
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&missing_cache_lifecycle_context),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan texture-cache release call sites"
         ))
     ));
     let mut mismatched_cache_lifecycle_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
@@ -4826,6 +4866,9 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         &policy_release_evidence,
         true,
         SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    mismatched_cache_lifecycle_context.texture_cache_release_hook = Some(
+        SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(&policy_dmabuf),
     );
     mismatched_cache_lifecycle_context.texture_cache_release_lifecycle = Some(
         SampledDmabufWaylandTextureCacheReleaseLifecycle::new_for_tests(&unrelated_dmabuf),
@@ -4843,6 +4886,9 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         &policy_release_evidence,
         true,
         SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    cache_lifecycle_context.texture_cache_release_hook = Some(
+        SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(&policy_dmabuf),
     );
     cache_lifecycle_context.texture_cache_release_lifecycle = Some(
         SampledDmabufWaylandTextureCacheReleaseLifecycle::new_for_tests(&policy_dmabuf),

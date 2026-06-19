@@ -23,9 +23,9 @@
 //! coverage. Sampled dmabuf import is validation-reachable through the explicit known-layout
 //! development helper and the normal `ImportDmaWl` path's staged guards. The normal Wayland path now
 //! models the policy context, explicit acquire/release sync evidence, first-import vs. reacquire
-//! history, and known-layout evidence identity, but production evidence sources remain
-//! development-gated and the Wayland release-point/cache lifecycle still needs an explicit Smithay
-//! ownership hook before this can be public-advertised through `ImportDma`.
+//! history, known-layout evidence identity, and renderer cache-release hook evidence. Production
+//! external-state evidence sources and no-next-import/teardown cache-release call sites remain
+//! development-gated before this can be public-advertised through `ImportDma`.
 //!
 //! Intended implementation order:
 //!
@@ -386,7 +386,28 @@ impl SampledDmabufWaylandTextureCachePolicy {
     }
 }
 
-/// Evidence that texture-cache eviction/reset paths can release sampled dmabuf textures before drop.
+/// Evidence that the renderer surface-cache release hook can release sampled dmabuf textures.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SampledDmabufWaylandTextureCacheReleaseHook {
+    dmabuf: WeakDmabuf,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufWaylandTextureCacheReleaseHook {
+    #[cfg(test)]
+    fn new_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+        }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+}
+
+/// Evidence that no-next-import/teardown call sites release sampled dmabuf textures before drop.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandTextureCacheReleaseLifecycle {
@@ -442,6 +463,7 @@ struct SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
     first_import_foreign_general: Option<SampledDmabufKnownLayoutEvidence>,
     current_reacquire_layout: Option<SampledDmabufWaylandCurrentReacquireLayoutEvidence>,
     current_reacquire_foreign_general: Option<SampledDmabufKnownLayoutEvidence>,
+    texture_cache_release_hook: Option<SampledDmabufWaylandTextureCacheReleaseHook>,
     texture_cache_release_lifecycle: Option<SampledDmabufWaylandTextureCacheReleaseLifecycle>,
 }
 
@@ -476,6 +498,7 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
             first_import_foreign_general: None,
             current_reacquire_layout: None,
             current_reacquire_foreign_general: None,
+            texture_cache_release_hook: None,
             texture_cache_release_lifecycle: None,
         }
     }
@@ -488,6 +511,11 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
         self.first_import_foreign_general = sources.first_import_foreign_general;
         self.current_reacquire_layout = sources.current_reacquire_layout;
         self.current_reacquire_foreign_general = sources.current_reacquire_foreign_general;
+        self
+    }
+
+    fn with_texture_cache_release_hook(mut self, hook: SampledDmabufWaylandTextureCacheReleaseHook) -> Self {
+        self.texture_cache_release_hook = Some(hook);
         self
     }
 }
@@ -1031,6 +1059,16 @@ impl VulkanRenderer {
         self.prune_sampled_dmabuf_layout_history();
         self.sampled_dmabuf_layout_history
             .insert(dmabuf.weak(), SampledDmabufWaylandLayoutHistory::LocallyAcquired);
+    }
+
+    #[allow(dead_code)]
+    fn sampled_dmabuf_wayland_texture_cache_release_hook(
+        &self,
+        dmabuf: &Dmabuf,
+    ) -> SampledDmabufWaylandTextureCacheReleaseHook {
+        SampledDmabufWaylandTextureCacheReleaseHook {
+            dmabuf: dmabuf.weak(),
+        }
     }
 
     #[allow(dead_code)]
@@ -1686,11 +1724,11 @@ impl VulkanRenderer {
     /// The validation-stage normal path imports a fresh sampled dmabuf texture for each explicit-sync
     /// commit instead of reusing renderer-local image state across commit-specific acquire/release
     /// points. That is not sufficient by itself: eviction, reset, and destruction paths must also be
-    /// able to release imported Vulkan sampled dmabuf textures before drop. The generic
-    /// renderer-surface helpers model the renderer-available part of that cleanup, but they do not
-    /// make renderer-unavailable destruction automatic and do not prove that every no-next-import
-    /// path has a tested call site. Keep that lifecycle as a separate token so the generic cache hook
-    /// cannot be mistaken for a completed Vulkan release path.
+    /// able to release imported Vulkan sampled dmabuf textures before drop. The renderer hook token
+    /// only proves that a renderer-available cache release can call into Vulkan; it does not prove
+    /// that compositors invoke the helper at every no-next-import/teardown point. Keep the call-site
+    /// lifecycle as a separate token so the generic cache hook cannot be mistaken for a completed
+    /// Vulkan release path.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_texture_cache_policy(
         &self,
@@ -1702,9 +1740,20 @@ impl VulkanRenderer {
             ));
         }
 
+        let Some(release_hook) = context.texture_cache_release_hook.as_ref() else {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan texture-cache release hook",
+            ));
+        };
+        if !release_hook.is_for_dmabuf(context.dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland texture-cache release hook identity",
+            ));
+        }
+
         let Some(release_lifecycle) = context.texture_cache_release_lifecycle.as_ref() else {
             return Err(VulkanError::MissingCapability(
-                "sampled dmabuf Wayland Vulkan texture-cache release lifecycle",
+                "sampled dmabuf Wayland Vulkan texture-cache release call sites",
             ));
         };
         if !release_lifecycle.is_for_dmabuf(context.dmabuf) {
@@ -2860,6 +2909,7 @@ impl ImportDmaWl for VulkanRenderer {
             self.sampled_dmabuf_wayland_external_state_evidence_sources(dmabuf, layout_history)?;
         let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_evidence(dmabuf, buffer)?;
         let release_evidence = self.sampled_dmabuf_wayland_release_evidence(dmabuf, buffer)?;
+        let texture_cache_release_hook = self.sampled_dmabuf_wayland_texture_cache_release_hook(dmabuf);
         let policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
             dmabuf,
             &import,
@@ -2868,7 +2918,8 @@ impl ImportDmaWl for VulkanRenderer {
             true,
             layout_history,
         )
-        .with_external_state_sources(external_state_sources);
+        .with_external_state_sources(external_state_sources)
+        .with_texture_cache_release_hook(texture_cache_release_hook);
         let layout_evidence = self.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&policy_context)?;
         let foreign_general = self.validate_sampled_dmabuf_known_layout_contract(dmabuf, layout_evidence)?;
 
