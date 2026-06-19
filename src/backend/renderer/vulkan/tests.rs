@@ -4026,6 +4026,90 @@ fn public_dmabuf_import_gates_formats() {
 }
 
 #[test]
+fn sampled_dmabuf_wayland_policy_does_not_public_advertise_import_dma() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let format = Format {
+        code: Fourcc::Abgr8888,
+        modifier: Modifier::Linear,
+    };
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    renderer.capabilities.import.dmabuf = true;
+    renderer.capabilities.external_memory.foreign_queue_family = true;
+    renderer.capabilities.formats.dmabuf_import = [format].into_iter().collect();
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
+
+    let import = VulkanDmabufImportState::from_dmabuf(&dmabuf).unwrap();
+    assert!(renderer.validate_sampled_dmabuf_import_metadata(&dmabuf).is_ok());
+
+    let acquire_sync = SyncPoint::from(SignaledExportableFence);
+    let acquire_evidence = SampledDmabufAcquireSyncEvidence::new(&dmabuf, acquire_sync);
+    let release_evidence = renderer
+        .validate_sampled_dmabuf_wayland_release_point_contract(&dmabuf, true)
+        .unwrap();
+    let external_state = SampledDmabufWaylandForeignGeneralEvidence::new_for_tests(&dmabuf);
+    let external_state_sources = renderer
+        .sampled_dmabuf_wayland_external_state_evidence_sources(
+            &dmabuf,
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+            Some(&external_state),
+        )
+        .unwrap();
+    let policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &dmabuf,
+        &import,
+        &acquire_evidence,
+        &release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    )
+    .with_external_state_sources(external_state_sources)
+    .with_texture_cache_replacement_release_reachability(
+        SampledDmabufWaylandTextureCacheReplacementReleaseReachability::new_for_tests(&dmabuf),
+    )
+    .with_texture_cache_release_hook(SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(
+        &dmabuf,
+    ))
+    .with_texture_cache_release_lifecycle(Some(
+        SampledDmabufWaylandTextureCacheReleaseLifecycle::new_for_tests(&dmabuf),
+    ))
+    .with_release_ownership(SampledDmabufReleaseOwnershipEvidence::new_for_tests(&dmabuf));
+
+    let wayland_policy = renderer
+        .validate_sampled_dmabuf_wayland_vulkan_interop_policy(&policy_context)
+        .unwrap();
+    let known_layout = renderer
+        .validate_sampled_dmabuf_known_layout_contract(&dmabuf, wayland_policy)
+        .unwrap();
+    assert!(known_layout.is_for_dmabuf(&dmabuf));
+
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan first-import layout policy"
+        ))
+    ));
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+    assert!(!renderer.has_dmabuf_format(format));
+    assert!(matches!(
+        renderer.import_dmabuf(&dmabuf, None),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
+}
+
+#[test]
 fn sampled_dmabuf_import_validation_guards_metadata_before_device_lookup() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let valid_dmabuf = dmabuf_with_planes_for_tests(
