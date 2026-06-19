@@ -1200,7 +1200,7 @@ mod tests {
     #[derive(Debug)]
     struct HookRenderer {
         context_id: ContextId<TestTexture>,
-        fail_release: bool,
+        fail_release: Option<SurfaceCacheTextureReleaseError<TestError>>,
         released: Vec<u32>,
     }
 
@@ -1263,13 +1263,7 @@ mod tests {
             texture: &Self::TextureId,
         ) -> Result<(), SurfaceCacheTextureReleaseError<Self::Error>> {
             self.released.push(texture.0);
-            if self.fail_release {
-                Err(SurfaceCacheTextureReleaseError::RetrySafe(
-                    TestError::ReleaseFailed,
-                ))
-            } else {
-                Ok(())
-            }
+            self.fail_release.map_or(Ok(()), Err)
         }
     }
 
@@ -1420,7 +1414,9 @@ mod tests {
 
         let mut renderer = HookRenderer {
             context_id: context_id.clone(),
-            fail_release: true,
+            fail_release: Some(SurfaceCacheTextureReleaseError::RetrySafe(
+                TestError::ReleaseFailed,
+            )),
             released: Vec::new(),
         };
 
@@ -1440,7 +1436,7 @@ mod tests {
             .map(Vec::len);
         assert_eq!(retained, Some(1));
 
-        renderer.fail_release = false;
+        renderer.fail_release = None;
         super::import_surface(&mut renderer, &states).unwrap();
         assert_eq!(renderer.released, vec![12, 12]);
         assert!(
@@ -1494,7 +1490,7 @@ mod tests {
 
         let mut renderer = HookRenderer {
             context_id: context_id.clone(),
-            fail_release: false,
+            fail_release: None,
             released: Vec::new(),
         };
 
@@ -1530,7 +1526,9 @@ mod tests {
 
         let mut renderer = HookRenderer {
             context_id: context_id.clone(),
-            fail_release: true,
+            fail_release: Some(SurfaceCacheTextureReleaseError::RetrySafe(
+                TestError::ReleaseFailed,
+            )),
             released: Vec::new(),
         };
 
@@ -1573,7 +1571,7 @@ mod tests {
 
         let mut renderer = HookRenderer {
             context_id: context_id.clone(),
-            fail_release: false,
+            fail_release: None,
             released: Vec::new(),
         };
 
@@ -1611,7 +1609,7 @@ mod tests {
 
         let mut renderer = HookRenderer {
             context_id: context_id.clone(),
-            fail_release: false,
+            fail_release: None,
             released: Vec::new(),
         };
 
@@ -1646,7 +1644,9 @@ mod tests {
 
         let mut renderer = HookRenderer {
             context_id: context_id.clone(),
-            fail_release: true,
+            fail_release: Some(SurfaceCacheTextureReleaseError::RetrySafe(
+                TestError::ReleaseFailed,
+            )),
             released: Vec::new(),
         };
 
@@ -1665,6 +1665,73 @@ mod tests {
         assert_eq!(
             state.retired_textures.get(&context_id.erased()).map(Vec::len),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn retire_and_release_surface_textures_side_effect_failure_drops_failed_keeps_later() {
+        let context_id = ContextId::<TestTexture>::new();
+        let mut state = RendererSurfaceState::default();
+        state
+            .textures
+            .insert(context_id.erased(), Box::new(TestTexture(111)));
+        state.retire_textures();
+        state
+            .textures
+            .insert(context_id.erased(), Box::new(TestTexture(112)));
+        state
+            .renderer_seen
+            .insert(context_id.erased(), state.current_commit());
+
+        let states = SurfaceData {
+            role: None,
+            data_map: Default::default(),
+            cached_state: MultiCache::new(),
+        };
+        states.data_map.insert_if_missing_threadsafe(|| Mutex::new(state));
+
+        let mut renderer = HookRenderer {
+            context_id: context_id.clone(),
+            fail_release: Some(SurfaceCacheTextureReleaseError::ReleaseSideEffectsCommitted(
+                TestError::ReleaseFailed,
+            )),
+            released: Vec::new(),
+        };
+
+        assert_eq!(
+            super::retire_and_release_surface_textures(&mut renderer, &states),
+            Err(TestError::ReleaseFailed)
+        );
+        assert_eq!(renderer.released, vec![111]);
+        let state = states
+            .data_map
+            .get::<super::RendererSurfaceStateUserData>()
+            .unwrap()
+            .lock()
+            .unwrap();
+        assert!(state.textures.is_empty());
+        assert!(!state.renderer_seen.contains_key(&context_id.erased()));
+        assert_eq!(
+            state
+                .retired_textures
+                .get(&context_id.erased())
+                .map(|textures| textures.len()),
+            Some(1)
+        );
+        drop(state);
+
+        renderer.fail_release = None;
+        super::release_retired_surface_textures(&mut renderer, &states).unwrap();
+        assert_eq!(renderer.released, vec![111, 112]);
+        assert!(
+            !states
+                .data_map
+                .get::<super::RendererSurfaceStateUserData>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .retired_textures
+                .contains_key(&context_id.erased())
         );
     }
 
@@ -1700,7 +1767,7 @@ mod tests {
         states.data_map.insert_if_missing_threadsafe(|| Mutex::new(state));
         let mut renderer = HookRenderer {
             context_id: context_id.clone(),
-            fail_release: false,
+            fail_release: None,
             released: Vec::new(),
         };
 
