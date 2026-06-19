@@ -5,7 +5,10 @@ use crate::{
         ContextId, ErasedContextId, ImportAll, Renderer, SurfaceCacheTextureReleaseError, Texture,
         buffer_dimensions, buffer_has_alpha, element::RenderElement,
     },
-    utils::{Buffer as BufferCoord, Coordinate, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
+    utils::{
+        Buffer as BufferCoord, Coordinate, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
+        user_data::UserDataMap,
+    },
     wayland::{
         compositor::{
             self, BufferAssignment, Damage, RectangleKind, SUBSURFACE_ROLE, SubsurfaceCachedState,
@@ -144,8 +147,9 @@ pub struct RendererSurfaceState {
     pub(crate) opaque_regions: Vec<Rectangle<i32, Logical>>,
 }
 
-/// SAFETY: Only thing unsafe here is the `Box<dyn Any>`, which are the textures.
-/// Those are guarded by our Renderers handling thread-safety and the `ContextId`.
+/// SAFETY: The texture storage uses `Box<dyn Any>` and is guarded by our Renderers handling
+/// thread-safety and the `ContextId`. Buffer wrapper user data uses [`UserDataMap`]'s own
+/// thread-local/thread-safe storage rules.
 /// Theoretically a renderer could be thread-safe, but its texture type isn't, but that is **very** theoretical.
 unsafe impl Send for RendererSurfaceState {}
 unsafe impl Sync for RendererSurfaceState {}
@@ -153,6 +157,7 @@ unsafe impl Sync for RendererSurfaceState {}
 #[derive(Debug)]
 struct InnerBuffer {
     buffer: WlBuffer,
+    user_data: UserDataMap,
     #[cfg(feature = "backend_drm")]
     acquire_point: Option<DrmSyncPoint>,
     #[cfg(feature = "backend_drm")]
@@ -180,6 +185,7 @@ impl Buffer {
         Self {
             inner: Arc::new(InnerBuffer {
                 buffer,
+                user_data: UserDataMap::new(),
                 #[cfg(feature = "backend_drm")]
                 acquire_point: None,
                 #[cfg(feature = "backend_drm")]
@@ -194,6 +200,7 @@ impl Buffer {
         Self {
             inner: Arc::new(InnerBuffer {
                 buffer,
+                user_data: UserDataMap::new(),
                 acquire_point: Some(acquire_point),
                 release_point: ReleasePointSlot::new(Some(release_point)),
             }),
@@ -216,6 +223,18 @@ impl Buffer {
     #[allow(dead_code)]
     pub(crate) fn take_release_point_for_renderer(&self) -> Option<DrmSyncPoint> {
         self.inner.release_point.take_for_renderer()
+    }
+
+    /// Access user data associated with this renderer-managed Wayland buffer wrapper.
+    ///
+    /// Renderer integrations that need per-commit evidence for importing the current buffer can store
+    /// it here without changing the raw `wl_buffer` object. This storage is wrapper-local: the
+    /// wrapper is replaced when Smithay sees a different buffer, and also for same-buffer commits
+    /// carrying explicit synchronization points. Same-buffer implicit-sync commits may keep the same
+    /// wrapper, so callers that store commit-local evidence must ensure their own evidence source is
+    /// refreshed or invalidated when the wrapper is reused.
+    pub fn user_data(&self) -> &UserDataMap {
+        &self.inner.user_data
     }
 }
 
@@ -287,6 +306,7 @@ impl RendererSurfaceState {
                     self.buffer = Some(Buffer {
                         inner: Arc::new(InnerBuffer {
                             buffer,
+                            user_data: UserDataMap::new(),
                             #[cfg(feature = "backend_drm")]
                             acquire_point: syncobj_state.acquire_point.take(),
                             #[cfg(feature = "backend_drm")]

@@ -56,6 +56,7 @@
 use std::{
     collections::HashMap,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
+    sync::Mutex,
 };
 
 #[cfg(all(
@@ -66,6 +67,8 @@ use std::{
 use crate::backend::renderer::ImportAll;
 #[cfg(feature = "wayland_frontend")]
 use crate::backend::renderer::{ImportDmaWl, ImportMemWl};
+#[cfg(feature = "wayland_frontend")]
+use crate::utils::user_data::UserDataMap;
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use crate::wayland::drm_syncobj::DrmSyncPoint;
 use crate::{
@@ -127,6 +130,86 @@ impl SampledDmabufKnownLayoutEvidence {
 
     fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
         self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+}
+
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+struct SampledDmabufWaylandForeignGeneralEvidenceSlot {
+    evidence: Mutex<Option<SampledDmabufWaylandForeignGeneralEvidence>>,
+}
+
+/// Commit-local proof that a Wayland dmabuf is ready for Vulkan sampled import.
+///
+/// This evidence is stored on Smithay's renderer-managed Wayland buffer wrapper. It is deliberately
+/// separate from linux-dmabuf metadata and explicit-sync points: those describe buffer layout data and
+/// ordering, but not the Vulkan image layout or queue-family ownership needed by the sampled import
+/// acquire barrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct SampledDmabufWaylandForeignGeneralEvidence {
+    dmabuf: WeakDmabuf,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufWaylandForeignGeneralEvidence {
+    unsafe fn new(dmabuf: WeakDmabuf) -> Self {
+        Self { dmabuf }
+    }
+
+    #[cfg(test)]
+    fn new_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+        }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+
+    fn first_import_layout(
+        &self,
+        dmabuf: &Dmabuf,
+    ) -> Result<SampledDmabufWaylandFirstImportLayoutEvidence, VulkanError> {
+        if !self.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland external-state identity",
+            ));
+        }
+        Ok(SampledDmabufWaylandFirstImportLayoutEvidence {
+            dmabuf: self.dmabuf.clone(),
+        })
+    }
+
+    fn current_reacquire_layout(
+        &self,
+        dmabuf: &Dmabuf,
+    ) -> Result<SampledDmabufWaylandCurrentReacquireLayoutEvidence, VulkanError> {
+        if !self.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland external-state identity",
+            ));
+        }
+        Ok(SampledDmabufWaylandCurrentReacquireLayoutEvidence {
+            dmabuf: self.dmabuf.clone(),
+        })
+    }
+
+    fn known_foreign_general(
+        &self,
+        dmabuf: &Dmabuf,
+    ) -> Result<SampledDmabufKnownLayoutEvidence, VulkanError> {
+        if !self.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland external-state identity",
+            ));
+        }
+        Ok(unsafe {
+            // SAFETY: Creating this storage token is unsafe and requires the caller to prove the
+            // current Wayland buffer's dmabuf was released to FOREIGN ownership in GENERAL layout.
+            SampledDmabufKnownLayoutEvidence::foreign_general(self.dmabuf.clone())
+        })
     }
 }
 
@@ -1016,6 +1099,49 @@ impl VulkanRenderer {
         VulkanRendererBuilder::new()
     }
 
+    /// Mark a renderer-managed Wayland dmabuf buffer as released to Vulkan `FOREIGN + GENERAL`.
+    ///
+    /// This is a development-stage evidence API for the normal [`ImportDmaWl`] path. It does not
+    /// public-advertise sampled [`ImportDma`] support and does not derive evidence from Wayland
+    /// protocol metadata. The marker is stored on Smithay's current renderer-managed buffer wrapper,
+    /// so explicit-sync same-buffer commits receive a fresh evidence slot when
+    /// `on_commit_buffer_handler` refreshes the wrapper.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prove that the current commit represented by `buffer` and `dmabuf` has been
+    /// released by its producer to `VK_QUEUE_FAMILY_FOREIGN_EXT` in `VK_IMAGE_LAYOUT_GENERAL`, and
+    /// that the buffer's acquire synchronization orders the producer writes and ownership release for
+    /// this exact dmabuf. This proof must be current for this commit; linux-dmabuf format/plane
+    /// metadata and linux-drm-syncobj acquire/release points are not sufficient by themselves.
+    #[cfg(feature = "wayland_frontend")]
+    pub unsafe fn mark_wayland_dmabuf_foreign_general_for_sampled_import(
+        buffer: &super::utils::Buffer,
+        dmabuf: &Dmabuf,
+    ) -> Result<(), VulkanError> {
+        unsafe {
+            // SAFETY: Forwarded from this public unsafe evidence-marking function's caller.
+            Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(buffer.user_data(), dmabuf)
+        }
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    unsafe fn mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+        user_data: &UserDataMap,
+        dmabuf: &Dmabuf,
+    ) -> Result<(), VulkanError> {
+        let slot =
+            user_data.get_or_insert_threadsafe(SampledDmabufWaylandForeignGeneralEvidenceSlot::default);
+        let mut evidence = slot.evidence.lock().map_err(|_| {
+            VulkanError::UnsupportedOperation("sampled dmabuf Wayland external-state evidence")
+        })?;
+        *evidence = Some(unsafe {
+            // SAFETY: Forwarded from this unsafe evidence-marking helper's caller.
+            SampledDmabufWaylandForeignGeneralEvidence::new(dmabuf.weak())
+        });
+        Ok(())
+    }
+
     /// Returns the uninitialized/default capabilities without constructing a renderer.
     ///
     /// All capability bits are false and all format/extension sets are empty until a renderer is
@@ -1478,13 +1604,18 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn sampled_dmabuf_wayland_first_import_layout_evidence(
         &self,
-        _dmabuf: &Dmabuf,
+        dmabuf: &Dmabuf,
         layout_history: SampledDmabufWaylandLayoutHistory,
+        external_state: Option<&SampledDmabufWaylandForeignGeneralEvidence>,
     ) -> Result<Option<SampledDmabufWaylandFirstImportLayoutEvidence>, VulkanError> {
         match layout_history {
-            SampledDmabufWaylandLayoutHistory::NoRendererHistory => Err(VulkanError::MissingCapability(
-                "sampled dmabuf Wayland Vulkan first-import layout policy",
-            )),
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory => external_state
+                .map(|evidence| evidence.first_import_layout(dmabuf))
+                .transpose()?
+                .ok_or(VulkanError::MissingCapability(
+                    "sampled dmabuf Wayland Vulkan first-import layout policy",
+                ))
+                .map(Some),
             SampledDmabufWaylandLayoutHistory::LocallyAcquired
             | SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => Ok(None),
         }
@@ -1500,13 +1631,18 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn sampled_dmabuf_wayland_first_import_foreign_general_evidence(
         &self,
-        _dmabuf: &Dmabuf,
+        dmabuf: &Dmabuf,
         layout_history: SampledDmabufWaylandLayoutHistory,
+        external_state: Option<&SampledDmabufWaylandForeignGeneralEvidence>,
     ) -> Result<Option<SampledDmabufKnownLayoutEvidence>, VulkanError> {
         match layout_history {
-            SampledDmabufWaylandLayoutHistory::NoRendererHistory => Err(VulkanError::MissingCapability(
-                "sampled dmabuf Wayland Vulkan foreign GENERAL policy",
-            )),
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory => external_state
+                .map(|evidence| evidence.known_foreign_general(dmabuf))
+                .transpose()?
+                .ok_or(VulkanError::MissingCapability(
+                    "sampled dmabuf Wayland Vulkan foreign GENERAL policy",
+                ))
+                .map(Some),
             SampledDmabufWaylandLayoutHistory::LocallyAcquired
             | SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => Ok(None),
         }
@@ -1546,19 +1682,22 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn sampled_dmabuf_wayland_current_reacquire_layout_evidence(
         &self,
-        _dmabuf: &Dmabuf,
+        dmabuf: &Dmabuf,
         layout_history: SampledDmabufWaylandLayoutHistory,
+        external_state: Option<&SampledDmabufWaylandForeignGeneralEvidence>,
     ) -> Result<Option<SampledDmabufWaylandCurrentReacquireLayoutEvidence>, VulkanError> {
         match layout_history {
             SampledDmabufWaylandLayoutHistory::NoRendererHistory => Ok(None),
             SampledDmabufWaylandLayoutHistory::LocallyAcquired => Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland Vulkan unreleased local acquire",
             )),
-            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => {
-                Err(VulkanError::MissingCapability(
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => external_state
+                .map(|evidence| evidence.current_reacquire_layout(dmabuf))
+                .transpose()?
+                .ok_or(VulkanError::MissingCapability(
                     "sampled dmabuf Wayland Vulkan current reacquire layout policy",
                 ))
-            }
+                .map(Some),
         }
     }
 
@@ -1601,24 +1740,68 @@ impl VulkanRenderer {
         }
     }
 
+    /// Read commit-local Wayland/Vulkan external-state evidence from the renderer buffer wrapper.
+    #[cfg(feature = "wayland_frontend")]
+    fn sampled_dmabuf_wayland_buffer_foreign_general_evidence(
+        &self,
+        buffer: &super::utils::Buffer,
+        dmabuf: &Dmabuf,
+    ) -> Result<Option<SampledDmabufWaylandForeignGeneralEvidence>, VulkanError> {
+        self.sampled_dmabuf_wayland_user_data_foreign_general_evidence(buffer.user_data(), dmabuf)
+    }
+
+    /// Read commit-local Wayland/Vulkan external-state evidence from wrapper-local user data.
+    #[cfg(feature = "wayland_frontend")]
+    fn sampled_dmabuf_wayland_user_data_foreign_general_evidence(
+        &self,
+        user_data: &UserDataMap,
+        dmabuf: &Dmabuf,
+    ) -> Result<Option<SampledDmabufWaylandForeignGeneralEvidence>, VulkanError> {
+        let Some(slot) = user_data.get::<SampledDmabufWaylandForeignGeneralEvidenceSlot>() else {
+            return Ok(None);
+        };
+        let evidence = slot.evidence.lock().map_err(|_| {
+            VulkanError::UnsupportedOperation("sampled dmabuf Wayland external-state evidence")
+        })?;
+        let Some(evidence) = evidence.as_ref() else {
+            return Ok(None);
+        };
+        if !evidence.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland external-state identity",
+            ));
+        }
+        Ok(Some(evidence.clone()))
+    }
+
     /// Gather the external-state evidence sources used by the normal Wayland sampled-dmabuf path.
     ///
     /// This preserves the production fail-closed order before sync evidence is considered: first the
     /// first-import layout and known-state sources, then the current-reacquire layout and known-state
-    /// sources. The helper is intentionally still validation-stage; production first-import and
-    /// reacquire evidence sources remain development-gated at their exact missing contracts.
+    /// sources. The helper is intentionally still validation-stage: caller-provided
+    /// `FOREIGN + GENERAL` evidence may now satisfy the external-state source, but public
+    /// advertisement and the release lifecycle remain development-gated at their exact missing
+    /// contracts.
     #[allow(dead_code)]
     fn sampled_dmabuf_wayland_external_state_evidence_sources(
         &self,
         dmabuf: &Dmabuf,
         layout_history: SampledDmabufWaylandLayoutHistory,
+        external_state: Option<&SampledDmabufWaylandForeignGeneralEvidence>,
     ) -> Result<SampledDmabufWaylandExternalStateEvidenceSources, VulkanError> {
         let first_import_layout =
-            self.sampled_dmabuf_wayland_first_import_layout_evidence(dmabuf, layout_history)?;
-        let first_import_foreign_general =
-            self.sampled_dmabuf_wayland_first_import_foreign_general_evidence(dmabuf, layout_history)?;
-        let current_reacquire_layout =
-            self.sampled_dmabuf_wayland_current_reacquire_layout_evidence(dmabuf, layout_history)?;
+            self.sampled_dmabuf_wayland_first_import_layout_evidence(dmabuf, layout_history, external_state)?;
+        let first_import_foreign_general = self
+            .sampled_dmabuf_wayland_first_import_foreign_general_evidence(
+                dmabuf,
+                layout_history,
+                external_state,
+            )?;
+        let current_reacquire_layout = self.sampled_dmabuf_wayland_current_reacquire_layout_evidence(
+            dmabuf,
+            layout_history,
+            external_state,
+        )?;
         let current_reacquire_foreign_general = self
             .sampled_dmabuf_wayland_current_reacquire_foreign_general_evidence(
                 dmabuf,
@@ -3047,8 +3230,13 @@ impl ImportDmaWl for VulkanRenderer {
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
 
         let layout_history = self.sampled_dmabuf_layout_history(dmabuf);
-        let external_state_sources =
-            self.sampled_dmabuf_wayland_external_state_evidence_sources(dmabuf, layout_history)?;
+        let wayland_external_state =
+            self.sampled_dmabuf_wayland_buffer_foreign_general_evidence(buffer, dmabuf)?;
+        let external_state_sources = self.sampled_dmabuf_wayland_external_state_evidence_sources(
+            dmabuf,
+            layout_history,
+            wayland_external_state.as_ref(),
+        )?;
         let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_evidence(dmabuf, buffer)?;
         let release_evidence = self.sampled_dmabuf_wayland_release_evidence(dmabuf, buffer)?;
         let release_ownership = self.sampled_dmabuf_wayland_release_ownership_evidence(dmabuf, buffer)?;
@@ -3077,9 +3265,10 @@ impl ImportDmaWl for VulkanRenderer {
 
         let texture = unsafe {
             // SAFETY: The validation-stage Wayland path above only produces layout evidence from
-            // Smithay's Wayland/Vulkan interop policy. Production first-import and reacquire
-            // evidence sources still fail closed until the current Wayland/Vulkan external-state
-            // contract and release lifecycle hooks are implemented for the normal Smithay path.
+            // Smithay's Wayland/Vulkan interop policy. Caller-provided external-state evidence may
+            // satisfy the first-import/reacquire layout source, but public advertisement and the
+            // no-next-import/teardown release lifecycle still fail closed until the normal Smithay
+            // path has complete coverage.
             self.create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
                 dmabuf,
                 foreign_general,

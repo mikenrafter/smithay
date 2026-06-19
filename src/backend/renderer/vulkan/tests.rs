@@ -24,7 +24,7 @@ use crate::backend::renderer::{
     sync::{Fence, SyncPoint},
 };
 use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
-use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
+use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform, user_data::UserDataMap};
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use crate::wayland::drm_syncobj::DrmSyncPoint;
 
@@ -4254,6 +4254,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.sampled_dmabuf_wayland_current_reacquire_layout_evidence(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+            None,
         ),
         Ok(None)
     ));
@@ -4269,6 +4270,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.sampled_dmabuf_wayland_first_import_layout_evidence(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+            None,
         ),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan first-import layout policy"
@@ -4278,6 +4280,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.sampled_dmabuf_wayland_external_state_evidence_sources(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+            None,
         ),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan first-import layout policy"
@@ -4287,9 +4290,66 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.sampled_dmabuf_wayland_first_import_foreign_general_evidence(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+            None,
         ),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan foreign GENERAL policy"
+        ))
+    ));
+    let wayland_external_state = SampledDmabufWaylandForeignGeneralEvidence::new_for_tests(&policy_dmabuf);
+    let first_import_sources = renderer
+        .sampled_dmabuf_wayland_external_state_evidence_sources(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+            Some(&wayland_external_state),
+        )
+        .unwrap();
+    assert!(first_import_sources.first_import_layout.is_some());
+    assert!(first_import_sources.first_import_foreign_general.is_some());
+    assert!(first_import_sources.current_reacquire_layout.is_none());
+    assert!(first_import_sources.current_reacquire_foreign_general.is_none());
+    let mismatched_wayland_external_state =
+        SampledDmabufWaylandForeignGeneralEvidence::new_for_tests(&unrelated_dmabuf);
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_external_state_evidence_sources(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+            Some(&mismatched_wayland_external_state),
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland external-state identity"
+        ))
+    ));
+    let user_data_external_state = UserDataMap::new();
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_user_data_foreign_general_evidence(
+            &user_data_external_state,
+            &policy_dmabuf,
+        ),
+        Ok(None)
+    ));
+    unsafe {
+        // SAFETY: This unit test only validates evidence storage and identity routing; it performs
+        // no Vulkan import, acquire, sampling, or release operation with the constructed evidence.
+        VulkanRenderer::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+            &user_data_external_state,
+            &policy_dmabuf,
+        )
+        .unwrap();
+    }
+    let stored_external_state = renderer
+        .sampled_dmabuf_wayland_user_data_foreign_general_evidence(&user_data_external_state, &policy_dmabuf)
+        .unwrap()
+        .unwrap();
+    assert!(stored_external_state.is_for_dmabuf(&policy_dmabuf));
+    assert!(!stored_external_state.is_for_dmabuf(&unrelated_dmabuf));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_user_data_foreign_general_evidence(
+            &user_data_external_state,
+            &unrelated_dmabuf,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland external-state identity"
         ))
     ));
     let mismatched_import_dmabuf = dmabuf_with_planes_for_tests(
@@ -4482,6 +4542,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.sampled_dmabuf_wayland_current_reacquire_layout_evidence(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            None,
         ),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan current reacquire layout policy"
@@ -4501,15 +4562,32 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.sampled_dmabuf_wayland_external_state_evidence_sources(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            None,
         ),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan current reacquire layout policy"
         ))
     ));
+    let current_reacquire_sources = renderer
+        .sampled_dmabuf_wayland_external_state_evidence_sources(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            Some(&wayland_external_state),
+        )
+        .unwrap();
+    assert!(current_reacquire_sources.first_import_layout.is_none());
+    assert!(current_reacquire_sources.first_import_foreign_general.is_none());
+    assert!(current_reacquire_sources.current_reacquire_layout.is_some());
+    assert!(
+        current_reacquire_sources
+            .current_reacquire_foreign_general
+            .is_some()
+    );
     assert!(matches!(
         renderer.sampled_dmabuf_wayland_first_import_layout_evidence(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            None,
         ),
         Ok(None)
     ));
@@ -4517,6 +4595,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.sampled_dmabuf_wayland_first_import_foreign_general_evidence(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            None,
         ),
         Ok(None)
     ));
@@ -4550,6 +4629,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.sampled_dmabuf_wayland_current_reacquire_layout_evidence(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::LocallyAcquired,
+            None,
         ),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan unreleased local acquire"
@@ -4569,6 +4649,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.sampled_dmabuf_wayland_external_state_evidence_sources(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::LocallyAcquired,
+            None,
         ),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan unreleased local acquire"
@@ -4578,6 +4659,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.sampled_dmabuf_wayland_first_import_layout_evidence(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::LocallyAcquired,
+            None,
         ),
         Ok(None)
     ));
@@ -4585,6 +4667,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.sampled_dmabuf_wayland_first_import_foreign_general_evidence(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::LocallyAcquired,
+            None,
         ),
         Ok(None)
     ));
