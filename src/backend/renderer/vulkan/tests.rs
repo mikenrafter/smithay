@@ -4094,6 +4094,15 @@ fn sampled_dmabuf_wayland_policy_does_not_public_advertise_import_dma() {
         .validate_sampled_dmabuf_known_layout_contract(&dmabuf, wayland_policy)
         .unwrap();
     assert!(known_layout.is_for_dmabuf(&dmabuf));
+    assert_eq!(
+        renderer.sampled_dmabuf_public_import_contracts(),
+        SampledDmabufPublicImportContracts {
+            raw_import_capability: true,
+            advertised_formats: true,
+            public_external_state_policy: false,
+            public_import_lifecycle: false,
+        }
+    );
 
     assert!(matches!(
         renderer.validate_sampled_dmabuf_public_advertisement_contract(),
@@ -4188,11 +4197,29 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         modifier: Modifier::Linear,
     };
 
+    assert_eq!(
+        renderer.sampled_dmabuf_public_import_contracts(),
+        SampledDmabufPublicImportContracts {
+            raw_import_capability: false,
+            advertised_formats: false,
+            public_external_state_policy: false,
+            public_import_lifecycle: false,
+        }
+    );
     assert!(matches!(
         renderer.validate_sampled_dmabuf_public_advertisement_contract(),
         Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
     ));
     renderer.capabilities.import.dmabuf = true;
+    assert_eq!(
+        renderer.sampled_dmabuf_public_import_contracts(),
+        SampledDmabufPublicImportContracts {
+            raw_import_capability: true,
+            advertised_formats: false,
+            public_external_state_policy: false,
+            public_import_lifecycle: false,
+        }
+    );
     assert!(matches!(
         renderer.validate_sampled_dmabuf_public_advertisement_contract(),
         Err(VulkanError::MissingCapability(
@@ -4200,6 +4227,15 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         ))
     ));
     renderer.capabilities.formats.dmabuf_import = [advertised_format].into_iter().collect();
+    assert_eq!(
+        renderer.sampled_dmabuf_public_import_contracts(),
+        SampledDmabufPublicImportContracts {
+            raw_import_capability: true,
+            advertised_formats: true,
+            public_external_state_policy: false,
+            public_import_lifecycle: false,
+        }
+    );
     assert!(matches!(
         renderer.validate_sampled_dmabuf_public_advertisement_contract(),
         Err(VulkanError::MissingCapability(
@@ -4212,6 +4248,26 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf public external-state policy"
         ))
     ));
+    assert!(matches!(
+        SampledDmabufPublicImportContracts {
+            raw_import_capability: true,
+            advertised_formats: true,
+            public_external_state_policy: true,
+            public_import_lifecycle: false,
+        }
+        .validate(),
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
+    ));
+    assert!(
+        SampledDmabufPublicImportContracts {
+            raw_import_capability: true,
+            advertised_formats: true,
+            public_external_state_policy: true,
+            public_import_lifecycle: true,
+        }
+        .validate()
+        .is_ok()
+    );
 
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_acquire_sync_contract(None),

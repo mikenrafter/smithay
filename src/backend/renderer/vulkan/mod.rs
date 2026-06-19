@@ -133,6 +133,44 @@ impl SampledDmabufKnownLayoutEvidence {
     }
 }
 
+/// Ordered readiness gates for public sampled dmabuf [`ImportDma`] advertisement.
+///
+/// This is intentionally separate from the validation-stage [`ImportDmaWl`] path. The Wayland path
+/// may use commit-local evidence from Smithay's renderer-managed buffer wrapper, but public generic
+/// [`ImportDma`] has only a raw [`Dmabuf`] and damage. Future work must fill in these contracts in
+/// order instead of deriving Vulkan image layout, queue-family ownership, or release lifecycle from
+/// linux-dmabuf metadata or syncobj points alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SampledDmabufPublicImportContracts {
+    raw_import_capability: bool,
+    advertised_formats: bool,
+    public_external_state_policy: bool,
+    public_import_lifecycle: bool,
+}
+
+impl SampledDmabufPublicImportContracts {
+    fn validate(self) -> Result<(), VulkanError> {
+        if !self.raw_import_capability {
+            return Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"));
+        }
+        if !self.advertised_formats {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf advertised formats",
+            ));
+        }
+        if !self.public_external_state_policy {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf public external-state policy",
+            ));
+        }
+        if !self.public_import_lifecycle {
+            return Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"));
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 struct SampledDmabufWaylandForeignGeneralEvidenceSlot {
@@ -1383,20 +1421,22 @@ impl VulkanRenderer {
     /// transitions, sampled rendering, release synchronization, and tests all pass through the normal
     /// Smithay renderer path.
     fn validate_sampled_dmabuf_public_advertisement_contract(&self) -> Result<(), VulkanError> {
-        if !self.capabilities.import.dmabuf {
-            return Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"));
-        }
-        if self.capabilities.formats.dmabuf_import.iter().next().is_none() {
-            return Err(VulkanError::MissingCapability(
-                "sampled dmabuf advertised formats",
-            ));
-        }
-        self.validate_sampled_dmabuf_public_external_state_contract()?;
+        self.sampled_dmabuf_public_import_contracts().validate()
+    }
 
-        // Final enablement marker: even if raw capability data is populated, public `ImportDma`
-        // advertisement must stay fail-closed until import, acquire, sampling, release, and tests
-        // are complete on the normal Smithay path.
-        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
+    /// Gather public sampled-dmabuf [`ImportDma`] readiness without advertising it.
+    ///
+    /// Raw Vulkan probing may populate format records used by validation tests and development paths,
+    /// but the generic public import trait still lacks an external-state and lifecycle contract for
+    /// arbitrary dmabufs. Keep those fields false until a real Smithay-facing contract replaces the
+    /// current fail-closed markers.
+    fn sampled_dmabuf_public_import_contracts(&self) -> SampledDmabufPublicImportContracts {
+        SampledDmabufPublicImportContracts {
+            raw_import_capability: self.capabilities.import.dmabuf,
+            advertised_formats: self.capabilities.formats.dmabuf_import.iter().next().is_some(),
+            public_external_state_policy: false,
+            public_import_lifecycle: false,
+        }
     }
 
     /// Check whether the normal sampled-dmabuf external-state policy is ready for public import.
@@ -1407,9 +1447,16 @@ impl VulkanRenderer {
     /// separate guard so enabling raw dmabuf import flags cannot skip the currently missing contracts.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_public_external_state_contract(&self) -> Result<(), VulkanError> {
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf public external-state policy",
-        ))
+        if self
+            .sampled_dmabuf_public_import_contracts()
+            .public_external_state_policy
+        {
+            Ok(())
+        } else {
+            Err(VulkanError::MissingCapability(
+                "sampled dmabuf public external-state policy",
+            ))
+        }
     }
 
     /// Convert Wayland explicit-sync state into the renderer sync-point contract used by Vulkan.
@@ -2736,9 +2783,9 @@ impl VulkanRenderer {
     /// Import a dmabuf as a sampled texture when the producer's Vulkan external state is known.
     ///
     /// This is a validation-stage development helper for the intended sampled dmabuf path. It does
-    /// not make generic [`ImportDma`] public-advertised, and `dmabuf_formats()` remains gated by
-    /// [`VulkanImportCapabilities::dmabuf`] until arbitrary client-buffer acquire/layout/sync
-    /// contracts are implemented and tested.
+    /// not make generic [`ImportDma`] public-advertised, and `dmabuf_formats()` remains gated by the
+    /// public sampled-dmabuf readiness contract until arbitrary client-buffer acquire/layout/sync and
+    /// release-lifecycle contracts are implemented and tested.
     ///
     /// Use [`VulkanRenderer::release_imported_dmabuf_texture_to_foreign_general_sync_point`] before
     /// handing the dmabuf back to a foreign Vulkan producer/consumer.
