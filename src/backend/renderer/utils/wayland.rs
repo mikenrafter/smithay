@@ -77,6 +77,57 @@ impl ReleasePointSlot {
 /// ```
 pub type RendererSurfaceStateUserData = Mutex<RendererSurfaceState>;
 
+#[derive(Debug, Default)]
+struct SurfaceImportCacheReleaseState {
+    post_retired_release_import_depth: Mutex<usize>,
+}
+
+struct SurfaceImportCacheReleaseGuard<'a> {
+    state: &'a SurfaceImportCacheReleaseState,
+}
+
+impl Drop for SurfaceImportCacheReleaseGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut post_retired_release_import_depth) = self.state.post_retired_release_import_depth.lock()
+        {
+            *post_retired_release_import_depth = post_retired_release_import_depth.saturating_sub(1);
+        }
+    }
+}
+
+fn enter_surface_import_after_retired_release(states: &SurfaceData) -> SurfaceImportCacheReleaseGuard<'_> {
+    let state = states
+        .data_map
+        .get_or_insert_threadsafe(SurfaceImportCacheReleaseState::default);
+    if let Ok(mut post_retired_release_import_depth) = state.post_retired_release_import_depth.lock() {
+        *post_retired_release_import_depth = post_retired_release_import_depth.saturating_add(1);
+    }
+
+    SurfaceImportCacheReleaseGuard { state }
+}
+
+/// Returns whether renderer-managed surface import is currently past retired-texture release.
+///
+/// This is a narrow call-site marker for renderers that need to distinguish the normal
+/// [`import_surface`] path from direct trait calls with an arbitrary surface argument. It is only set
+/// for the duration of `renderer.import_buffer_from_surface_state(...)` after
+/// [`release_retired_surface_textures`] has succeeded. It relies on the renderer-utils convention
+/// that commit/update and import access for a given surface is serialized by the compositor event
+/// loop; it is not a cross-thread epoch proof for concurrent mutation of the same `SurfaceData`.
+pub(crate) fn surface_import_after_retired_release(states: &SurfaceData) -> bool {
+    states
+        .data_map
+        .get::<SurfaceImportCacheReleaseState>()
+        .and_then(|state| {
+            state
+                .post_retired_release_import_depth
+                .lock()
+                .ok()
+                .map(|guard| *guard > 0)
+        })
+        .unwrap_or(false)
+}
+
 /// Surface state for rendering related data
 #[derive(Default, Debug)]
 pub struct RendererSurfaceState {
@@ -848,6 +899,7 @@ where
                     return Ok(());
                 }
 
+                let _post_retired_release_import = enter_surface_import_after_retired_release(states);
                 match renderer.import_buffer_from_surface_state(buffer, Some(states), &buffer_damage) {
                     Some(Ok(m)) => {
                         e.insert(Box::new(m));
@@ -1379,6 +1431,27 @@ mod tests {
                 .retired_textures
                 .contains_key(&context_id.erased())
         );
+    }
+
+    #[test]
+    fn surface_import_after_retired_release_marker_is_scoped() {
+        let states = SurfaceData {
+            role: None,
+            data_map: Default::default(),
+            cached_state: MultiCache::new(),
+        };
+
+        assert!(!super::surface_import_after_retired_release(&states));
+        {
+            let _guard = super::enter_surface_import_after_retired_release(&states);
+            assert!(super::surface_import_after_retired_release(&states));
+            {
+                let _nested_guard = super::enter_surface_import_after_retired_release(&states);
+                assert!(super::surface_import_after_retired_release(&states));
+            }
+            assert!(super::surface_import_after_retired_release(&states));
+        }
+        assert!(!super::surface_import_after_retired_release(&states));
     }
 
     #[test]

@@ -4839,7 +4839,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             false,
         ),
         Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan texture-cache replacement reachability"
+            "sampled dmabuf Wayland Vulkan import_surface post-retired-release call site"
         ))
     ));
     let replacement_release_reachability = renderer
@@ -4850,7 +4850,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&policy_context),
         Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan texture-cache replacement reachability"
+            "sampled dmabuf Wayland Vulkan import_surface post-retired-release call site"
         ))
     ));
     let mut mismatched_cache_replacement_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
@@ -4867,7 +4867,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&mismatched_cache_replacement_context),
         Err(VulkanError::UnsupportedOperation(
-            "sampled dmabuf Wayland texture-cache replacement reachability identity"
+            "sampled dmabuf Wayland import_surface post-retired-release call site identity"
         ))
     ));
     let mut missing_cache_hook_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(

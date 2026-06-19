@@ -386,12 +386,12 @@ impl SampledDmabufWaylandTextureCachePolicy {
     }
 }
 
-/// Evidence that the import has a Wayland surface argument for surface-cache routing.
+/// Evidence that the import is on the post-retired-release surface-cache call site.
 ///
 /// This is only validation-stage reachability evidence. The normal `import_surface` helper drains
-/// retired textures before importing a replacement, but `ImportDmaWl` can only observe that it was
-/// called with a surface argument, not that specific caller ordering. The full texture-cache release
-/// lifecycle therefore remains guarded separately.
+/// retired textures before importing a replacement and exposes a temporary marker for that import
+/// call under Smithay's normal serialized renderer-utils surface access. The full texture-cache
+/// release lifecycle therefore remains guarded separately.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandTextureCacheReplacementReleaseReachability {
@@ -1725,23 +1725,23 @@ impl VulkanRenderer {
     ///
     /// `RendererSurfaceState::update_buffer` retires cached textures on new buffer commits, and
     /// `import_surface` drains those retired textures with the renderer release hook before importing
-    /// the replacement texture on Smithay's normal surface-cache path. The `ImportDmaWl` hook can
-    /// only observe that a surface argument is present, not that this specific helper ordering was
-    /// used by the caller. Keep this as a validation-stage reachability marker; the full
-    /// no-next-import, reset, and destruction release lifecycle remains guarded below.
+    /// the replacement texture on Smithay's normal surface-cache path. Under the normal serialized
+    /// renderer-utils surface access model, this marker proves that the current import call is past
+    /// that retired-texture release point; the full no-next-import, reset, and destruction release
+    /// lifecycle remains guarded below.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_texture_cache_replacement_reachability_contract(
         &self,
         dmabuf: &Dmabuf,
-        surface_argument_present: bool,
+        post_retired_release_import: bool,
     ) -> Result<SampledDmabufWaylandTextureCacheReplacementReleaseReachability, VulkanError> {
-        if surface_argument_present {
+        if post_retired_release_import {
             Ok(SampledDmabufWaylandTextureCacheReplacementReleaseReachability {
                 dmabuf: dmabuf.weak(),
             })
         } else {
             Err(VulkanError::MissingCapability(
-                "sampled dmabuf Wayland Vulkan texture-cache replacement reachability",
+                "sampled dmabuf Wayland Vulkan import_surface post-retired-release call site",
             ))
         }
     }
@@ -1873,12 +1873,12 @@ impl VulkanRenderer {
             context.texture_cache_replacement_release_reachability.as_ref()
         else {
             return Err(VulkanError::MissingCapability(
-                "sampled dmabuf Wayland Vulkan texture-cache replacement reachability",
+                "sampled dmabuf Wayland Vulkan import_surface post-retired-release call site",
             ));
         };
         if !replacement_release_reachability.is_for_dmabuf(context.dmabuf) {
             return Err(VulkanError::UnsupportedOperation(
-                "sampled dmabuf Wayland texture-cache replacement reachability identity",
+                "sampled dmabuf Wayland import_surface post-retired-release call site identity",
             ));
         }
 
@@ -3055,7 +3055,9 @@ impl ImportDmaWl for VulkanRenderer {
         let replacement_release_reachability = self
             .validate_sampled_dmabuf_wayland_texture_cache_replacement_reachability_contract(
                 dmabuf,
-                surface.is_some(),
+                surface
+                    .map(super::utils::surface_import_after_retired_release)
+                    .unwrap_or(false),
             )?;
         let texture_cache_release_hook = self.sampled_dmabuf_wayland_texture_cache_release_hook(dmabuf);
         let policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
