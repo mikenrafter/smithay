@@ -695,6 +695,14 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
         self
     }
 
+    fn with_texture_cache_release_lifecycle(
+        mut self,
+        lifecycle: Option<SampledDmabufWaylandTextureCacheReleaseLifecycle>,
+    ) -> Self {
+        self.texture_cache_release_lifecycle = lifecycle;
+        self
+    }
+
     fn with_release_ownership(mut self, release_ownership: SampledDmabufReleaseOwnershipEvidence) -> Self {
         self.release_ownership = Some(release_ownership);
         self
@@ -1860,6 +1868,16 @@ impl VulkanRenderer {
         dmabuf: &Dmabuf,
     ) -> Result<Option<SampledDmabufWaylandForeignGeneralEvidence>, VulkanError> {
         self.sampled_dmabuf_wayland_user_data_foreign_general_evidence(buffer.user_data(), dmabuf)
+    }
+
+    /// Read compositor-provided texture-cache release lifecycle evidence from the renderer buffer wrapper.
+    #[cfg(feature = "wayland_frontend")]
+    fn sampled_dmabuf_wayland_buffer_texture_cache_release_lifecycle(
+        &self,
+        buffer: &super::utils::Buffer,
+        dmabuf: &Dmabuf,
+    ) -> Result<Option<SampledDmabufWaylandTextureCacheReleaseLifecycle>, VulkanError> {
+        self.sampled_dmabuf_wayland_user_data_texture_cache_release_lifecycle(buffer.user_data(), dmabuf)
     }
 
     /// Read commit-local Wayland/Vulkan external-state evidence from wrapper-local user data.
@@ -3381,6 +3399,8 @@ impl ImportDmaWl for VulkanRenderer {
                     .unwrap_or(false),
             )?;
         let texture_cache_release_hook = self.sampled_dmabuf_wayland_texture_cache_release_hook(dmabuf);
+        let texture_cache_release_lifecycle =
+            self.sampled_dmabuf_wayland_buffer_texture_cache_release_lifecycle(buffer, dmabuf)?;
         let policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
             dmabuf,
             &import,
@@ -3392,6 +3412,7 @@ impl ImportDmaWl for VulkanRenderer {
         .with_external_state_sources(external_state_sources)
         .with_texture_cache_replacement_release_reachability(replacement_release_reachability)
         .with_texture_cache_release_hook(texture_cache_release_hook)
+        .with_texture_cache_release_lifecycle(texture_cache_release_lifecycle)
         .with_release_ownership(release_ownership);
         let layout_evidence = self.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&policy_context)?;
         let foreign_general = self.validate_sampled_dmabuf_known_layout_contract(dmabuf, layout_evidence)?;
@@ -3399,9 +3420,10 @@ impl ImportDmaWl for VulkanRenderer {
         let texture = unsafe {
             // SAFETY: The validation-stage Wayland path above only produces layout evidence from
             // Smithay's Wayland/Vulkan interop policy. Caller-provided external-state evidence may
-            // satisfy the first-import/reacquire layout source, but public advertisement and the
-            // no-next-import/teardown release lifecycle still fail closed until the normal Smithay
-            // path has complete coverage.
+            // satisfy the first-import/reacquire layout source, and renderer-context-bound lifecycle
+            // evidence may satisfy the no-next-import/teardown texture-cache guard. Public sampled
+            // ImportDma advertisement still remains closed until the whole import/release lifecycle
+            // is implemented and tested beyond this normal ImportDmaWl validation path.
             self.create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
                 dmabuf,
                 foreign_general,
