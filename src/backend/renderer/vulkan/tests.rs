@@ -3849,6 +3849,99 @@ fn runtime_dmabuf_loopback_samples_with_exported_release_sync() {
 }
 
 #[test]
+#[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
+fn runtime_dmabuf_loopback_cache_release_hook_releases_sampled_texture() {
+    let test_name = "Vulkan dmabuf loopback cache release hook test";
+    let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
+        return;
+    };
+    let Some(render_format) =
+        runtime_offscreen_sample_render_format(&candidate.renderer, candidate.format.code, test_name)
+    else {
+        return;
+    };
+
+    let allocator_release = unsafe {
+        // SAFETY: The dmabuf was just exported from `candidate.image`, and this ignored runtime test
+        // does not hand it to any other API before asking the allocator to release the fresh image to
+        // FOREIGN/GENERAL for the renderer acquire below.
+        candidate
+            .allocator
+            .release_dmabuf_to_foreign_general(&candidate.image, &candidate.dmabuf)
+    }
+    .expect("release allocator dmabuf to foreign GENERAL");
+
+    let mut target = unsafe {
+        // SAFETY: `allocator_release` proves that the allocator-owned image backing this exported
+        // dmabuf was released to VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL layout. There is no
+        // intervening access before this renderer acquire.
+        candidate
+            .renderer
+            .bind_allocator_released_dmabuf_render_target(&mut candidate.dmabuf, allocator_release)
+    }
+    .expect("bind allocator-released dmabuf as Vulkan render target")
+    .expect("renderer should advertise the selected dmabuf render-target modifier");
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = candidate
+            .renderer
+            .render(&mut target, (4, 4).into(), Transform::Normal)
+            .expect("render into loopback dmabuf target");
+        frame
+            .clear(Color32F::new(0.375, 0.25, 0.875, 1.0), &full_damage)
+            .expect("clear loopback dmabuf render target");
+    }
+
+    let evidence = candidate
+        .renderer
+        .release_dmabuf_render_target_for_sampled_loopback(&mut target, false)
+        .expect("release loopback render target to foreign GENERAL")
+        .expect("released loopback render target should produce sampled import evidence");
+    drop(target);
+
+    let texture = unsafe {
+        // SAFETY: `evidence` was produced by releasing the same Smithay dmabuf identity immediately
+        // above, and there is no intervening access, acquire, release, or layout/ownership transition
+        // before this sampled loopback import. The validation-stage release obligation has no real
+        // Wayland syncobj point; it exists only to drive the generic surface-cache release hook through
+        // the Vulkan sampled-dmabuf release path.
+        candidate
+            .renderer
+            .import_dmabuf_texture_from_loopback_with_release_for_tests(
+                &candidate.dmabuf,
+                evidence,
+                SampledDmabufReleaseOwnership::new_for_tests(&candidate.dmabuf),
+            )
+    }
+    .expect("import loopback dmabuf with sampled release obligation")
+    .expect("selected modifier should support sampled dmabuf import");
+    assert!(texture.has_sampled_dmabuf_release_for_tests());
+
+    runtime_sample_texture_to_offscreen_and_assert_non_black(
+        &mut candidate.renderer,
+        &texture,
+        render_format,
+        test_name,
+    );
+
+    assert!(Renderer::release_imported_texture_for_surface_cache(&mut candidate.renderer, &texture).is_ok());
+    assert_eq!(
+        candidate
+            .renderer
+            .sampled_dmabuf_layout_history(&candidate.dmabuf),
+        SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+    );
+    assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
+    assert!(matches!(
+        candidate
+            .renderer
+            .validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
+}
+
+#[test]
 #[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format and sync-file export"]
 fn runtime_dmabuf_loopback_reimports_after_sampled_release_with_exported_sync() {
     let test_name = "Vulkan dmabuf loopback exported-sync reimport test";

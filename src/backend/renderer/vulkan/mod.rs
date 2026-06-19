@@ -3158,6 +3158,45 @@ impl VulkanRenderer {
         Ok(texture)
     }
 
+    /// Import a Smithay-controlled loopback dmabuf as a sampled texture with a release obligation.
+    ///
+    /// This test-only helper lets ignored runtime probes exercise the same Vulkan release hook used by
+    /// renderer-utils surface-cache retirement without constructing a real Wayland `wl_buffer` and DRM
+    /// syncobj release point. It remains validation-stage evidence: public `ImportDma` advertisement
+    /// is unchanged, and production `ImportDmaWl` still obtains release ownership from the
+    /// renderer-managed Wayland buffer wrapper.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy the same no-intervening-use and known `FOREIGN + GENERAL` external
+    /// state requirements as [`VulkanRenderer::import_dmabuf_texture_from_loopback`].
+    #[cfg(test)]
+    unsafe fn import_dmabuf_texture_from_loopback_with_release_for_tests(
+        &mut self,
+        dmabuf: &Dmabuf,
+        evidence: VulkanDmabufLoopbackImportEvidence,
+        release_ownership: SampledDmabufReleaseOwnership,
+    ) -> Result<Option<VulkanTexture>, VulkanError> {
+        let foreign_general = self.validate_dmabuf_loopback_import_evidence(dmabuf, &evidence)?;
+        let acquire_sync = evidence.acquire_sync;
+        let texture = unsafe {
+            // SAFETY: Forwarded from this test-only helper's caller and validated against the
+            // consumed loopback evidence's dmabuf identity above. The release obligation remains a
+            // renderer-owned texture obligation and is validated against the same dmabuf before it is
+            // attached.
+            self.create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
+                dmabuf,
+                foreign_general,
+                Some(&acquire_sync),
+                || Ok(release_ownership),
+            )?
+        };
+        if texture.is_some() {
+            self.record_sampled_dmabuf_locally_acquired(dmabuf);
+        }
+        Ok(texture)
+    }
+
     /// Release an explicitly acquired dmabuf render target after rendering failed before frame finish.
     ///
     /// This is the public error-cleanup counterpart to
