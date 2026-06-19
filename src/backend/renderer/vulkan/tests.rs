@@ -4771,6 +4771,18 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland release ownership transfer"
         ))
     ));
+    assert!(matches!(
+        renderer
+            .validate_sampled_dmabuf_wayland_release_ownership_availability_contract(&policy_dmabuf, false),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland release ownership transfer"
+        ))
+    ));
+    let production_release_ownership_evidence = renderer
+        .validate_sampled_dmabuf_wayland_release_ownership_availability_contract(&policy_dmabuf, true)
+        .unwrap();
+    assert!(production_release_ownership_evidence.is_for_dmabuf(&policy_dmabuf));
+    assert!(!production_release_ownership_evidence.is_for_dmabuf(&unrelated_dmabuf));
     let mut mismatched_release_ownership_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
         &policy_dmabuf,
         &policy_import,
@@ -4797,9 +4809,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         true,
         SampledDmabufWaylandLayoutHistory::NoRendererHistory,
     );
-    release_ownership_context.release_ownership = Some(SampledDmabufReleaseOwnershipEvidence::new_for_tests(
-        &policy_dmabuf,
-    ));
+    release_ownership_context.release_ownership = Some(production_release_ownership_evidence);
     assert!(
         renderer
             .validate_sampled_dmabuf_wayland_release_ownership_policy(&release_ownership_context)
