@@ -3547,6 +3547,43 @@ fn runtime_dmabuf_loopback_candidate(test_name: &str) -> Option<RuntimeDmabufLoo
     None
 }
 
+fn runtime_offscreen_sample_render_format(
+    renderer: &VulkanRenderer,
+    preferred: Fourcc,
+    test_name: &str,
+) -> Option<Fourcc> {
+    renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == preferred
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.color_attachment
+                && record.usages.color_attachment_blend
+                && record.usages.transfer_src
+                && record.usages.transfer_dst
+        })
+        .or_else(|| {
+            renderer.capabilities().formats.records.iter().find(|record| {
+                record.tiling == VulkanFormatTiling::Optimal
+                    && record.usages.color_attachment
+                    && record.usages.color_attachment_blend
+                    && record.usages.transfer_src
+                    && record.usages.transfer_dst
+                    && get_format_info(record.format)
+                        .map(|info| !info.is_10bit)
+                        .unwrap_or(false)
+            })
+        })
+        .map(|record| record.format)
+        .or_else(|| {
+            eprintln!("skipping {test_name}: no offscreen render format");
+            None
+        })
+}
+
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
 fn runtime_dmabuf_loopback_prerequisites_find_common_exportable_modifier() {
@@ -3668,6 +3705,139 @@ fn runtime_dmabuf_loopback_imports_released_render_target_as_sampled_texture() {
 }
 
 #[test]
+#[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format and sync-file export"]
+fn runtime_dmabuf_loopback_samples_with_exported_release_sync() {
+    let Some(mut candidate) =
+        runtime_dmabuf_loopback_candidate("Vulkan dmabuf loopback exported-sync sampling test")
+    else {
+        return;
+    };
+    let Some(render_format) = runtime_offscreen_sample_render_format(
+        &candidate.renderer,
+        candidate.format.code,
+        "Vulkan dmabuf loopback exported-sync sampling test",
+    ) else {
+        return;
+    };
+
+    let allocator_release = unsafe {
+        // SAFETY: The dmabuf was just exported from `candidate.image`, and this ignored runtime test
+        // does not hand it to any other API before asking the allocator to release the fresh image to
+        // FOREIGN/GENERAL for the renderer acquire below.
+        candidate
+            .allocator
+            .release_dmabuf_to_foreign_general(&candidate.image, &candidate.dmabuf)
+    }
+    .expect("release allocator dmabuf to foreign GENERAL");
+
+    let mut target = unsafe {
+        // SAFETY: `allocator_release` proves that the allocator-owned image backing this exported
+        // dmabuf was released to VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL layout. There is no
+        // intervening access before this renderer acquire.
+        candidate
+            .renderer
+            .bind_allocator_released_dmabuf_render_target(&mut candidate.dmabuf, allocator_release)
+    }
+    .expect("bind allocator-released dmabuf as Vulkan render target")
+    .expect("renderer should advertise the selected dmabuf render-target modifier");
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = candidate
+            .renderer
+            .render(&mut target, (4, 4).into(), Transform::Normal)
+            .expect("render into loopback dmabuf target");
+        frame
+            .clear(Color32F::new(0.125, 0.625, 0.875, 1.0), &full_damage)
+            .expect("clear loopback dmabuf render target");
+    }
+
+    let evidence = match candidate
+        .renderer
+        .release_dmabuf_render_target_for_sampled_loopback(&mut target, true)
+    {
+        Ok(Some(evidence)) => evidence,
+        Ok(None) => panic!("released loopback render target should produce sampled import evidence"),
+        Err(VulkanError::UnsupportedOperation("sync-file semaphore export")) => {
+            eprintln!(
+                "skipping Vulkan dmabuf loopback exported-sync sampling test: sync-file export unsupported"
+            );
+            candidate
+                .renderer
+                .release_dmabuf_render_target_for_sampled_loopback(&mut target, false)
+                .expect("release loopback render target without exported sync after export skip");
+            return;
+        }
+        Err(err) => panic!("release loopback render target to foreign GENERAL with exported sync: {err:?}"),
+    };
+    drop(target);
+    assert!(evidence.is_for_dmabuf(&candidate.dmabuf));
+    assert!(
+        evidence.acquire_sync().contains_fence(),
+        "exported loopback release should carry a fence-backed acquire SyncPoint"
+    );
+
+    let texture = unsafe {
+        // SAFETY: `evidence` was produced by releasing the same Smithay dmabuf identity immediately
+        // above, and there is no intervening access, acquire, release, or layout/ownership transition
+        // before this sampled loopback import. Unlike the direct ImportDma experiment, this path passes
+        // the exported release sync point into the Vulkan acquire helper.
+        candidate
+            .renderer
+            .import_dmabuf_texture_from_loopback(&candidate.dmabuf, evidence)
+    }
+    .expect("import exported-sync loopback dmabuf as sampled texture")
+    .expect("selected modifier should support sampled dmabuf import");
+
+    let mut sample_target = candidate
+        .renderer
+        .create_offscreen_render_target(render_format, (4, 4).into())
+        .expect("create offscreen sampling target");
+    candidate
+        .renderer
+        .clear_offscreen_render_target(&mut sample_target, Color32F::BLACK)
+        .expect("clear sampling target before texture render");
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = candidate
+            .renderer
+            .render(&mut sample_target, (4, 4).into(), Transform::Normal)
+            .expect("render into offscreen sampling target");
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::from_size((4.0, 4.0).into()),
+                Rectangle::from_size((4, 4).into()),
+                &full_damage,
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .expect("sample exported-sync loopback dmabuf texture into offscreen target");
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    let readback = candidate
+        .renderer
+        .read_offscreen_render_target(&mut sample_target)
+        .expect("read back sampled offscreen target");
+    assert!(
+        readback
+            .chunks_exact(4)
+            .any(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0),
+        "sampling exported-sync loopback dmabuf texture should write non-black color data"
+    );
+
+    let (released, release_sync) = candidate
+        .renderer
+        .release_imported_dmabuf_texture_to_foreign_general_sync_point(&texture, true)
+        .expect("release exported-sync sampled texture after offscreen sampling");
+    assert!(released);
+    assert!(release_sync.contains_fence());
+}
+
+#[test]
 #[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
 fn runtime_direct_import_dma_experiment_imports_released_render_target_as_sampled_texture() {
     let Some(mut candidate) = runtime_dmabuf_loopback_candidate("Vulkan direct ImportDma experiment test")
@@ -3757,41 +3927,11 @@ fn runtime_direct_import_dma_experiment_samples_imported_texture() {
     else {
         return;
     };
-    let Some(render_format) = candidate
-        .renderer
-        .capabilities()
-        .formats
-        .records
-        .iter()
-        .find(|record| {
-            record.format == candidate.format.code
-                && record.tiling == VulkanFormatTiling::Optimal
-                && record.usages.color_attachment
-                && record.usages.color_attachment_blend
-                && record.usages.transfer_src
-                && record.usages.transfer_dst
-        })
-        .or_else(|| {
-            candidate
-                .renderer
-                .capabilities()
-                .formats
-                .records
-                .iter()
-                .find(|record| {
-                    record.tiling == VulkanFormatTiling::Optimal
-                        && record.usages.color_attachment
-                        && record.usages.color_attachment_blend
-                        && record.usages.transfer_src
-                        && record.usages.transfer_dst
-                        && get_format_info(record.format)
-                            .map(|info| !info.is_10bit)
-                            .unwrap_or(false)
-                })
-        })
-        .map(|record| record.format)
-    else {
-        eprintln!("skipping Vulkan direct ImportDma sampling test: no offscreen render format");
+    let Some(render_format) = runtime_offscreen_sample_render_format(
+        &candidate.renderer,
+        candidate.format.code,
+        "Vulkan direct ImportDma sampling test",
+    ) else {
         return;
     };
 
