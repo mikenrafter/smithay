@@ -3589,7 +3589,7 @@ fn runtime_sample_texture_to_offscreen_and_assert_non_black(
     texture: &VulkanTexture,
     render_format: Fourcc,
     test_name: &str,
-) {
+) -> Vec<u8> {
     let mut sample_target = renderer
         .create_offscreen_render_target(render_format, (4, 4).into())
         .expect("create offscreen sampling target");
@@ -3625,6 +3625,7 @@ fn runtime_sample_texture_to_offscreen_and_assert_non_black(
             .any(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0),
         "{test_name}: sampling dmabuf texture should write non-black color data"
     );
+    readback
 }
 
 #[test]
@@ -3910,7 +3911,7 @@ fn runtime_dmabuf_loopback_reimports_after_sampled_release_with_exported_sync() 
     }
     .expect("import first exported-sync loopback dmabuf as sampled texture")
     .expect("selected modifier should support first sampled dmabuf import");
-    runtime_sample_texture_to_offscreen_and_assert_non_black(
+    let first_readback = runtime_sample_texture_to_offscreen_and_assert_non_black(
         &mut candidate.renderer,
         &first_texture,
         render_format,
@@ -3966,11 +3967,15 @@ fn runtime_dmabuf_loopback_reimports_after_sampled_release_with_exported_sync() 
     }
     .expect("import rebound exported-sync loopback dmabuf as sampled texture")
     .expect("selected modifier should support rebound sampled dmabuf import");
-    runtime_sample_texture_to_offscreen_and_assert_non_black(
+    let second_readback = runtime_sample_texture_to_offscreen_and_assert_non_black(
         &mut candidate.renderer,
         &second_texture,
         render_format,
         test_name,
+    );
+    assert_ne!(
+        first_readback, second_readback,
+        "reimported sampled dmabuf should reflect the second render-target clear, not stale first contents"
     );
 
     let (released, final_release_sync) = candidate
