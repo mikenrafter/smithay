@@ -3410,7 +3410,11 @@ impl ImportDma for VulkanRenderer {
         _dmabuf: &Dmabuf,
         _damage: Option<&[Rectangle<i32, BufferCoord>]>,
     ) -> Result<Self::TextureId, Self::Error> {
-        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        self.validate_sampled_dmabuf_public_advertisement_contract()?;
+
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf public import implementation",
+        ))
     }
 }
 

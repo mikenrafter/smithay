@@ -3965,7 +3965,9 @@ fn public_dmabuf_import_gates_formats() {
 
     assert!(matches!(
         renderer.import_dmabuf(&dmabuf, None),
-        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf public external-state policy"
+        ))
     ));
     assert!(matches!(
         // SAFETY: This scaffold renderer has no Vulkan device, so the explicit validation-stage
@@ -4114,7 +4116,9 @@ fn sampled_dmabuf_wayland_policy_does_not_public_advertise_import_dma() {
     assert!(!renderer.has_dmabuf_format(format));
     assert!(matches!(
         renderer.import_dmabuf(&dmabuf, None),
-        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf public external-state policy"
+        ))
     ));
 }
 
