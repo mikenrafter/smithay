@@ -2995,6 +2995,48 @@ impl VulkanRenderer {
         Ok((released, sync_point_from_sync_file(sync_file)))
     }
 
+    /// Complete the normal Wayland sampled-dmabuf import after evidence collection.
+    ///
+    /// This is the shared implementation core for [`ImportDmaWl`]. It deliberately still requires a
+    /// late-bound release-ownership transfer closure so the renderer-managed Wayland buffer wrapper
+    /// remains the production owner of the move-only release point until all policy guards have passed.
+    /// Extracting this helper keeps the intended Wayland path testable without turning the direct
+    /// `ImportDma` experiment into public support or inventing a side-channel advertisement surface.
+    #[cfg(feature = "wayland_frontend")]
+    #[allow(dead_code)]
+    fn import_wayland_dmabuf_with_policy_context<F>(
+        &mut self,
+        context: SampledDmabufWaylandVulkanInteropPolicyContext<'_>,
+        release_ownership: F,
+    ) -> Result<VulkanTexture, VulkanError>
+    where
+        F: FnOnce() -> Result<SampledDmabufReleaseOwnership, VulkanError>,
+    {
+        let dmabuf = context.dmabuf;
+        let layout_evidence = self.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&context)?;
+        let foreign_general = self.validate_sampled_dmabuf_known_layout_contract(dmabuf, layout_evidence)?;
+
+        let texture = unsafe {
+            // SAFETY: The validation-stage Wayland policy above is the only production source of
+            // layout evidence for this helper. The release-ownership closure is late-bound so the
+            // move-only Wayland release point is not taken until all policy guards have accepted the
+            // import and texture construction is ready to attach the release obligation.
+            self.create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
+                dmabuf,
+                foreign_general,
+                Some(context.acquire_sync.sync()),
+                release_ownership,
+            )?
+        };
+
+        if let Some(texture) = texture {
+            self.record_sampled_dmabuf_locally_acquired(dmabuf);
+            Ok(texture)
+        } else {
+            Err(VulkanError::MissingCapability("sampled dmabuf texture import"))
+        }
+    }
+
     /// Release an acquired dmabuf render target back to foreign ownership in `GENERAL` layout.
     ///
     /// This is the release counterpart to the acquired dmabuf render-target helper used by public
@@ -3512,30 +3554,9 @@ impl ImportDmaWl for VulkanRenderer {
         .with_texture_cache_release_hook(texture_cache_release_hook)
         .with_texture_cache_release_lifecycle(texture_cache_release_lifecycle)
         .with_release_ownership(release_ownership);
-        let layout_evidence = self.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&policy_context)?;
-        let foreign_general = self.validate_sampled_dmabuf_known_layout_contract(dmabuf, layout_evidence)?;
-
-        let texture = unsafe {
-            // SAFETY: The validation-stage Wayland path above only produces layout evidence from
-            // Smithay's Wayland/Vulkan interop policy. Caller-provided external-state evidence may
-            // satisfy the first-import/reacquire layout source, and renderer-context-bound lifecycle
-            // evidence may satisfy the no-next-import/teardown texture-cache guard. Public sampled
-            // ImportDma advertisement still remains closed until the whole import/release lifecycle
-            // is implemented and tested beyond this normal ImportDmaWl validation path.
-            self.create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
-                dmabuf,
-                foreign_general,
-                Some(acquire_sync.sync()),
-                || Self::sampled_dmabuf_take_wayland_release_ownership(dmabuf, buffer),
-            )?
-        };
-
-        if let Some(texture) = texture {
-            self.record_sampled_dmabuf_locally_acquired(dmabuf);
-            Ok(texture)
-        } else {
-            Err(VulkanError::MissingCapability("sampled dmabuf texture import"))
-        }
+        self.import_wayland_dmabuf_with_policy_context(policy_context, || {
+            Self::sampled_dmabuf_take_wayland_release_ownership(dmabuf, buffer)
+        })
     }
 }
 

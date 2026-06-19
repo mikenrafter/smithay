@@ -5540,6 +5540,32 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&first_import_context),
         Ok(SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(_))
     ));
+    #[cfg(feature = "wayland_frontend")]
+    {
+        renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+            Fourcc::Abgr8888,
+            vk::DrmFormatModifierPropertiesEXT {
+                drm_format_modifier: Modifier::Linear.into(),
+                drm_format_modifier_plane_count: 1,
+                drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            },
+        )];
+        let release_transfer_called = Cell::new(false);
+        let import_result = renderer.import_wayland_dmabuf_with_policy_context(first_import_context, || {
+            release_transfer_called.set(true);
+            Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland release ownership transfer",
+            ))
+        });
+        assert!(
+            matches!(import_result, Err(VulkanError::VulkanUnavailable)),
+            "unexpected Wayland import helper result: {import_result:?}"
+        );
+        assert!(
+            !release_transfer_called.get(),
+            "Wayland release ownership must stay with the buffer wrapper until policy validation reaches device import"
+        );
+    }
     assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&renderer_release_history_context),
         Err(VulkanError::MissingCapability(
