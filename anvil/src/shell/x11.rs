@@ -84,6 +84,11 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
             .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
             .cloned();
         if let Some(elem) = maybe {
+            if let Some(surface) = window.wl_surface() {
+                self.backend_data.retire_surface_tree_textures(&surface);
+            } else {
+                trace!("X11 window unmapped without an associated Wayland surface");
+            }
             self.space.unmap_elem(&elem)
         }
         if !window.is_override_redirect() {

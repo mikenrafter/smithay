@@ -91,6 +91,14 @@ impl Backend for X11Data {
         self.surface.reset_buffers();
     }
     fn early_import(&mut self, _surface: &wl_surface::WlSurface) {}
+    fn retire_surface_tree_textures(&mut self, surface: &wl_surface::WlSurface) {
+        if let Err(err) = smithay::backend::renderer::utils::retire_and_release_surface_tree_textures(
+            &mut self.renderer,
+            surface,
+        ) {
+            warn!("Failed to release retired surface textures: {}", err);
+        }
+    }
     fn update_led_state(&mut self, _led_state: LedState) {}
 }
 

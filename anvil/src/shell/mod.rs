@@ -271,6 +271,8 @@ impl<BackendData: Backend> WlrLayerShellHandler for AnvilState<BackendData> {
                 .cloned();
             layer.map(|layer| (map, layer))
         }) {
+            self.backend_data
+                .retire_surface_tree_textures(surface.wl_surface());
             map.unmap_layer(&layer);
         }
     }

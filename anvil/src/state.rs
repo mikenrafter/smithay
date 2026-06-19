@@ -1209,5 +1209,6 @@ pub trait Backend {
     fn seat_name(&self) -> String;
     fn reset_buffers(&mut self, output: &Output);
     fn early_import(&mut self, surface: &WlSurface);
+    fn retire_surface_tree_textures(&mut self, _surface: &WlSurface) {}
     fn update_led_state(&mut self, led_state: LedState);
 }
