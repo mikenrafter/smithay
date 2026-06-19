@@ -3584,6 +3584,49 @@ fn runtime_offscreen_sample_render_format(
         })
 }
 
+fn runtime_sample_texture_to_offscreen_and_assert_non_black(
+    renderer: &mut VulkanRenderer,
+    texture: &VulkanTexture,
+    render_format: Fourcc,
+    test_name: &str,
+) {
+    let mut sample_target = renderer
+        .create_offscreen_render_target(render_format, (4, 4).into())
+        .expect("create offscreen sampling target");
+    renderer
+        .clear_offscreen_render_target(&mut sample_target, Color32F::BLACK)
+        .expect("clear sampling target before texture render");
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = renderer
+            .render(&mut sample_target, (4, 4).into(), Transform::Normal)
+            .expect("render into offscreen sampling target");
+        frame
+            .render_texture_from_to(
+                texture,
+                Rectangle::from_size((4.0, 4.0).into()),
+                Rectangle::from_size((4, 4).into()),
+                &full_damage,
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .expect("sample dmabuf texture into offscreen target");
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    let readback = renderer
+        .read_offscreen_render_target(&mut sample_target)
+        .expect("read back sampled offscreen target");
+    assert!(
+        readback
+            .chunks_exact(4)
+            .any(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0),
+        "{test_name}: sampling dmabuf texture should write non-black color data"
+    );
+}
+
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
 fn runtime_dmabuf_loopback_prerequisites_find_common_exportable_modifier() {
@@ -3789,44 +3832,11 @@ fn runtime_dmabuf_loopback_samples_with_exported_release_sync() {
     .expect("import exported-sync loopback dmabuf as sampled texture")
     .expect("selected modifier should support sampled dmabuf import");
 
-    let mut sample_target = candidate
-        .renderer
-        .create_offscreen_render_target(render_format, (4, 4).into())
-        .expect("create offscreen sampling target");
-    candidate
-        .renderer
-        .clear_offscreen_render_target(&mut sample_target, Color32F::BLACK)
-        .expect("clear sampling target before texture render");
-
-    {
-        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
-        let mut frame = candidate
-            .renderer
-            .render(&mut sample_target, (4, 4).into(), Transform::Normal)
-            .expect("render into offscreen sampling target");
-        frame
-            .render_texture_from_to(
-                &texture,
-                Rectangle::from_size((4.0, 4.0).into()),
-                Rectangle::from_size((4, 4).into()),
-                &full_damage,
-                &[],
-                Transform::Normal,
-                1.0,
-            )
-            .expect("sample exported-sync loopback dmabuf texture into offscreen target");
-        assert!(frame.finish().unwrap().is_reached());
-    }
-
-    let readback = candidate
-        .renderer
-        .read_offscreen_render_target(&mut sample_target)
-        .expect("read back sampled offscreen target");
-    assert!(
-        readback
-            .chunks_exact(4)
-            .any(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0),
-        "sampling exported-sync loopback dmabuf texture should write non-black color data"
+    runtime_sample_texture_to_offscreen_and_assert_non_black(
+        &mut candidate.renderer,
+        &texture,
+        render_format,
+        "Vulkan dmabuf loopback exported-sync sampling test",
     );
 
     let (released, release_sync) = candidate
@@ -3835,6 +3845,140 @@ fn runtime_dmabuf_loopback_samples_with_exported_release_sync() {
         .expect("release exported-sync sampled texture after offscreen sampling");
     assert!(released);
     assert!(release_sync.contains_fence());
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format and sync-file export"]
+fn runtime_dmabuf_loopback_reimports_after_sampled_release_with_exported_sync() {
+    let test_name = "Vulkan dmabuf loopback exported-sync reimport test";
+    let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
+        return;
+    };
+    let Some(render_format) =
+        runtime_offscreen_sample_render_format(&candidate.renderer, candidate.format.code, test_name)
+    else {
+        return;
+    };
+
+    let allocator_release = unsafe {
+        // SAFETY: The dmabuf was just exported from `candidate.image`, and this ignored runtime test
+        // does not hand it to any other API before asking the allocator to release the fresh image to
+        // FOREIGN/GENERAL for the renderer acquire below.
+        candidate
+            .allocator
+            .release_dmabuf_to_foreign_general(&candidate.image, &candidate.dmabuf)
+    }
+    .expect("release allocator dmabuf to foreign GENERAL");
+
+    let mut target = unsafe {
+        // SAFETY: `allocator_release` proves that the allocator-owned image backing this exported
+        // dmabuf was released to VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL layout. There is no
+        // intervening access before this renderer acquire.
+        candidate
+            .renderer
+            .bind_allocator_released_dmabuf_render_target(&mut candidate.dmabuf, allocator_release)
+    }
+    .expect("bind allocator-released dmabuf as Vulkan render target")
+    .expect("renderer should advertise the selected dmabuf render-target modifier");
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = candidate
+            .renderer
+            .render(&mut target, (4, 4).into(), Transform::Normal)
+            .expect("render first loopback dmabuf target contents");
+        frame
+            .clear(Color32F::new(0.25, 0.75, 0.125, 1.0), &full_damage)
+            .expect("clear first loopback dmabuf render target");
+    }
+
+    let first_evidence = candidate
+        .renderer
+        .release_dmabuf_render_target_for_sampled_loopback(&mut target, true)
+        .expect("release first loopback render target to foreign GENERAL with exported sync")
+        .expect("first loopback release should produce sampled import evidence");
+    drop(target);
+    assert!(first_evidence.is_for_dmabuf(&candidate.dmabuf));
+    assert!(first_evidence.acquire_sync().contains_fence());
+
+    let first_texture = unsafe {
+        // SAFETY: `first_evidence` was produced by releasing the same Smithay dmabuf identity
+        // immediately above, and there is no intervening use before this sampled import.
+        candidate
+            .renderer
+            .import_dmabuf_texture_from_loopback(&candidate.dmabuf, first_evidence)
+    }
+    .expect("import first exported-sync loopback dmabuf as sampled texture")
+    .expect("selected modifier should support first sampled dmabuf import");
+    runtime_sample_texture_to_offscreen_and_assert_non_black(
+        &mut candidate.renderer,
+        &first_texture,
+        render_format,
+        test_name,
+    );
+
+    let (released, sampled_release_sync) = candidate
+        .renderer
+        .release_imported_dmabuf_texture_to_foreign_general_sync_point(&first_texture, true)
+        .expect("release first sampled texture to foreign GENERAL with exported sync");
+    assert!(released);
+    assert!(sampled_release_sync.contains_fence());
+    drop(first_texture);
+
+    let mut rebound_target = unsafe {
+        // SAFETY: The sampled texture release above returned the same dmabuf to FOREIGN/GENERAL and
+        // produced `sampled_release_sync` as the completion dependency. There is no intervening use
+        // before this preserve acquire rebinds the dmabuf as a render target.
+        candidate.renderer.bind_dmabuf_render_target(
+            &mut candidate.dmabuf,
+            VulkanDmabufRenderTargetAcquire::preserve(Some(&sampled_release_sync)),
+        )
+    }
+    .expect("rebind sampled-released dmabuf as Vulkan render target")
+    .expect("renderer should rebind the sampled-released dmabuf render-target modifier");
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = candidate
+            .renderer
+            .render(&mut rebound_target, (4, 4).into(), Transform::Normal)
+            .expect("render second loopback dmabuf target contents");
+        frame
+            .clear(Color32F::new(0.875, 0.125, 0.375, 1.0), &full_damage)
+            .expect("clear rebound loopback dmabuf render target");
+    }
+
+    let second_evidence = candidate
+        .renderer
+        .release_dmabuf_render_target_for_sampled_loopback(&mut rebound_target, true)
+        .expect("release rebound loopback render target to foreign GENERAL with exported sync")
+        .expect("rebound loopback release should produce sampled import evidence");
+    drop(rebound_target);
+    assert!(second_evidence.is_for_dmabuf(&candidate.dmabuf));
+    assert!(second_evidence.acquire_sync().contains_fence());
+
+    let second_texture = unsafe {
+        // SAFETY: `second_evidence` was produced by releasing the rebound render target for the same
+        // dmabuf identity immediately above, and there is no intervening use before sampled import.
+        candidate
+            .renderer
+            .import_dmabuf_texture_from_loopback(&candidate.dmabuf, second_evidence)
+    }
+    .expect("import rebound exported-sync loopback dmabuf as sampled texture")
+    .expect("selected modifier should support rebound sampled dmabuf import");
+    runtime_sample_texture_to_offscreen_and_assert_non_black(
+        &mut candidate.renderer,
+        &second_texture,
+        render_format,
+        test_name,
+    );
+
+    let (released, final_release_sync) = candidate
+        .renderer
+        .release_imported_dmabuf_texture_to_foreign_general_sync_point(&second_texture, true)
+        .expect("release rebound sampled texture to foreign GENERAL with exported sync");
+    assert!(released);
+    assert!(final_release_sync.contains_fence());
 }
 
 #[test]
@@ -3982,44 +4126,11 @@ fn runtime_direct_import_dma_experiment_samples_imported_texture() {
         .expect("direct ImportDma experiment should import released dmabuf as sampled texture");
     assert!(texture.has_sampled_image_for_tests());
 
-    let mut sample_target = candidate
-        .renderer
-        .create_offscreen_render_target(render_format, (4, 4).into())
-        .expect("create offscreen sampling target");
-    candidate
-        .renderer
-        .clear_offscreen_render_target(&mut sample_target, Color32F::BLACK)
-        .expect("clear sampling target before texture render");
-
-    {
-        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
-        let mut frame = candidate
-            .renderer
-            .render(&mut sample_target, (4, 4).into(), Transform::Normal)
-            .expect("render into offscreen sampling target");
-        frame
-            .render_texture_from_to(
-                &texture,
-                Rectangle::from_size((4.0, 4.0).into()),
-                Rectangle::from_size((4, 4).into()),
-                &full_damage,
-                &[],
-                Transform::Normal,
-                1.0,
-            )
-            .expect("sample direct imported dmabuf texture into offscreen target");
-        assert!(frame.finish().unwrap().is_reached());
-    }
-
-    let readback = candidate
-        .renderer
-        .read_offscreen_render_target(&mut sample_target)
-        .expect("read back sampled offscreen target");
-    assert!(
-        readback
-            .chunks_exact(4)
-            .any(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0),
-        "sampling direct imported dmabuf texture should write non-black color data"
+    runtime_sample_texture_to_offscreen_and_assert_non_black(
+        &mut candidate.renderer,
+        &texture,
+        render_format,
+        "Vulkan direct ImportDma sampling test",
     );
 
     let (released, release_sync) = candidate
