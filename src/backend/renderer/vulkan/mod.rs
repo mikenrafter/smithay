@@ -523,6 +523,24 @@ struct SampledDmabufWaylandTextureCacheReleaseLifecycle {
     dmabuf: WeakDmabuf,
 }
 
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+struct SampledDmabufWaylandTextureCacheReleaseLifecycleSlot {
+    evidence: Mutex<Option<SampledDmabufWaylandTextureCacheReleaseLifecycleEvidence>>,
+}
+
+/// Explicit proof that no-next-import/teardown call sites release sampled dmabuf textures.
+///
+/// This is a validation-stage marker for compositor-owned lifecycle coverage. It is tied to the
+/// Vulkan renderer context because the release call sites must use the same renderer/context that
+/// imported the sampled dmabuf texture from the Wayland surface cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct SampledDmabufWaylandTextureCacheReleaseLifecycleEvidence {
+    dmabuf: WeakDmabuf,
+    renderer_context: ContextId<VulkanTexture>,
+}
+
 #[allow(dead_code)]
 impl SampledDmabufWaylandTextureCacheReleaseLifecycle {
     #[cfg(test)]
@@ -534,6 +552,44 @@ impl SampledDmabufWaylandTextureCacheReleaseLifecycle {
 
     fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
         self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+}
+
+#[allow(dead_code)]
+impl SampledDmabufWaylandTextureCacheReleaseLifecycleEvidence {
+    unsafe fn new(dmabuf: WeakDmabuf, renderer_context: ContextId<VulkanTexture>) -> Self {
+        Self {
+            dmabuf,
+            renderer_context,
+        }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+
+    fn is_for_renderer_context(&self, renderer_context: &ContextId<VulkanTexture>) -> bool {
+        &self.renderer_context == renderer_context
+    }
+
+    fn release_lifecycle(
+        &self,
+        dmabuf: &Dmabuf,
+        renderer_context: &ContextId<VulkanTexture>,
+    ) -> Result<SampledDmabufWaylandTextureCacheReleaseLifecycle, VulkanError> {
+        if !self.is_for_renderer_context(renderer_context) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland texture-cache release lifecycle renderer identity",
+            ));
+        }
+        if !self.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland texture-cache release lifecycle identity",
+            ));
+        }
+        Ok(SampledDmabufWaylandTextureCacheReleaseLifecycle {
+            dmabuf: self.dmabuf.clone(),
+        })
     }
 }
 
@@ -1138,6 +1194,62 @@ impl VulkanRenderer {
         *evidence = Some(unsafe {
             // SAFETY: Forwarded from this unsafe evidence-marking helper's caller.
             SampledDmabufWaylandForeignGeneralEvidence::new(dmabuf.weak())
+        });
+        Ok(())
+    }
+
+    /// Mark a renderer-managed Wayland dmabuf buffer as covered by texture-cache release call sites.
+    ///
+    /// This is a development-stage lifecycle evidence API for the normal [`ImportDmaWl`] path. It
+    /// does not public-advertise sampled [`ImportDma`] support and is not inferred from Wayland
+    /// protocol state. This marker proves only that the compositor has wired the no-next-import and
+    /// teardown release call sites for this renderer/context; it does not prove external image state,
+    /// acquire synchronization, release synchronization, or public import support.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prove that imports of `buffer` for this exact renderer context go through the
+    /// normal renderer-utils surface cache, and that before any no-next-import, reset, unmap, surface
+    /// destruction, renderer teardown, or compositor decision to stop importing the surface with this
+    /// renderer, the compositor will call
+    /// [`super::utils::retire_and_release_surface_textures`] or
+    /// [`super::utils::retire_and_release_surface_tree_textures`] while this renderer is still
+    /// available. If release returns a retry-safe error, the caller must not reset/drop the affected
+    /// surface state until the obligation is retried or otherwise preserved. No active frame, render
+    /// element, clone, or external user may sample the cached texture after the teardown release helper
+    /// has retired and released it.
+    #[cfg(feature = "wayland_frontend")]
+    pub unsafe fn mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+        &self,
+        buffer: &super::utils::Buffer,
+        dmabuf: &Dmabuf,
+    ) -> Result<(), VulkanError> {
+        unsafe {
+            // SAFETY: Forwarded from this public unsafe lifecycle-marking function's caller.
+            self.mark_wayland_dmabuf_user_data_texture_cache_release_lifecycle_for_sampled_import(
+                buffer.user_data(),
+                dmabuf,
+            )
+        }
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    unsafe fn mark_wayland_dmabuf_user_data_texture_cache_release_lifecycle_for_sampled_import(
+        &self,
+        user_data: &UserDataMap,
+        dmabuf: &Dmabuf,
+    ) -> Result<(), VulkanError> {
+        let slot =
+            user_data.get_or_insert_threadsafe(SampledDmabufWaylandTextureCacheReleaseLifecycleSlot::default);
+        let mut evidence = slot.evidence.lock().map_err(|_| {
+            VulkanError::UnsupportedOperation("sampled dmabuf Wayland texture-cache release lifecycle")
+        })?;
+        *evidence = Some(unsafe {
+            // SAFETY: Forwarded from this unsafe lifecycle-marking helper's caller.
+            SampledDmabufWaylandTextureCacheReleaseLifecycleEvidence::new(
+                dmabuf.weak(),
+                self.context_id.clone(),
+            )
         });
         Ok(())
     }
@@ -1772,6 +1884,27 @@ impl VulkanRenderer {
             ));
         }
         Ok(Some(evidence.clone()))
+    }
+
+    /// Read compositor-provided texture-cache release lifecycle evidence from wrapper-local user data.
+    #[cfg(feature = "wayland_frontend")]
+    #[allow(dead_code)]
+    fn sampled_dmabuf_wayland_user_data_texture_cache_release_lifecycle(
+        &self,
+        user_data: &UserDataMap,
+        dmabuf: &Dmabuf,
+    ) -> Result<Option<SampledDmabufWaylandTextureCacheReleaseLifecycle>, VulkanError> {
+        let Some(slot) = user_data.get::<SampledDmabufWaylandTextureCacheReleaseLifecycleSlot>() else {
+            return Ok(None);
+        };
+        let evidence = slot.evidence.lock().map_err(|_| {
+            VulkanError::UnsupportedOperation("sampled dmabuf Wayland texture-cache release lifecycle")
+        })?;
+        let Some(evidence) = evidence.as_ref() else {
+            return Ok(None);
+        };
+
+        evidence.release_lifecycle(dmabuf, &self.context_id).map(Some)
     }
 
     /// Gather the external-state evidence sources used by the normal Wayland sampled-dmabuf path.

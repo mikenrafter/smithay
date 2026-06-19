@@ -4382,6 +4382,52 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland external-state identity"
         ))
     ));
+    let user_data_lifecycle = UserDataMap::new();
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_user_data_texture_cache_release_lifecycle(
+            &user_data_lifecycle,
+            &policy_dmabuf,
+        ),
+        Ok(None)
+    ));
+    unsafe {
+        // SAFETY: This unit test validates only marker storage and identity checks. It does not
+        // import, sample, release, reset, destroy, or otherwise use a real Wayland surface cache.
+        renderer
+            .mark_wayland_dmabuf_user_data_texture_cache_release_lifecycle_for_sampled_import(
+                &user_data_lifecycle,
+                &policy_dmabuf,
+            )
+            .unwrap();
+    }
+    let stored_lifecycle = renderer
+        .sampled_dmabuf_wayland_user_data_texture_cache_release_lifecycle(
+            &user_data_lifecycle,
+            &policy_dmabuf,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(stored_lifecycle.is_for_dmabuf(&policy_dmabuf));
+    assert!(!stored_lifecycle.is_for_dmabuf(&unrelated_dmabuf));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_user_data_texture_cache_release_lifecycle(
+            &user_data_lifecycle,
+            &unrelated_dmabuf,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland texture-cache release lifecycle identity"
+        ))
+    ));
+    let unrelated_renderer = VulkanRenderer::new_scaffold_for_tests();
+    assert!(matches!(
+        unrelated_renderer.sampled_dmabuf_wayland_user_data_texture_cache_release_lifecycle(
+            &user_data_lifecycle,
+            &policy_dmabuf,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland texture-cache release lifecycle renderer identity"
+        ))
+    ));
     let mismatched_import_dmabuf = dmabuf_with_planes_for_tests(
         (8, 3).into(),
         Fourcc::Abgr8888,
