@@ -1408,7 +1408,7 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_public_external_state_contract(&self) -> Result<(), VulkanError> {
         Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan first-import layout policy",
+            "sampled dmabuf public external-state policy",
         ))
     }
 

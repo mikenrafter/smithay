@@ -4098,7 +4098,7 @@ fn sampled_dmabuf_wayland_policy_does_not_public_advertise_import_dma() {
     assert!(matches!(
         renderer.validate_sampled_dmabuf_public_advertisement_contract(),
         Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan first-import layout policy"
+            "sampled dmabuf public external-state policy"
         ))
     ));
     assert!(renderer.dmabuf_formats().iter().next().is_none());
@@ -4203,13 +4203,13 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(matches!(
         renderer.validate_sampled_dmabuf_public_advertisement_contract(),
         Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan first-import layout policy"
+            "sampled dmabuf public external-state policy"
         ))
     ));
     assert!(matches!(
         renderer.validate_sampled_dmabuf_public_external_state_contract(),
         Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan first-import layout policy"
+            "sampled dmabuf public external-state policy"
         ))
     ));
 
@@ -5001,7 +5001,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(matches!(
         renderer.validate_sampled_dmabuf_public_advertisement_contract(),
         Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan first-import layout policy"
+            "sampled dmabuf public external-state policy"
         ))
     ));
     assert!(
