@@ -4308,6 +4308,36 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(first_import_sources.first_import_foreign_general.is_some());
     assert!(first_import_sources.current_reacquire_layout.is_none());
     assert!(first_import_sources.current_reacquire_foreign_general.is_none());
+    let mut external_state_lifecycle_renderer = VulkanRenderer::new_scaffold_for_tests();
+    external_state_lifecycle_renderer
+        .capabilities
+        .external_memory
+        .foreign_queue_family = true;
+    let external_state_lifecycle_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
+        &policy_import,
+        &policy_acquire_evidence,
+        &policy_release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    )
+    .with_external_state_sources(first_import_sources.clone())
+    .with_texture_cache_replacement_release_reachability(
+        SampledDmabufWaylandTextureCacheReplacementReleaseReachability::new_for_tests(&policy_dmabuf),
+    )
+    .with_texture_cache_release_hook(SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(
+        &policy_dmabuf,
+    ))
+    .with_release_ownership(SampledDmabufReleaseOwnershipEvidence::new_for_tests(
+        &policy_dmabuf,
+    ));
+    assert!(matches!(
+        external_state_lifecycle_renderer
+            .validate_sampled_dmabuf_wayland_vulkan_interop_policy(&external_state_lifecycle_context),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan texture-cache release call sites"
+        ))
+    ));
     let mismatched_wayland_external_state =
         SampledDmabufWaylandForeignGeneralEvidence::new_for_tests(&unrelated_dmabuf);
     assert!(matches!(
