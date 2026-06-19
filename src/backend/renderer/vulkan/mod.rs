@@ -146,6 +146,7 @@ struct SampledDmabufPublicImportContracts {
     advertised_formats: bool,
     public_external_state_policy: bool,
     public_import_lifecycle: bool,
+    public_import_implementation: bool,
 }
 
 impl SampledDmabufPublicImportContracts {
@@ -165,6 +166,11 @@ impl SampledDmabufPublicImportContracts {
         }
         if !self.public_import_lifecycle {
             return Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"));
+        }
+        if !self.public_import_implementation {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf public import implementation",
+            ));
         }
 
         Ok(())
@@ -1428,14 +1434,15 @@ impl VulkanRenderer {
     ///
     /// Raw Vulkan probing may populate format records used by validation tests and development paths,
     /// but the generic public import trait still lacks an external-state and lifecycle contract for
-    /// arbitrary dmabufs. Keep those fields false until a real Smithay-facing contract replaces the
-    /// current fail-closed markers.
+    /// arbitrary dmabufs, and the direct generic import implementation is still pending. Keep those
+    /// fields false until real Smithay-facing contracts replace the current fail-closed markers.
     fn sampled_dmabuf_public_import_contracts(&self) -> SampledDmabufPublicImportContracts {
         SampledDmabufPublicImportContracts {
             raw_import_capability: self.capabilities.import.dmabuf,
             advertised_formats: self.capabilities.formats.dmabuf_import.iter().next().is_some(),
             public_external_state_policy: false,
             public_import_lifecycle: false,
+            public_import_implementation: false,
         }
     }
 

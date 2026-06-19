@@ -4103,6 +4103,7 @@ fn sampled_dmabuf_wayland_policy_does_not_public_advertise_import_dma() {
             advertised_formats: true,
             public_external_state_policy: false,
             public_import_lifecycle: false,
+            public_import_implementation: false,
         }
     );
 
@@ -4208,6 +4209,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             advertised_formats: false,
             public_external_state_policy: false,
             public_import_lifecycle: false,
+            public_import_implementation: false,
         }
     );
     assert!(matches!(
@@ -4222,6 +4224,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             advertised_formats: false,
             public_external_state_policy: false,
             public_import_lifecycle: false,
+            public_import_implementation: false,
         }
     );
     assert!(matches!(
@@ -4238,6 +4241,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             advertised_formats: true,
             public_external_state_policy: false,
             public_import_lifecycle: false,
+            public_import_implementation: false,
         }
     );
     assert!(matches!(
@@ -4258,9 +4262,23 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             advertised_formats: true,
             public_external_state_policy: true,
             public_import_lifecycle: false,
+            public_import_implementation: false,
         }
         .validate(),
         Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
+    ));
+    assert!(matches!(
+        SampledDmabufPublicImportContracts {
+            raw_import_capability: true,
+            advertised_formats: true,
+            public_external_state_policy: true,
+            public_import_lifecycle: true,
+            public_import_implementation: false,
+        }
+        .validate(),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf public import implementation"
+        ))
     ));
     assert!(
         SampledDmabufPublicImportContracts {
@@ -4268,6 +4286,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             advertised_formats: true,
             public_external_state_policy: true,
             public_import_lifecycle: true,
+            public_import_implementation: true,
         }
         .validate()
         .is_ok()
