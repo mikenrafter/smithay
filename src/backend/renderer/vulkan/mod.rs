@@ -386,6 +386,32 @@ impl SampledDmabufWaylandTextureCachePolicy {
     }
 }
 
+/// Evidence that the import has a Wayland surface argument for surface-cache routing.
+///
+/// This is only validation-stage reachability evidence. The normal `import_surface` helper drains
+/// retired textures before importing a replacement, but `ImportDmaWl` can only observe that it was
+/// called with a surface argument, not that specific caller ordering. The full texture-cache release
+/// lifecycle therefore remains guarded separately.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SampledDmabufWaylandTextureCacheReplacementReleaseReachability {
+    dmabuf: WeakDmabuf,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufWaylandTextureCacheReplacementReleaseReachability {
+    #[cfg(test)]
+    fn new_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+        }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+}
+
 /// Evidence that the renderer surface-cache release hook can release sampled dmabuf textures.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,6 +489,8 @@ struct SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
     first_import_foreign_general: Option<SampledDmabufKnownLayoutEvidence>,
     current_reacquire_layout: Option<SampledDmabufWaylandCurrentReacquireLayoutEvidence>,
     current_reacquire_foreign_general: Option<SampledDmabufKnownLayoutEvidence>,
+    texture_cache_replacement_release_reachability:
+        Option<SampledDmabufWaylandTextureCacheReplacementReleaseReachability>,
     texture_cache_release_hook: Option<SampledDmabufWaylandTextureCacheReleaseHook>,
     texture_cache_release_lifecycle: Option<SampledDmabufWaylandTextureCacheReleaseLifecycle>,
 }
@@ -498,6 +526,7 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
             first_import_foreign_general: None,
             current_reacquire_layout: None,
             current_reacquire_foreign_general: None,
+            texture_cache_replacement_release_reachability: None,
             texture_cache_release_hook: None,
             texture_cache_release_lifecycle: None,
         }
@@ -511,6 +540,14 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
         self.first_import_foreign_general = sources.first_import_foreign_general;
         self.current_reacquire_layout = sources.current_reacquire_layout;
         self.current_reacquire_foreign_general = sources.current_reacquire_foreign_general;
+        self
+    }
+
+    fn with_texture_cache_replacement_release_reachability(
+        mut self,
+        reachability: SampledDmabufWaylandTextureCacheReplacementReleaseReachability,
+    ) -> Self {
+        self.texture_cache_replacement_release_reachability = Some(reachability);
         self
     }
 
@@ -1684,6 +1721,31 @@ impl VulkanRenderer {
         })
     }
 
+    /// Validate surface-cache reachability for replacement import.
+    ///
+    /// `RendererSurfaceState::update_buffer` retires cached textures on new buffer commits, and
+    /// `import_surface` drains those retired textures with the renderer release hook before importing
+    /// the replacement texture on Smithay's normal surface-cache path. The `ImportDmaWl` hook can
+    /// only observe that a surface argument is present, not that this specific helper ordering was
+    /// used by the caller. Keep this as a validation-stage reachability marker; the full
+    /// no-next-import, reset, and destruction release lifecycle remains guarded below.
+    #[allow(dead_code)]
+    fn validate_sampled_dmabuf_wayland_texture_cache_replacement_reachability_contract(
+        &self,
+        dmabuf: &Dmabuf,
+        surface_argument_present: bool,
+    ) -> Result<SampledDmabufWaylandTextureCacheReplacementReleaseReachability, VulkanError> {
+        if surface_argument_present {
+            Ok(SampledDmabufWaylandTextureCacheReplacementReleaseReachability {
+                dmabuf: dmabuf.weak(),
+            })
+        } else {
+            Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan texture-cache replacement reachability",
+            ))
+        }
+    }
+
     /// Validate renderer ownership of the Wayland release point for a normal Wayland dmabuf.
     ///
     /// This is the final validation-stage ownership-availability guard before the intended path may
@@ -1804,6 +1866,19 @@ impl VulkanRenderer {
         if !context.per_commit_texture_import {
             return Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland Vulkan texture-cache policy",
+            ));
+        }
+
+        let Some(replacement_release_reachability) =
+            context.texture_cache_replacement_release_reachability.as_ref()
+        else {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan texture-cache replacement reachability",
+            ));
+        };
+        if !replacement_release_reachability.is_for_dmabuf(context.dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland texture-cache replacement reachability identity",
             ));
         }
 
@@ -2963,7 +3038,7 @@ impl ImportDmaWl for VulkanRenderer {
     fn import_dma_buffer_from_surface_state(
         &mut self,
         buffer: &super::utils::Buffer,
-        _surface: Option<&crate::wayland::compositor::SurfaceData>,
+        surface: Option<&crate::wayland::compositor::SurfaceData>,
         _damage: &[Rectangle<i32, BufferCoord>],
     ) -> Result<Self::TextureId, Self::Error> {
         let dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
@@ -2977,6 +3052,11 @@ impl ImportDmaWl for VulkanRenderer {
         let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_evidence(dmabuf, buffer)?;
         let release_evidence = self.sampled_dmabuf_wayland_release_evidence(dmabuf, buffer)?;
         let release_ownership = self.sampled_dmabuf_wayland_release_ownership_evidence(dmabuf, buffer)?;
+        let replacement_release_reachability = self
+            .validate_sampled_dmabuf_wayland_texture_cache_replacement_reachability_contract(
+                dmabuf,
+                surface.is_some(),
+            )?;
         let texture_cache_release_hook = self.sampled_dmabuf_wayland_texture_cache_release_hook(dmabuf);
         let policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
             dmabuf,
@@ -2987,6 +3067,7 @@ impl ImportDmaWl for VulkanRenderer {
             layout_history,
         )
         .with_external_state_sources(external_state_sources)
+        .with_texture_cache_replacement_release_reachability(replacement_release_reachability)
         .with_texture_cache_release_hook(texture_cache_release_hook)
         .with_release_ownership(release_ownership);
         let layout_evidence = self.validate_sampled_dmabuf_wayland_vulkan_interop_policy(&policy_context)?;

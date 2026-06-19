@@ -4429,6 +4429,8 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     first_import_context.release_ownership = Some(SampledDmabufReleaseOwnershipEvidence::new_for_tests(
         &policy_dmabuf,
     ));
+    first_import_context.texture_cache_replacement_release_reachability =
+        Some(SampledDmabufWaylandTextureCacheReplacementReleaseReachability::new_for_tests(&policy_dmabuf));
     first_import_context.texture_cache_release_hook = Some(
         SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(&policy_dmabuf),
     );
@@ -4650,6 +4652,8 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     current_reacquire_context.release_ownership = Some(SampledDmabufReleaseOwnershipEvidence::new_for_tests(
         &policy_dmabuf,
     ));
+    current_reacquire_context.texture_cache_replacement_release_reachability =
+        Some(SampledDmabufWaylandTextureCacheReplacementReleaseReachability::new_for_tests(&policy_dmabuf));
     current_reacquire_context.texture_cache_release_hook = Some(
         SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(&policy_dmabuf),
     );
@@ -4830,7 +4834,54 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         ))
     ));
     assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_texture_cache_replacement_reachability_contract(
+            &policy_dmabuf,
+            false,
+        ),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan texture-cache replacement reachability"
+        ))
+    ));
+    let replacement_release_reachability = renderer
+        .validate_sampled_dmabuf_wayland_texture_cache_replacement_reachability_contract(&policy_dmabuf, true)
+        .unwrap();
+    assert!(replacement_release_reachability.is_for_dmabuf(&policy_dmabuf));
+    assert!(!replacement_release_reachability.is_for_dmabuf(&unrelated_dmabuf));
+    assert!(matches!(
         renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&policy_context),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan texture-cache replacement reachability"
+        ))
+    ));
+    let mut mismatched_cache_replacement_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
+        &policy_import,
+        &policy_acquire_evidence,
+        &policy_release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    mismatched_cache_replacement_context.texture_cache_replacement_release_reachability = Some(
+        SampledDmabufWaylandTextureCacheReplacementReleaseReachability::new_for_tests(&unrelated_dmabuf),
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&mismatched_cache_replacement_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland texture-cache replacement reachability identity"
+        ))
+    ));
+    let mut missing_cache_hook_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
+        &policy_import,
+        &policy_acquire_evidence,
+        &policy_release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    missing_cache_hook_context.texture_cache_replacement_release_reachability =
+        Some(replacement_release_reachability.clone());
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&missing_cache_hook_context),
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland Vulkan texture-cache release hook"
         ))
@@ -4843,6 +4894,8 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         true,
         SampledDmabufWaylandLayoutHistory::NoRendererHistory,
     );
+    mismatched_cache_hook_context.texture_cache_replacement_release_reachability =
+        Some(replacement_release_reachability.clone());
     mismatched_cache_hook_context.texture_cache_release_hook = Some(
         SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(&unrelated_dmabuf),
     );
@@ -4860,6 +4913,8 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         true,
         SampledDmabufWaylandLayoutHistory::NoRendererHistory,
     );
+    missing_cache_lifecycle_context.texture_cache_replacement_release_reachability =
+        Some(replacement_release_reachability.clone());
     missing_cache_lifecycle_context.texture_cache_release_hook = Some(
         SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(&policy_dmabuf),
     );
@@ -4877,6 +4932,8 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         true,
         SampledDmabufWaylandLayoutHistory::NoRendererHistory,
     );
+    mismatched_cache_lifecycle_context.texture_cache_replacement_release_reachability =
+        Some(replacement_release_reachability.clone());
     mismatched_cache_lifecycle_context.texture_cache_release_hook = Some(
         SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(&policy_dmabuf),
     );
@@ -4897,6 +4954,8 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         true,
         SampledDmabufWaylandLayoutHistory::NoRendererHistory,
     );
+    cache_lifecycle_context.texture_cache_replacement_release_reachability =
+        Some(replacement_release_reachability);
     cache_lifecycle_context.texture_cache_release_hook = Some(
         SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(&policy_dmabuf),
     );
