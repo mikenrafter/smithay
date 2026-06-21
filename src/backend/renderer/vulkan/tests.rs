@@ -257,6 +257,43 @@ fn dmabuf_wl_buffer_for_tests(
     Some((display, client_side, wl_buffer))
 }
 
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+fn import_surface_dmabuf_buffer_for_tests(
+    dmabuf: Dmabuf,
+    acquire_point: u64,
+    release_point: u64,
+) -> Option<(
+    Display<DmabufBufferTestState>,
+    UnixStream,
+    SurfaceData,
+    crate::backend::renderer::utils::Buffer,
+)> {
+    let (display, client_side, wl_buffer) = dmabuf_wl_buffer_for_tests(dmabuf)?;
+    let surface = SurfaceData {
+        role: None,
+        data_map: Default::default(),
+        cached_state: MultiCache::new(),
+    };
+    {
+        let mut attributes = surface.cached_state.get::<SurfaceAttributes>();
+        attributes.current().buffer = Some(BufferAssignment::NewBuffer(wl_buffer));
+    }
+    {
+        let mut syncobj = surface.cached_state.get::<DrmSyncobjCachedState>();
+        syncobj.current().acquire_point = Some(DrmSyncPoint::invalid_for_tests(acquire_point).unwrap());
+        syncobj.current().release_point = Some(DrmSyncPoint::invalid_for_tests(release_point).unwrap());
+    }
+
+    let mut surface_state = crate::backend::renderer::utils::RendererSurfaceState::default();
+    surface_state.update_buffer(&surface);
+    let buffer = surface_state.buffer().unwrap().clone();
+    surface
+        .data_map
+        .insert_if_missing_threadsafe(|| Mutex::new(surface_state));
+
+    Some((display, client_side, surface, buffer))
+}
+
 fn extension_names_for_tests(extensions: Vec<&'static CStr>) -> Vec<String> {
     extensions
         .into_iter()
@@ -6385,28 +6422,11 @@ fn import_surface_real_buffer_reaches_texture_cache_lifecycle_guard() {
         DmabufFlags::empty(),
         &[(0, 0, 4)],
     );
-    let Some((_display, _client_side, wl_buffer)) = dmabuf_wl_buffer_for_tests(dmabuf.clone()) else {
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_buffer_for_tests(dmabuf.clone(), 21, 22)
+    else {
         return;
     };
-
-    let surface = SurfaceData {
-        role: None,
-        data_map: Default::default(),
-        cached_state: MultiCache::new(),
-    };
-    {
-        let mut attributes = surface.cached_state.get::<SurfaceAttributes>();
-        attributes.current().buffer = Some(BufferAssignment::NewBuffer(wl_buffer));
-    }
-    {
-        let mut syncobj = surface.cached_state.get::<DrmSyncobjCachedState>();
-        syncobj.current().acquire_point = Some(DrmSyncPoint::invalid_for_tests(21).unwrap());
-        syncobj.current().release_point = Some(DrmSyncPoint::invalid_for_tests(22).unwrap());
-    }
-
-    let mut surface_state = crate::backend::renderer::utils::RendererSurfaceState::default();
-    surface_state.update_buffer(&surface);
-    let buffer = surface_state.buffer().unwrap().clone();
     unsafe {
         // SAFETY: This validation-stage fixture supplies explicit current-commit external-state
         // evidence so normal renderer-utils import_surface can be driven past the direct-call-site
@@ -6414,9 +6434,6 @@ fn import_surface_real_buffer_reaches_texture_cache_lifecycle_guard() {
         VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &dmabuf).unwrap();
     }
     assert!(buffer.release_point().is_some());
-    surface
-        .data_map
-        .insert_if_missing_threadsafe(|| Mutex::new(surface_state));
 
     let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
     assert!(matches!(
@@ -6428,6 +6445,51 @@ fn import_surface_real_buffer_reaches_texture_cache_lifecycle_guard() {
     assert!(
         buffer.release_point().is_some(),
         "normal import_surface guard must not consume Wayland release ownership before lifecycle evidence"
+    );
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_surface_lifecycle_evidence_reaches_device_import_boundary() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
+    renderer.capabilities.external_memory.foreign_queue_family = true;
+
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_buffer_for_tests(dmabuf.clone(), 31, 32)
+    else {
+        return;
+    };
+    unsafe {
+        // SAFETY: This validation-stage fixture supplies both current-commit external-state evidence
+        // and compositor lifecycle evidence so normal import_surface can be driven to the scaffold's
+        // device-import boundary without public-advertising sampled-dmabuf import.
+        VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &dmabuf).unwrap();
+        renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
+            .unwrap();
+    }
+    assert!(buffer.release_point().is_some());
+
+    let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
+    assert!(matches!(import_result, Err(VulkanError::VulkanUnavailable)));
+    assert!(
+        buffer.release_point().is_some(),
+        "scaffold device boundary must not consume Wayland release ownership before texture construction"
     );
 }
 
