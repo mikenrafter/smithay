@@ -1,5 +1,7 @@
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use std::os::unix::net::UnixStream;
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+use std::sync::Mutex;
 use std::{
     cell::Cell,
     ffi::CStr,
@@ -34,7 +36,8 @@ use crate::wayland::drm_syncobj::DrmSyncPoint;
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use crate::wayland::{
     buffer::BufferHandler,
-    compositor::{MultiCache, SurfaceData},
+    compositor::{BufferAssignment, MultiCache, SurfaceAttributes, SurfaceData},
+    drm_syncobj::DrmSyncobjCachedState,
 };
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use wayland_server::{
@@ -6319,7 +6322,6 @@ fn import_dma_wl_real_buffer_requires_import_surface_reachability() {
             drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
         },
     )];
-
     let dmabuf = dmabuf_with_planes_for_tests(
         (1, 1).into(),
         Fourcc::Abgr8888,
@@ -6359,6 +6361,73 @@ fn import_dma_wl_real_buffer_requires_import_surface_reachability() {
     assert!(
         buffer.release_point().is_some(),
         "direct ImportDmaWl guard must not consume Wayland release ownership"
+    );
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_surface_real_buffer_reaches_texture_cache_lifecycle_guard() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
+    renderer.capabilities.external_memory.foreign_queue_family = true;
+
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let Some((_display, _client_side, wl_buffer)) = dmabuf_wl_buffer_for_tests(dmabuf.clone()) else {
+        return;
+    };
+
+    let surface = SurfaceData {
+        role: None,
+        data_map: Default::default(),
+        cached_state: MultiCache::new(),
+    };
+    {
+        let mut attributes = surface.cached_state.get::<SurfaceAttributes>();
+        attributes.current().buffer = Some(BufferAssignment::NewBuffer(wl_buffer));
+    }
+    {
+        let mut syncobj = surface.cached_state.get::<DrmSyncobjCachedState>();
+        syncobj.current().acquire_point = Some(DrmSyncPoint::invalid_for_tests(21).unwrap());
+        syncobj.current().release_point = Some(DrmSyncPoint::invalid_for_tests(22).unwrap());
+    }
+
+    let mut surface_state = crate::backend::renderer::utils::RendererSurfaceState::default();
+    surface_state.update_buffer(&surface);
+    let buffer = surface_state.buffer().unwrap().clone();
+    unsafe {
+        // SAFETY: This validation-stage fixture supplies explicit current-commit external-state
+        // evidence so normal renderer-utils import_surface can be driven past the direct-call-site
+        // guard. The test still fails before sampled-dmabuf texture import or public advertisement.
+        VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &dmabuf).unwrap();
+    }
+    assert!(buffer.release_point().is_some());
+    surface
+        .data_map
+        .insert_if_missing_threadsafe(|| Mutex::new(surface_state));
+
+    let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
+    assert!(matches!(
+        import_result,
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan texture-cache release call sites"
+        ))
+    ));
+    assert!(
+        buffer.release_point().is_some(),
+        "normal import_surface guard must not consume Wayland release ownership before lifecycle evidence"
     );
 }
 
