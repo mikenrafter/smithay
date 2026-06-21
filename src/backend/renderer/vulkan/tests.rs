@@ -1,3 +1,5 @@
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+use std::os::unix::net::UnixStream;
 use std::{
     cell::Cell,
     ffi::CStr,
@@ -17,6 +19,8 @@ use crate::backend::allocator::{
         VulkanAllocatorForeignReleaseError, VulkanImage,
     },
 };
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+use crate::backend::renderer::ImportDmaWl;
 use crate::backend::renderer::sync::Interrupted;
 use crate::backend::renderer::{
     Bind, Color32F, DebugFlags, ExportMem, Frame, ImportDma, ImportMem, Offscreen, RenderTargetLifecycle,
@@ -27,6 +31,17 @@ use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
 use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform, user_data::UserDataMap};
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use crate::wayland::drm_syncobj::DrmSyncPoint;
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+use crate::wayland::{
+    buffer::BufferHandler,
+    compositor::{MultiCache, SurfaceData},
+};
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+use wayland_server::{
+    Display,
+    backend::{ClientData, ClientId, DisconnectReason, InitError},
+    protocol::wl_buffer::WlBuffer,
+};
 
 use super::capabilities::{
     format_usage_from_features, linear_tiling_supported, modifier_record_from_properties,
@@ -194,6 +209,49 @@ fn dmabuf_with_planes_for_tests(
         builder.add_plane(File::open("/dev/null").unwrap().into(), idx, offset, stride);
     }
     builder.build().unwrap()
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+struct DmabufBufferTestState;
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+impl BufferHandler for DmabufBufferTestState {
+    fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+crate::delegate_dispatch2!(DmabufBufferTestState);
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[derive(Default)]
+struct DmabufBufferTestClientState;
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+impl ClientData for DmabufBufferTestClientState {
+    fn initialized(&self, _client_id: ClientId) {}
+
+    fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+fn dmabuf_wl_buffer_for_tests(
+    dmabuf: Dmabuf,
+) -> Option<(Display<DmabufBufferTestState>, UnixStream, WlBuffer)> {
+    let display = match Display::<DmabufBufferTestState>::new() {
+        Ok(display) => display,
+        Err(InitError::NoWaylandLib) => return None,
+        Err(err) => panic!("failed to create test Wayland display: {err}"),
+    };
+    let mut display_handle = display.handle();
+    let (client_side, server_side) = UnixStream::pair().unwrap();
+    let client = display_handle
+        .insert_client(server_side, Arc::new(DmabufBufferTestClientState))
+        .unwrap();
+    let wl_buffer = client
+        .create_resource::<WlBuffer, Dmabuf, DmabufBufferTestState>(&display_handle, 1, dmabuf)
+        .unwrap();
+
+    Some((display, client_side, wl_buffer))
 }
 
 fn extension_names_for_tests(extensions: Vec<&'static CStr>) -> Vec<String> {
@@ -6247,6 +6305,61 @@ fn sampled_dmabuf_release_keeps_wayland_point_after_failed_satisfaction() {
             "sampled dmabuf release point import sync file"
         ))
     ));
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_dma_wl_real_buffer_requires_import_surface_reachability() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
+
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let Some((_display, _client_side, wl_buffer)) = dmabuf_wl_buffer_for_tests(dmabuf.clone()) else {
+        return;
+    };
+    assert!(crate::wayland::dmabuf::get_dmabuf(&wl_buffer).is_ok());
+
+    let acquire_point = DrmSyncPoint::invalid_for_tests(11).unwrap();
+    let release_point = DrmSyncPoint::invalid_for_tests(12).unwrap();
+    let buffer =
+        crate::backend::renderer::utils::Buffer::with_explicit(wl_buffer, acquire_point, release_point);
+    unsafe {
+        // SAFETY: This validation-stage fixture supplies explicit current-commit external-state
+        // evidence so production ImportDmaWl can be driven to its normal-path call-site guard. The
+        // test does not advertise or execute arbitrary sampled-dmabuf import.
+        VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &dmabuf).unwrap();
+    }
+    assert!(buffer.release_point().is_some());
+
+    let surface = SurfaceData {
+        role: None,
+        data_map: Default::default(),
+        cached_state: MultiCache::new(),
+    };
+    let import_result = renderer.import_dma_buffer_from_surface_state(&buffer, Some(&surface), &[]);
+    assert!(matches!(
+        import_result,
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan import_surface post-retired-release call site"
+        ))
+    ));
+    assert!(
+        buffer.release_point().is_some(),
+        "direct ImportDmaWl guard must not consume Wayland release ownership"
+    );
 }
 
 #[test]
