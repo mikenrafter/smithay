@@ -405,6 +405,34 @@ where
     PrivateSurfaceData::with_states(surface, f)
 }
 
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use super::*;
+
+    /// Create a server-side `wl_surface` with Smithay compositor state initialized.
+    ///
+    /// This intentionally bypasses the client request path for focused unit tests that need a real
+    /// `WlSurface` tree but do not need protocol round-trips.
+    pub(crate) fn create_surface<D>(client: &Client, handle: &DisplayHandle) -> WlSurface
+    where
+        D: wayland_server::Dispatch<WlSurface, SurfaceUserData> + 'static,
+    {
+        let surface = client
+            .create_resource::<WlSurface, SurfaceUserData, D>(
+                handle,
+                5,
+                self::handlers::surface_user_data_for_tests::<D>(),
+            )
+            .unwrap();
+        PrivateSurfaceData::init(&surface);
+        surface
+    }
+
+    pub(crate) fn set_parent(child: &WlSurface, parent: &WlSurface) {
+        PrivateSurfaceData::set_parent(child, parent).unwrap();
+    }
+}
+
 /// Send the `scale` and `transform` preferences for the given surface when it supports them.
 ///
 /// The new state is only send when it differs from the already cached one on the calling thread.

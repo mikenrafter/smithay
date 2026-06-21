@@ -156,6 +156,15 @@ pub struct SurfaceUserData {
     pub(super) user_state_type: (std::any::TypeId, &'static str),
 }
 
+#[cfg(test)]
+pub(crate) fn surface_user_data_for_tests<D: 'static>() -> SurfaceUserData {
+    SurfaceUserData {
+        inner: PrivateSurfaceData::new(),
+        alive_tracker: Default::default(),
+        user_state_type: (std::any::TypeId::of::<D>(), std::any::type_name::<D>()),
+    }
+}
+
 impl<D> Dispatch2<WlSurface, D> for SurfaceUserData
 where
     D: Dispatch<WlCallback, GlobalData>,

@@ -1128,11 +1128,18 @@ mod tests {
         Texture,
     };
     use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
-    use crate::wayland::compositor::{BufferAssignment, MultiCache, SurfaceAttributes, SurfaceData};
+    use crate::wayland::compositor::{
+        BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, MultiCache,
+        SurfaceAttributes, SurfaceData,
+    };
     #[cfg(feature = "backend_drm")]
     use crate::wayland::drm_syncobj::DrmSyncPoint;
-    use std::{collections::VecDeque, error::Error, fmt, sync::Mutex};
-    use wayland_server::protocol::wl_buffer::WlBuffer;
+    use std::{collections::VecDeque, error::Error, fmt, os::unix::net::UnixStream, sync::Arc, sync::Mutex};
+    use wayland_server::{
+        Client, Display,
+        backend::{ClientData, ClientId, DisconnectReason, InitError},
+        protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
+    };
 
     #[derive(Debug)]
     struct TestTexture(u32);
@@ -1165,6 +1172,44 @@ mod tests {
     }
 
     impl Error for TestError {}
+
+    struct SurfaceTreeTestState {
+        compositor_state: CompositorState,
+    }
+
+    impl CompositorHandler for SurfaceTreeTestState {
+        fn compositor_state(&mut self) -> &mut CompositorState {
+            &mut self.compositor_state
+        }
+
+        fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+            &client
+                .get_data::<SurfaceTreeTestClientState>()
+                .unwrap()
+                .compositor_state
+        }
+
+        fn commit(&mut self, _surface: &WlSurface) {}
+    }
+
+    impl AsMut<CompositorState> for SurfaceTreeTestState {
+        fn as_mut(&mut self) -> &mut CompositorState {
+            &mut self.compositor_state
+        }
+    }
+
+    crate::delegate_dispatch2!(SurfaceTreeTestState);
+
+    #[derive(Default)]
+    struct SurfaceTreeTestClientState {
+        compositor_state: CompositorClientState,
+    }
+
+    impl ClientData for SurfaceTreeTestClientState {
+        fn initialized(&self, _client_id: ClientId) {}
+
+        fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+    }
 
     #[derive(Debug)]
     struct TestFrame;
@@ -1301,7 +1346,7 @@ mod tests {
         }
     }
 
-    fn surface_data_with_active_texture(context_id: &ContextId<TestTexture>, texture: u32) -> SurfaceData {
+    fn insert_active_texture(states: &SurfaceData, context_id: &ContextId<TestTexture>, texture: u32) {
         let mut state = RendererSurfaceState::default();
         state
             .textures
@@ -1310,13 +1355,40 @@ mod tests {
             .renderer_seen
             .insert(context_id.erased(), state.current_commit());
 
+        states.data_map.insert_if_missing_threadsafe(|| Mutex::new(state));
+    }
+
+    fn surface_data_with_active_texture(context_id: &ContextId<TestTexture>, texture: u32) -> SurfaceData {
         let states = SurfaceData {
             role: None,
             data_map: Default::default(),
             cached_state: MultiCache::new(),
         };
-        states.data_map.insert_if_missing_threadsafe(|| Mutex::new(state));
+        insert_active_texture(&states, context_id, texture);
         states
+    }
+
+    fn test_surface_tree() -> Option<(Display<SurfaceTreeTestState>, UnixStream, WlSurface, WlSurface)> {
+        let display = match Display::<SurfaceTreeTestState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return None,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let mut display_handle = display.handle();
+        let (client_side, server_side) = UnixStream::pair().unwrap();
+        let client = display_handle
+            .insert_client(server_side, Arc::new(SurfaceTreeTestClientState::default()))
+            .unwrap();
+        let parent = crate::wayland::compositor::test_utils::create_surface::<SurfaceTreeTestState>(
+            &client,
+            &display_handle,
+        );
+        let child = crate::wayland::compositor::test_utils::create_surface::<SurfaceTreeTestState>(
+            &client,
+            &display_handle,
+        );
+        crate::wayland::compositor::test_utils::set_parent(&child, &parent);
+        Some((display, client_side, parent, child))
     }
 
     #[test]
@@ -1772,6 +1844,64 @@ mod tests {
             .unwrap();
         assert!(second_state.textures.is_empty());
         assert!(!second_state.retired_textures.contains_key(&context_id.erased()));
+    }
+
+    #[test]
+    fn retire_and_release_surface_tree_continues_after_parent_error() {
+        let Some((_display, _client_side, parent, child)) = test_surface_tree() else {
+            // `use_system_lib` test builds can run in environments where libwayland-server.so is
+            // not loadable. The same live-tree path is exercised when the Wayland server backend is
+            // available.
+            return;
+        };
+        let context_id = ContextId::<TestTexture>::new();
+        crate::wayland::compositor::with_states(&parent, |states| {
+            insert_active_texture(states, &context_id, 141);
+        });
+        crate::wayland::compositor::with_states(&child, |states| {
+            insert_active_texture(states, &context_id, 142);
+        });
+
+        let mut renderer = HookRenderer {
+            context_id: context_id.clone(),
+            fail_releases: VecDeque::from([SurfaceCacheTextureReleaseError::RetrySafe(
+                TestError::ReleaseFailed,
+            )]),
+            released: Vec::new(),
+        };
+
+        assert_eq!(
+            super::retire_and_release_surface_tree_textures(&mut renderer, &parent),
+            Err(TestError::ReleaseFailed)
+        );
+        // `retire_and_release_surface_tree_textures` releases from the traversal filter. The filter
+        // sees the parent before descending to children, so the first injected failure applies to
+        // the parent texture while the child still proves post-error traversal.
+        assert_eq!(renderer.released, vec![141, 142]);
+
+        crate::wayland::compositor::with_states(&parent, |states| {
+            let state = states
+                .data_map
+                .get::<super::RendererSurfaceStateUserData>()
+                .unwrap()
+                .lock()
+                .unwrap();
+            assert!(state.textures.is_empty());
+            assert_eq!(
+                state.retired_textures.get(&context_id.erased()).map(Vec::len),
+                Some(1)
+            );
+        });
+        crate::wayland::compositor::with_states(&child, |states| {
+            let state = states
+                .data_map
+                .get::<super::RendererSurfaceStateUserData>()
+                .unwrap()
+                .lock()
+                .unwrap();
+            assert!(state.textures.is_empty());
+            assert!(!state.retired_textures.contains_key(&context_id.erased()));
+        });
     }
 
     #[test]
