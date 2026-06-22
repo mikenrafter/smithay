@@ -4094,13 +4094,18 @@ fn runtime_dmabuf_loopback_cache_release_hook_releases_sampled_texture() {
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format and DRM syncobj"]
-fn runtime_import_dma_wl_loopback_imports_and_releases_with_drm_syncobj() {
-    let test_name = "Vulkan ImportDmaWl loopback DRM syncobj test";
+fn runtime_import_dma_wl_loopback_samples_and_releases_with_drm_syncobj() {
+    let test_name = "Vulkan ImportDmaWl loopback DRM syncobj sampling test";
     let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
         return;
     };
     let Some(drm_device) = candidate.drm_syncobj_device.clone() else {
         eprintln!("skipping {test_name}: no DRM device for syncobj timeline");
+        return;
+    };
+    let Some(render_format) =
+        runtime_offscreen_sample_render_format(&candidate.renderer, candidate.format.code, test_name)
+    else {
         return;
     };
 
@@ -4208,6 +4213,23 @@ fn runtime_import_dma_wl_loopback_imports_and_releases_with_drm_syncobj() {
         buffer.release_point().is_none(),
         "successful ImportDmaWl texture construction must take Wayland release ownership"
     );
+    let cached_texture = {
+        let data = surface
+            .data_map
+            .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
+            .expect("import_surface should preserve renderer surface state");
+        let data = data.lock().unwrap();
+        data.texture(candidate.renderer.context_id())
+            .expect("normal ImportDmaWl import_surface should cache a Vulkan texture")
+            .clone()
+    };
+    runtime_sample_texture_to_offscreen_and_assert_non_black(
+        &mut candidate.renderer,
+        &cached_texture,
+        render_format,
+        test_name,
+    );
+    drop(cached_texture);
     assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
     assert!(matches!(
         candidate
