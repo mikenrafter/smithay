@@ -40,16 +40,19 @@ use crate::wayland::drm_syncobj::DrmSyncPoint;
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use crate::wayland::{
     buffer::BufferHandler,
-    compositor::{BufferAssignment, MultiCache, SurfaceAttributes, SurfaceData},
+    compositor::{
+        BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, MultiCache,
+        SurfaceAttributes, SurfaceData,
+    },
     drm_syncobj::DrmSyncobjCachedState,
 };
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use rustix::fs::{Mode, OFlags};
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use wayland_server::{
-    Display,
+    Client, Display,
     backend::{ClientData, ClientId, DisconnectReason, InitError},
-    protocol::wl_buffer::WlBuffer,
+    protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
 };
 
 use super::capabilities::{
@@ -229,11 +232,36 @@ impl BufferHandler for DmabufBufferTestState {
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+impl CompositorHandler for DmabufBufferTestState {
+    fn compositor_state(&mut self) -> &mut CompositorState {
+        unreachable!("Vulkan dmabuf buffer tests do not dispatch compositor requests")
+    }
+
+    fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        &client
+            .get_data::<DmabufBufferTestClientState>()
+            .unwrap()
+            .compositor_state
+    }
+
+    fn commit(&mut self, _surface: &WlSurface) {}
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+impl AsMut<CompositorState> for DmabufBufferTestState {
+    fn as_mut(&mut self) -> &mut CompositorState {
+        unreachable!("Vulkan dmabuf buffer tests do not dispatch compositor globals")
+    }
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 crate::delegate_dispatch2!(DmabufBufferTestState);
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[derive(Default)]
-struct DmabufBufferTestClientState;
+struct DmabufBufferTestClientState {
+    compositor_state: CompositorClientState,
+}
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 impl ClientData for DmabufBufferTestClientState {
@@ -254,7 +282,7 @@ fn dmabuf_wl_buffer_for_tests(
     let mut display_handle = display.handle();
     let (client_side, server_side) = UnixStream::pair().unwrap();
     let client = display_handle
-        .insert_client(server_side, Arc::new(DmabufBufferTestClientState))
+        .insert_client(server_side, Arc::new(DmabufBufferTestClientState::default()))
         .unwrap();
     let wl_buffer = client
         .create_resource::<WlBuffer, Dmabuf, DmabufBufferTestState>(&display_handle, 1, dmabuf)
@@ -312,6 +340,58 @@ fn import_surface_dmabuf_buffer_with_sync_points_for_tests(
     surface
         .data_map
         .insert_if_missing_threadsafe(|| Mutex::new(surface_state));
+
+    Some((display, client_side, surface, buffer))
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+fn import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+    dmabuf: Dmabuf,
+    acquire_point: DrmSyncPoint,
+    release_point: DrmSyncPoint,
+) -> Option<(
+    Display<DmabufBufferTestState>,
+    UnixStream,
+    WlSurface,
+    crate::backend::renderer::utils::Buffer,
+)> {
+    let display = match Display::<DmabufBufferTestState>::new() {
+        Ok(display) => display,
+        Err(InitError::NoWaylandLib) => return None,
+        Err(err) => panic!("failed to create test Wayland display: {err}"),
+    };
+    let mut display_handle = display.handle();
+    let (client_side, server_side) = UnixStream::pair().unwrap();
+    let client = display_handle
+        .insert_client(server_side, Arc::new(DmabufBufferTestClientState::default()))
+        .unwrap();
+    let wl_buffer = client
+        .create_resource::<WlBuffer, Dmabuf, DmabufBufferTestState>(&display_handle, 1, dmabuf)
+        .unwrap();
+    let surface = crate::wayland::compositor::test_utils::create_surface::<DmabufBufferTestState>(
+        &client,
+        &display_handle,
+    );
+
+    let buffer = crate::wayland::compositor::with_states(&surface, |states| {
+        {
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            attributes.current().buffer = Some(BufferAssignment::NewBuffer(wl_buffer));
+        }
+        {
+            let mut syncobj = states.cached_state.get::<DrmSyncobjCachedState>();
+            syncobj.current().acquire_point = Some(acquire_point);
+            syncobj.current().release_point = Some(release_point);
+        }
+
+        let mut surface_state = crate::backend::renderer::utils::RendererSurfaceState::default();
+        surface_state.update_buffer(states);
+        let buffer = surface_state.buffer().unwrap().clone();
+        states
+            .data_map
+            .insert_if_missing_threadsafe(|| Mutex::new(surface_state));
+        buffer
+    });
 
     Some((display, client_side, surface, buffer))
 }
@@ -4491,6 +4571,181 @@ fn runtime_import_dma_wl_loopback_removed_buffer_releases_cached_dmabuf() {
                 &release_point_probe,
                 "panic cleanup should signal removed-buffer Wayland release point",
             );
+        }
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format and DRM syncobj"]
+fn runtime_import_dma_wl_loopback_surface_tree_teardown_releases_cached_dmabuf() {
+    let test_name = "Vulkan ImportDmaWl loopback surface-tree teardown release test";
+    let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
+        return;
+    };
+    let Some(drm_device) = candidate.drm_syncobj_device.clone() else {
+        eprintln!("skipping {test_name}: no DRM device for syncobj timeline");
+        return;
+    };
+    let Some(render_format) =
+        runtime_offscreen_sample_render_format(&candidate.renderer, candidate.format.code, test_name)
+    else {
+        return;
+    };
+
+    let allocator_release = unsafe {
+        // SAFETY: The dmabuf was just exported from `candidate.image`, and this ignored runtime test
+        // does not hand it to any other API before asking the allocator to release the fresh image to
+        // FOREIGN/GENERAL for the renderer acquire below.
+        candidate
+            .allocator
+            .release_dmabuf_to_foreign_general(&candidate.image, &candidate.dmabuf)
+    }
+    .expect("release allocator dmabuf to foreign GENERAL");
+
+    let mut target = unsafe {
+        // SAFETY: `allocator_release` proves that the allocator-owned image backing this exported
+        // dmabuf was released to VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL layout. There is no
+        // intervening access before this renderer acquire.
+        candidate
+            .renderer
+            .bind_allocator_released_dmabuf_render_target(&mut candidate.dmabuf, allocator_release)
+    }
+    .expect("bind allocator-released dmabuf as Vulkan render target")
+    .expect("renderer should advertise the selected dmabuf render-target modifier");
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = candidate
+            .renderer
+            .render(&mut target, (4, 4).into(), Transform::Normal)
+            .expect("render loopback dmabuf target before surface-tree teardown release");
+        frame
+            .clear(Color32F::new(0.375, 0.625, 0.875, 1.0), &full_damage)
+            .expect("clear loopback dmabuf render target before surface-tree teardown release");
+    }
+
+    let evidence = match candidate
+        .renderer
+        .release_dmabuf_render_target_for_sampled_loopback(&mut target, true)
+    {
+        Ok(Some(evidence)) => evidence,
+        Ok(None) => panic!("loopback release should produce sampled import evidence"),
+        Err(VulkanError::UnsupportedOperation("sync-file semaphore export")) => {
+            eprintln!("skipping {test_name}: sync-file export unsupported");
+            candidate
+                .renderer
+                .release_dmabuf_render_target_for_sampled_loopback(&mut target, false)
+                .expect("release loopback render target without exported sync after export skip");
+            return;
+        }
+        Err(err) => panic!("release loopback render target to foreign GENERAL with exported sync: {err:?}"),
+    };
+    drop(target);
+    assert!(evidence.is_for_dmabuf(&candidate.dmabuf));
+
+    let (acquire_point, release_point) = DrmSyncPoint::timeline_pair_for_tests(&drm_device, 31, 32)
+        .expect("create DRM syncobj acquire/release timeline points");
+    if !import_or_signal_wayland_acquire_point_for_tests(test_name, evidence.acquire_sync(), &acquire_point) {
+        return;
+    }
+    let release_point_probe = release_point.clone();
+
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+            candidate.dmabuf.clone(),
+            acquire_point,
+            release_point,
+        )
+    else {
+        return;
+    };
+    unsafe {
+        // SAFETY: `evidence` proves this exact Smithay-controlled loopback dmabuf was released to
+        // FOREIGN ownership in GENERAL layout, and its release sync was attached to or waited before
+        // the Wayland acquire point. There is no intervening use before import_surface.
+        VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &candidate.dmabuf)
+            .unwrap();
+        // SAFETY: this ignored runtime probe drives the buffer through a live WlSurface's normal
+        // renderer-utils surface cache, then calls retire_and_release_surface_tree_textures while the
+        // renderer is still available before dropping the surface tree state.
+        candidate
+            .renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+                &buffer,
+                &candidate.dmabuf,
+            )
+            .unwrap();
+    }
+
+    crate::wayland::compositor::with_states(&surface, |states| {
+        crate::backend::renderer::utils::import_surface(&mut candidate.renderer, states)
+    })
+    .expect("normal ImportDmaWl import_surface should import sampled loopback dmabuf before teardown");
+    assert!(
+        buffer.release_point().is_none(),
+        "successful ImportDmaWl texture construction must take Wayland release ownership"
+    );
+
+    let mut release_satisfied = false;
+    let teardown_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let cached_texture = crate::wayland::compositor::with_states(&surface, |states| {
+            let data = states
+                .data_map
+                .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
+                .expect("import_surface should preserve renderer surface state");
+            let data = data.lock().unwrap();
+            data.texture(candidate.renderer.context_id()).cloned()
+        });
+        let cached_texture =
+            cached_texture.expect("ImportDmaWl import_surface should cache a Vulkan texture");
+        runtime_sample_texture_to_offscreen_and_assert_non_black(
+            &mut candidate.renderer,
+            &cached_texture,
+            render_format,
+            test_name,
+        );
+        drop(cached_texture);
+        drop(buffer);
+
+        crate::backend::renderer::utils::retire_and_release_surface_tree_textures(
+            &mut candidate.renderer,
+            &surface,
+        )
+        .expect("surface-tree teardown should release sampled dmabuf through cache hook");
+        release_point_probe
+            .wait(1_000_000_000)
+            .expect("surface-tree teardown release should signal Wayland release point");
+        release_satisfied = true;
+
+        crate::wayland::compositor::with_states(&surface, |states| {
+            let data = states
+                .data_map
+                .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
+                .expect("surface-tree teardown should preserve renderer surface state for inspection");
+            let data = data.lock().unwrap();
+            assert!(data.texture(candidate.renderer.context_id()).is_none());
+        });
+        assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
+        assert!(matches!(
+            candidate
+                .renderer
+                .validate_sampled_dmabuf_public_advertisement_contract(),
+            Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        ));
+    }));
+
+    if let Err(payload) = teardown_result {
+        if !release_satisfied {
+            crate::wayland::compositor::with_states(&surface, |states| {
+                retire_import_surface_textures_and_wait_for_tests(
+                    &mut candidate.renderer,
+                    states,
+                    &release_point_probe,
+                    "panic cleanup should signal surface-tree teardown Wayland release point",
+                );
+            });
         }
         std::panic::resume_unwind(payload);
     }
