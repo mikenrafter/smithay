@@ -1267,10 +1267,13 @@ impl VulkanRenderer {
     /// renderer, the compositor will call
     /// [`super::utils::retire_and_release_surface_textures`] or
     /// [`super::utils::retire_and_release_surface_tree_textures`] while this renderer is still
-    /// available. If release returns a retry-safe error, the caller must not reset/drop the affected
-    /// surface state until the obligation is retried or otherwise preserved. No active frame, render
-    /// element, clone, or external user may sample the cached texture after the teardown release helper
-    /// has retired and released it.
+    /// available. If renderer-utils has already retired the texture for this renderer context, such as
+    /// after a removed-buffer commit or replacement update, the compositor may instead call
+    /// [`super::utils::release_retired_surface_textures`] before the retired texture is dropped. If
+    /// release returns a retry-safe error, the caller must not reset/drop the affected surface state
+    /// until the obligation is retried or otherwise preserved. No active frame, render element, clone,
+    /// or external user may sample the cached texture after the teardown release helper has retired and
+    /// released it.
     #[cfg(feature = "wayland_frontend")]
     pub unsafe fn mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
         &self,
