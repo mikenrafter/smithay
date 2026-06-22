@@ -373,7 +373,7 @@ fn import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
         &display_handle,
     );
 
-    let buffer = crate::wayland::compositor::with_states(&surface, |states| {
+    crate::wayland::compositor::with_states(&surface, |states| {
         {
             let mut attributes = states.cached_state.get::<SurfaceAttributes>();
             attributes.current().buffer = Some(BufferAssignment::NewBuffer(wl_buffer));
@@ -383,15 +383,15 @@ fn import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
             syncobj.current().acquire_point = Some(acquire_point);
             syncobj.current().release_point = Some(release_point);
         }
-
-        let mut surface_state = crate::backend::renderer::utils::RendererSurfaceState::default();
-        surface_state.update_buffer(states);
-        let buffer = surface_state.buffer().unwrap().clone();
-        states
-            .data_map
-            .insert_if_missing_threadsafe(|| Mutex::new(surface_state));
-        buffer
     });
+    crate::backend::renderer::utils::on_commit_buffer_handler::<DmabufBufferTestState>(&surface);
+    let buffer = crate::backend::renderer::utils::with_renderer_surface_state(&surface, |state| {
+        state
+            .buffer()
+            .expect("on_commit_buffer_handler should store the committed dmabuf buffer")
+            .clone()
+    })
+    .expect("on_commit_buffer_handler should create renderer surface state");
 
     Some((display, client_side, surface, buffer))
 }
