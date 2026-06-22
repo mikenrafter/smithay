@@ -1702,6 +1702,47 @@ mod tests {
     }
 
     #[test]
+    fn reset_drops_active_texture_without_renderer_release_hook() {
+        let context_id = ContextId::<TestTexture>::new();
+        let mut state = RendererSurfaceState::default();
+        state
+            .textures
+            .insert(context_id.erased(), Box::new(TestTexture(72)));
+
+        let states = SurfaceData {
+            role: None,
+            data_map: Default::default(),
+            cached_state: MultiCache::new(),
+        };
+        states.data_map.insert_if_missing_threadsafe(|| Mutex::new(state));
+
+        states
+            .data_map
+            .get::<super::RendererSurfaceStateUserData>()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .reset();
+
+        let mut renderer = HookRenderer {
+            context_id: context_id.clone(),
+            fail_releases: VecDeque::new(),
+            released: Vec::new(),
+        };
+
+        super::release_retired_surface_textures(&mut renderer, &states).unwrap();
+        assert!(renderer.released.is_empty());
+        let state = states
+            .data_map
+            .get::<super::RendererSurfaceStateUserData>()
+            .unwrap()
+            .lock()
+            .unwrap();
+        assert!(state.texture(context_id.clone()).is_none());
+        assert!(!state.retired_textures.contains_key(&context_id.erased()));
+    }
+
+    #[test]
     fn retire_and_release_surface_textures_only_retires_renderer_context() {
         let context_id = ContextId::<TestTexture>::new();
         let other_context_id = ContextId::<TestTexture>::new();
