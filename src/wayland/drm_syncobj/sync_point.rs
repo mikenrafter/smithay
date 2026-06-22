@@ -139,6 +139,41 @@ impl DrmSyncPoint {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn timeline_pair_for_tests(
+        device: &DrmDeviceFd,
+        acquire_point: u64,
+        release_point: u64,
+    ) -> io::Result<(Self, Self)> {
+        let syncobj = device.create_syncobj(false)?;
+        let timeline_fd = match device.syncobj_to_fd(syncobj, false) {
+            Ok(fd) => fd,
+            Err(err) => {
+                let _ = device.destroy_syncobj(syncobj);
+                return Err(err);
+            }
+        };
+        let timeline = match DrmTimeline::new(device, timeline_fd) {
+            Ok(timeline) => timeline,
+            Err(err) => {
+                let _ = device.destroy_syncobj(syncobj);
+                return Err(err);
+            }
+        };
+        let _ = device.destroy_syncobj(syncobj);
+
+        Ok((
+            Self {
+                timeline: timeline.clone(),
+                point: acquire_point,
+            },
+            Self {
+                timeline,
+                point: release_point,
+            },
+        ))
+    }
+
     /// Create an eventfd that will be signaled by the syncpoint
     pub fn eventfd(&self) -> io::Result<Arc<OwnedFd>> {
         let fd = rustix::event::eventfd(
@@ -337,7 +372,7 @@ impl EventSource for DrmSyncPointSource {
     }
 }
 
-/// [`Blocker`] implementation for an accompaning [`DrmSyncPointSource`]
+/// [`Blocker`] implementation for an accompanying [`DrmSyncPointSource`]
 #[derive(Debug)]
 pub struct DrmSyncPointBlocker {
     signal: Arc<AtomicBool>,
