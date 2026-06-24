@@ -625,8 +625,8 @@ pub struct VulkanRenderingCapabilities {
     /// Whether the Vulkan dmabuf render-target development path has probed formats.
     ///
     /// This indicates the explicit unsafe development API has probed formats and gates this fork's
-    /// conservative generic [`Bind<Dmabuf>`] path. The generic path discards previous contents and
-    /// forces full repaint; callers using the explicit path must satisfy
+    /// conservative generic [`Bind<Dmabuf>`](crate::backend::renderer::Bind) path. The generic path
+    /// discards previous contents and forces full repaint; callers using the explicit path must satisfy
     /// [`crate::backend::renderer::vulkan::VulkanRenderer::bind_dmabuf_render_target`] safety
     /// requirements. This flag does not imply broad imported-dmabuf renderer-framebuffer support.
     pub dmabuf_target_development: bool,

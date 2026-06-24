@@ -117,6 +117,7 @@ fn enter_surface_import_after_retired_release(states: &SurfaceData) -> SurfaceIm
 /// [`release_retired_surface_textures`] has succeeded. It relies on the renderer-utils convention
 /// that commit/update and import access for a given surface is serialized by the compositor event
 /// loop; it is not a cross-thread epoch proof for concurrent mutation of the same `SurfaceData`.
+#[cfg(any(test, feature = "renderer_vulkan"))]
 pub(crate) fn surface_import_after_retired_release(states: &SurfaceData) -> bool {
     states
         .data_map

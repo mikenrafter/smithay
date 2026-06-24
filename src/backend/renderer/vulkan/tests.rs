@@ -4436,6 +4436,148 @@ fn runtime_import_dma_wl_loopback_samples_and_releases_with_drm_syncobj() {
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format and DRM syncobj"]
+fn runtime_import_dma_wl_loopback_development_override_samples_and_releases() {
+    let test_name = "Vulkan ImportDmaWl loopback development override sampling test";
+    let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
+        return;
+    };
+    candidate
+        .renderer
+        .assume_wayland_dmabuf_foreign_general_for_tests(true);
+    let Some(drm_device) = candidate.drm_syncobj_device.clone() else {
+        eprintln!("skipping {test_name}: no DRM device for syncobj timeline");
+        return;
+    };
+    let Some(render_format) =
+        runtime_offscreen_sample_render_format(&candidate.renderer, candidate.format.code, test_name)
+    else {
+        return;
+    };
+
+    let allocator_release = unsafe {
+        // SAFETY: The dmabuf was just exported from `candidate.image`, and this ignored runtime test
+        // does not hand it to any other API before asking the allocator to release the fresh image to
+        // FOREIGN/GENERAL for the renderer acquire below.
+        candidate
+            .allocator
+            .release_dmabuf_to_foreign_general(&candidate.image, &candidate.dmabuf)
+    }
+    .expect("release allocator dmabuf to foreign GENERAL");
+
+    let mut target = unsafe {
+        // SAFETY: `allocator_release` proves that the allocator-owned image backing this exported
+        // dmabuf was released to VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL layout. There is no
+        // intervening access before this renderer acquire.
+        candidate
+            .renderer
+            .bind_allocator_released_dmabuf_render_target(&mut candidate.dmabuf, allocator_release)
+    }
+    .expect("bind allocator-released dmabuf as Vulkan render target")
+    .expect("renderer should advertise the selected dmabuf render-target modifier");
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = candidate
+            .renderer
+            .render(&mut target, (4, 4).into(), Transform::Normal)
+            .expect("render into loopback dmabuf target for development override");
+        frame
+            .clear(Color32F::new(0.75, 0.25, 0.5, 1.0), &full_damage)
+            .expect("clear loopback dmabuf render target for development override");
+    }
+
+    let evidence = match candidate
+        .renderer
+        .release_dmabuf_render_target_for_sampled_loopback(&mut target, true)
+    {
+        Ok(Some(evidence)) => evidence,
+        Ok(None) => panic!("released loopback render target should produce sampled import evidence"),
+        Err(VulkanError::UnsupportedOperation("sync-file semaphore export")) => {
+            eprintln!("skipping {test_name}: sync-file export unsupported");
+            candidate
+                .renderer
+                .release_dmabuf_render_target_for_sampled_loopback(&mut target, false)
+                .expect("release loopback render target without exported sync after export skip");
+            return;
+        }
+        Err(err) => panic!("release loopback render target to foreign GENERAL with exported sync: {err:?}"),
+    };
+    drop(target);
+    assert!(evidence.is_for_dmabuf(&candidate.dmabuf));
+
+    let (acquire_point, release_point) = DrmSyncPoint::timeline_pair_for_tests(&drm_device, 61, 62)
+        .expect("create DRM syncobj acquire/release timeline points");
+    if !import_or_signal_wayland_acquire_point_for_tests(test_name, evidence.acquire_sync(), &acquire_point) {
+        return;
+    }
+    let release_point_probe = release_point.clone();
+
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_buffer_with_sync_points_for_tests(
+            candidate.dmabuf.clone(),
+            acquire_point,
+            release_point,
+        )
+    else {
+        return;
+    };
+    unsafe {
+        // SAFETY: this ignored runtime probe deliberately does not install per-buffer external-state
+        // user-data. Instead, the default-off renderer override above supplies the same validation-stage
+        // FOREIGN + GENERAL assumption through the normal ImportDmaWl path. The dmabuf was produced by
+        // Smithay's own loopback target and released to FOREIGN/GENERAL before the Wayland acquire
+        // point was imported or signaled.
+        candidate
+            .renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+                &buffer,
+                &candidate.dmabuf,
+            )
+            .unwrap();
+    }
+    assert!(buffer.release_point().is_some());
+
+    crate::backend::renderer::utils::import_surface(&mut candidate.renderer, &surface)
+        .expect("normal ImportDmaWl import_surface should import sampled loopback dmabuf via override");
+    assert!(
+        buffer.release_point().is_none(),
+        "successful override ImportDmaWl texture construction must take Wayland release ownership"
+    );
+    let cached_texture = {
+        let data = surface
+            .data_map
+            .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
+            .expect("import_surface should preserve renderer surface state");
+        let data = data.lock().unwrap();
+        data.texture(candidate.renderer.context_id())
+            .expect("override ImportDmaWl import_surface should cache a Vulkan texture")
+            .clone()
+    };
+    runtime_sample_texture_to_offscreen_and_assert_non_black(
+        &mut candidate.renderer,
+        &cached_texture,
+        render_format,
+        test_name,
+    );
+    drop(cached_texture);
+    assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
+    assert!(matches!(
+        candidate
+            .renderer
+            .validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
+
+    crate::backend::renderer::utils::retire_and_release_surface_textures(&mut candidate.renderer, &surface)
+        .expect("retire and release imported sampled dmabuf through surface-cache hook");
+    release_point_probe
+        .wait(1_000_000_000)
+        .expect("override sampled dmabuf release should signal Wayland release point");
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format and DRM syncobj"]
 fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
     let test_name = "Vulkan ImportDmaWl loopback same-dmabuf reacquire test";
     let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
@@ -7848,6 +7990,104 @@ fn import_surface_real_buffer_reaches_texture_cache_lifecycle_guard() {
         buffer.release_point().is_some(),
         "normal import_surface guard must not consume Wayland release ownership before lifecycle evidence"
     );
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_surface_development_override_reaches_texture_cache_lifecycle_guard() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.assume_wayland_dmabuf_foreign_general_for_tests(true);
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
+    renderer.capabilities.external_memory.foreign_queue_family = true;
+
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_buffer_for_tests(dmabuf.clone(), 23, 24)
+    else {
+        return;
+    };
+    assert!(buffer.release_point().is_some());
+
+    let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
+    assert!(matches!(
+        import_result,
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan texture-cache release call sites"
+        ))
+    ));
+    assert!(
+        buffer.release_point().is_some(),
+        "development override must not consume Wayland release ownership before lifecycle evidence"
+    );
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_surface_development_override_with_lifecycle_reaches_device_import_boundary() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.assume_wayland_dmabuf_foreign_general_for_tests(true);
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
+    renderer.capabilities.external_memory.foreign_queue_family = true;
+
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_buffer_for_tests(dmabuf.clone(), 25, 26)
+    else {
+        return;
+    };
+    unsafe {
+        // SAFETY: This validation-stage fixture supplies compositor lifecycle evidence while the
+        // default-off renderer override supplies current-commit external-state evidence. The test
+        // proves the normal import_surface path reaches the scaffold device boundary without a
+        // per-buffer foreign-state marker or public sampled-dmabuf advertisement.
+        renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
+            .unwrap();
+    }
+    assert!(buffer.release_point().is_some());
+
+    let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
+    assert!(matches!(import_result, Err(VulkanError::VulkanUnavailable)));
+    assert!(
+        buffer.release_point().is_some(),
+        "scaffold device boundary must not consume Wayland release ownership before texture construction"
+    );
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
