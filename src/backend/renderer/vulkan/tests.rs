@@ -8347,6 +8347,116 @@ fn import_surface_real_buffer_reaches_texture_cache_lifecycle_guard() {
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
+fn import_surface_lifecycle_evidence_does_not_imply_first_import_external_state() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
+    renderer.capabilities.external_memory.foreign_queue_family = true;
+
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_buffer_for_tests(dmabuf.clone(), 33, 34)
+    else {
+        return;
+    };
+    unsafe {
+        // SAFETY: This fixture supplies only the compositor texture-cache release lifecycle contract.
+        // It deliberately does not supply current-commit Vulkan external-state evidence, proving that
+        // linux-dmabuf metadata plus explicit sync points do not imply the first-import image layout.
+        renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
+            .unwrap();
+    }
+    assert!(buffer.release_point().is_some());
+
+    let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
+    assert!(matches!(
+        import_result,
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan first-import layout policy"
+        ))
+    ));
+    assert!(
+        buffer.release_point().is_some(),
+        "first-import external-state guard must not consume Wayland release ownership"
+    );
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_surface_lifecycle_evidence_does_not_imply_reacquire_external_state() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
+    renderer.capabilities.external_memory.foreign_queue_family = true;
+
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    renderer.record_sampled_dmabuf_released_to_foreign_general(&dmabuf);
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_buffer_for_tests(dmabuf.clone(), 35, 36)
+    else {
+        return;
+    };
+    unsafe {
+        // SAFETY: This fixture supplies only renderer-local prior release history and compositor
+        // texture-cache release lifecycle. It deliberately omits fresh current-commit producer-return
+        // evidence, proving that prior release history plus explicit sync does not imply reacquire
+        // layout/ownership for the next Wayland commit.
+        renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
+            .unwrap();
+    }
+    assert!(buffer.release_point().is_some());
+
+    let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
+    assert!(matches!(
+        import_result,
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan current reacquire layout policy"
+        ))
+    ));
+    assert!(
+        buffer.release_point().is_some(),
+        "reacquire external-state guard must not consume Wayland release ownership"
+    );
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
 fn import_surface_development_override_reaches_texture_cache_lifecycle_guard() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     renderer.assume_wayland_dmabuf_foreign_general_for_tests(true);
