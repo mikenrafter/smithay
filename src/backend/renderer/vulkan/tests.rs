@@ -3735,6 +3735,65 @@ fn runtime_drm_syncobj_device_for_tests(
     }
 }
 
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device and DRM syncobj"]
+fn runtime_drm_syncobj_imports_exported_sync_file_to_timeline_point() {
+    let test_name = "DRM syncobj sync-file timeline import test";
+    let instance = match Instance::new(Version::VERSION_1_3, None) {
+        Ok(instance) => instance,
+        Err(err) => {
+            eprintln!("skipping {test_name}: failed to create instance: {err:?}");
+            return;
+        }
+    };
+
+    let devices = match PhysicalDevice::enumerate(&instance) {
+        Ok(devices) => devices,
+        Err(err) => {
+            eprintln!("skipping {test_name}: failed to enumerate devices: {err:?}");
+            return;
+        }
+    };
+
+    let mut setup_errors = Vec::new();
+    for physical_device in devices {
+        let Some(drm_device) = runtime_drm_syncobj_device_for_tests(&physical_device, test_name) else {
+            continue;
+        };
+
+        let (source_point, destination_point) =
+            match DrmSyncPoint::timeline_pair_for_tests(&drm_device, 67, 68) {
+                Ok(points) => points,
+                Err(err) => {
+                    setup_errors.push(format!("failed to create DRM syncobj timeline points: {err}"));
+                    continue;
+                }
+            };
+
+        source_point
+            .signal()
+            .expect("signal source DRM timeline point before sync-file export");
+        let sync_file = source_point
+            .export_sync_file()
+            .expect("export source DRM timeline point as sync-file");
+        destination_point
+            .import_sync_file(sync_file.as_fd())
+            .expect("import exported sync-file into destination DRM timeline point");
+        destination_point
+            .wait(1_000_000_000)
+            .expect("destination DRM timeline point should wait after sync-file import");
+        assert!(destination_point.is_signaled());
+        return;
+    }
+
+    if setup_errors.is_empty() {
+        eprintln!("skipping {test_name}: no Vulkan physical device exposed a usable DRM node");
+    } else {
+        eprintln!("skipping {test_name}: {}", setup_errors.join("; "));
+    }
+}
+
 fn runtime_dmabuf_loopback_candidate(test_name: &str) -> Option<RuntimeDmabufLoopbackCandidate> {
     let instance = match Instance::new(Version::VERSION_1_3, None) {
         Ok(instance) => instance,
