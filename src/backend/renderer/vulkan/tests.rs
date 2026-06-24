@@ -4444,6 +4444,13 @@ fn runtime_import_dma_wl_loopback_development_override_samples_and_releases() {
     candidate
         .renderer
         .assume_wayland_dmabuf_foreign_general_for_tests(true);
+    assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
+    assert!(matches!(
+        candidate
+            .renderer
+            .validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
     let Some(drm_device) = candidate.drm_syncobj_device.clone() else {
         eprintln!("skipping {test_name}: no DRM device for syncobj timeline");
         return;
@@ -4853,6 +4860,293 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
                     &surface,
                     &first_release_point_probe,
                     "panic cleanup should signal first same-dmabuf Wayland release point",
+                );
+            }
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format and DRM syncobj"]
+fn runtime_import_dma_wl_loopback_development_override_reacquires_same_dmabuf_after_cache_release() {
+    let test_name = "Vulkan ImportDmaWl loopback development override same-dmabuf reacquire test";
+    let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
+        return;
+    };
+    candidate
+        .renderer
+        .assume_wayland_dmabuf_foreign_general_for_tests(true);
+    assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
+    assert!(matches!(
+        candidate
+            .renderer
+            .validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
+    let Some(drm_device) = candidate.drm_syncobj_device.clone() else {
+        eprintln!("skipping {test_name}: no DRM device for syncobj timeline");
+        return;
+    };
+    let Some(render_format) =
+        runtime_offscreen_sample_render_format(&candidate.renderer, candidate.format.code, test_name)
+    else {
+        return;
+    };
+
+    let allocator_release = unsafe {
+        // SAFETY: The dmabuf was just exported from `candidate.image`, and this ignored runtime test
+        // does not hand it to any other API before asking the allocator to release the fresh image to
+        // FOREIGN/GENERAL for the renderer acquire below.
+        candidate
+            .allocator
+            .release_dmabuf_to_foreign_general(&candidate.image, &candidate.dmabuf)
+    }
+    .expect("release allocator dmabuf to foreign GENERAL for override reacquire");
+
+    let mut target = unsafe {
+        // SAFETY: `allocator_release` proves that the allocator-owned image backing this exported
+        // dmabuf was released to VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL layout. There is no
+        // intervening access before this renderer acquire.
+        candidate
+            .renderer
+            .bind_allocator_released_dmabuf_render_target(&mut candidate.dmabuf, allocator_release)
+    }
+    .expect("bind allocator-released dmabuf as Vulkan render target for override reacquire")
+    .expect("renderer should advertise the selected dmabuf render-target modifier");
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = candidate
+            .renderer
+            .render(&mut target, (4, 4).into(), Transform::Normal)
+            .expect("render loopback dmabuf target before override same-dmabuf reacquire");
+        frame
+            .clear(Color32F::new(0.125, 0.5, 0.875, 1.0), &full_damage)
+            .expect("clear loopback dmabuf render target before override same-dmabuf reacquire");
+    }
+
+    let evidence = match candidate
+        .renderer
+        .release_dmabuf_render_target_for_sampled_loopback(&mut target, true)
+    {
+        Ok(Some(evidence)) => evidence,
+        Ok(None) => panic!("loopback release should produce sampled import evidence"),
+        Err(VulkanError::UnsupportedOperation("sync-file semaphore export")) => {
+            eprintln!("skipping {test_name}: sync-file export unsupported");
+            candidate
+                .renderer
+                .release_dmabuf_render_target_for_sampled_loopback(&mut target, false)
+                .expect("release loopback render target without exported sync after export skip");
+            return;
+        }
+        Err(err) => panic!("release loopback render target to foreign GENERAL with exported sync: {err:?}"),
+    };
+    drop(target);
+    assert!(evidence.is_for_dmabuf(&candidate.dmabuf));
+
+    let (first_acquire_point, first_release_point) =
+        DrmSyncPoint::timeline_pair_for_tests(&drm_device, 63, 64)
+            .expect("create first DRM syncobj acquire/release timeline points for override reacquire");
+    if !import_or_signal_wayland_acquire_point_for_tests(
+        test_name,
+        evidence.acquire_sync(),
+        &first_acquire_point,
+    ) {
+        return;
+    }
+    let first_release_point_probe = first_release_point.clone();
+
+    let Some((_first_display, _first_client_side, surface, first_buffer)) =
+        import_surface_dmabuf_buffer_with_sync_points_for_tests(
+            candidate.dmabuf.clone(),
+            first_acquire_point,
+            first_release_point,
+        )
+    else {
+        return;
+    };
+    unsafe {
+        // SAFETY: this ignored runtime probe deliberately does not install per-buffer external-state
+        // user-data. Instead, the default-off renderer override supplies validation-stage FOREIGN +
+        // GENERAL evidence through the normal ImportDmaWl path. The dmabuf was produced by Smithay's
+        // loopback target and released to FOREIGN/GENERAL before the Wayland acquire point was
+        // imported or signaled.
+        candidate
+            .renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+                &first_buffer,
+                &candidate.dmabuf,
+            )
+            .unwrap();
+    }
+
+    let mut first_cache_needs_release_for_cleanup = false;
+    let mut first_release_satisfied = false;
+    let mut second_release_point_for_cleanup = None;
+    let mut second_cache_needs_release_for_cleanup = false;
+    let reacquire_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> bool {
+        crate::backend::renderer::utils::import_surface(&mut candidate.renderer, &surface)
+            .expect("override ImportDmaWl import_surface should import first sampled loopback dmabuf");
+        first_cache_needs_release_for_cleanup = true;
+        assert!(
+            first_buffer.release_point().is_none(),
+            "first override ImportDmaWl texture construction must take Wayland release ownership"
+        );
+
+        let first_cached_texture = {
+            let data = surface
+                .data_map
+                .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
+                .expect("first override import_surface should preserve renderer surface state");
+            let data = data.lock().unwrap();
+            data.texture(candidate.renderer.context_id())
+                .expect("first override ImportDmaWl import_surface should cache a Vulkan texture")
+                .clone()
+        };
+        runtime_sample_texture_to_offscreen_and_assert_non_black(
+            &mut candidate.renderer,
+            &first_cached_texture,
+            render_format,
+            test_name,
+        );
+        drop(first_cached_texture);
+        drop(first_buffer);
+
+        crate::backend::renderer::utils::retire_and_release_surface_textures(
+            &mut candidate.renderer,
+            &surface,
+        )
+        .expect("first override sampled dmabuf cache release should run through renderer-utils hook");
+        first_release_point_probe
+            .wait(1_000_000_000)
+            .expect("first override sampled dmabuf release should signal Wayland release point");
+        first_cache_needs_release_for_cleanup = false;
+        first_release_satisfied = true;
+        assert_eq!(
+            candidate
+                .renderer
+                .sampled_dmabuf_layout_history(&candidate.dmabuf),
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+        );
+
+        let (second_acquire_point, second_release_point) =
+            DrmSyncPoint::timeline_pair_for_tests(&drm_device, 65, 66)
+                .expect("create second DRM syncobj acquire/release timeline points for override reacquire");
+        import_or_signal_reacquire_point_from_release_for_tests(
+            test_name,
+            &first_release_point_probe,
+            &second_acquire_point,
+        );
+        let second_release_point_probe = second_release_point.clone();
+        second_release_point_for_cleanup = Some(second_release_point_probe.clone());
+
+        let Some((_second_display, _second_client_side, second_buffer)) =
+            update_import_surface_dmabuf_buffer_with_sync_points_for_tests(
+                &surface,
+                candidate.dmabuf.clone(),
+                second_acquire_point,
+                second_release_point,
+            )
+        else {
+            return false;
+        };
+        unsafe {
+            // SAFETY: this ignored runtime probe again relies on the default-off renderer override
+            // instead of per-buffer external-state user-data. The previous renderer release signaled
+            // the first Wayland release point, and the current acquire point was imported or signaled
+            // before reacquiring the same dmabuf through normal ImportDmaWl.
+            candidate
+                .renderer
+                .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+                    &second_buffer,
+                    &candidate.dmabuf,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            candidate
+                .renderer
+                .sampled_dmabuf_layout_history(&candidate.dmabuf),
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+        );
+
+        crate::backend::renderer::utils::import_surface(&mut candidate.renderer, &surface)
+            .expect("override ImportDmaWl import_surface should reacquire same sampled dmabuf");
+        second_cache_needs_release_for_cleanup = true;
+        assert!(
+            second_buffer.release_point().is_none(),
+            "override same-dmabuf reacquire must take the second Wayland release ownership"
+        );
+        assert_eq!(
+            candidate
+                .renderer
+                .sampled_dmabuf_layout_history(&candidate.dmabuf),
+            SampledDmabufWaylandLayoutHistory::LocallyAcquired
+        );
+
+        let second_cached_texture = {
+            let data = surface
+                .data_map
+                .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
+                .expect("override same-dmabuf reacquire should preserve renderer surface state");
+            let data = data.lock().unwrap();
+            data.texture(candidate.renderer.context_id())
+                .expect("override same-dmabuf reacquire should cache a Vulkan texture")
+                .clone()
+        };
+        runtime_sample_texture_to_offscreen_and_assert_non_black(
+            &mut candidate.renderer,
+            &second_cached_texture,
+            render_format,
+            test_name,
+        );
+        drop(second_cached_texture);
+        assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
+        assert!(matches!(
+            candidate
+                .renderer
+                .validate_sampled_dmabuf_public_advertisement_contract(),
+            Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        ));
+
+        retire_import_surface_textures_and_wait_for_tests(
+            &mut candidate.renderer,
+            &surface,
+            &second_release_point_probe,
+            "override same-dmabuf reacquire release should signal second Wayland release point",
+        );
+        second_cache_needs_release_for_cleanup = false;
+        assert_eq!(
+            candidate
+                .renderer
+                .sampled_dmabuf_layout_history(&candidate.dmabuf),
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+        );
+        drop(second_buffer);
+        true
+    }));
+
+    match reacquire_result {
+        Ok(true) => {}
+        Ok(false) => {}
+        Err(payload) => {
+            if second_cache_needs_release_for_cleanup {
+                if let Some(second_release_point) = second_release_point_for_cleanup.as_ref() {
+                    retire_import_surface_textures_and_wait_for_tests(
+                        &mut candidate.renderer,
+                        &surface,
+                        second_release_point,
+                        "panic cleanup should signal override same-dmabuf reacquire Wayland release point",
+                    );
+                }
+            } else if first_cache_needs_release_for_cleanup && !first_release_satisfied {
+                retire_import_surface_textures_and_wait_for_tests(
+                    &mut candidate.renderer,
+                    &surface,
+                    &first_release_point_probe,
+                    "panic cleanup should signal first override same-dmabuf Wayland release point",
                 );
             }
             std::panic::resume_unwind(payload);
