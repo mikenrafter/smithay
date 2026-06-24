@@ -5333,13 +5333,10 @@ fn create_sampler(
         .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
         .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
         .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-        .mip_lod_bias(0.0)
         .anisotropy_enable(false)
         .max_anisotropy(1.0)
         .compare_enable(false)
         .compare_op(vk::CompareOp::ALWAYS)
-        .min_lod(0.0)
-        .max_lod(0.0)
         .border_color(vk::BorderColor::FLOAT_TRANSPARENT_BLACK)
         .unnormalized_coordinates(false);
     let sampler =
