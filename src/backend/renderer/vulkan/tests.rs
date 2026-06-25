@@ -5036,12 +5036,13 @@ fn runtime_import_dma_wl_loopback_surface_tree_teardown_releases_cached_dmabuf()
         // SAFETY: `evidence` proves this exact Smithay-controlled loopback dmabuf was released to
         // FOREIGN ownership in GENERAL layout, and its release sync was attached to or waited before
         // the Wayland acquire point. There is no intervening use before import_surface.
-        // The probe drives the buffer through a live WlSurface's normal renderer-utils surface cache,
-        // then calls retire_and_release_surface_tree_textures while the renderer is still available
-        // before dropping the surface tree state.
+        // The probe drives the buffer through a live WlSurface's normal renderer-utils surface cache
+        // and records the evidence through the surface-level helper, then calls
+        // retire_and_release_surface_tree_textures while the renderer is still available before
+        // dropping the surface tree state.
         candidate
             .renderer
-            .mark_wayland_dmabuf_current_commit_for_sampled_import(&buffer, &candidate.dmabuf)
+            .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &candidate.dmabuf)
             .unwrap();
     }
 
