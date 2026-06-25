@@ -1234,6 +1234,43 @@ impl VulkanRenderer {
         }
     }
 
+    /// Mark a renderer-managed Wayland dmabuf commit for validation-stage sampled import.
+    ///
+    /// This is the intended development contract for the normal [`ImportDmaWl`] path. It stores both
+    /// pieces of compositor-provided evidence that cannot be inferred from Wayland protocol metadata:
+    /// current-commit `FOREIGN + GENERAL` Vulkan external image state and renderer-utils
+    /// texture-cache release lifecycle coverage for this renderer context. It does not consume the
+    /// Wayland release point, create a Vulkan image, or public-advertise generic sampled [`ImportDma`]
+    /// support.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy the safety contracts of
+    /// [`VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import`] and
+    /// [`VulkanRenderer::mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import`] for
+    /// this same `buffer`/`dmabuf` pair and this renderer context. In particular, the proof of
+    /// `FOREIGN + GENERAL` ownership/layout must be current for this commit, and the compositor must
+    /// preserve or retry any cache-release obligation before dropping/resetting the surface state.
+    #[cfg(feature = "wayland_frontend")]
+    pub unsafe fn mark_wayland_dmabuf_current_commit_for_sampled_import(
+        &self,
+        buffer: &super::utils::Buffer,
+        dmabuf: &Dmabuf,
+    ) -> Result<(), VulkanError> {
+        unsafe {
+            // SAFETY: Forwarded from this combined validation contract's caller.
+            Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+                buffer.user_data(),
+                dmabuf,
+            )?;
+            // SAFETY: Forwarded from this combined validation contract's caller.
+            self.mark_wayland_dmabuf_user_data_texture_cache_release_lifecycle_for_sampled_import(
+                buffer.user_data(),
+                dmabuf,
+            )
+        }
+    }
+
     #[cfg(feature = "wayland_frontend")]
     unsafe fn mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
         user_data: &UserDataMap,

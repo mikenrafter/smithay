@@ -4439,18 +4439,13 @@ fn runtime_import_dma_wl_loopback_samples_and_releases_with_drm_syncobj() {
         // to FOREIGN ownership in GENERAL layout. The test either imports that release fence into the
         // Wayland acquire point or waits it on the CPU before explicitly signaling the acquire point.
         // There is no intervening use before import_surface.
-        VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &candidate.dmabuf)
-            .unwrap();
+        // It then drives the buffer through the normal renderer-utils surface cache and calls
+        // retire_and_release_surface_textures while the renderer is still available before dropping
+        // the surface state.
         candidate
             .renderer
-            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                &buffer,
-                &candidate.dmabuf,
-            )
+            .mark_wayland_dmabuf_current_commit_for_sampled_import(&buffer, &candidate.dmabuf)
             .unwrap();
-        // SAFETY: this ignored runtime probe drives the buffer through the normal renderer-utils
-        // surface cache, then calls retire_and_release_surface_textures while the renderer is still
-        // available before dropping the surface state.
     }
     assert!(buffer.release_point().is_some());
 
@@ -4586,20 +4581,12 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
         // SAFETY: `evidence` proves this exact Smithay-controlled loopback dmabuf was released to
         // FOREIGN ownership in GENERAL layout, and its release sync was attached to or waited before
         // the first Wayland acquire point. There is no intervening use before import_surface.
-        VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(
-            &first_buffer,
-            &candidate.dmabuf,
-        )
-        .unwrap();
-        // SAFETY: this ignored runtime probe drives the buffer through the normal renderer-utils
-        // surface cache, then calls retire_and_release_surface_textures before reacquiring the same
-        // dmabuf through a later normal ImportDmaWl commit.
+        // The probe drives the buffer through the normal renderer-utils surface cache, then calls
+        // retire_and_release_surface_textures before reacquiring the same dmabuf through a later
+        // normal ImportDmaWl commit.
         candidate
             .renderer
-            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                &first_buffer,
-                &candidate.dmabuf,
-            )
+            .mark_wayland_dmabuf_current_commit_for_sampled_import(&first_buffer, &candidate.dmabuf)
             .unwrap();
     }
 
@@ -4675,17 +4662,9 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
             // GENERAL layout and signaled the first Wayland release point. This test then attaches or
             // signals a current Wayland acquire point before the same dmabuf is reacquired through the
             // normal ImportDmaWl path.
-            VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(
-                &second_buffer,
-                &candidate.dmabuf,
-            )
-            .unwrap();
             candidate
                 .renderer
-                .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                    &second_buffer,
-                    &candidate.dmabuf,
-                )
+                .mark_wayland_dmabuf_current_commit_for_sampled_import(&second_buffer, &candidate.dmabuf)
                 .unwrap();
         }
         assert_eq!(
@@ -4866,18 +4845,13 @@ fn runtime_import_dma_wl_loopback_removed_buffer_releases_cached_dmabuf() {
         // SAFETY: `evidence` proves this exact Smithay-controlled loopback dmabuf was released to
         // FOREIGN ownership in GENERAL layout, and its release sync was attached to or waited before
         // the Wayland acquire point. There is no intervening use before import_surface.
-        VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &candidate.dmabuf)
-            .unwrap();
-        // SAFETY: this ignored runtime probe drives the buffer through the normal renderer-utils
-        // surface cache. After the removed-buffer update retires the cached texture, the test calls
-        // release_retired_surface_textures while the renderer is still available before dropping the
-        // surface state, and panic cleanup falls back to retire_and_release_surface_textures.
+        // The probe drives the buffer through the normal renderer-utils surface cache. After the
+        // removed-buffer update retires the cached texture, the test calls release_retired_surface_textures
+        // while the renderer is still available before dropping the surface state, and panic cleanup
+        // falls back to retire_and_release_surface_textures.
         candidate
             .renderer
-            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                &buffer,
-                &candidate.dmabuf,
-            )
+            .mark_wayland_dmabuf_current_commit_for_sampled_import(&buffer, &candidate.dmabuf)
             .unwrap();
     }
 
@@ -5042,17 +5016,12 @@ fn runtime_import_dma_wl_loopback_surface_tree_teardown_releases_cached_dmabuf()
         // SAFETY: `evidence` proves this exact Smithay-controlled loopback dmabuf was released to
         // FOREIGN ownership in GENERAL layout, and its release sync was attached to or waited before
         // the Wayland acquire point. There is no intervening use before import_surface.
-        VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &candidate.dmabuf)
-            .unwrap();
-        // SAFETY: this ignored runtime probe drives the buffer through a live WlSurface's normal
-        // renderer-utils surface cache, then calls retire_and_release_surface_tree_textures while the
-        // renderer is still available before dropping the surface tree state.
+        // The probe drives the buffer through a live WlSurface's normal renderer-utils surface cache,
+        // then calls retire_and_release_surface_tree_textures while the renderer is still available
+        // before dropping the surface tree state.
         candidate
             .renderer
-            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                &buffer,
-                &candidate.dmabuf,
-            )
+            .mark_wayland_dmabuf_current_commit_for_sampled_import(&buffer, &candidate.dmabuf)
             .unwrap();
     }
 
@@ -5228,17 +5197,9 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
         // SAFETY: `first_evidence` proves this exact Smithay-controlled loopback dmabuf was released
         // to FOREIGN ownership in GENERAL layout, and its release sync was attached to or waited before
         // the first Wayland acquire point. There is no intervening use before the first import_surface.
-        VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(
-            &first_buffer,
-            &candidate.dmabuf,
-        )
-        .unwrap();
         candidate
             .renderer
-            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                &first_buffer,
-                &candidate.dmabuf,
-            )
+            .mark_wayland_dmabuf_current_commit_for_sampled_import(&first_buffer, &candidate.dmabuf)
             .unwrap();
     }
 
@@ -5389,17 +5350,9 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
             // released to FOREIGN ownership in GENERAL layout, and its release sync was attached to or
             // waited before the second Wayland acquire point. update_buffer retired the first cached
             // texture; import_surface must release it before importing this second buffer.
-            VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(
-                &second_buffer,
-                &second_dmabuf,
-            )
-            .unwrap();
             candidate
                 .renderer
-                .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                    &second_buffer,
-                    &second_dmabuf,
-                )
+                .mark_wayland_dmabuf_current_commit_for_sampled_import(&second_buffer, &second_dmabuf)
                 .unwrap();
         }
         assert!(second_buffer.release_point().is_some());
@@ -8049,9 +8002,8 @@ fn import_surface_lifecycle_evidence_reaches_device_import_boundary() {
         // SAFETY: This validation-stage fixture supplies both current-commit external-state evidence
         // and compositor lifecycle evidence so normal import_surface can be driven to the scaffold's
         // device-import boundary without public-advertising sampled-dmabuf import.
-        VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &dmabuf).unwrap();
         renderer
-            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
+            .mark_wayland_dmabuf_current_commit_for_sampled_import(&buffer, &dmabuf)
             .unwrap();
     }
     assert!(buffer.release_point().is_some());
