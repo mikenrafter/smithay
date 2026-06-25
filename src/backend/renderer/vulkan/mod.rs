@@ -92,7 +92,7 @@ use crate::{
 };
 use ash::vk;
 #[cfg(feature = "wayland_frontend")]
-use wayland_server::protocol::wl_buffer;
+use wayland_server::protocol::{wl_buffer, wl_surface::WlSurface};
 
 mod capabilities;
 mod device;
@@ -1268,6 +1268,57 @@ impl VulkanRenderer {
                 dmabuf,
             )
         }
+    }
+
+    /// Mark the current renderer-managed dmabuf commit on a [`WlSurface`] for validation-stage
+    /// sampled import.
+    ///
+    /// This is a convenience wrapper around
+    /// [`mark_wayland_dmabuf_current_commit_for_sampled_import`](Self::mark_wayland_dmabuf_current_commit_for_sampled_import)
+    /// for compositors that use Smithay's normal [`super::utils::on_commit_buffer_handler`] path. It
+    /// looks up the current renderer-managed buffer stored for `surface`, verifies that it is the same
+    /// dmabuf identity as `dmabuf`, and then records the combined current-commit external-state and
+    /// texture-cache release lifecycle contract on that buffer wrapper. It does not consume the
+    /// Wayland release point, create a Vulkan image, or public-advertise generic sampled [`ImportDma`]
+    /// support.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prove that the surface's current renderer-managed buffer is the current commit
+    /// represented by `dmabuf`, that the producer released that image to
+    /// `VK_QUEUE_FAMILY_FOREIGN_EXT` in `VK_IMAGE_LAYOUT_GENERAL`, and that the buffer's acquire
+    /// synchronization orders the producer writes and ownership release for this exact commit. The
+    /// caller must also satisfy the renderer-utils texture-cache release lifecycle contract for this
+    /// renderer context, preserving or retrying any cache-release obligation before dropping/resetting
+    /// the surface state.
+    #[cfg(feature = "wayland_frontend")]
+    pub unsafe fn mark_wayland_surface_current_dmabuf_commit_for_sampled_import(
+        &self,
+        surface: &WlSurface,
+        dmabuf: &Dmabuf,
+    ) -> Result<(), VulkanError> {
+        super::utils::with_renderer_surface_state(surface, |state| {
+            let buffer = state.buffer().ok_or(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland current buffer",
+            ))?;
+            let current_dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
+                .map_err(|_| VulkanError::UnsupportedOperation("sampled dmabuf Wayland current buffer"))?;
+
+            if current_dmabuf != dmabuf {
+                return Err(VulkanError::UnsupportedOperation(
+                    "sampled dmabuf Wayland current buffer identity",
+                ));
+            }
+
+            unsafe {
+                // SAFETY: Forwarded from this surface-level validation contract's caller after
+                // verifying that the current renderer-managed buffer is the requested dmabuf.
+                self.mark_wayland_dmabuf_current_commit_for_sampled_import(buffer, dmabuf)
+            }
+        })
+        .unwrap_or(Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland renderer surface state",
+        )))
     }
 
     #[cfg(feature = "wayland_frontend")]

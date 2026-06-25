@@ -397,6 +397,26 @@ fn import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+fn empty_import_surface_for_tests() -> Option<(Display<DmabufBufferTestState>, UnixStream, WlSurface)> {
+    let display = match Display::<DmabufBufferTestState>::new() {
+        Ok(display) => display,
+        Err(InitError::NoWaylandLib) => return None,
+        Err(err) => panic!("failed to create test Wayland display: {err}"),
+    };
+    let mut display_handle = display.handle();
+    let (client_side, server_side) = UnixStream::pair().unwrap();
+    let client = display_handle
+        .insert_client(server_side, Arc::new(DmabufBufferTestClientState::default()))
+        .unwrap();
+    let surface = crate::wayland::compositor::test_utils::create_surface::<DmabufBufferTestState>(
+        &client,
+        &display_handle,
+    );
+
+    Some((display, client_side, surface))
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 fn update_import_surface_dmabuf_buffer_with_sync_points_for_tests(
     surface: &SurfaceData,
     dmabuf: Dmabuf,
@@ -8014,6 +8034,161 @@ fn import_surface_lifecycle_evidence_reaches_device_import_boundary() {
         buffer.release_point().is_some(),
         "scaffold device boundary must not consume Wayland release ownership before texture construction"
     );
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_surface_current_surface_marker_reaches_device_import_boundary() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
+    renderer.capabilities.external_memory.foreign_queue_family = true;
+
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let acquire_point = DrmSyncPoint::invalid_for_tests(37).unwrap();
+    let release_point = DrmSyncPoint::invalid_for_tests(38).unwrap();
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+            dmabuf.clone(),
+            acquire_point,
+            release_point,
+        )
+    else {
+        return;
+    };
+    unsafe {
+        // SAFETY: This validation-stage fixture treats the current WlSurface commit as the exact
+        // dmabuf returned to FOREIGN/GENERAL and covered by renderer-utils release lifecycle. The
+        // helper must locate the current renderer-managed buffer before recording that evidence.
+        renderer
+            .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &dmabuf)
+            .unwrap();
+    }
+    assert!(buffer.release_point().is_some());
+
+    let import_result = crate::wayland::compositor::with_states(&surface, |states| {
+        crate::backend::renderer::utils::import_surface(&mut renderer, states)
+    });
+    assert!(matches!(import_result, Err(VulkanError::VulkanUnavailable)));
+    assert!(
+        buffer.release_point().is_some(),
+        "scaffold device boundary must not consume Wayland release ownership before texture construction"
+    );
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_surface_current_surface_marker_rejects_missing_current_buffer() {
+    let renderer = VulkanRenderer::new_scaffold_for_tests();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let Some((_display, _client_side, surface)) = empty_import_surface_for_tests() else {
+        return;
+    };
+    crate::backend::renderer::utils::on_commit_buffer_handler::<DmabufBufferTestState>(&surface);
+
+    let result = unsafe {
+        // SAFETY: This negative test supplies no current buffer, so the helper must reject the surface
+        // state before recording any sampled-import evidence.
+        renderer.mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &dmabuf)
+    };
+    assert!(matches!(
+        result,
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland current buffer"
+        ))
+    ));
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_surface_current_surface_marker_rejects_missing_renderer_surface_state() {
+    let renderer = VulkanRenderer::new_scaffold_for_tests();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let Some((_display, _client_side, surface)) = empty_import_surface_for_tests() else {
+        return;
+    };
+
+    let result = unsafe {
+        // SAFETY: This negative test deliberately skips on_commit_buffer_handler, so the helper must
+        // reject the unprocessed surface before recording any sampled-import evidence.
+        renderer.mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &dmabuf)
+    };
+    assert!(matches!(
+        result,
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland renderer surface state"
+        ))
+    ));
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_surface_current_surface_marker_rejects_mismatched_dmabuf() {
+    let renderer = VulkanRenderer::new_scaffold_for_tests();
+    let committed_dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let mismatched_dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Xrgb8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+            committed_dmabuf,
+            DrmSyncPoint::invalid_for_tests(39).unwrap(),
+            DrmSyncPoint::invalid_for_tests(40).unwrap(),
+        )
+    else {
+        return;
+    };
+
+    let result = unsafe {
+        // SAFETY: This negative test deliberately asks the helper to mark a different dmabuf than the
+        // surface's current renderer-managed buffer, which must be rejected before evidence is stored.
+        renderer.mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &mismatched_dmabuf)
+    };
+    assert!(matches!(
+        result,
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland current buffer identity"
+        ))
+    ));
+    assert!(buffer.release_point().is_some());
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
 }
 
 #[test]
