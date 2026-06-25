@@ -1148,8 +1148,6 @@ pub struct VulkanRenderer {
     capabilities: VulkanRendererCapabilities,
     device: Option<VulkanDeviceState>,
     sampled_dmabuf_layout_history: HashMap<WeakDmabuf, SampledDmabufWaylandLayoutHistory>,
-    #[cfg(all(test, feature = "wayland_frontend"))]
-    experimental_wayland_dmabuf_assume_foreign_general: bool,
 }
 
 /// Builder for explicit Vulkan renderer initialization.
@@ -1192,8 +1190,6 @@ impl VulkanRendererBuilder {
             capabilities,
             device: Some(device),
             sampled_dmabuf_layout_history: HashMap::new(),
-            #[cfg(all(test, feature = "wayland_frontend"))]
-            experimental_wayland_dmabuf_assume_foreign_general: false,
         })
     }
 }
@@ -1332,14 +1328,7 @@ impl VulkanRenderer {
             capabilities: VulkanRendererCapabilities::default(),
             device: None,
             sampled_dmabuf_layout_history: HashMap::new(),
-            #[cfg(all(test, feature = "wayland_frontend"))]
-            experimental_wayland_dmabuf_assume_foreign_general: false,
         }
-    }
-
-    #[cfg(all(test, feature = "wayland_frontend", feature = "backend_drm"))]
-    fn assume_wayland_dmabuf_foreign_general_for_tests(&mut self, enabled: bool) {
-        self.experimental_wayland_dmabuf_assume_foreign_general = enabled;
     }
 
     /// Returns the discovered Vulkan renderer capabilities.
@@ -1940,19 +1929,6 @@ impl VulkanRenderer {
             self.sampled_dmabuf_wayland_user_data_foreign_general_evidence(buffer.user_data(), dmabuf)?
         {
             return Ok(Some(evidence));
-        }
-
-        #[cfg(test)]
-        if self.experimental_wayland_dmabuf_assume_foreign_general {
-            tracing::warn!(
-                "experimentally importing Wayland sampled dmabuf by assuming FOREIGN ownership and GENERAL layout"
-            );
-            return Ok(Some(unsafe {
-                // SAFETY: This branch is a loud, default-off local development override. It is used
-                // only to drive the normal ImportDmaWl path to the next observable contract while
-                // keeping public sampled-dmabuf advertisement closed.
-                SampledDmabufWaylandForeignGeneralEvidence::new(dmabuf.weak())
-            }));
         }
 
         Ok(None)
