@@ -1223,13 +1223,13 @@ impl VulkanRenderer {
     /// that the buffer's acquire synchronization orders the producer writes and ownership release for
     /// this exact dmabuf. This proof must be current for this commit; linux-dmabuf format/plane
     /// metadata and linux-drm-syncobj acquire/release points are not sufficient by themselves.
-    #[cfg(feature = "wayland_frontend")]
-    pub unsafe fn mark_wayland_dmabuf_foreign_general_for_sampled_import(
+    #[cfg(all(test, feature = "wayland_frontend"))]
+    unsafe fn mark_wayland_dmabuf_foreign_general_for_sampled_import(
         buffer: &super::utils::Buffer,
         dmabuf: &Dmabuf,
     ) -> Result<(), VulkanError> {
         unsafe {
-            // SAFETY: Forwarded from this public unsafe evidence-marking function's caller.
+            // SAFETY: Forwarded from this test-only unsafe evidence-marking helper's caller.
             Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(buffer.user_data(), dmabuf)
         }
     }
@@ -1245,12 +1245,11 @@ impl VulkanRenderer {
     ///
     /// # Safety
     ///
-    /// The caller must satisfy the safety contracts of
-    /// [`VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import`] and
-    /// [`VulkanRenderer::mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import`] for
-    /// this same `buffer`/`dmabuf` pair and this renderer context. In particular, the proof of
-    /// `FOREIGN + GENERAL` ownership/layout must be current for this commit, and the compositor must
-    /// preserve or retry any cache-release obligation before dropping/resetting the surface state.
+    /// The caller must satisfy both lower-level contracts for this same `buffer`/`dmabuf` pair and
+    /// this renderer context: current-commit external-state evidence and renderer-utils
+    /// texture-cache release lifecycle coverage. In particular, the proof of `FOREIGN + GENERAL`
+    /// ownership/layout must be current for this commit, and the compositor must preserve or retry any
+    /// cache-release obligation before dropping/resetting the surface state.
     #[cfg(feature = "wayland_frontend")]
     pub unsafe fn mark_wayland_dmabuf_current_commit_for_sampled_import(
         &self,
@@ -1311,14 +1310,14 @@ impl VulkanRenderer {
     /// until the obligation is retried or otherwise preserved. No active frame, render element, clone,
     /// or external user may sample the cached texture after the teardown release helper has retired and
     /// released it.
-    #[cfg(feature = "wayland_frontend")]
-    pub unsafe fn mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+    #[cfg(all(test, feature = "wayland_frontend"))]
+    unsafe fn mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
         &self,
         buffer: &super::utils::Buffer,
         dmabuf: &Dmabuf,
     ) -> Result<(), VulkanError> {
         unsafe {
-            // SAFETY: Forwarded from this public unsafe lifecycle-marking function's caller.
+            // SAFETY: Forwarded from this test-only unsafe lifecycle-marking helper's caller.
             self.mark_wayland_dmabuf_user_data_texture_cache_release_lifecycle_for_sampled_import(
                 buffer.user_data(),
                 dmabuf,
