@@ -417,39 +417,6 @@ fn empty_import_surface_for_tests() -> Option<(Display<DmabufBufferTestState>, U
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
-fn update_import_surface_dmabuf_buffer_with_sync_points_for_tests(
-    surface: &SurfaceData,
-    dmabuf: Dmabuf,
-    acquire_point: DrmSyncPoint,
-    release_point: DrmSyncPoint,
-) -> Option<(
-    Display<DmabufBufferTestState>,
-    UnixStream,
-    crate::backend::renderer::utils::Buffer,
-)> {
-    let (display, client_side, wl_buffer) = dmabuf_wl_buffer_for_tests(dmabuf)?;
-    {
-        let mut attributes = surface.cached_state.get::<SurfaceAttributes>();
-        attributes.current().buffer = Some(BufferAssignment::NewBuffer(wl_buffer));
-    }
-    {
-        let mut syncobj = surface.cached_state.get::<DrmSyncobjCachedState>();
-        syncobj.current().acquire_point = Some(acquire_point);
-        syncobj.current().release_point = Some(release_point);
-    }
-
-    let data = surface
-        .data_map
-        .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
-        .expect("surface should already have renderer state");
-    let mut surface_state = data.lock().unwrap();
-    surface_state.update_buffer(surface);
-    let buffer = surface_state.buffer().unwrap().clone();
-
-    Some((display, client_side, buffer))
-}
-
-#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 fn update_import_wl_surface_dmabuf_buffer_with_sync_points_for_tests(
     display_handle: &DisplayHandle,
     surface: &WlSurface,
@@ -5304,8 +5271,8 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
     }
     let first_release_point_probe = first_release_point.clone();
 
-    let Some((_first_display, _first_client_side, surface, first_buffer)) =
-        import_surface_dmabuf_buffer_with_sync_points_for_tests(
+    let Some((first_display, _first_client_side, surface, first_buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
             candidate.dmabuf.clone(),
             first_acquire_point,
             first_release_point,
@@ -5317,17 +5284,27 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
         // SAFETY: `first_evidence` proves this exact Smithay-controlled loopback dmabuf was released
         // to FOREIGN ownership in GENERAL layout, and its release sync was attached to or waited before
         // the first Wayland acquire point. There is no intervening use before the first import_surface.
+        // The probe drives the first buffer through a live WlSurface and records evidence through the
+        // surface-level helper before replacing it with a second dmabuf commit on the same WlSurface.
         candidate
             .renderer
-            .mark_wayland_dmabuf_current_commit_for_sampled_import(&first_buffer, &candidate.dmabuf)
+            .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &candidate.dmabuf)
             .unwrap();
     }
 
-    crate::backend::renderer::utils::import_surface(&mut candidate.renderer, &surface)
-        .expect("normal ImportDmaWl import_surface should import first sampled loopback dmabuf");
+    crate::wayland::compositor::with_states(&surface, |states| {
+        crate::backend::renderer::utils::import_surface(&mut candidate.renderer, states)
+    })
+    .expect("normal ImportDmaWl import_surface should import first sampled loopback dmabuf");
     assert!(
         first_buffer.release_point().is_none(),
         "first ImportDmaWl texture construction must take the first Wayland release ownership"
+    );
+    assert_eq!(
+        candidate
+            .renderer
+            .sampled_dmabuf_layout_history(&candidate.dmabuf),
+        SampledDmabufWaylandLayoutHistory::LocallyAcquired
     );
 
     let mut first_release_satisfied_for_cleanup = false;
@@ -5335,14 +5312,16 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
     let mut second_cache_needs_release_for_cleanup = false;
     let post_first_import_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> bool {
         let first_cached_texture = {
-            let data = surface
-                .data_map
-                .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
-                .expect("first import_surface should preserve renderer surface state");
-            let data = data.lock().unwrap();
-            data.texture(candidate.renderer.context_id())
-                .expect("first ImportDmaWl import_surface should cache a Vulkan texture")
-                .clone()
+            crate::wayland::compositor::with_states(&surface, |states| {
+                let data = states
+                    .data_map
+                    .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
+                    .expect("first import_surface should preserve renderer surface state");
+                let data = data.lock().unwrap();
+                data.texture(candidate.renderer.context_id())
+                    .expect("first ImportDmaWl import_surface should cache a Vulkan texture")
+                    .clone()
+            })
         };
         let first_readback = runtime_sample_texture_to_offscreen_and_assert_non_black(
             &mut candidate.renderer,
@@ -5403,7 +5382,7 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
                 let release_without_export = candidate
                     .renderer
                     .release_dmabuf_render_target_for_sampled_loopback(&mut second_target, false);
-                retire_import_surface_textures_and_wait_for_tests(
+                retire_import_wl_surface_textures_and_wait_for_tests(
                     &mut candidate.renderer,
                     &surface,
                     &first_release_point_probe,
@@ -5415,7 +5394,7 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
                 return false;
             }
             Err(err) => {
-                retire_import_surface_textures_and_wait_for_tests(
+                retire_import_wl_surface_textures_and_wait_for_tests(
                     &mut candidate.renderer,
                     &surface,
                     &first_release_point_probe,
@@ -5436,7 +5415,7 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
             second_evidence.acquire_sync(),
             &second_acquire_point,
         ) {
-            retire_import_surface_textures_and_wait_for_tests(
+            retire_import_wl_surface_textures_and_wait_for_tests(
                 &mut candidate.renderer,
                 &surface,
                 &first_release_point_probe,
@@ -5448,37 +5427,31 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
         let second_release_point_probe = second_release_point.clone();
         second_release_point_for_cleanup = Some(second_release_point_probe.clone());
 
-        let Some((_second_display, _second_client_side, second_buffer)) =
-            update_import_surface_dmabuf_buffer_with_sync_points_for_tests(
-                &surface,
-                second_dmabuf.clone(),
-                second_acquire_point,
-                second_release_point,
-            )
-        else {
-            retire_import_surface_textures_and_wait_for_tests(
-                &mut candidate.renderer,
-                &surface,
-                &first_release_point_probe,
-                "cleanup after second buffer setup skip should signal first Wayland release point",
-            );
-            first_release_satisfied_for_cleanup = true;
-            return false;
-        };
+        let display_handle = first_display.handle();
+        let second_buffer = update_import_wl_surface_dmabuf_buffer_with_sync_points_for_tests(
+            &display_handle,
+            &surface,
+            second_dmabuf.clone(),
+            second_acquire_point,
+            second_release_point,
+        );
         unsafe {
             // SAFETY: `second_evidence` proves this exact second Smithay-controlled loopback dmabuf was
             // released to FOREIGN ownership in GENERAL layout, and its release sync was attached to or
-            // waited before the second Wayland acquire point. update_buffer retired the first cached
-            // texture; import_surface must release it before importing this second buffer.
+            // waited before the second Wayland acquire point. on_commit_buffer_handler retired the
+            // first cached texture on the same WlSurface; import_surface must release it before
+            // importing this second buffer.
             candidate
                 .renderer
-                .mark_wayland_dmabuf_current_commit_for_sampled_import(&second_buffer, &second_dmabuf)
+                .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &second_dmabuf)
                 .unwrap();
         }
         assert!(second_buffer.release_point().is_some());
 
-        if let Err(err) = crate::backend::renderer::utils::import_surface(&mut candidate.renderer, &surface) {
-            retire_import_surface_textures_and_wait_for_tests(
+        if let Err(err) = crate::wayland::compositor::with_states(&surface, |states| {
+            crate::backend::renderer::utils::import_surface(&mut candidate.renderer, states)
+        }) {
+            retire_import_wl_surface_textures_and_wait_for_tests(
                 &mut candidate.renderer,
                 &surface,
                 &first_release_point_probe,
@@ -5498,16 +5471,28 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
             second_buffer.release_point().is_none(),
             "replacement ImportDmaWl texture construction must take the second Wayland release ownership"
         );
+        assert_eq!(
+            candidate
+                .renderer
+                .sampled_dmabuf_layout_history(&candidate.dmabuf),
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+        );
+        assert_eq!(
+            candidate.renderer.sampled_dmabuf_layout_history(&second_dmabuf),
+            SampledDmabufWaylandLayoutHistory::LocallyAcquired
+        );
 
         let second_cached_texture = {
-            let data = surface
-                .data_map
-                .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
-                .expect("second import_surface should preserve renderer surface state");
-            let data = data.lock().unwrap();
-            data.texture(candidate.renderer.context_id())
-                .expect("replacement ImportDmaWl import_surface should cache a Vulkan texture")
-                .clone()
+            crate::wayland::compositor::with_states(&surface, |states| {
+                let data = states
+                    .data_map
+                    .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
+                    .expect("second import_surface should preserve renderer surface state");
+                let data = data.lock().unwrap();
+                data.texture(candidate.renderer.context_id())
+                    .expect("replacement ImportDmaWl import_surface should cache a Vulkan texture")
+                    .clone()
+            })
         };
         let second_readback = runtime_sample_texture_to_offscreen_and_assert_non_black(
             &mut candidate.renderer,
@@ -5528,13 +5513,17 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
             Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
         ));
 
-        retire_import_surface_textures_and_wait_for_tests(
+        retire_import_wl_surface_textures_and_wait_for_tests(
             &mut candidate.renderer,
             &surface,
             &second_release_point_probe,
             "replacement sampled dmabuf release should signal second Wayland release point",
         );
         second_cache_needs_release_for_cleanup = false;
+        assert_eq!(
+            candidate.renderer.sampled_dmabuf_layout_history(&second_dmabuf),
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+        );
         drop(second_buffer);
         true
     }));
@@ -5545,7 +5534,7 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
         Err(payload) => {
             if second_cache_needs_release_for_cleanup {
                 if let Some(second_release_point) = second_release_point_for_cleanup.as_ref() {
-                    retire_import_surface_textures_and_wait_for_tests(
+                    retire_import_wl_surface_textures_and_wait_for_tests(
                         &mut candidate.renderer,
                         &surface,
                         second_release_point,
@@ -5553,7 +5542,7 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
                     );
                 }
             } else if !first_release_satisfied_for_cleanup {
-                retire_import_surface_textures_and_wait_for_tests(
+                retire_import_wl_surface_textures_and_wait_for_tests(
                     &mut candidate.renderer,
                     &surface,
                     &first_release_point_probe,
