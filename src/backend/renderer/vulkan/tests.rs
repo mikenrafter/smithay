@@ -383,14 +383,15 @@ fn import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
     );
     let _syncobj_surface = crate::wayland::drm_syncobj::test_utils::install_surface_for_tests::<
         DmabufBufferTestState,
-    >(&client, &display_handle, &surface);
+    >(&display_handle, &surface);
 
     let mut state = DmabufBufferTestState;
-    crate::wayland::compositor::with_states(&surface, |states| {
-        let mut syncobj = states.cached_state.get::<DrmSyncobjCachedState>();
-        syncobj.pending().acquire_point = Some(acquire_point);
-        syncobj.pending().release_point = Some(release_point);
-    });
+    crate::wayland::drm_syncobj::test_utils::set_surface_points_for_tests::<DmabufBufferTestState>(
+        &display_handle,
+        &surface,
+        &acquire_point,
+        &release_point,
+    );
     crate::wayland::compositor::test_utils::commit_buffer_assignment(
         &mut state,
         &display_handle,
@@ -457,7 +458,7 @@ fn import_surface_commit_helper_exposes_pending_dmabuf_and_sync_to_pre_commit_ho
     );
     let _syncobj_surface = crate::wayland::drm_syncobj::test_utils::install_surface_for_tests::<
         DmabufBufferTestState,
-    >(&client, &display_handle, &surface);
+    >(&display_handle, &surface);
     let observed_pre_commit = Arc::new(Mutex::new(false));
     let observed_pre_commit_hook = observed_pre_commit.clone();
     let pre_commit_dmabuf = dmabuf.clone();
@@ -496,11 +497,12 @@ fn import_surface_commit_helper_exposes_pending_dmabuf_and_sync_to_pre_commit_ho
 
     let acquire_point = DrmSyncPoint::invalid_for_tests(101).unwrap();
     let release_point = DrmSyncPoint::invalid_for_tests(102).unwrap();
-    crate::wayland::compositor::with_states(&surface, |states| {
-        let mut syncobj = states.cached_state.get::<DrmSyncobjCachedState>();
-        syncobj.pending().acquire_point = Some(acquire_point);
-        syncobj.pending().release_point = Some(release_point);
-    });
+    crate::wayland::drm_syncobj::test_utils::set_surface_points_for_tests::<DmabufBufferTestState>(
+        &display_handle,
+        &surface,
+        &acquire_point,
+        &release_point,
+    );
     let mut state = DmabufBufferTestState;
     crate::wayland::compositor::test_utils::commit_buffer_assignment(
         &mut state,
@@ -530,8 +532,9 @@ fn update_import_wl_surface_dmabuf_buffer_with_sync_points_for_tests(
     release_point: DrmSyncPoint,
 ) -> crate::backend::renderer::utils::Buffer {
     // Focused renderer tests bypass client socket dispatch, but the original fixture installs the
-    // server-side DRM syncobj surface object/hooks. Updates still stage pending surface/sync state and
-    // drive Smithay's normal compositor commit lifecycle. The wl_buffer is created for the same
+    // server-side DRM syncobj surface object/hooks. Updates still stage pending sync points through
+    // server-side DRM syncobj timeline resources and drive Smithay's normal compositor commit lifecycle.
+    // The wl_buffer is created for the same
     // client/display as `surface` so the fixture models a later commit on the same WlSurface instead
     // of a detached SurfaceData update.
     let client = surface
@@ -541,11 +544,12 @@ fn update_import_wl_surface_dmabuf_buffer_with_sync_points_for_tests(
         .create_resource::<WlBuffer, Dmabuf, DmabufBufferTestState>(display_handle, 1, dmabuf)
         .expect("create updated dmabuf wl_buffer for test WlSurface client");
     let mut state = DmabufBufferTestState;
-    crate::wayland::compositor::with_states(surface, |states| {
-        let mut syncobj = states.cached_state.get::<DrmSyncobjCachedState>();
-        syncobj.pending().acquire_point = Some(acquire_point);
-        syncobj.pending().release_point = Some(release_point);
-    });
+    crate::wayland::drm_syncobj::test_utils::set_surface_points_for_tests::<DmabufBufferTestState>(
+        display_handle,
+        surface,
+        &acquire_point,
+        &release_point,
+    );
     crate::wayland::compositor::test_utils::commit_buffer_assignment(
         &mut state,
         display_handle,

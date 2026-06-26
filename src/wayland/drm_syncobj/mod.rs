@@ -296,6 +296,37 @@ fn destruction_hook<D: DrmSyncobjHandler>(_data: &mut D, surface: &WlSurface) {
     });
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PendingSyncPointKind {
+    Acquire,
+    Release,
+}
+
+fn set_pending_sync_point_from_timeline_resource(
+    surface: &WlSurface,
+    timeline: &WpLinuxDrmSyncobjTimelineV1,
+    point_hi: u32,
+    point_lo: u32,
+    kind: PendingSyncPointKind,
+) {
+    let sync_point = DrmSyncPoint {
+        timeline: timeline
+            .data::<DrmSyncobjTimelineData>()
+            .unwrap()
+            .timeline
+            .clone(),
+        point: ((point_hi as u64) << 32) + (point_lo as u64),
+    };
+    with_states(surface, |states| {
+        let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+        let cached_state = cached.pending();
+        match kind {
+            PendingSyncPointKind::Acquire => cached_state.acquire_point = Some(sync_point),
+            PendingSyncPointKind::Release => cached_state.release_point = Some(sync_point),
+        }
+    });
+}
+
 impl<D> Dispatch2<WpLinuxDrmSyncobjManagerV1, D> for GlobalData
 where
     D: Dispatch<WpLinuxDrmSyncobjSurfaceV1, DrmSyncobjSurfaceData>,
@@ -382,10 +413,16 @@ where
 pub(crate) mod test_utils {
     use std::cell::RefCell;
 
-    use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1;
+    use wayland_protocols::wp::linux_drm_syncobj::v1::server::{
+        wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
+        wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1,
+    };
     use wayland_server::{Client, Dispatch, DisplayHandle, Resource};
 
-    use super::{DrmSyncobjHandler, DrmSyncobjSurfaceData, commit_hook, destruction_hook};
+    use super::{
+        DrmSyncPoint, DrmSyncobjHandler, DrmSyncobjSurfaceData, DrmSyncobjTimelineData, PendingSyncPointKind,
+        commit_hook, destruction_hook, set_pending_sync_point_from_timeline_resource,
+    };
     use crate::wayland::compositor::{self, with_states};
 
     /// Install a server-side DRM syncobj surface object for a focused test surface.
@@ -396,7 +433,6 @@ pub(crate) mod test_utils {
     /// must stage pending sync points themselves or drive the request handlers separately.
     #[allow(dead_code)]
     pub(crate) fn install_surface_for_tests<D>(
-        client: &Client,
         handle: &DisplayHandle,
         surface: &wayland_server::protocol::wl_surface::WlSurface,
     ) -> WpLinuxDrmSyncobjSurfaceV1
@@ -417,6 +453,9 @@ pub(crate) mod test_utils {
 
         let commit_hook_id = compositor::add_pre_commit_hook::<D, _>(surface, commit_hook);
         let destruction_hook_id = compositor::add_destruction_hook::<D, _>(surface, destruction_hook);
+        let client = surface
+            .client()
+            .expect("test WlSurface should still be attached to a live client");
         let syncobj_surface = client
             .create_resource::<WpLinuxDrmSyncobjSurfaceV1, DrmSyncobjSurfaceData, D>(
                 handle,
@@ -436,6 +475,79 @@ pub(crate) mod test_utils {
         });
 
         syncobj_surface
+    }
+
+    fn timeline_resource_for_tests<D>(
+        client: &Client,
+        handle: &DisplayHandle,
+        point: &DrmSyncPoint,
+    ) -> WpLinuxDrmSyncobjTimelineV1
+    where
+        D: Dispatch<WpLinuxDrmSyncobjTimelineV1, DrmSyncobjTimelineData> + 'static,
+    {
+        client
+            .create_resource::<WpLinuxDrmSyncobjTimelineV1, DrmSyncobjTimelineData, D>(
+                handle,
+                1,
+                DrmSyncobjTimelineData {
+                    timeline: point.timeline.clone(),
+                },
+            )
+            .expect("create test DRM syncobj timeline resource")
+    }
+
+    fn point_halves(point: &DrmSyncPoint) -> (u32, u32) {
+        ((point.point >> 32) as u32, point.point as u32)
+    }
+
+    /// Stage acquire/release points through DRM syncobj timeline resources for a focused test surface.
+    ///
+    /// This uses the same pending-point construction helper as the protocol request handlers after
+    /// creating server-side timeline resources for the provided [`DrmSyncPoint`]s. It still bypasses
+    /// client socket dispatch and `wp_linux_drm_syncobj_manager_v1.import_timeline`; callers provide
+    /// already-created timeline points.
+    #[allow(dead_code)]
+    pub(crate) fn set_surface_points_for_tests<D>(
+        handle: &DisplayHandle,
+        surface: &wayland_server::protocol::wl_surface::WlSurface,
+        acquire_point: &DrmSyncPoint,
+        release_point: &DrmSyncPoint,
+    ) where
+        D: Dispatch<WpLinuxDrmSyncobjTimelineV1, DrmSyncobjTimelineData> + 'static,
+    {
+        let has_syncobj_surface = with_states(surface, |states| {
+            states
+                .data_map
+                .get::<RefCell<Option<WpLinuxDrmSyncobjSurfaceV1>>>()
+                .map(|v| v.borrow().is_some())
+                .unwrap_or(false)
+        });
+        assert!(
+            has_syncobj_surface,
+            "test surface should have a DRM syncobj surface object before staging points"
+        );
+        let client = surface
+            .client()
+            .expect("test WlSurface should still be attached to a live client");
+        let acquire_timeline = timeline_resource_for_tests::<D>(&client, handle, acquire_point);
+        let release_timeline = timeline_resource_for_tests::<D>(&client, handle, release_point);
+        let (acquire_hi, acquire_lo) = point_halves(acquire_point);
+        let (release_hi, release_lo) = point_halves(release_point);
+
+        set_pending_sync_point_from_timeline_resource(
+            surface,
+            &acquire_timeline,
+            acquire_hi,
+            acquire_lo,
+            PendingSyncPointKind::Acquire,
+        );
+        set_pending_sync_point_from_timeline_resource(
+            surface,
+            &release_timeline,
+            release_hi,
+            release_lo,
+            PendingSyncPointKind::Release,
+        );
     }
 }
 
@@ -496,19 +608,13 @@ where
                     return;
                 };
 
-                let sync_point = DrmSyncPoint {
-                    timeline: timeline
-                        .data::<DrmSyncobjTimelineData>()
-                        .unwrap()
-                        .timeline
-                        .clone(),
-                    point: ((point_hi as u64) << 32) + (point_lo as u64),
-                };
-                with_states(&surface, |states| {
-                    let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
-                    let cached_state = cached.pending();
-                    cached_state.acquire_point = Some(sync_point);
-                });
+                set_pending_sync_point_from_timeline_resource(
+                    &surface,
+                    &timeline,
+                    point_hi,
+                    point_lo,
+                    PendingSyncPointKind::Acquire,
+                );
             }
             wp_linux_drm_syncobj_surface_v1::Request::SetReleasePoint {
                 timeline,
@@ -523,19 +629,13 @@ where
                     return;
                 };
 
-                let sync_point = DrmSyncPoint {
-                    timeline: timeline
-                        .data::<DrmSyncobjTimelineData>()
-                        .unwrap()
-                        .timeline
-                        .clone(),
-                    point: ((point_hi as u64) << 32) + (point_lo as u64),
-                };
-                with_states(&surface, |states| {
-                    let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
-                    let cached_state = cached.pending();
-                    cached_state.release_point = Some(sync_point);
-                });
+                set_pending_sync_point_from_timeline_resource(
+                    &surface,
+                    &timeline,
+                    point_hi,
+                    point_lo,
+                    PendingSyncPointKind::Release,
+                );
             }
             _ => unreachable!(),
         }
