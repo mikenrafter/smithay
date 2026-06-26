@@ -301,22 +301,6 @@ fn dmabuf_wl_buffer_for_tests(
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
-fn import_surface_dmabuf_buffer_for_tests(
-    dmabuf: Dmabuf,
-    acquire_point: u64,
-    release_point: u64,
-) -> Option<(
-    Display<DmabufBufferTestState>,
-    UnixStream,
-    SurfaceData,
-    crate::backend::renderer::utils::Buffer,
-)> {
-    let acquire_point = DrmSyncPoint::invalid_for_tests(acquire_point).unwrap();
-    let release_point = DrmSyncPoint::invalid_for_tests(release_point).unwrap();
-    import_surface_dmabuf_buffer_with_sync_points_for_tests(dmabuf, acquire_point, release_point)
-}
-
-#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 fn import_surface_dmabuf_buffer_with_sync_points_for_tests(
     dmabuf: Dmabuf,
     acquire_point: DrmSyncPoint,
@@ -351,6 +335,24 @@ fn import_surface_dmabuf_buffer_with_sync_points_for_tests(
         .insert_if_missing_threadsafe(|| Mutex::new(surface_state));
 
     Some((display, client_side, surface, buffer))
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+fn assert_buffer_release_point_matches_for_tests(
+    buffer: &crate::backend::renderer::utils::Buffer,
+    expected_release_point: &DrmSyncPoint,
+    message: &str,
+) {
+    let release_point = buffer.release_point().expect(message);
+    assert_eq!(
+        release_point.point_for_tests(),
+        expected_release_point.point_for_tests(),
+        "{message}: point value changed"
+    );
+    assert!(
+        release_point.same_timeline_for_tests(expected_release_point),
+        "{message}: timeline identity changed"
+    );
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
@@ -8199,8 +8201,8 @@ fn import_dma_wl_real_buffer_requires_import_surface_reachability() {
     };
     assert!(crate::wayland::dmabuf::get_dmabuf(&wl_buffer).is_ok());
 
-    let acquire_point = DrmSyncPoint::invalid_for_tests(11).unwrap();
-    let release_point = DrmSyncPoint::invalid_for_tests(12).unwrap();
+    let (acquire_point, release_point) = DrmSyncPoint::invalid_timeline_pair_for_tests(11, 12).unwrap();
+    let expected_release_point = release_point.clone();
     let buffer =
         crate::backend::renderer::utils::Buffer::with_explicit(wl_buffer, acquire_point, release_point);
     unsafe {
@@ -8209,7 +8211,11 @@ fn import_dma_wl_real_buffer_requires_import_surface_reachability() {
         // test does not advertise or execute arbitrary sampled-dmabuf import.
         VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &dmabuf).unwrap();
     }
-    assert!(buffer.release_point().is_some());
+    assert_buffer_release_point_matches_for_tests(
+        &buffer,
+        &expected_release_point,
+        "direct ImportDmaWl fixture should keep initial release point",
+    );
 
     let surface = SurfaceData {
         role: None,
@@ -8223,9 +8229,10 @@ fn import_dma_wl_real_buffer_requires_import_surface_reachability() {
             "sampled dmabuf Wayland Vulkan import_surface post-retired-release call site"
         ))
     ));
-    assert!(
-        buffer.release_point().is_some(),
-        "direct ImportDmaWl guard must not consume Wayland release ownership"
+    assert_buffer_release_point_matches_for_tests(
+        &buffer,
+        &expected_release_point,
+        "direct ImportDmaWl guard must not consume Wayland release ownership",
     );
 }
 
@@ -8250,8 +8257,10 @@ fn import_surface_real_buffer_reaches_texture_cache_lifecycle_guard() {
         DmabufFlags::empty(),
         &[(0, 0, 4)],
     );
+    let (acquire_point, release_point) = DrmSyncPoint::invalid_timeline_pair_for_tests(21, 22).unwrap();
+    let expected_release_point = release_point.clone();
     let Some((_display, _client_side, surface, buffer)) =
-        import_surface_dmabuf_buffer_for_tests(dmabuf.clone(), 21, 22)
+        import_surface_dmabuf_buffer_with_sync_points_for_tests(dmabuf.clone(), acquire_point, release_point)
     else {
         return;
     };
@@ -8261,7 +8270,11 @@ fn import_surface_real_buffer_reaches_texture_cache_lifecycle_guard() {
         // guard. The test still fails before sampled-dmabuf texture import or public advertisement.
         VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &dmabuf).unwrap();
     }
-    assert!(buffer.release_point().is_some());
+    assert_buffer_release_point_matches_for_tests(
+        &buffer,
+        &expected_release_point,
+        "import_surface fixture should keep initial release point",
+    );
 
     let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
     assert!(matches!(
@@ -8270,9 +8283,10 @@ fn import_surface_real_buffer_reaches_texture_cache_lifecycle_guard() {
             "sampled dmabuf Wayland Vulkan texture-cache release call sites"
         ))
     ));
-    assert!(
-        buffer.release_point().is_some(),
-        "normal import_surface guard must not consume Wayland release ownership before lifecycle evidence"
+    assert_buffer_release_point_matches_for_tests(
+        &buffer,
+        &expected_release_point,
+        "normal import_surface guard must not consume Wayland release ownership before lifecycle evidence",
     );
 }
 
@@ -8297,8 +8311,10 @@ fn import_surface_lifecycle_evidence_does_not_imply_first_import_external_state(
         DmabufFlags::empty(),
         &[(0, 0, 4)],
     );
+    let (acquire_point, release_point) = DrmSyncPoint::invalid_timeline_pair_for_tests(33, 34).unwrap();
+    let expected_release_point = release_point.clone();
     let Some((_display, _client_side, surface, buffer)) =
-        import_surface_dmabuf_buffer_for_tests(dmabuf.clone(), 33, 34)
+        import_surface_dmabuf_buffer_with_sync_points_for_tests(dmabuf.clone(), acquire_point, release_point)
     else {
         return;
     };
@@ -8310,7 +8326,11 @@ fn import_surface_lifecycle_evidence_does_not_imply_first_import_external_state(
             .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
             .unwrap();
     }
-    assert!(buffer.release_point().is_some());
+    assert_buffer_release_point_matches_for_tests(
+        &buffer,
+        &expected_release_point,
+        "first-import fixture should keep initial release point",
+    );
 
     let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
     assert!(matches!(
@@ -8319,9 +8339,10 @@ fn import_surface_lifecycle_evidence_does_not_imply_first_import_external_state(
             "sampled dmabuf Wayland Vulkan first-import layout policy"
         ))
     ));
-    assert!(
-        buffer.release_point().is_some(),
-        "first-import external-state guard must not consume Wayland release ownership"
+    assert_buffer_release_point_matches_for_tests(
+        &buffer,
+        &expected_release_point,
+        "first-import external-state guard must not consume Wayland release ownership",
     );
     assert!(renderer.dmabuf_formats().iter().next().is_none());
     assert!(matches!(
@@ -8352,8 +8373,10 @@ fn import_surface_lifecycle_evidence_does_not_imply_reacquire_external_state() {
         &[(0, 0, 4)],
     );
     renderer.record_sampled_dmabuf_released_to_foreign_general(&dmabuf);
+    let (acquire_point, release_point) = DrmSyncPoint::invalid_timeline_pair_for_tests(35, 36).unwrap();
+    let expected_release_point = release_point.clone();
     let Some((_display, _client_side, surface, buffer)) =
-        import_surface_dmabuf_buffer_for_tests(dmabuf.clone(), 35, 36)
+        import_surface_dmabuf_buffer_with_sync_points_for_tests(dmabuf.clone(), acquire_point, release_point)
     else {
         return;
     };
@@ -8366,7 +8389,11 @@ fn import_surface_lifecycle_evidence_does_not_imply_reacquire_external_state() {
             .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
             .unwrap();
     }
-    assert!(buffer.release_point().is_some());
+    assert_buffer_release_point_matches_for_tests(
+        &buffer,
+        &expected_release_point,
+        "reacquire fixture should keep initial release point",
+    );
 
     let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
     assert!(matches!(
@@ -8375,9 +8402,10 @@ fn import_surface_lifecycle_evidence_does_not_imply_reacquire_external_state() {
             "sampled dmabuf Wayland Vulkan current reacquire layout policy"
         ))
     ));
-    assert!(
-        buffer.release_point().is_some(),
-        "reacquire external-state guard must not consume Wayland release ownership"
+    assert_buffer_release_point_matches_for_tests(
+        &buffer,
+        &expected_release_point,
+        "reacquire external-state guard must not consume Wayland release ownership",
     );
     assert!(renderer.dmabuf_formats().iter().next().is_none());
     assert!(matches!(
@@ -8407,8 +8435,10 @@ fn import_surface_lifecycle_evidence_reaches_device_import_boundary() {
         DmabufFlags::empty(),
         &[(0, 0, 4)],
     );
+    let (acquire_point, release_point) = DrmSyncPoint::invalid_timeline_pair_for_tests(31, 32).unwrap();
+    let expected_release_point = release_point.clone();
     let Some((_display, _client_side, surface, buffer)) =
-        import_surface_dmabuf_buffer_for_tests(dmabuf.clone(), 31, 32)
+        import_surface_dmabuf_buffer_with_sync_points_for_tests(dmabuf.clone(), acquire_point, release_point)
     else {
         return;
     };
@@ -8420,13 +8450,18 @@ fn import_surface_lifecycle_evidence_reaches_device_import_boundary() {
             .mark_wayland_dmabuf_current_commit_for_sampled_import(&buffer, &dmabuf)
             .unwrap();
     }
-    assert!(buffer.release_point().is_some());
+    assert_buffer_release_point_matches_for_tests(
+        &buffer,
+        &expected_release_point,
+        "device-boundary fixture should keep initial release point",
+    );
 
     let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
     assert!(matches!(import_result, Err(VulkanError::VulkanUnavailable)));
-    assert!(
-        buffer.release_point().is_some(),
-        "scaffold device boundary must not consume Wayland release ownership before texture construction"
+    assert_buffer_release_point_matches_for_tests(
+        &buffer,
+        &expected_release_point,
+        "scaffold device boundary must not consume Wayland release ownership before texture construction",
     );
 }
 
@@ -8451,8 +8486,8 @@ fn import_surface_current_surface_marker_reaches_device_import_boundary() {
         DmabufFlags::empty(),
         &[(0, 0, 4)],
     );
-    let acquire_point = DrmSyncPoint::invalid_for_tests(37).unwrap();
-    let release_point = DrmSyncPoint::invalid_for_tests(38).unwrap();
+    let (acquire_point, release_point) = DrmSyncPoint::invalid_timeline_pair_for_tests(37, 38).unwrap();
+    let expected_release_point = release_point.clone();
     let Some((_display, _client_side, surface, buffer)) =
         import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
             dmabuf.clone(),
@@ -8470,15 +8505,20 @@ fn import_surface_current_surface_marker_reaches_device_import_boundary() {
             .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &dmabuf)
             .unwrap();
     }
-    assert!(buffer.release_point().is_some());
+    assert_buffer_release_point_matches_for_tests(
+        &buffer,
+        &expected_release_point,
+        "current-surface fixture should keep initial release point",
+    );
 
     let import_result = crate::wayland::compositor::with_states(&surface, |states| {
         crate::backend::renderer::utils::import_surface(&mut renderer, states)
     });
     assert!(matches!(import_result, Err(VulkanError::VulkanUnavailable)));
-    assert!(
-        buffer.release_point().is_some(),
-        "scaffold device boundary must not consume Wayland release ownership before texture construction"
+    assert_buffer_release_point_matches_for_tests(
+        &buffer,
+        &expected_release_point,
+        "scaffold device boundary must not consume Wayland release ownership before texture construction",
     );
     assert!(renderer.dmabuf_formats().iter().next().is_none());
 }
