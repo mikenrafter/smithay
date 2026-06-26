@@ -8141,6 +8141,42 @@ fn sampled_dmabuf_release_keeps_wayland_point_after_failed_satisfaction() {
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
+fn import_dma_wl_release_ownership_transfer_preserves_syncobj_point() {
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let Some((_display, _client_side, wl_buffer)) = dmabuf_wl_buffer_for_tests(dmabuf.clone()) else {
+        return;
+    };
+    let (acquire_point, release_point) =
+        DrmSyncPoint::invalid_timeline_pair_for_tests(0x2_0000_0001, 0x2_0000_0002).unwrap();
+    let expected_release_point = release_point.clone();
+    let buffer =
+        crate::backend::renderer::utils::Buffer::with_explicit(wl_buffer, acquire_point, release_point);
+
+    let release_ownership = VulkanRenderer::sampled_dmabuf_take_wayland_release_ownership(&dmabuf, &buffer)
+        .expect("release ownership transfer should take the Wayland syncobj point");
+    assert!(buffer.release_point().is_none());
+    let release = release_ownership.into_release();
+    let moved_release_point = release
+        .wayland_release_point_for_tests()
+        .expect("release ownership should retain the moved Wayland syncobj point");
+    assert_eq!(
+        moved_release_point.point_for_tests(),
+        expected_release_point.point_for_tests()
+    );
+    assert!(
+        moved_release_point.same_timeline_for_tests(&expected_release_point),
+        "release ownership transfer should preserve timeline identity"
+    );
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
 fn import_dma_wl_real_buffer_requires_import_surface_reachability() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(

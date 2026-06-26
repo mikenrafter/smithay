@@ -286,6 +286,11 @@ impl VulkanSampledDmabufRelease {
         self.satisfy_wayland_release_once(None)
     }
 
+    #[cfg(all(test, feature = "wayland_frontend", feature = "backend_drm"))]
+    pub(super) fn wayland_release_point_for_tests(&self) -> Option<DrmSyncPoint> {
+        self.inner.lock().unwrap().wayland_release_point.clone()
+    }
+
     pub(super) fn satisfy_wayland_release_once(
         &self,
         _release_sync_file: Option<BorrowedFd<'_>>,
