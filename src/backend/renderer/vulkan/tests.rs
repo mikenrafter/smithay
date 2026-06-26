@@ -419,6 +419,96 @@ fn empty_import_surface_for_tests() -> Option<(Display<DmabufBufferTestState>, U
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_surface_commit_helper_exposes_pending_dmabuf_and_sync_to_pre_commit_hook() {
+    let display = match Display::<DmabufBufferTestState>::new() {
+        Ok(display) => display,
+        Err(InitError::NoWaylandLib) => return,
+        Err(err) => panic!("failed to create test Wayland display: {err}"),
+    };
+    let mut display_handle = display.handle();
+    let (_client_side, server_side) = UnixStream::pair().unwrap();
+    let client = display_handle
+        .insert_client(server_side, Arc::new(DmabufBufferTestClientState::default()))
+        .unwrap();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let wl_buffer = client
+        .create_resource::<WlBuffer, Dmabuf, DmabufBufferTestState>(&display_handle, 1, dmabuf.clone())
+        .unwrap();
+    let surface = crate::wayland::compositor::test_utils::create_surface::<DmabufBufferTestState>(
+        &client,
+        &display_handle,
+    );
+    let observed_pre_commit = Arc::new(Mutex::new(false));
+    let observed_pre_commit_hook = observed_pre_commit.clone();
+    let pre_commit_dmabuf = dmabuf.clone();
+    crate::wayland::compositor::add_pre_commit_hook::<DmabufBufferTestState, _>(
+        &surface,
+        move |_, _, surface| {
+            crate::wayland::compositor::with_states(surface, |states| {
+                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                let pending_buffer =
+                    attributes
+                        .pending()
+                        .buffer
+                        .as_ref()
+                        .and_then(|assignment| match assignment {
+                            BufferAssignment::NewBuffer(buffer) => Some(buffer),
+                            BufferAssignment::Removed => None,
+                        });
+                let pending_dmabuf = pending_buffer
+                    .and_then(|buffer| crate::wayland::dmabuf::get_dmabuf(buffer).ok())
+                    .expect("pre-commit hook should see pending dmabuf buffer");
+                assert_eq!(pending_dmabuf, &pre_commit_dmabuf);
+
+                let mut syncobj = states.cached_state.get::<DrmSyncobjCachedState>();
+                assert!(
+                    syncobj.pending().acquire_point.is_some(),
+                    "pre-commit hook should see pending acquire point"
+                );
+                assert!(
+                    syncobj.pending().release_point.is_some(),
+                    "pre-commit hook should see pending release point"
+                );
+            });
+            *observed_pre_commit_hook.lock().unwrap() = true;
+        },
+    );
+
+    let acquire_point = DrmSyncPoint::invalid_for_tests(101).unwrap();
+    let release_point = DrmSyncPoint::invalid_for_tests(102).unwrap();
+    crate::wayland::compositor::with_states(&surface, |states| {
+        let mut syncobj = states.cached_state.get::<DrmSyncobjCachedState>();
+        syncobj.pending().acquire_point = Some(acquire_point);
+        syncobj.pending().release_point = Some(release_point);
+    });
+    let mut state = DmabufBufferTestState;
+    crate::wayland::compositor::test_utils::commit_buffer_assignment(
+        &mut state,
+        &display_handle,
+        &surface,
+        Some(wl_buffer),
+    );
+
+    assert!(*observed_pre_commit.lock().unwrap());
+    crate::backend::renderer::utils::with_renderer_surface_state(&surface, |state| {
+        let buffer = state
+            .buffer()
+            .expect("CompositorHandler::commit should install renderer-managed buffer");
+        assert_eq!(crate::wayland::dmabuf::get_dmabuf(buffer).unwrap(), &dmabuf);
+        assert!(buffer.acquire_point().is_some());
+        assert!(buffer.release_point().is_some());
+    })
+    .expect("CompositorHandler::commit should create renderer surface state");
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 fn update_import_wl_surface_dmabuf_buffer_with_sync_points_for_tests(
     display_handle: &DisplayHandle,
     surface: &WlSurface,
