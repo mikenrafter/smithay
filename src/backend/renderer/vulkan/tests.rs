@@ -44,7 +44,7 @@ use crate::wayland::{
         BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, MultiCache,
         SurfaceAttributes, SurfaceData,
     },
-    drm_syncobj::DrmSyncobjCachedState,
+    drm_syncobj::{DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState},
 };
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use rustix::fs::{Mode, OFlags};
@@ -257,6 +257,13 @@ impl AsMut<CompositorState> for DmabufBufferTestState {
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+impl DrmSyncobjHandler for DmabufBufferTestState {
+    fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+        None
+    }
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 crate::delegate_dispatch2!(DmabufBufferTestState);
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
@@ -374,6 +381,9 @@ fn import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
         &client,
         &display_handle,
     );
+    let _syncobj_surface = crate::wayland::drm_syncobj::test_utils::install_surface_for_tests::<
+        DmabufBufferTestState,
+    >(&client, &display_handle, &surface);
 
     let mut state = DmabufBufferTestState;
     crate::wayland::compositor::with_states(&surface, |states| {
@@ -445,6 +455,9 @@ fn import_surface_commit_helper_exposes_pending_dmabuf_and_sync_to_pre_commit_ho
         &client,
         &display_handle,
     );
+    let _syncobj_surface = crate::wayland::drm_syncobj::test_utils::install_surface_for_tests::<
+        DmabufBufferTestState,
+    >(&client, &display_handle, &surface);
     let observed_pre_commit = Arc::new(Mutex::new(false));
     let observed_pre_commit_hook = observed_pre_commit.clone();
     let pre_commit_dmabuf = dmabuf.clone();
@@ -516,8 +529,9 @@ fn update_import_wl_surface_dmabuf_buffer_with_sync_points_for_tests(
     acquire_point: DrmSyncPoint,
     release_point: DrmSyncPoint,
 ) -> crate::backend::renderer::utils::Buffer {
-    // Focused renderer tests bypass client socket dispatch, but still stage pending surface/sync state
-    // and drive Smithay's normal compositor commit lifecycle. The wl_buffer is created for the same
+    // Focused renderer tests bypass client socket dispatch, but the original fixture installs the
+    // server-side DRM syncobj surface object/hooks. Updates still stage pending surface/sync state and
+    // drive Smithay's normal compositor commit lifecycle. The wl_buffer is created for the same
     // client/display as `surface` so the fixture models a later commit on the same WlSurface instead
     // of a detached SurfaceData update.
     let client = surface
