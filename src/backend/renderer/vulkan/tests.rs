@@ -244,7 +244,9 @@ impl CompositorHandler for DmabufBufferTestState {
             .compositor_state
     }
 
-    fn commit(&mut self, _surface: &WlSurface) {}
+    fn commit(&mut self, surface: &WlSurface) {
+        crate::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
+    }
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
@@ -373,25 +375,25 @@ fn import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
         &display_handle,
     );
 
+    let mut state = DmabufBufferTestState;
     crate::wayland::compositor::with_states(&surface, |states| {
-        {
-            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
-            attributes.current().buffer = Some(BufferAssignment::NewBuffer(wl_buffer));
-        }
-        {
-            let mut syncobj = states.cached_state.get::<DrmSyncobjCachedState>();
-            syncobj.current().acquire_point = Some(acquire_point);
-            syncobj.current().release_point = Some(release_point);
-        }
+        let mut syncobj = states.cached_state.get::<DrmSyncobjCachedState>();
+        syncobj.pending().acquire_point = Some(acquire_point);
+        syncobj.pending().release_point = Some(release_point);
     });
-    crate::backend::renderer::utils::on_commit_buffer_handler::<DmabufBufferTestState>(&surface);
+    crate::wayland::compositor::test_utils::commit_buffer_assignment(
+        &mut state,
+        &display_handle,
+        &surface,
+        Some(wl_buffer),
+    );
     let buffer = crate::backend::renderer::utils::with_renderer_surface_state(&surface, |state| {
         state
             .buffer()
-            .expect("on_commit_buffer_handler should store the committed dmabuf buffer")
+            .expect("commit should store the committed dmabuf buffer")
             .clone()
     })
-    .expect("on_commit_buffer_handler should create renderer surface state");
+    .expect("commit should create renderer surface state");
 
     Some((display, client_side, surface, buffer))
 }
@@ -424,46 +426,48 @@ fn update_import_wl_surface_dmabuf_buffer_with_sync_points_for_tests(
     acquire_point: DrmSyncPoint,
     release_point: DrmSyncPoint,
 ) -> crate::backend::renderer::utils::Buffer {
-    // Focused renderer tests bypass Wayland request dispatch by installing the next commit's cached
-    // buffer/sync state directly, then still drive Smithay's normal renderer-utils commit hook. The
-    // wl_buffer is created for the same client/display as `surface` so the fixture models a later
-    // commit on the same WlSurface instead of a detached SurfaceData update.
+    // Focused renderer tests bypass client socket dispatch, but still stage pending surface/sync state
+    // and drive Smithay's normal compositor commit lifecycle. The wl_buffer is created for the same
+    // client/display as `surface` so the fixture models a later commit on the same WlSurface instead
+    // of a detached SurfaceData update.
     let client = surface
         .client()
         .expect("test WlSurface should still be attached to a live client");
     let wl_buffer = client
         .create_resource::<WlBuffer, Dmabuf, DmabufBufferTestState>(display_handle, 1, dmabuf)
         .expect("create updated dmabuf wl_buffer for test WlSurface client");
+    let mut state = DmabufBufferTestState;
     crate::wayland::compositor::with_states(surface, |states| {
-        {
-            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
-            attributes.current().buffer = Some(BufferAssignment::NewBuffer(wl_buffer));
-        }
-        {
-            let mut syncobj = states.cached_state.get::<DrmSyncobjCachedState>();
-            syncobj.current().acquire_point = Some(acquire_point);
-            syncobj.current().release_point = Some(release_point);
-        }
+        let mut syncobj = states.cached_state.get::<DrmSyncobjCachedState>();
+        syncobj.pending().acquire_point = Some(acquire_point);
+        syncobj.pending().release_point = Some(release_point);
     });
-    crate::backend::renderer::utils::on_commit_buffer_handler::<DmabufBufferTestState>(surface);
+    crate::wayland::compositor::test_utils::commit_buffer_assignment(
+        &mut state,
+        display_handle,
+        surface,
+        Some(wl_buffer),
+    );
     let buffer = crate::backend::renderer::utils::with_renderer_surface_state(surface, |state| {
         state
             .buffer()
-            .expect("on_commit_buffer_handler should store the updated dmabuf buffer")
+            .expect("commit should store the updated dmabuf buffer")
             .clone()
     })
-    .expect("on_commit_buffer_handler should preserve renderer surface state");
+    .expect("commit should preserve renderer surface state");
 
     buffer
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
-fn remove_import_wl_surface_buffer_for_tests(surface: &WlSurface) {
-    crate::wayland::compositor::with_states(surface, |states| {
-        let mut attributes = states.cached_state.get::<SurfaceAttributes>();
-        attributes.current().buffer = Some(BufferAssignment::Removed);
-    });
-    crate::backend::renderer::utils::on_commit_buffer_handler::<DmabufBufferTestState>(surface);
+fn remove_import_wl_surface_buffer_for_tests(display_handle: &DisplayHandle, surface: &WlSurface) {
+    let mut state = DmabufBufferTestState;
+    crate::wayland::compositor::test_utils::commit_buffer_assignment(
+        &mut state,
+        display_handle,
+        surface,
+        None,
+    );
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
@@ -4903,7 +4907,7 @@ fn runtime_import_dma_wl_loopback_removed_buffer_releases_cached_dmabuf() {
     }
     let release_point_probe = release_point.clone();
 
-    let Some((_display, _client_side, surface, buffer)) =
+    let Some((display, _client_side, surface, buffer)) =
         import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
             candidate.dmabuf.clone(),
             acquire_point,
@@ -4959,7 +4963,8 @@ fn runtime_import_dma_wl_loopback_removed_buffer_releases_cached_dmabuf() {
         drop(cached_texture);
         drop(buffer);
 
-        remove_import_wl_surface_buffer_for_tests(&surface);
+        let display_handle = display.handle();
+        remove_import_wl_surface_buffer_for_tests(&display_handle, &surface);
         let (buffer_removed, texture_removed) = {
             crate::wayland::compositor::with_states(&surface, |states| {
                 let data = states

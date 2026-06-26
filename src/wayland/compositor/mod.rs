@@ -428,6 +428,41 @@ pub(crate) mod test_utils {
         surface
     }
 
+    /// Commit a buffer assignment through the same server-side state transitions as
+    /// `wl_surface.attach` followed by `wl_surface.commit`.
+    ///
+    /// This still bypasses client socket dispatch, but unlike directly mutating current cached state it
+    /// stages pending surface state, invokes compositor pre-commit hooks, and runs Smithay's normal
+    /// transaction commit path. For ready non-sync surfaces that reaches [`CompositorHandler::commit`]
+    /// immediately; sync subsurfaces and blockers follow the same delayed transaction behavior as real
+    /// commits. Focused tests can use this when they need Smithay's normal commit lifecycle without
+    /// constructing full client-side globals.
+    pub(crate) fn commit_buffer_assignment<D>(
+        state: &mut D,
+        handle: &DisplayHandle,
+        surface: &WlSurface,
+        buffer: Option<wl_buffer::WlBuffer>,
+    ) where
+        D: CompositorHandler + 'static,
+    {
+        let client = surface
+            .client()
+            .expect("test surface should still be attached to a live client");
+        let client_scale = state.client_compositor_state(&client).client_scale();
+        PrivateSurfaceData::with_states(surface, |states| {
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            let pending = attributes.pending();
+            pending.buffer = Some(match buffer {
+                Some(buffer) => BufferAssignment::NewBuffer(buffer),
+                None => BufferAssignment::Removed,
+            });
+            pending.client_scale = client_scale;
+        });
+
+        PrivateSurfaceData::invoke_pre_commit_hooks(state, handle, surface);
+        PrivateSurfaceData::commit(surface, handle, state);
+    }
+
     pub(crate) fn set_parent(child: &WlSurface, parent: &WlSurface) {
         PrivateSurfaceData::set_parent(child, parent).unwrap();
     }
