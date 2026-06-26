@@ -4286,8 +4286,8 @@ fn runtime_dmabuf_loopback_imports_released_render_target_as_sampled_texture() {
 
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
-fn runtime_import_dma_experiment_samples_released_loopback_dmabuf() {
-    let test_name = "Vulkan generic ImportDma experimental loopback sampling test";
+fn runtime_import_dma_known_layout_helper_samples_released_loopback_dmabuf() {
+    let test_name = "Vulkan known-layout sampled dmabuf loopback sampling test";
     let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
         return;
     };
@@ -4334,7 +4334,7 @@ fn runtime_import_dma_experiment_samples_released_loopback_dmabuf() {
             .expect("render into loopback dmabuf target");
         frame
             .clear(Color32F::new(0.8, 0.2, 0.1, 1.0), &full_damage)
-            .expect("clear generic ImportDma loopback target");
+            .expect("clear known-layout loopback target");
     }
     assert_eq!(target.image.layout, VulkanImageLayoutState::ColorAttachment);
 
@@ -4348,15 +4348,21 @@ fn runtime_import_dma_experiment_samples_released_loopback_dmabuf() {
     assert!(evidence.is_for_dmabuf(&candidate.dmabuf));
     assert!(
         evidence.acquire_sync().is_reached(),
-        "generic ImportDma experiment has no acquire-sync input, so the release dependency must already be reached"
+        "known-layout sampled import uses the loopback release dependency as acquire sync"
     );
-    // Drop the loopback evidence before calling the generic trait method: this probe is meant to
-    // exercise the current generic ImportDma experimental assumption, not an evidence-consuming API.
-    drop(evidence);
 
-    let texture =
-        <VulkanRenderer as ImportDma>::import_dmabuf(&mut candidate.renderer, &candidate.dmabuf, None)
-            .expect("generic ImportDma experimental path should import released loopback dmabuf");
+    let texture = unsafe {
+        // SAFETY: `evidence` proves this exact loopback dmabuf was released to FOREIGN ownership in
+        // GENERAL layout, and its acquire SyncPoint represents that completed release. This explicit
+        // helper is the normal Vulkan contract boundary; the safe generic ImportDma trait intentionally
+        // has no parameter for this evidence and remains fail-closed below.
+        candidate
+            .renderer
+            .import_dmabuf_texture_with_known_general_layout(&candidate.dmabuf, Some(evidence.acquire_sync()))
+    }
+    .expect("known-layout sampled dmabuf import should reach Vulkan")
+    .expect("known-layout sampled dmabuf import should produce a texture");
+    drop(evidence);
     assert_eq!(texture.width(), 4);
     assert_eq!(texture.height(), 4);
     assert_eq!(texture.format(), Some(candidate.format.code));
@@ -4375,6 +4381,12 @@ fn runtime_import_dma_experiment_samples_released_loopback_dmabuf() {
             .validate_sampled_dmabuf_public_advertisement_contract(),
         Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
     ));
+    assert!(matches!(
+        <VulkanRenderer as ImportDma>::import_dmabuf(&mut candidate.renderer, &candidate.dmabuf, None),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf generic ImportDma external-state contract"
+        ))
+    ));
 
     runtime_sample_texture_to_offscreen_and_assert_non_black(
         &mut candidate.renderer,
@@ -4386,7 +4398,7 @@ fn runtime_import_dma_experiment_samples_released_loopback_dmabuf() {
     let (released, release_sync) = candidate
         .renderer
         .release_imported_dmabuf_texture_to_foreign_general_sync_point(&texture, false)
-        .expect("release generic ImportDma sampled texture back to foreign GENERAL");
+        .expect("release known-layout sampled texture back to foreign GENERAL");
     assert!(released);
     assert!(release_sync.is_reached());
     assert_eq!(
@@ -4480,8 +4492,8 @@ fn runtime_dmabuf_loopback_samples_with_exported_release_sync() {
     let texture = unsafe {
         // SAFETY: `evidence` was produced by releasing the same Smithay dmabuf identity immediately
         // above, and there is no intervening access, acquire, release, or layout/ownership transition
-        // before this sampled loopback import. Unlike the direct ImportDma experiment, this path passes
-        // the exported release sync point into the Vulkan acquire helper.
+        // before this sampled loopback import. Unlike the safe generic ImportDma trait, this path
+        // passes the exported release sync point into the Vulkan acquire helper.
         candidate
             .renderer
             .import_dmabuf_texture_from_loopback(&candidate.dmabuf, evidence)
@@ -5917,8 +5929,8 @@ fn runtime_dmabuf_loopback_reimports_after_sampled_release_with_exported_sync() 
 
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
-fn runtime_direct_import_dma_experiment_imports_released_render_target_as_sampled_texture() {
-    let Some(mut candidate) = runtime_dmabuf_loopback_candidate("Vulkan direct ImportDma experiment test")
+fn runtime_direct_import_dma_fails_closed_after_released_render_target() {
+    let Some(mut candidate) = runtime_dmabuf_loopback_candidate("Vulkan direct ImportDma fail-closed test")
     else {
         return;
     };
@@ -5973,15 +5985,12 @@ fn runtime_direct_import_dma_experiment_imports_released_render_target_as_sample
     assert!(evidence.is_for_dmabuf(&candidate.dmabuf));
     assert!(evidence.acquire_sync().is_reached());
 
-    let texture = candidate
-        .renderer
-        .import_dmabuf(&candidate.dmabuf, None)
-        .expect("direct ImportDma experiment should import released dmabuf as sampled texture");
-
-    assert_eq!(texture.width(), 4);
-    assert_eq!(texture.height(), 4);
-    assert_eq!(texture.format(), Some(candidate.format.code));
-    assert!(texture.has_sampled_image_for_tests());
+    assert!(matches!(
+        <VulkanRenderer as ImportDma>::import_dmabuf(&mut candidate.renderer, &candidate.dmabuf, None),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf generic ImportDma external-state contract"
+        ))
+    ));
     assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
     assert!(matches!(
         candidate
@@ -5989,27 +5998,14 @@ fn runtime_direct_import_dma_experiment_imports_released_render_target_as_sample
             .validate_sampled_dmabuf_public_advertisement_contract(),
         Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
     ));
-
-    let (released, release_sync) = candidate
-        .renderer
-        .release_imported_dmabuf_texture_to_foreign_general_sync_point(&texture, false)
-        .expect("release direct imported sampled texture back to foreign GENERAL");
-    assert!(released);
-    assert!(release_sync.is_reached());
 }
 
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
-fn runtime_direct_import_dma_experiment_samples_imported_texture() {
-    let Some(mut candidate) = runtime_dmabuf_loopback_candidate("Vulkan direct ImportDma sampling test")
+fn runtime_direct_import_dma_fails_closed_before_sampling_released_dmabuf() {
+    let Some(mut candidate) =
+        runtime_dmabuf_loopback_candidate("Vulkan direct ImportDma sampling guard test")
     else {
-        return;
-    };
-    let Some(render_format) = runtime_offscreen_sample_render_format(
-        &candidate.renderer,
-        candidate.format.code,
-        "Vulkan direct ImportDma sampling test",
-    ) else {
         return;
     };
 
@@ -6054,25 +6050,12 @@ fn runtime_direct_import_dma_experiment_samples_imported_texture() {
     assert!(evidence.is_for_dmabuf(&candidate.dmabuf));
     assert!(evidence.acquire_sync().is_reached());
 
-    let texture = candidate
-        .renderer
-        .import_dmabuf(&candidate.dmabuf, None)
-        .expect("direct ImportDma experiment should import released dmabuf as sampled texture");
-    assert!(texture.has_sampled_image_for_tests());
-
-    runtime_sample_texture_to_offscreen_and_assert_non_black(
-        &mut candidate.renderer,
-        &texture,
-        render_format,
-        "Vulkan direct ImportDma sampling test",
-    );
-
-    let (released, release_sync) = candidate
-        .renderer
-        .release_imported_dmabuf_texture_to_foreign_general_sync_point(&texture, false)
-        .expect("release sampled texture after offscreen sampling");
-    assert!(released);
-    assert!(release_sync.is_reached());
+    assert!(matches!(
+        <VulkanRenderer as ImportDma>::import_dmabuf(&mut candidate.renderer, &candidate.dmabuf, None),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf generic ImportDma external-state contract"
+        ))
+    ));
 }
 
 #[test]
@@ -6373,7 +6356,9 @@ fn public_dmabuf_import_gates_formats() {
 
     assert!(matches!(
         renderer.import_dmabuf(&dmabuf, None),
-        Err(VulkanError::VulkanUnavailable)
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf generic ImportDma external-state contract"
+        ))
     ));
     assert!(matches!(
         // SAFETY: This scaffold renderer has no Vulkan device, so the explicit validation-stage
@@ -6523,7 +6508,9 @@ fn sampled_dmabuf_wayland_policy_does_not_public_advertise_import_dma() {
     assert!(!renderer.has_dmabuf_format(format));
     assert!(matches!(
         renderer.import_dmabuf(&dmabuf, None),
-        Err(VulkanError::VulkanUnavailable)
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf generic ImportDma external-state contract"
+        ))
     ));
 }
 

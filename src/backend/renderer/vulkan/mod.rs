@@ -20,13 +20,14 @@
 //! target abstraction as the other renderers once the validation-stage gate is true. Generic
 //! texture `ExportMem`, `ExportDma`, broad explicit sync, blit/copy, and full presentation remain
 //! unsupported until their corresponding capability bits can become true with coverage. Sampled dmabuf
-//! import is validation-reachable through the explicit known-layout development helper, a local-only
-//! experimental generic `ImportDma` path that assumes `FOREIGN + GENERAL` external state, and the
-//! normal `ImportDmaWl` path's staged guards. The normal Wayland path now models the policy context,
-//! explicit acquire/release sync evidence, first-import vs. reacquire history, known-layout evidence
-//! identity, and renderer cache-release hook evidence. Public sampled `ImportDma` advertisement still
-//! remains closed until production external-state evidence, acquire/release lifecycle, teardown cache
-//! release, and direct import implementation contracts are proven by tests.
+//! import is validation-reachable through the explicit known-layout development helper and the normal
+//! `ImportDmaWl` path's staged guards. The safe generic `ImportDma` path fails closed until Smithay has
+//! a contract for the producer's external state, acquire sync, and release lifecycle. The normal
+//! Wayland path now models the policy context, explicit acquire/release sync evidence, first-import vs.
+//! reacquire history, known-layout evidence identity, and renderer cache-release hook evidence. Public
+//! sampled `ImportDma` advertisement still remains closed until production external-state evidence,
+//! acquire/release lifecycle, teardown cache release, and direct import implementation contracts are
+//! proven by tests.
 //!
 //! Intended implementation order:
 //!
@@ -2681,42 +2682,6 @@ impl VulkanRenderer {
         )))
     }
 
-    /// Development-only direct sampled dmabuf import experiment.
-    ///
-    /// This intentionally does not make sampled [`ImportDma`] public-advertised: `dmabuf_formats()`
-    /// still uses the ordered public readiness contract. The purpose of this path is to make direct
-    /// calls reach the Vulkan sampled import implementation in this local fork so validation/runtime
-    /// probes can expose the next concrete failure instead of stopping forever at abstract public
-    /// external-state guards.
-    ///
-    /// # Safety assumption
-    ///
-    /// This path assumes, for development discovery only, that the producer has already released the
-    /// dmabuf to `VK_QUEUE_FAMILY_FOREIGN_EXT` in `VK_IMAGE_LAYOUT_GENERAL`, and that producer writes
-    /// and ownership release are already complete and visible to this renderer. There is no acquire
-    /// sync input on generic [`ImportDma`], so this must not be treated as downstream/public support.
-    fn experimental_import_dmabuf_assume_foreign_general(
-        &mut self,
-        dmabuf: &Dmabuf,
-    ) -> Result<Option<VulkanTexture>, VulkanError> {
-        tracing::warn!(
-            "experimentally importing sampled dmabuf by assuming FOREIGN ownership and GENERAL layout"
-        );
-        let foreign_general = unsafe {
-            // SAFETY: This is the explicit local-development assumption documented on this helper.
-            SampledDmabufKnownLayoutEvidence::foreign_general(dmabuf.weak())
-        };
-
-        unsafe {
-            // SAFETY: This is the explicit local-development assumption documented on this helper.
-            self.create_imported_dmabuf_texture_with_known_general_layout_and_sync_point(
-                dmabuf,
-                foreign_general,
-                None,
-            )
-        }
-    }
-
     /// Import a known-layout dmabuf and attach the Wayland release obligation to the texture.
     ///
     /// # Safety
@@ -2950,14 +2915,18 @@ impl VulkanRenderer {
             // the dmabuf to FOREIGN ownership in GENERAL layout.
             SampledDmabufKnownLayoutEvidence::foreign_general(dmabuf.weak())
         };
-        // SAFETY: Forwarded from this public unsafe method's caller.
-        unsafe {
+        let texture = unsafe {
+            // SAFETY: Forwarded from this public unsafe method's caller.
             self.create_imported_dmabuf_texture_with_known_general_layout_and_sync_point(
                 dmabuf,
                 foreign_general,
                 acquire_sync,
-            )
+            )?
+        };
+        if texture.is_some() {
+            self.record_sampled_dmabuf_locally_acquired(dmabuf);
         }
+        Ok(texture)
     }
 
     /// Release an acquired dmabuf texture back to foreign ownership in `VK_IMAGE_LAYOUT_GENERAL`.
@@ -3096,8 +3065,8 @@ impl VulkanRenderer {
     /// This is the shared implementation core for [`ImportDmaWl`]. It deliberately still requires a
     /// late-bound release-ownership transfer closure so the renderer-managed Wayland buffer wrapper
     /// remains the production owner of the move-only release point until all policy guards have passed.
-    /// Extracting this helper keeps the intended Wayland path testable without turning the direct
-    /// `ImportDma` experiment into public support or inventing a side-channel advertisement surface.
+    /// Extracting this helper keeps the intended Wayland path testable while generic `ImportDma`
+    /// remains fail-closed and without inventing a side-channel advertisement surface.
     #[cfg(feature = "wayland_frontend")]
     #[allow(dead_code)]
     fn import_wayland_dmabuf_with_policy_context<F>(
@@ -3628,17 +3597,12 @@ impl ImportDma for VulkanRenderer {
 
     fn import_dmabuf(
         &mut self,
-        dmabuf: &Dmabuf,
+        _dmabuf: &Dmabuf,
         _damage: Option<&[Rectangle<i32, BufferCoord>]>,
     ) -> Result<Self::TextureId, Self::Error> {
-        let texture = self.experimental_import_dmabuf_assume_foreign_general(dmabuf)?;
-
-        if let Some(texture) = texture {
-            self.record_sampled_dmabuf_locally_acquired(dmabuf);
-            Ok(texture)
-        } else {
-            Err(VulkanError::MissingCapability("sampled dmabuf texture import"))
-        }
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf generic ImportDma external-state contract",
+        ))
     }
 }
 
