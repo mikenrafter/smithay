@@ -339,9 +339,10 @@ where
                     },
                 );
                 with_states(&surface, |states| {
-                    states
+                    let syncobj_surface_cell = states
                         .data_map
-                        .insert_if_missing(|| RefCell::new(Some(syncobj_surface)))
+                        .get_or_insert(|| RefCell::new(None::<WpLinuxDrmSyncobjSurfaceV1>));
+                    *syncobj_surface_cell.borrow_mut() = Some(syncobj_surface);
                 });
             }
             wp_linux_drm_syncobj_manager_v1::Request::ImportTimeline { id, fd } => {
@@ -374,6 +375,67 @@ where
             wp_linux_drm_syncobj_manager_v1::Request::Destroy => {}
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use std::cell::RefCell;
+
+    use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1;
+    use wayland_server::{Client, Dispatch, DisplayHandle, Resource};
+
+    use super::{DrmSyncobjHandler, DrmSyncobjSurfaceData, commit_hook, destruction_hook};
+    use crate::wayland::compositor::{self, with_states};
+
+    /// Install a server-side DRM syncobj surface object for a focused test surface.
+    ///
+    /// This mirrors the server-side setup performed by `wp_linux_drm_syncobj_manager_v1.get_surface`:
+    /// it creates the protocol resource, installs the commit/destruction hooks, and stores the resource
+    /// in the surface data map. It intentionally still bypasses client socket dispatch; tests using it
+    /// must stage pending sync points themselves or drive the request handlers separately.
+    #[allow(dead_code)]
+    pub(crate) fn install_surface_for_tests<D>(
+        client: &Client,
+        handle: &DisplayHandle,
+        surface: &wayland_server::protocol::wl_surface::WlSurface,
+    ) -> WpLinuxDrmSyncobjSurfaceV1
+    where
+        D: Dispatch<WpLinuxDrmSyncobjSurfaceV1, DrmSyncobjSurfaceData> + DrmSyncobjHandler + 'static,
+    {
+        let already_exists = with_states(surface, |states| {
+            states
+                .data_map
+                .get::<RefCell<Option<WpLinuxDrmSyncobjSurfaceV1>>>()
+                .map(|v| v.borrow().is_some())
+                .unwrap_or(false)
+        });
+        assert!(
+            !already_exists,
+            "test surface already has a DRM syncobj surface object"
+        );
+
+        let commit_hook_id = compositor::add_pre_commit_hook::<D, _>(surface, commit_hook);
+        let destruction_hook_id = compositor::add_destruction_hook::<D, _>(surface, destruction_hook);
+        let syncobj_surface = client
+            .create_resource::<WpLinuxDrmSyncobjSurfaceV1, DrmSyncobjSurfaceData, D>(
+                handle,
+                1,
+                DrmSyncobjSurfaceData {
+                    surface: surface.downgrade(),
+                    commit_hook_id,
+                    destruction_hook_id,
+                },
+            )
+            .expect("create test DRM syncobj surface resource");
+        with_states(surface, |states| {
+            let syncobj_surface_cell = states
+                .data_map
+                .get_or_insert(|| RefCell::new(None::<WpLinuxDrmSyncobjSurfaceV1>));
+            *syncobj_surface_cell.borrow_mut() = Some(syncobj_surface.clone());
+        });
+
+        syncobj_surface
     }
 }
 
