@@ -124,6 +124,7 @@ impl DrmSyncPoint {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn invalid_for_tests(point: u64) -> io::Result<Self> {
         let timeline_fd = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)?;
         let syncobj = drm::control::from_u32(1).expect("non-zero syncobj handle");
@@ -140,6 +141,46 @@ impl DrmSyncPoint {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn invalid_timeline_pair_for_tests(
+        acquire_point: u64,
+        release_point: u64,
+    ) -> io::Result<(Self, Self)> {
+        let timeline_fd = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)?;
+        let syncobj = drm::control::from_u32(1).expect("non-zero syncobj handle");
+        let dev_ctx = Mutex::new(DrmTimelineDeviceSpecific {
+            device: WeakDrmDeviceFd::new(),
+            syncobj,
+            event_fds: Vec::new(),
+        });
+        let timeline = DrmTimeline(Arc::new(DrmTimelineInner { timeline_fd, dev_ctx }));
+
+        Ok((
+            Self {
+                timeline: timeline.clone(),
+                point: acquire_point,
+            },
+            Self {
+                timeline,
+                point: release_point,
+            },
+        ))
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn point_for_tests(&self) -> u64 {
+        self.point
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn same_timeline_for_tests(&self, other: &Self) -> bool {
+        self.timeline == other.timeline
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn timeline_pair_for_tests(
         device: &DrmDeviceFd,
         acquire_point: u64,

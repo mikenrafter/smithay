@@ -459,6 +459,12 @@ fn import_surface_commit_helper_exposes_pending_dmabuf_and_sync_to_pre_commit_ho
     let _syncobj_surface = crate::wayland::drm_syncobj::test_utils::install_surface_for_tests::<
         DmabufBufferTestState,
     >(&display_handle, &surface);
+    let (acquire_point, release_point) =
+        DrmSyncPoint::invalid_timeline_pair_for_tests(0x1_0000_0065, 0x1_0000_0066).unwrap();
+    let expected_acquire_point = acquire_point.clone();
+    let expected_release_point = release_point.clone();
+    let expected_committed_acquire_point = acquire_point.clone();
+    let expected_committed_release_point = release_point.clone();
     let observed_pre_commit = Arc::new(Mutex::new(false));
     let observed_pre_commit_hook = observed_pre_commit.clone();
     let pre_commit_dmabuf = dmabuf.clone();
@@ -482,21 +488,40 @@ fn import_surface_commit_helper_exposes_pending_dmabuf_and_sync_to_pre_commit_ho
                 assert_eq!(pending_dmabuf, &pre_commit_dmabuf);
 
                 let mut syncobj = states.cached_state.get::<DrmSyncobjCachedState>();
-                assert!(
-                    syncobj.pending().acquire_point.is_some(),
-                    "pre-commit hook should see pending acquire point"
+                let pending = syncobj.pending();
+                let acquire_point = pending
+                    .acquire_point
+                    .as_ref()
+                    .expect("pre-commit hook should see pending acquire point");
+                let release_point = pending
+                    .release_point
+                    .as_ref()
+                    .expect("pre-commit hook should see pending release point");
+                assert_eq!(
+                    acquire_point.point_for_tests(),
+                    expected_acquire_point.point_for_tests()
+                );
+                assert_eq!(
+                    release_point.point_for_tests(),
+                    expected_release_point.point_for_tests()
                 );
                 assert!(
-                    syncobj.pending().release_point.is_some(),
-                    "pre-commit hook should see pending release point"
+                    acquire_point.same_timeline_for_tests(&expected_acquire_point),
+                    "pre-commit acquire point should keep the staged timeline identity"
+                );
+                assert!(
+                    release_point.same_timeline_for_tests(&expected_release_point),
+                    "pre-commit release point should keep the staged timeline identity"
+                );
+                assert!(
+                    acquire_point.same_timeline_for_tests(release_point),
+                    "staged acquire/release points should remain on the same timeline"
                 );
             });
             *observed_pre_commit_hook.lock().unwrap() = true;
         },
     );
 
-    let acquire_point = DrmSyncPoint::invalid_for_tests(101).unwrap();
-    let release_point = DrmSyncPoint::invalid_for_tests(102).unwrap();
     crate::wayland::drm_syncobj::test_utils::set_surface_points_for_tests::<DmabufBufferTestState>(
         &display_handle,
         &surface,
@@ -517,8 +542,32 @@ fn import_surface_commit_helper_exposes_pending_dmabuf_and_sync_to_pre_commit_ho
             .buffer()
             .expect("CompositorHandler::commit should install renderer-managed buffer");
         assert_eq!(crate::wayland::dmabuf::get_dmabuf(buffer).unwrap(), &dmabuf);
-        assert!(buffer.acquire_point().is_some());
-        assert!(buffer.release_point().is_some());
+        let acquire_point = buffer
+            .acquire_point()
+            .expect("committed renderer-managed buffer should keep acquire point");
+        let release_point = buffer
+            .release_point()
+            .expect("committed renderer-managed buffer should keep release point");
+        assert_eq!(
+            acquire_point.point_for_tests(),
+            expected_committed_acquire_point.point_for_tests()
+        );
+        assert_eq!(
+            release_point.point_for_tests(),
+            expected_committed_release_point.point_for_tests()
+        );
+        assert!(
+            acquire_point.same_timeline_for_tests(&expected_committed_acquire_point),
+            "committed acquire point should keep the staged timeline identity"
+        );
+        assert!(
+            release_point.same_timeline_for_tests(&expected_committed_release_point),
+            "committed release point should keep the staged timeline identity"
+        );
+        assert!(
+            acquire_point.same_timeline_for_tests(&release_point),
+            "committed acquire/release points should remain on the same timeline"
+        );
     })
     .expect("CompositorHandler::commit should create renderer surface state");
 }
