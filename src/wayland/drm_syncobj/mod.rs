@@ -710,7 +710,7 @@ mod tests {
         wp_linux_drm_syncobj_manager_v1, wp_linux_drm_syncobj_surface_v1,
     };
     use wayland_server::{
-        Display, DisplayHandle,
+        Display, DisplayHandle, Resource,
         backend::{ClientData, ClientId, DisconnectReason, InitError},
     };
 
@@ -823,12 +823,22 @@ mod tests {
     }
 
     fn syncobj_surface_marker_is_some(surface: &wayland_server::protocol::wl_surface::WlSurface) -> bool {
+        syncobj_surface_marker_protocol_id(surface).is_some()
+    }
+
+    fn syncobj_surface_marker_protocol_id(
+        surface: &wayland_server::protocol::wl_surface::WlSurface,
+    ) -> Option<u32> {
         compositor::with_states(surface, |states| {
             states
                 .data_map
                 .get::<RefCell<Option<WpLinuxDrmSyncobjSurfaceV1>>>()
-                .map(|resource| resource.borrow().is_some())
-                .unwrap_or(false)
+                .and_then(|resource| {
+                    resource
+                        .borrow()
+                        .as_ref()
+                        .map(|resource| resource.id().protocol_id())
+                })
         })
     }
 
@@ -949,7 +959,6 @@ mod tests {
             syncobj_surface_marker_is_some(&server_surface),
             "initial get_surface should install server syncobj surface marker"
         );
-
         client_state
             .syncobj_surface
             .take()
@@ -975,6 +984,105 @@ mod tests {
         assert!(
             syncobj_surface_marker_is_some(&server_surface),
             "second get_surface should reinstall server syncobj surface marker"
+        );
+    }
+
+    #[test]
+    fn duplicate_get_surface_reports_protocol_error_without_replacing_marker() {
+        let mut display = match Display::<ProtocolServerState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let mut display_handle: DisplayHandle = display.handle();
+        let compositor_state = compositor::CompositorState::new::<ProtocolServerState>(&display_handle);
+        let syncobj_state =
+            DrmSyncobjState::new_without_import_device_for_tests::<ProtocolServerState>(&display_handle);
+        let mut server_state = ProtocolServerState {
+            compositor_state,
+            syncobj_state: Some(syncobj_state),
+            surfaces: Vec::new(),
+        };
+        let (client_side, server_side) = UnixStream::pair().unwrap();
+        let _server_client = display_handle
+            .insert_client(server_side, Arc::new(ProtocolClientData::default()))
+            .expect("insert test client");
+
+        let client_connection = Connection::from_socket(client_side).expect("connect test client socket");
+        let mut event_queue = client_connection.new_event_queue();
+        let qh = event_queue.handle();
+        let mut client_state = ProtocolClientState::default();
+
+        client_connection.display().get_registry(&qh, ());
+        client_connection.flush().expect("flush get_registry");
+        pump_server(&mut display, &mut server_state);
+        event_queue
+            .blocking_dispatch(&mut client_state)
+            .expect("dispatch registry globals");
+
+        let compositor = client_state
+            .compositor
+            .as_ref()
+            .expect("test compositor global should be advertised");
+        let syncobj_manager = client_state
+            .syncobj_manager
+            .as_ref()
+            .expect("test syncobj global should be advertised")
+            .clone();
+        let surface = compositor.create_surface(&qh, ());
+        let syncobj_surface = syncobj_manager.get_surface(&surface, &qh, ());
+        client_state.surface = Some(surface);
+        client_state.syncobj_surface = Some(syncobj_surface);
+        client_connection
+            .flush()
+            .expect("flush initial get_surface request");
+        pump_server(&mut display, &mut server_state);
+
+        let server_surface = server_state
+            .surfaces
+            .first()
+            .expect("client create_surface should reach server state")
+            .clone();
+        assert!(
+            syncobj_surface_marker_is_some(&server_surface),
+            "initial get_surface should install server syncobj surface marker"
+        );
+        let original_marker_id = syncobj_surface_marker_protocol_id(&server_surface)
+            .expect("initial get_surface should install server syncobj surface marker");
+
+        let surface = client_state
+            .surface
+            .as_ref()
+            .expect("test wl_surface should remain live");
+        let duplicate_syncobj_surface = syncobj_manager.get_surface(surface, &qh, ());
+        client_state.syncobj_surface = Some(duplicate_syncobj_surface);
+        client_connection
+            .flush()
+            .expect("flush duplicate get_surface request");
+        pump_server(&mut display, &mut server_state);
+
+        let protocol_error = if let Some(guard) = event_queue.prepare_read() {
+            let _ = guard.read();
+            let _ = event_queue.dispatch_pending(&mut client_state);
+            client_connection.protocol_error()
+        } else {
+            let _ = event_queue.dispatch_pending(&mut client_state);
+            client_connection.protocol_error()
+        }
+        .expect("duplicate get_surface should disconnect the client with a protocol error");
+        assert_eq!(protocol_error.object_interface, "wp_linux_drm_syncobj_manager_v1");
+        assert_eq!(
+            protocol_error.code, 0,
+            "surface_exists is error code 0 in linux-drm-syncobj-v1"
+        );
+        assert!(
+            syncobj_surface_marker_is_some(&server_surface),
+            "duplicate get_surface must not clear or replace the existing marker"
+        );
+        assert_eq!(
+            syncobj_surface_marker_protocol_id(&server_surface),
+            Some(original_marker_id),
+            "duplicate get_surface must preserve the original marker resource"
         );
     }
 }
