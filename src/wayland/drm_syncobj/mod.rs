@@ -431,19 +431,157 @@ where
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use std::cell::RefCell;
+    use std::{
+        cell::RefCell,
+        os::fd::{AsFd, OwnedFd},
+        os::unix::net::UnixStream,
+        sync::{Arc, Weak},
+    };
 
+    use wayland_client::{
+        Connection, Dispatch as ClientDispatch, QueueHandle, delegate_noop, protocol::wl_registry,
+    };
+    use wayland_protocols::wp::linux_drm_syncobj::v1::client::{
+        wp_linux_drm_syncobj_manager_v1, wp_linux_drm_syncobj_timeline_v1,
+    };
     use wayland_protocols::wp::linux_drm_syncobj::v1::server::{
         wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
         wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1,
     };
-    use wayland_server::{Client, Dispatch, DisplayHandle, Resource};
+    use wayland_server::{
+        Client, Dispatch as ServerDispatch, Display, DisplayHandle, Resource,
+        backend::{ClientData, ClientId, DisconnectReason, InitError},
+    };
 
     use super::{
-        DrmSyncPoint, DrmSyncobjHandler, DrmSyncobjSurfaceData, DrmSyncobjTimelineData, PendingSyncPointKind,
-        commit_hook, destruction_hook, set_pending_sync_point_from_timeline_resource,
+        DrmSyncPoint, DrmSyncobjHandler, DrmSyncobjState, DrmSyncobjSurfaceData, DrmSyncobjTimelineData,
+        PendingSyncPointKind, commit_hook, destruction_hook, set_pending_sync_point_from_timeline_resource,
     };
+    use crate::backend::drm::DrmDeviceFd;
     use crate::wayland::compositor::{self, with_states};
+
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    pub(crate) struct ClientTimelineImportEvidence {
+        pub(crate) known_timeline_count: usize,
+    }
+
+    #[derive(Default)]
+    struct TimelineProtocolClientData;
+
+    impl ClientData for TimelineProtocolClientData {
+        fn initialized(&self, _client_id: ClientId) {}
+
+        fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+    }
+
+    struct TimelineProtocolServerState {
+        syncobj_state: Option<DrmSyncobjState>,
+    }
+
+    impl DrmSyncobjHandler for TimelineProtocolServerState {
+        fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+            self.syncobj_state.as_mut()
+        }
+    }
+
+    crate::delegate_dispatch2!(TimelineProtocolServerState);
+
+    #[derive(Default)]
+    struct TimelineProtocolClientState {
+        syncobj_manager: Option<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1>,
+        timeline: Option<wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1>,
+    }
+
+    impl ClientDispatch<wl_registry::WlRegistry, ()> for TimelineProtocolClientState {
+        fn event(
+            state: &mut Self,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global { name, interface, .. } = event {
+                if interface.as_str() == "wp_linux_drm_syncobj_manager_v1" {
+                    state.syncobj_manager = Some(
+                        registry.bind::<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1, _, _>(
+                            name,
+                            1,
+                            qh,
+                            (),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    delegate_noop!(TimelineProtocolClientState: ignore wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1);
+    delegate_noop!(TimelineProtocolClientState: ignore wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1);
+
+    fn pump_timeline_protocol_server(
+        display: &mut Display<TimelineProtocolServerState>,
+        state: &mut TimelineProtocolServerState,
+    ) {
+        display
+            .dispatch_clients(state)
+            .expect("dispatch test client requests");
+        display.flush_clients().expect("flush test server events");
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn import_timeline_through_client_for_tests(
+        import_device: DrmDeviceFd,
+        timeline_fd: OwnedFd,
+    ) -> Option<ClientTimelineImportEvidence> {
+        let mut display = match Display::<TimelineProtocolServerState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return None,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let mut display_handle = display.handle();
+        let syncobj_state =
+            DrmSyncobjState::new::<TimelineProtocolServerState>(&display_handle, import_device);
+        let mut server_state = TimelineProtocolServerState {
+            syncobj_state: Some(syncobj_state),
+        };
+        let (client_side, server_side) = UnixStream::pair().unwrap();
+        let _server_client = display_handle
+            .insert_client(server_side, Arc::new(TimelineProtocolClientData))
+            .expect("insert test client");
+
+        let client_connection = Connection::from_socket(client_side).expect("connect test client socket");
+        let mut event_queue = client_connection.new_event_queue();
+        let qh = event_queue.handle();
+        let mut client_state = TimelineProtocolClientState::default();
+
+        client_connection.display().get_registry(&qh, ());
+        client_connection.flush().expect("flush get_registry");
+        pump_timeline_protocol_server(&mut display, &mut server_state);
+        event_queue
+            .blocking_dispatch(&mut client_state)
+            .expect("dispatch registry globals");
+
+        let syncobj_manager = client_state
+            .syncobj_manager
+            .as_ref()
+            .expect("test syncobj global should be advertised");
+        let timeline = syncobj_manager.import_timeline(timeline_fd.as_fd(), &qh, ());
+        client_state.timeline = Some(timeline);
+        client_connection.flush().expect("flush import_timeline request");
+        pump_timeline_protocol_server(&mut display, &mut server_state);
+
+        let known_timeline_count = server_state
+            .syncobj_state
+            .as_ref()
+            .expect("test syncobj state should remain installed")
+            .known_timelines
+            .iter()
+            .filter_map(Weak::upgrade)
+            .count();
+        Some(ClientTimelineImportEvidence { known_timeline_count })
+    }
 
     /// Install a server-side DRM syncobj surface object for a focused test surface.
     ///
@@ -457,7 +595,7 @@ pub(crate) mod test_utils {
         surface: &wayland_server::protocol::wl_surface::WlSurface,
     ) -> WpLinuxDrmSyncobjSurfaceV1
     where
-        D: Dispatch<WpLinuxDrmSyncobjSurfaceV1, DrmSyncobjSurfaceData> + DrmSyncobjHandler + 'static,
+        D: ServerDispatch<WpLinuxDrmSyncobjSurfaceV1, DrmSyncobjSurfaceData> + DrmSyncobjHandler + 'static,
     {
         let already_exists = with_states(surface, |states| {
             states
@@ -503,7 +641,7 @@ pub(crate) mod test_utils {
         point: &DrmSyncPoint,
     ) -> WpLinuxDrmSyncobjTimelineV1
     where
-        D: Dispatch<WpLinuxDrmSyncobjTimelineV1, DrmSyncobjTimelineData> + 'static,
+        D: ServerDispatch<WpLinuxDrmSyncobjTimelineV1, DrmSyncobjTimelineData> + 'static,
     {
         client
             .create_resource::<WpLinuxDrmSyncobjTimelineV1, DrmSyncobjTimelineData, D>(
@@ -533,7 +671,7 @@ pub(crate) mod test_utils {
         acquire_point: &DrmSyncPoint,
         release_point: &DrmSyncPoint,
     ) where
-        D: Dispatch<WpLinuxDrmSyncobjTimelineV1, DrmSyncobjTimelineData> + 'static,
+        D: ServerDispatch<WpLinuxDrmSyncobjTimelineV1, DrmSyncobjTimelineData> + 'static,
     {
         let has_syncobj_surface = with_states(surface, |states| {
             states

@@ -47,6 +47,8 @@ use crate::wayland::{
     drm_syncobj::{DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState},
 };
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+use drm::control::Device as _;
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use rustix::fs::{Mode, OFlags};
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use wayland_server::{
@@ -3933,6 +3935,24 @@ fn runtime_drm_syncobj_device_for_tests(
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+fn runtime_syncobj_timeline_fd_for_tests(device: &DrmDeviceFd) -> Result<OwnedFd, String> {
+    let syncobj = device
+        .create_syncobj(false)
+        .map_err(|err| format!("create syncobj: {err}"))?;
+    let timeline_fd = match device.syncobj_to_fd(syncobj, false) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let _ = device.destroy_syncobj(syncobj);
+            return Err(format!("export syncobj fd: {err}"));
+        }
+    };
+    device
+        .destroy_syncobj(syncobj)
+        .map_err(|err| format!("destroy exported source syncobj: {err}"))?;
+    Ok(timeline_fd)
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device and DRM syncobj"]
 fn runtime_drm_syncobj_imports_exported_sync_file_to_timeline_point() {
@@ -3981,6 +4001,64 @@ fn runtime_drm_syncobj_imports_exported_sync_file_to_timeline_point() {
             .wait(1_000_000_000)
             .expect("destination DRM timeline point should wait after sync-file import");
         assert!(destination_point.is_signaled());
+        return;
+    }
+
+    if setup_errors.is_empty() {
+        eprintln!("skipping {test_name}: no Vulkan physical device exposed a usable DRM node");
+    } else {
+        eprintln!("skipping {test_name}: {}", setup_errors.join("; "));
+    }
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device, DRM syncobj and Wayland test display"]
+fn runtime_drm_syncobj_import_timeline_protocol_installs_server_timeline() {
+    let test_name = "DRM syncobj client import_timeline protocol test";
+    let instance = match Instance::new(Version::VERSION_1_3, None) {
+        Ok(instance) => instance,
+        Err(err) => {
+            eprintln!("skipping {test_name}: failed to create instance: {err:?}");
+            return;
+        }
+    };
+
+    let devices = match PhysicalDevice::enumerate(&instance) {
+        Ok(devices) => devices,
+        Err(err) => {
+            eprintln!("skipping {test_name}: failed to enumerate devices: {err:?}");
+            return;
+        }
+    };
+
+    let mut setup_errors = Vec::new();
+    for physical_device in devices {
+        let Some(drm_device) = runtime_drm_syncobj_device_for_tests(&physical_device, test_name) else {
+            continue;
+        };
+
+        let timeline_fd = match runtime_syncobj_timeline_fd_for_tests(&drm_device) {
+            Ok(fd) => fd,
+            Err(err) => {
+                setup_errors.push(format!("{} syncobj timeline fd: {err}", physical_device.name()));
+                continue;
+            }
+        };
+
+        let Some(evidence) =
+            crate::wayland::drm_syncobj::test_utils::import_timeline_through_client_for_tests(
+                drm_device,
+                timeline_fd,
+            )
+        else {
+            eprintln!("skipping {test_name}: failed to create Wayland test display");
+            return;
+        };
+        assert_eq!(
+            evidence.known_timeline_count, 1,
+            "client import_timeline should install exactly one live server timeline"
+        );
         return;
     }
 
