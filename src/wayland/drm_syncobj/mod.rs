@@ -439,10 +439,11 @@ pub(crate) mod test_utils {
     };
 
     use wayland_client::{
-        Connection, Dispatch as ClientDispatch, QueueHandle, delegate_noop, protocol::wl_registry,
+        Connection, Dispatch as ClientDispatch, QueueHandle, delegate_noop,
+        protocol::{wl_compositor, wl_registry, wl_surface},
     };
     use wayland_protocols::wp::linux_drm_syncobj::v1::client::{
-        wp_linux_drm_syncobj_manager_v1, wp_linux_drm_syncobj_timeline_v1,
+        wp_linux_drm_syncobj_manager_v1, wp_linux_drm_syncobj_surface_v1, wp_linux_drm_syncobj_timeline_v1,
     };
     use wayland_protocols::wp::linux_drm_syncobj::v1::server::{
         wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1,
@@ -454,8 +455,9 @@ pub(crate) mod test_utils {
     };
 
     use super::{
-        DrmSyncPoint, DrmSyncobjHandler, DrmSyncobjState, DrmSyncobjSurfaceData, DrmSyncobjTimelineData,
-        PendingSyncPointKind, commit_hook, destruction_hook, set_pending_sync_point_from_timeline_resource,
+        DrmSyncPoint, DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState, DrmSyncobjSurfaceData,
+        DrmSyncobjTimelineData, PendingSyncPointKind, commit_hook, destruction_hook,
+        set_pending_sync_point_from_timeline_resource,
     };
     use crate::backend::drm::DrmDeviceFd;
     use crate::wayland::compositor::{self, with_states};
@@ -464,6 +466,15 @@ pub(crate) mod test_utils {
     #[allow(dead_code)]
     pub(crate) struct ClientTimelineImportEvidence {
         pub(crate) known_timeline_count: usize,
+    }
+
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    pub(crate) struct ClientSurfacePointEvidence {
+        pub(crate) known_timeline_count: usize,
+        pub(crate) acquire_point: u64,
+        pub(crate) release_point: u64,
+        pub(crate) acquire_release_same_timeline: bool,
     }
 
     #[derive(Default)]
@@ -519,6 +530,106 @@ pub(crate) mod test_utils {
 
     delegate_noop!(TimelineProtocolClientState: ignore wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1);
     delegate_noop!(TimelineProtocolClientState: ignore wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1);
+
+    #[derive(Default)]
+    struct SurfacePointProtocolClientData {
+        compositor_state: compositor::CompositorClientState,
+    }
+
+    impl ClientData for SurfacePointProtocolClientData {
+        fn initialized(&self, _client_id: ClientId) {}
+
+        fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+    }
+
+    struct SurfacePointProtocolServerState {
+        compositor_state: compositor::CompositorState,
+        syncobj_state: Option<DrmSyncobjState>,
+        surfaces: Vec<wayland_server::protocol::wl_surface::WlSurface>,
+    }
+
+    impl compositor::CompositorHandler for SurfacePointProtocolServerState {
+        fn compositor_state(&mut self) -> &mut compositor::CompositorState {
+            &mut self.compositor_state
+        }
+
+        fn client_compositor_state<'a>(
+            &self,
+            client: &'a wayland_server::Client,
+        ) -> &'a compositor::CompositorClientState {
+            &client
+                .get_data::<SurfacePointProtocolClientData>()
+                .expect("test client should carry compositor state")
+                .compositor_state
+        }
+
+        fn new_surface(&mut self, surface: &wayland_server::protocol::wl_surface::WlSurface) {
+            self.surfaces.push(surface.clone());
+        }
+
+        fn commit(&mut self, _surface: &wayland_server::protocol::wl_surface::WlSurface) {}
+    }
+
+    impl DrmSyncobjHandler for SurfacePointProtocolServerState {
+        fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+            self.syncobj_state.as_mut()
+        }
+    }
+
+    impl AsMut<compositor::CompositorState> for SurfacePointProtocolServerState {
+        fn as_mut(&mut self) -> &mut compositor::CompositorState {
+            &mut self.compositor_state
+        }
+    }
+
+    crate::delegate_dispatch2!(SurfacePointProtocolServerState);
+
+    #[derive(Default)]
+    struct SurfacePointProtocolClientState {
+        compositor: Option<wl_compositor::WlCompositor>,
+        syncobj_manager: Option<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1>,
+        surface: Option<wl_surface::WlSurface>,
+        syncobj_surface: Option<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1>,
+        timeline: Option<wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1>,
+    }
+
+    impl ClientDispatch<wl_registry::WlRegistry, ()> for SurfacePointProtocolClientState {
+        fn event(
+            state: &mut Self,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global { name, interface, .. } = event {
+                match interface.as_str() {
+                    "wl_compositor" => {
+                        state.compositor =
+                            Some(registry.bind::<wl_compositor::WlCompositor, _, _>(name, 1, qh, ()))
+                    }
+                    "wp_linux_drm_syncobj_manager_v1" => {
+                        state.syncobj_manager = Some(
+                            registry
+                                .bind::<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1, _, _>(
+                                    name,
+                                    1,
+                                    qh,
+                                    (),
+                                ),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    delegate_noop!(SurfacePointProtocolClientState: ignore wl_compositor::WlCompositor);
+    delegate_noop!(SurfacePointProtocolClientState: ignore wl_surface::WlSurface);
+    delegate_noop!(SurfacePointProtocolClientState: ignore wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1);
+    delegate_noop!(SurfacePointProtocolClientState: ignore wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1);
+    delegate_noop!(SurfacePointProtocolClientState: ignore wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1);
 
     fn pump_timeline_protocol_server(
         display: &mut Display<TimelineProtocolServerState>,
@@ -581,6 +692,113 @@ pub(crate) mod test_utils {
             .filter_map(Weak::upgrade)
             .count();
         Some(ClientTimelineImportEvidence { known_timeline_count })
+    }
+
+    fn pump_surface_point_protocol_server(
+        display: &mut Display<SurfacePointProtocolServerState>,
+        state: &mut SurfacePointProtocolServerState,
+    ) {
+        display
+            .dispatch_clients(state)
+            .expect("dispatch test client requests");
+        display.flush_clients().expect("flush test server events");
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn import_timeline_and_set_surface_points_through_client_for_tests(
+        import_device: DrmDeviceFd,
+        timeline_fd: OwnedFd,
+        acquire_point: u64,
+        release_point: u64,
+    ) -> Option<ClientSurfacePointEvidence> {
+        let mut display = match Display::<SurfacePointProtocolServerState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return None,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let mut display_handle = display.handle();
+        let compositor_state =
+            compositor::CompositorState::new::<SurfacePointProtocolServerState>(&display_handle);
+        let syncobj_state =
+            DrmSyncobjState::new::<SurfacePointProtocolServerState>(&display_handle, import_device);
+        let mut server_state = SurfacePointProtocolServerState {
+            compositor_state,
+            syncobj_state: Some(syncobj_state),
+            surfaces: Vec::new(),
+        };
+        let (client_side, server_side) = UnixStream::pair().unwrap();
+        let _server_client = display_handle
+            .insert_client(server_side, Arc::new(SurfacePointProtocolClientData::default()))
+            .expect("insert test client");
+
+        let client_connection = Connection::from_socket(client_side).expect("connect test client socket");
+        let mut event_queue = client_connection.new_event_queue();
+        let qh = event_queue.handle();
+        let mut client_state = SurfacePointProtocolClientState::default();
+
+        client_connection.display().get_registry(&qh, ());
+        client_connection.flush().expect("flush get_registry");
+        pump_surface_point_protocol_server(&mut display, &mut server_state);
+        event_queue
+            .blocking_dispatch(&mut client_state)
+            .expect("dispatch registry globals");
+
+        let compositor = client_state
+            .compositor
+            .as_ref()
+            .expect("test compositor global should be advertised");
+        let syncobj_manager = client_state
+            .syncobj_manager
+            .as_ref()
+            .expect("test syncobj global should be advertised");
+        let surface = compositor.create_surface(&qh, ());
+        let syncobj_surface = syncobj_manager.get_surface(&surface, &qh, ());
+        let timeline = syncobj_manager.import_timeline(timeline_fd.as_fd(), &qh, ());
+        let (acquire_hi, acquire_lo) = (((acquire_point >> 32) as u32), acquire_point as u32);
+        let (release_hi, release_lo) = (((release_point >> 32) as u32), release_point as u32);
+        syncobj_surface.set_acquire_point(&timeline, acquire_hi, acquire_lo);
+        syncobj_surface.set_release_point(&timeline, release_hi, release_lo);
+        client_state.surface = Some(surface);
+        client_state.syncobj_surface = Some(syncobj_surface);
+        client_state.timeline = Some(timeline);
+        client_connection
+            .flush()
+            .expect("flush syncobj surface point requests");
+        pump_surface_point_protocol_server(&mut display, &mut server_state);
+
+        let server_surface = server_state
+            .surfaces
+            .first()
+            .expect("client create_surface should reach server state");
+        let (staged_acquire_point, staged_release_point, acquire_release_same_timeline) =
+            with_states(server_surface, |states| {
+                let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+                let pending = cached.pending();
+                let acquire = pending
+                    .acquire_point
+                    .as_ref()
+                    .expect("set_acquire_point should stage a pending acquire point");
+                let release = pending
+                    .release_point
+                    .as_ref()
+                    .expect("set_release_point should stage a pending release point");
+                (acquire.point, release.point, acquire.timeline == release.timeline)
+            });
+        let known_timeline_count = server_state
+            .syncobj_state
+            .as_ref()
+            .expect("test syncobj state should remain installed")
+            .known_timelines
+            .iter()
+            .filter_map(Weak::upgrade)
+            .count();
+
+        Some(ClientSurfacePointEvidence {
+            known_timeline_count,
+            acquire_point: staged_acquire_point,
+            release_point: staged_release_point,
+            acquire_release_same_timeline,
+        })
     }
 
     /// Install a server-side DRM syncobj surface object for a focused test surface.

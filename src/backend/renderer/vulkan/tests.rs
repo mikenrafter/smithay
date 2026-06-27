@@ -4069,6 +4069,80 @@ fn runtime_drm_syncobj_import_timeline_protocol_installs_server_timeline() {
     }
 }
 
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device, DRM syncobj and Wayland test display"]
+fn runtime_drm_syncobj_surface_point_protocol_stages_pending_points() {
+    let test_name = "DRM syncobj client surface point protocol test";
+    let instance = match Instance::new(Version::VERSION_1_3, None) {
+        Ok(instance) => instance,
+        Err(err) => {
+            eprintln!("skipping {test_name}: failed to create instance: {err:?}");
+            return;
+        }
+    };
+
+    let devices = match PhysicalDevice::enumerate(&instance) {
+        Ok(devices) => devices,
+        Err(err) => {
+            eprintln!("skipping {test_name}: failed to enumerate devices: {err:?}");
+            return;
+        }
+    };
+
+    let acquire_point = 0x1_0000_0021;
+    let release_point = 0x2_0000_0042;
+    let mut setup_errors = Vec::new();
+    for physical_device in devices {
+        let Some(drm_device) = runtime_drm_syncobj_device_for_tests(&physical_device, test_name) else {
+            continue;
+        };
+
+        let timeline_fd = match runtime_syncobj_timeline_fd_for_tests(&drm_device) {
+            Ok(fd) => fd,
+            Err(err) => {
+                setup_errors.push(format!("{} syncobj timeline fd: {err}", physical_device.name()));
+                continue;
+            }
+        };
+
+        let Some(evidence) =
+            crate::wayland::drm_syncobj::test_utils::import_timeline_and_set_surface_points_through_client_for_tests(
+                drm_device,
+                timeline_fd,
+                acquire_point,
+                release_point,
+            )
+        else {
+            eprintln!("skipping {test_name}: failed to create Wayland test display");
+            return;
+        };
+        assert_eq!(
+            evidence.known_timeline_count, 1,
+            "client import_timeline should install exactly one live server timeline"
+        );
+        assert_eq!(
+            evidence.acquire_point, acquire_point,
+            "set_acquire_point should stage the exact 64-bit acquire value"
+        );
+        assert_eq!(
+            evidence.release_point, release_point,
+            "set_release_point should stage the exact 64-bit release value"
+        );
+        assert!(
+            evidence.acquire_release_same_timeline,
+            "acquire/release points should reference the same imported timeline"
+        );
+        return;
+    }
+
+    if setup_errors.is_empty() {
+        eprintln!("skipping {test_name}: no Vulkan physical device exposed a usable DRM node");
+    } else {
+        eprintln!("skipping {test_name}: {}", setup_errors.join("; "));
+    }
+}
+
 fn runtime_dmabuf_loopback_candidate(test_name: &str) -> Option<RuntimeDmabufLoopbackCandidate> {
     let instance = match Instance::new(Version::VERSION_1_3, None) {
         Ok(instance) => instance,
