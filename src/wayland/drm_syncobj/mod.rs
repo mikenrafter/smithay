@@ -700,14 +700,14 @@ impl<D: DrmSyncobjHandler> Dispatch2<WpLinuxDrmSyncobjTimelineV1, D> for DrmSync
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::net::UnixStream, sync::Arc};
+    use std::{os::fd::AsFd, os::unix::net::UnixStream, sync::Arc};
 
     use wayland_client::{
         Connection, Dispatch, QueueHandle, delegate_noop,
         protocol::{wl_compositor, wl_registry, wl_surface},
     };
     use wayland_protocols::wp::linux_drm_syncobj::v1::client::{
-        wp_linux_drm_syncobj_manager_v1, wp_linux_drm_syncobj_surface_v1,
+        wp_linux_drm_syncobj_manager_v1, wp_linux_drm_syncobj_surface_v1, wp_linux_drm_syncobj_timeline_v1,
     };
     use wayland_server::{
         Display, DisplayHandle, Resource,
@@ -776,6 +776,7 @@ mod tests {
         syncobj_manager: Option<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1>,
         surface: Option<wl_surface::WlSurface>,
         syncobj_surface: Option<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1>,
+        timeline: Option<wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1>,
     }
 
     impl Dispatch<wl_registry::WlRegistry, ()> for ProtocolClientState {
@@ -814,6 +815,7 @@ mod tests {
     delegate_noop!(ProtocolClientState: ignore wl_surface::WlSurface);
     delegate_noop!(ProtocolClientState: ignore wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1);
     delegate_noop!(ProtocolClientState: ignore wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1);
+    delegate_noop!(ProtocolClientState: ignore wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1);
 
     fn pump_server(display: &mut Display<ProtocolServerState>, state: &mut ProtocolServerState) {
         display
@@ -840,6 +842,23 @@ mod tests {
                         .map(|resource| resource.id().protocol_id())
                 })
         })
+    }
+
+    fn read_protocol_error_after_server_pump(
+        event_queue: &mut wayland_client::EventQueue<ProtocolClientState>,
+        client_connection: &Connection,
+        client_state: &mut ProtocolClientState,
+    ) -> (String, u32) {
+        let protocol_error = if let Some(guard) = event_queue.prepare_read() {
+            let _ = guard.read();
+            let _ = event_queue.dispatch_pending(client_state);
+            client_connection.protocol_error()
+        } else {
+            let _ = event_queue.dispatch_pending(client_state);
+            client_connection.protocol_error()
+        }
+        .expect("client request should disconnect with a protocol error");
+        (protocol_error.object_interface, protocol_error.code)
     }
 
     #[test]
@@ -1061,18 +1080,11 @@ mod tests {
             .expect("flush duplicate get_surface request");
         pump_server(&mut display, &mut server_state);
 
-        let protocol_error = if let Some(guard) = event_queue.prepare_read() {
-            let _ = guard.read();
-            let _ = event_queue.dispatch_pending(&mut client_state);
-            client_connection.protocol_error()
-        } else {
-            let _ = event_queue.dispatch_pending(&mut client_state);
-            client_connection.protocol_error()
-        }
-        .expect("duplicate get_surface should disconnect the client with a protocol error");
-        assert_eq!(protocol_error.object_interface, "wp_linux_drm_syncobj_manager_v1");
+        let protocol_error =
+            read_protocol_error_after_server_pump(&mut event_queue, &client_connection, &mut client_state);
+        assert_eq!(protocol_error.0, "wp_linux_drm_syncobj_manager_v1");
         assert_eq!(
-            protocol_error.code, 0,
+            protocol_error.1, 0,
             "surface_exists is error code 0 in linux-drm-syncobj-v1"
         );
         assert!(
@@ -1083,6 +1095,68 @@ mod tests {
             syncobj_surface_marker_protocol_id(&server_surface),
             Some(original_marker_id),
             "duplicate get_surface must preserve the original marker resource"
+        );
+    }
+
+    #[test]
+    fn import_timeline_without_import_device_reports_invalid_timeline() {
+        let mut display = match Display::<ProtocolServerState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let mut display_handle: DisplayHandle = display.handle();
+        let compositor_state = compositor::CompositorState::new::<ProtocolServerState>(&display_handle);
+        let syncobj_state =
+            DrmSyncobjState::new_without_import_device_for_tests::<ProtocolServerState>(&display_handle);
+        let mut server_state = ProtocolServerState {
+            compositor_state,
+            syncobj_state: Some(syncobj_state),
+            surfaces: Vec::new(),
+        };
+        let (client_side, server_side) = UnixStream::pair().unwrap();
+        let _server_client = display_handle
+            .insert_client(server_side, Arc::new(ProtocolClientData::default()))
+            .expect("insert test client");
+
+        let client_connection = Connection::from_socket(client_side).expect("connect test client socket");
+        let mut event_queue = client_connection.new_event_queue();
+        let qh = event_queue.handle();
+        let mut client_state = ProtocolClientState::default();
+
+        client_connection.display().get_registry(&qh, ());
+        client_connection.flush().expect("flush get_registry");
+        pump_server(&mut display, &mut server_state);
+        event_queue
+            .blocking_dispatch(&mut client_state)
+            .expect("dispatch registry globals");
+
+        let syncobj_manager = client_state
+            .syncobj_manager
+            .as_ref()
+            .expect("test syncobj global should be advertised");
+        let timeline_fd = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
+            .expect("create test non-syncobj fd");
+        let timeline = syncobj_manager.import_timeline(timeline_fd.as_fd(), &qh, ());
+        client_state.timeline = Some(timeline);
+        client_connection.flush().expect("flush import_timeline request");
+        pump_server(&mut display, &mut server_state);
+
+        let protocol_error =
+            read_protocol_error_after_server_pump(&mut event_queue, &client_connection, &mut client_state);
+        assert_eq!(protocol_error.0, "wp_linux_drm_syncobj_manager_v1");
+        assert_eq!(
+            protocol_error.1, 1,
+            "invalid_timeline is error code 1 in linux-drm-syncobj-v1"
+        );
+        assert!(
+            server_state
+                .syncobj_state
+                .as_ref()
+                .expect("test syncobj state should remain installed")
+                .known_timelines
+                .is_empty(),
+            "failed import_timeline must not install a server timeline"
         );
     }
 }
