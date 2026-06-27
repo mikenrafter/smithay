@@ -4143,6 +4143,80 @@ fn runtime_drm_syncobj_surface_point_protocol_stages_pending_points() {
     }
 }
 
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device, DRM syncobj and Wayland test display"]
+fn runtime_drm_syncobj_surface_commit_without_buffer_reports_no_buffer() {
+    let test_name = "DRM syncobj client no-buffer commit protocol test";
+    let instance = match Instance::new(Version::VERSION_1_3, None) {
+        Ok(instance) => instance,
+        Err(err) => {
+            eprintln!("skipping {test_name}: failed to create instance: {err:?}");
+            return;
+        }
+    };
+
+    let devices = match PhysicalDevice::enumerate(&instance) {
+        Ok(devices) => devices,
+        Err(err) => {
+            eprintln!("skipping {test_name}: failed to enumerate devices: {err:?}");
+            return;
+        }
+    };
+
+    let acquire_point = 0x1_0000_0100;
+    let release_point = 0x1_0000_0101;
+    let mut setup_errors = Vec::new();
+    for physical_device in devices {
+        let Some(drm_device) = runtime_drm_syncobj_device_for_tests(&physical_device, test_name) else {
+            continue;
+        };
+
+        let timeline_fd = match runtime_syncobj_timeline_fd_for_tests(&drm_device) {
+            Ok(fd) => fd,
+            Err(err) => {
+                setup_errors.push(format!("{} syncobj timeline fd: {err}", physical_device.name()));
+                continue;
+            }
+        };
+
+        let Some(protocol_error) =
+            crate::wayland::drm_syncobj::test_utils::commit_surface_points_without_buffer_through_client_for_tests(
+                drm_device,
+                timeline_fd,
+                acquire_point,
+                release_point,
+            )
+        else {
+            eprintln!("skipping {test_name}: failed to create Wayland test display");
+            return;
+        };
+        assert_eq!(
+            protocol_error.object_interface, "wp_linux_drm_syncobj_surface_v1",
+            "no-buffer commit guard should report on the syncobj surface resource"
+        );
+        assert_eq!(
+            protocol_error.code, 3,
+            "no_buffer is error code 3 in linux-drm-syncobj-v1"
+        );
+        assert!(
+            !protocol_error.current_acquire_point_present,
+            "no-buffer commit must not promote the acquire point into current state"
+        );
+        assert!(
+            !protocol_error.current_release_point_present,
+            "no-buffer commit must not promote the release point into current state"
+        );
+        return;
+    }
+
+    if setup_errors.is_empty() {
+        eprintln!("skipping {test_name}: no Vulkan physical device exposed a usable DRM node");
+    } else {
+        eprintln!("skipping {test_name}: {}", setup_errors.join("; "));
+    }
+}
+
 fn runtime_dmabuf_loopback_candidate(test_name: &str) -> Option<RuntimeDmabufLoopbackCandidate> {
     let instance = match Instance::new(Version::VERSION_1_3, None) {
         Ok(instance) => instance,

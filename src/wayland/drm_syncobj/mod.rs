@@ -98,6 +98,26 @@ pub struct DrmSyncobjCachedState {
     pub release_point: Option<DrmSyncPoint>,
 }
 
+fn discard_invalid_pending_sync_points(pending: &mut DrmSyncobjCachedState) {
+    pending.acquire_point = None;
+    if let Some(release_point) = pending.release_point.take() {
+        if let Err(err) = release_point.signal() {
+            tracing::error!("Failed to signal syncobj release point: {}", err);
+        }
+    }
+}
+
+fn discard_invalid_pending_commit(
+    surface_pending: &mut SurfaceAttributes,
+    syncobj_pending: &mut DrmSyncobjCachedState,
+    discard_buffer: bool,
+) {
+    if discard_buffer {
+        surface_pending.buffer = None;
+    }
+    discard_invalid_pending_sync_points(syncobj_pending);
+}
+
 impl Cacheable for DrmSyncobjCachedState {
     fn commit(&mut self, _dh: &DisplayHandle) -> Self {
         Self {
@@ -246,12 +266,16 @@ where
 
 fn commit_hook<D: DrmSyncobjHandler>(_data: &mut D, _dh: &DisplayHandle, surface: &WlSurface) {
     compositor::with_states(surface, |states| {
-        let mut cached = states.cached_state.get::<SurfaceAttributes>();
-        let pending = cached.pending();
-        let new_buffer = pending.buffer.as_ref().and_then(|buffer| match buffer {
+        let mut surface_cached = states.cached_state.get::<SurfaceAttributes>();
+        let surface_pending = surface_cached.pending();
+        let new_buffer = surface_pending.buffer.as_ref().and_then(|buffer| match buffer {
             BufferAssignment::NewBuffer(buffer) => Some(buffer),
             _ => None,
         });
+        let has_new_buffer = new_buffer.is_some();
+        let new_buffer_is_unsupported = new_buffer
+            .map(|buffer| get_dmabuf(buffer).is_err())
+            .unwrap_or(false);
         if let Some(data) = states
             .data_map
             .get::<RefCell<Option<WpLinuxDrmSyncobjSurfaceV1>>>()
@@ -259,21 +283,26 @@ fn commit_hook<D: DrmSyncobjHandler>(_data: &mut D, _dh: &DisplayHandle, surface
             if let Some(syncobj_surface) = data.borrow().as_ref() {
                 let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
                 let pending = cached.pending();
-                if pending.acquire_point.is_some() && new_buffer.is_none() {
+                let has_acquire_point = pending.acquire_point.is_some();
+                let has_release_point = pending.release_point.is_some();
+                if (has_acquire_point || has_release_point) && !has_new_buffer {
                     syncobj_surface.post_error(
                         wp_linux_drm_syncobj_surface_v1::Error::NoBuffer,
-                        "acquire point without buffer".to_string(),
+                        "sync point without buffer".to_string(),
                     );
-                } else if pending.acquire_point.is_some() && pending.release_point.is_none() {
-                    syncobj_surface.post_error(
-                        wp_linux_drm_syncobj_surface_v1::Error::NoReleasePoint,
-                        "acquire point without release point".to_string(),
-                    );
-                } else if pending.acquire_point.is_none() && pending.release_point.is_some() {
+                    discard_invalid_pending_commit(surface_pending, pending, true);
+                } else if has_new_buffer && !has_acquire_point {
                     syncobj_surface.post_error(
                         wp_linux_drm_syncobj_surface_v1::Error::NoAcquirePoint,
-                        "release point without acquire point".to_string(),
+                        "buffer without acquire point".to_string(),
                     );
+                    discard_invalid_pending_commit(surface_pending, pending, true);
+                } else if has_new_buffer && !has_release_point {
+                    syncobj_surface.post_error(
+                        wp_linux_drm_syncobj_surface_v1::Error::NoReleasePoint,
+                        "buffer without release point".to_string(),
+                    );
+                    discard_invalid_pending_commit(surface_pending, pending, true);
                 } else if let (Some(acquire), Some(release)) =
                     (pending.acquire_point.as_ref(), pending.release_point.as_ref())
                 {
@@ -285,14 +314,13 @@ fn commit_hook<D: DrmSyncobjHandler>(_data: &mut D, _dh: &DisplayHandle, surface
                                 release.point, acquire.point
                             ),
                         );
-                    }
-                    if let Some(buffer) = new_buffer {
-                        if get_dmabuf(buffer).is_err() {
-                            syncobj_surface.post_error(
-                                wp_linux_drm_syncobj_surface_v1::Error::UnsupportedBuffer,
-                                "sync points with non-dmabuf buffer".to_string(),
-                            );
-                        }
+                        discard_invalid_pending_commit(surface_pending, pending, true);
+                    } else if new_buffer_is_unsupported {
+                        syncobj_surface.post_error(
+                            wp_linux_drm_syncobj_surface_v1::Error::UnsupportedBuffer,
+                            "sync points with non-dmabuf buffer".to_string(),
+                        );
+                        discard_invalid_pending_commit(surface_pending, pending, true);
                     }
                 }
             }
@@ -475,6 +503,15 @@ pub(crate) mod test_utils {
         pub(crate) acquire_point: u64,
         pub(crate) release_point: u64,
         pub(crate) acquire_release_same_timeline: bool,
+    }
+
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    pub(crate) struct ClientCommitProtocolErrorEvidence {
+        pub(crate) object_interface: String,
+        pub(crate) code: u32,
+        pub(crate) current_acquire_point_present: bool,
+        pub(crate) current_release_point_present: bool,
     }
 
     #[derive(Default)]
@@ -704,6 +741,30 @@ pub(crate) mod test_utils {
         display.flush_clients().expect("flush test server events");
     }
 
+    fn read_surface_point_protocol_error(
+        event_queue: &mut wayland_client::EventQueue<SurfacePointProtocolClientState>,
+        client_connection: &Connection,
+        client_state: &mut SurfacePointProtocolClientState,
+        current_acquire_point_present: bool,
+        current_release_point_present: bool,
+    ) -> ClientCommitProtocolErrorEvidence {
+        let protocol_error = if let Some(guard) = event_queue.prepare_read() {
+            let _ = guard.read();
+            let _ = event_queue.dispatch_pending(client_state);
+            client_connection.protocol_error()
+        } else {
+            let _ = event_queue.dispatch_pending(client_state);
+            client_connection.protocol_error()
+        }
+        .expect("client request should disconnect with a protocol error");
+        ClientCommitProtocolErrorEvidence {
+            object_interface: protocol_error.object_interface,
+            code: protocol_error.code,
+            current_acquire_point_present,
+            current_release_point_present,
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn import_timeline_and_set_surface_points_through_client_for_tests(
         import_device: DrmDeviceFd,
@@ -799,6 +860,89 @@ pub(crate) mod test_utils {
             release_point: staged_release_point,
             acquire_release_same_timeline,
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn commit_surface_points_without_buffer_through_client_for_tests(
+        import_device: DrmDeviceFd,
+        timeline_fd: OwnedFd,
+        acquire_point: u64,
+        release_point: u64,
+    ) -> Option<ClientCommitProtocolErrorEvidence> {
+        let mut display = match Display::<SurfacePointProtocolServerState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return None,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let mut display_handle = display.handle();
+        let compositor_state =
+            compositor::CompositorState::new::<SurfacePointProtocolServerState>(&display_handle);
+        let syncobj_state =
+            DrmSyncobjState::new::<SurfacePointProtocolServerState>(&display_handle, import_device);
+        let mut server_state = SurfacePointProtocolServerState {
+            compositor_state,
+            syncobj_state: Some(syncobj_state),
+            surfaces: Vec::new(),
+        };
+        let (client_side, server_side) = UnixStream::pair().unwrap();
+        let _server_client = display_handle
+            .insert_client(server_side, Arc::new(SurfacePointProtocolClientData::default()))
+            .expect("insert test client");
+
+        let client_connection = Connection::from_socket(client_side).expect("connect test client socket");
+        let mut event_queue = client_connection.new_event_queue();
+        let qh = event_queue.handle();
+        let mut client_state = SurfacePointProtocolClientState::default();
+
+        client_connection.display().get_registry(&qh, ());
+        client_connection.flush().expect("flush get_registry");
+        pump_surface_point_protocol_server(&mut display, &mut server_state);
+        event_queue
+            .blocking_dispatch(&mut client_state)
+            .expect("dispatch registry globals");
+
+        let compositor = client_state
+            .compositor
+            .as_ref()
+            .expect("test compositor global should be advertised");
+        let syncobj_manager = client_state
+            .syncobj_manager
+            .as_ref()
+            .expect("test syncobj global should be advertised");
+        let surface = compositor.create_surface(&qh, ());
+        let syncobj_surface = syncobj_manager.get_surface(&surface, &qh, ());
+        let timeline = syncobj_manager.import_timeline(timeline_fd.as_fd(), &qh, ());
+        let (acquire_hi, acquire_lo) = (((acquire_point >> 32) as u32), acquire_point as u32);
+        let (release_hi, release_lo) = (((release_point >> 32) as u32), release_point as u32);
+        syncobj_surface.set_acquire_point(&timeline, acquire_hi, acquire_lo);
+        syncobj_surface.set_release_point(&timeline, release_hi, release_lo);
+        surface.commit();
+        client_state.surface = Some(surface);
+        client_state.syncobj_surface = Some(syncobj_surface);
+        client_state.timeline = Some(timeline);
+        client_connection
+            .flush()
+            .expect("flush syncobj surface commit request");
+        pump_surface_point_protocol_server(&mut display, &mut server_state);
+
+        let server_surface = server_state
+            .surfaces
+            .first()
+            .expect("client create_surface should reach server state");
+        let (current_acquire_point_present, current_release_point_present) =
+            with_states(server_surface, |states| {
+                let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+                let current = cached.current();
+                (current.acquire_point.is_some(), current.release_point.is_some())
+            });
+
+        Some(read_surface_point_protocol_error(
+            &mut event_queue,
+            &client_connection,
+            &mut client_state,
+            current_acquire_point_present,
+            current_release_point_present,
+        ))
     }
 
     /// Install a server-side DRM syncobj surface object for a focused test surface.
