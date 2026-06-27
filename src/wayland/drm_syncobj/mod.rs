@@ -162,6 +162,26 @@ impl DrmSyncobjState {
         }
     }
 
+    #[cfg(test)]
+    fn new_without_import_device_for_tests<D>(display: &DisplayHandle) -> Self
+    where
+        D: GlobalDispatch<WpLinuxDrmSyncobjManagerV1, DrmSyncobjGlobalData>,
+        D: 'static,
+    {
+        let global = display.create_global::<D, WpLinuxDrmSyncobjManagerV1, DrmSyncobjGlobalData>(
+            1,
+            DrmSyncobjGlobalData {
+                filter: Box::new(|_| true),
+            },
+        );
+
+        Self {
+            global,
+            import_device: None,
+            known_timelines: Vec::new(),
+        }
+    }
+
     /// Closes the current `import_device`, allowing compositors to acquire a new fd.
     pub fn close_device<'a>(&'a mut self) -> CloseGuard<'a> {
         self.import_device.take();
@@ -675,5 +695,195 @@ impl<D: DrmSyncobjHandler> Dispatch2<WpLinuxDrmSyncobjTimelineV1, D> for DrmSync
                 .known_timelines
                 .retain(|t| t.upgrade().is_some_and(|t| !Arc::ptr_eq(&t, &self.timeline.0)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{os::unix::net::UnixStream, sync::Arc};
+
+    use wayland_client::{
+        Connection, Dispatch, QueueHandle, delegate_noop,
+        protocol::{wl_compositor, wl_registry, wl_surface},
+    };
+    use wayland_protocols::wp::linux_drm_syncobj::v1::client::{
+        wp_linux_drm_syncobj_manager_v1, wp_linux_drm_syncobj_surface_v1,
+    };
+    use wayland_server::{
+        Display, DisplayHandle,
+        backend::{ClientData, ClientId, DisconnectReason, InitError},
+    };
+
+    use super::*;
+    use crate::wayland::compositor;
+
+    #[derive(Default)]
+    struct ProtocolClientData {
+        compositor_state: compositor::CompositorClientState,
+    }
+
+    impl ClientData for ProtocolClientData {
+        fn initialized(&self, _client_id: ClientId) {}
+
+        fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+    }
+
+    struct ProtocolServerState {
+        compositor_state: compositor::CompositorState,
+        syncobj_state: Option<DrmSyncobjState>,
+        surfaces: Vec<wayland_server::protocol::wl_surface::WlSurface>,
+    }
+
+    impl compositor::CompositorHandler for ProtocolServerState {
+        fn compositor_state(&mut self) -> &mut compositor::CompositorState {
+            &mut self.compositor_state
+        }
+
+        fn client_compositor_state<'a>(
+            &self,
+            client: &'a wayland_server::Client,
+        ) -> &'a compositor::CompositorClientState {
+            &client
+                .get_data::<ProtocolClientData>()
+                .expect("test client should carry compositor state")
+                .compositor_state
+        }
+
+        fn new_surface(&mut self, surface: &wayland_server::protocol::wl_surface::WlSurface) {
+            self.surfaces.push(surface.clone());
+        }
+
+        fn commit(&mut self, _surface: &wayland_server::protocol::wl_surface::WlSurface) {}
+    }
+
+    impl DrmSyncobjHandler for ProtocolServerState {
+        fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+            self.syncobj_state.as_mut()
+        }
+    }
+
+    impl AsMut<compositor::CompositorState> for ProtocolServerState {
+        fn as_mut(&mut self) -> &mut compositor::CompositorState {
+            &mut self.compositor_state
+        }
+    }
+
+    crate::delegate_dispatch2!(ProtocolServerState);
+
+    #[derive(Default)]
+    struct ProtocolClientState {
+        compositor: Option<wl_compositor::WlCompositor>,
+        syncobj_manager: Option<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1>,
+        surface: Option<wl_surface::WlSurface>,
+        syncobj_surface: Option<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1>,
+    }
+
+    impl Dispatch<wl_registry::WlRegistry, ()> for ProtocolClientState {
+        fn event(
+            state: &mut Self,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global { name, interface, .. } = event {
+                match interface.as_str() {
+                    "wl_compositor" => {
+                        state.compositor =
+                            Some(registry.bind::<wl_compositor::WlCompositor, _, _>(name, 1, qh, ()));
+                    }
+                    "wp_linux_drm_syncobj_manager_v1" => {
+                        state.syncobj_manager = Some(
+                            registry
+                                .bind::<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1, _, _>(
+                                    name,
+                                    1,
+                                    qh,
+                                    (),
+                                ),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    delegate_noop!(ProtocolClientState: ignore wl_compositor::WlCompositor);
+    delegate_noop!(ProtocolClientState: ignore wl_surface::WlSurface);
+    delegate_noop!(ProtocolClientState: ignore wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1);
+    delegate_noop!(ProtocolClientState: ignore wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1);
+
+    fn pump_server(display: &mut Display<ProtocolServerState>, state: &mut ProtocolServerState) {
+        display
+            .dispatch_clients(state)
+            .expect("dispatch test client requests");
+        display.flush_clients().expect("flush test server events");
+    }
+
+    #[test]
+    fn get_surface_request_installs_syncobj_surface_state() {
+        let mut display = match Display::<ProtocolServerState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let mut display_handle: DisplayHandle = display.handle();
+        let compositor_state = compositor::CompositorState::new::<ProtocolServerState>(&display_handle);
+        let syncobj_state =
+            DrmSyncobjState::new_without_import_device_for_tests::<ProtocolServerState>(&display_handle);
+        let mut server_state = ProtocolServerState {
+            compositor_state,
+            syncobj_state: Some(syncobj_state),
+            surfaces: Vec::new(),
+        };
+        let (client_side, server_side) = UnixStream::pair().unwrap();
+        let _server_client = display_handle
+            .insert_client(server_side, Arc::new(ProtocolClientData::default()))
+            .expect("insert test client");
+
+        let client_connection = Connection::from_socket(client_side).expect("connect test client socket");
+        let mut event_queue = client_connection.new_event_queue();
+        let qh = event_queue.handle();
+        let mut client_state = ProtocolClientState::default();
+
+        client_connection.display().get_registry(&qh, ());
+        client_connection.flush().expect("flush get_registry");
+        pump_server(&mut display, &mut server_state);
+        event_queue
+            .blocking_dispatch(&mut client_state)
+            .expect("dispatch registry globals");
+
+        let compositor = client_state
+            .compositor
+            .as_ref()
+            .expect("test compositor global should be advertised");
+        let syncobj_manager = client_state
+            .syncobj_manager
+            .as_ref()
+            .expect("test syncobj global should be advertised");
+        let surface = compositor.create_surface(&qh, ());
+        let syncobj_surface = syncobj_manager.get_surface(&surface, &qh, ());
+        client_state.surface = Some(surface);
+        client_state.syncobj_surface = Some(syncobj_surface);
+        client_connection.flush().expect("flush get_surface request");
+        pump_server(&mut display, &mut server_state);
+
+        let server_surface = server_state
+            .surfaces
+            .first()
+            .expect("client create_surface should reach server state");
+        let has_syncobj_surface = compositor::with_states(server_surface, |states| {
+            states
+                .data_map
+                .get::<RefCell<Option<WpLinuxDrmSyncobjSurfaceV1>>>()
+                .map(|resource| resource.borrow().is_some())
+                .unwrap_or(false)
+        });
+        assert!(
+            has_syncobj_surface,
+            "client get_surface request should install server syncobj surface marker"
+        );
     }
 }

@@ -437,6 +437,7 @@ pub(crate) mod test_utils {
     /// immediately; sync subsurfaces and blockers follow the same delayed transaction behavior as real
     /// commits. Focused tests can use this when they need Smithay's normal commit lifecycle without
     /// constructing full client-side globals.
+    #[allow(dead_code)]
     pub(crate) fn commit_buffer_assignment<D>(
         state: &mut D,
         handle: &DisplayHandle,
