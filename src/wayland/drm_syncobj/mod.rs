@@ -822,6 +822,16 @@ mod tests {
         display.flush_clients().expect("flush test server events");
     }
 
+    fn syncobj_surface_marker_is_some(surface: &wayland_server::protocol::wl_surface::WlSurface) -> bool {
+        compositor::with_states(surface, |states| {
+            states
+                .data_map
+                .get::<RefCell<Option<WpLinuxDrmSyncobjSurfaceV1>>>()
+                .map(|resource| resource.borrow().is_some())
+                .unwrap_or(false)
+        })
+    }
+
     #[test]
     fn get_surface_request_installs_syncobj_surface_state() {
         let mut display = match Display::<ProtocolServerState>::new() {
@@ -874,16 +884,97 @@ mod tests {
             .surfaces
             .first()
             .expect("client create_surface should reach server state");
-        let has_syncobj_surface = compositor::with_states(server_surface, |states| {
-            states
-                .data_map
-                .get::<RefCell<Option<WpLinuxDrmSyncobjSurfaceV1>>>()
-                .map(|resource| resource.borrow().is_some())
-                .unwrap_or(false)
-        });
         assert!(
-            has_syncobj_surface,
+            syncobj_surface_marker_is_some(server_surface),
             "client get_surface request should install server syncobj surface marker"
+        );
+    }
+
+    #[test]
+    fn get_surface_destroy_allows_protocol_reinstall() {
+        let mut display = match Display::<ProtocolServerState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let mut display_handle: DisplayHandle = display.handle();
+        let compositor_state = compositor::CompositorState::new::<ProtocolServerState>(&display_handle);
+        let syncobj_state =
+            DrmSyncobjState::new_without_import_device_for_tests::<ProtocolServerState>(&display_handle);
+        let mut server_state = ProtocolServerState {
+            compositor_state,
+            syncobj_state: Some(syncobj_state),
+            surfaces: Vec::new(),
+        };
+        let (client_side, server_side) = UnixStream::pair().unwrap();
+        let _server_client = display_handle
+            .insert_client(server_side, Arc::new(ProtocolClientData::default()))
+            .expect("insert test client");
+
+        let client_connection = Connection::from_socket(client_side).expect("connect test client socket");
+        let mut event_queue = client_connection.new_event_queue();
+        let qh = event_queue.handle();
+        let mut client_state = ProtocolClientState::default();
+
+        client_connection.display().get_registry(&qh, ());
+        client_connection.flush().expect("flush get_registry");
+        pump_server(&mut display, &mut server_state);
+        event_queue
+            .blocking_dispatch(&mut client_state)
+            .expect("dispatch registry globals");
+
+        let compositor = client_state
+            .compositor
+            .as_ref()
+            .expect("test compositor global should be advertised");
+        let syncobj_manager = client_state
+            .syncobj_manager
+            .as_ref()
+            .expect("test syncobj global should be advertised");
+        let surface = compositor.create_surface(&qh, ());
+        let syncobj_surface = syncobj_manager.get_surface(&surface, &qh, ());
+        client_state.surface = Some(surface);
+        client_state.syncobj_surface = Some(syncobj_surface);
+        client_connection
+            .flush()
+            .expect("flush initial get_surface request");
+        pump_server(&mut display, &mut server_state);
+
+        let server_surface = server_state
+            .surfaces
+            .first()
+            .expect("client create_surface should reach server state")
+            .clone();
+        assert!(
+            syncobj_surface_marker_is_some(&server_surface),
+            "initial get_surface should install server syncobj surface marker"
+        );
+
+        client_state
+            .syncobj_surface
+            .take()
+            .expect("test syncobj surface should exist")
+            .destroy();
+        client_connection.flush().expect("flush syncobj surface destroy");
+        pump_server(&mut display, &mut server_state);
+        assert!(
+            !syncobj_surface_marker_is_some(&server_surface),
+            "destroy request should clear server syncobj surface marker"
+        );
+
+        let surface = client_state
+            .surface
+            .as_ref()
+            .expect("test wl_surface should remain live");
+        let syncobj_surface = syncobj_manager.get_surface(surface, &qh, ());
+        client_state.syncobj_surface = Some(syncobj_surface);
+        client_connection
+            .flush()
+            .expect("flush reinstall get_surface request");
+        pump_server(&mut display, &mut server_state);
+        assert!(
+            syncobj_surface_marker_is_some(&server_surface),
+            "second get_surface should reinstall server syncobj surface marker"
         );
     }
 }
