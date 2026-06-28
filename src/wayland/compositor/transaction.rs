@@ -27,17 +27,14 @@
 // of the wp_transaction protocol). Explicit synchronization introduces a notion of blockers: the transaction
 // cannot be applied before all blockers are released, and thus must wait for it to be the case.
 //
-// For those situations, the (currently unused) `TransactionQueue` will come into play. It is a per-client
-// queue of transactions, that stores and applies them by both respecting their topological order
-// (ensuring that for each surface, states are applied in the correct order) and that all transactions
-// wait before all their blockers are resolved to be merged. If a blocker is cancelled, the whole transaction
-// it blocks is cancelled as well, and simply dropped. Thanks to the logic of `Cache::apply_state`, the
-// associated state will be applied automatically when the next valid transaction is applied, ensuring
-// global coherence.
+// For those situations, the `TransactionQueue` comes into play. It is a per-client queue of transactions,
+// that stores and applies them by both respecting their topological order (ensuring that for each surface,
+// states are applied in the correct order) and that all transactions wait before all their blockers are
+// resolved to be merged. If a blocker is cancelled, the whole transaction it blocks is cancelled and the
+// cached states covered by that transaction are discarded without becoming current.
 
-// A significant part of the logic of this module is not yet used,
-// but will be once proper transaction & blockers support is
-// added to smithay
+// The transaction queue is used by explicit synchronization and can also serve future protocols such as
+// wp_transaction.
 use std::{
     collections::HashSet,
     fmt,
@@ -110,20 +107,23 @@ impl Blocker for Barrier {
 
 #[derive(Default)]
 struct TransactionState {
-    surfaces: Vec<(Weak<WlSurface>, Serial)>,
+    surfaces: Vec<(Weak<WlSurface>, Serial, Serial)>,
     blockers: Vec<Box<dyn Blocker + Send>>,
 }
 
 impl TransactionState {
     fn insert(&mut self, surface: WlSurface, id: Serial) {
         if let Some(place) = self.surfaces.iter_mut().find(|place| place.0 == surface) {
-            // the surface is already in the list, update the serial
-            if place.1 < id {
+            // the surface is already in the list, update the cached serial range
+            if id < place.1 {
                 place.1 = id;
+            }
+            if place.2 < id {
+                place.2 = id;
             }
         } else {
             // the surface is not in the list, insert it
-            self.surfaces.push((surface.downgrade(), id));
+            self.surfaces.push((surface.downgrade(), id, id));
         }
     }
 }
@@ -195,9 +195,10 @@ impl PendingTransaction {
         }
         // fuse our surfaces into our new transaction state
         self.with_inner_state(|state| {
-            for (surface, id) in my_state.surfaces {
+            for (surface, start_id, end_id) in my_state.surfaces {
                 if let Ok(surface) = surface.upgrade() {
-                    state.insert(surface, id);
+                    state.insert(surface.clone(), start_id);
+                    state.insert(surface, end_id);
                 }
             }
             state.blockers.extend(my_state.blockers);
@@ -223,8 +224,13 @@ impl PendingTransaction {
 
 #[derive(Debug)]
 pub(crate) struct Transaction {
-    surfaces: Vec<(Weak<WlSurface>, Serial)>,
+    surfaces: Vec<(Weak<WlSurface>, Serial, Serial)>,
     blockers: Vec<Box<dyn Blocker + Send>>,
+}
+
+pub(crate) enum TransactionQueueAction {
+    Apply(Transaction),
+    Discard(Vec<(Weak<WlSurface>, Serial, Serial)>),
 }
 
 impl fmt::Debug for Box<dyn Blocker + Send> {
@@ -259,13 +265,13 @@ impl Transaction {
     }
 
     pub(crate) fn apply<C: CompositorHandler + 'static>(self, dh: &DisplayHandle, state: &mut C) {
-        for (surface, id) in self.surfaces {
+        for (surface, _start_id, end_id) in self.surfaces {
             let Ok(surface) = surface.upgrade() else {
                 continue;
             };
 
             PrivateSurfaceData::with_states(&surface, |states| {
-                states.cached_state.apply_state(id, dh);
+                states.cached_state.apply_state(end_id, dh);
             });
 
             PrivateSurfaceData::invoke_post_commit_hooks::<C>(state, dh, &surface);
@@ -290,9 +296,9 @@ impl TransactionQueue {
         self.transactions.push(t);
     }
 
-    pub(crate) fn take_ready(&mut self) -> Vec<Transaction> {
+    pub(crate) fn take_ready(&mut self) -> Vec<TransactionQueueAction> {
         // FIXME: Get rid of this allocation here
-        let mut ready_transactions = Vec::new();
+        let mut actions = Vec::new();
         // this is a very non-optimized implementation
         // we just iterate over the queue of transactions, keeping track of which
         // surface we have seen as they encode transaction dependencies
@@ -303,12 +309,11 @@ impl TransactionQueue {
         // or the length of self.transactions is reduced by 1.
         while i < self.transactions.len() {
             let mut skip = false;
+            let mut cancelled = false;
             // does the transaction have any active blocker?
             match self.transactions[i].state() {
                 BlockerState::Cancelled => {
-                    // this transaction is cancelled, remove it without further processing
-                    self.transactions.remove(i);
-                    continue;
+                    cancelled = true;
                 }
                 BlockerState::Pending => {
                     skip = true;
@@ -317,7 +322,7 @@ impl TransactionQueue {
             }
             // if not, does this transaction depend on any previous transaction?
             if !skip {
-                for (s, _) in &self.transactions[i].surfaces {
+                for (s, _, _) in &self.transactions[i].surfaces {
                     // TODO: is this alive check still needed?
                     if !s.is_alive() {
                         continue;
@@ -332,7 +337,7 @@ impl TransactionQueue {
             if skip {
                 // this transaction is not yet ready and should be skipped, add its surfaces to our
                 // seen list
-                for (s, _) in &self.transactions[i].surfaces {
+                for (s, _, _) in &self.transactions[i].surfaces {
                     // TODO: is this alive check still needed?
                     if !s.is_alive() {
                         continue;
@@ -340,12 +345,17 @@ impl TransactionQueue {
                     self.seen_surfaces.insert(s.id().protocol_id());
                 }
                 i += 1;
+            } else if cancelled {
+                actions.push(TransactionQueueAction::Discard(
+                    self.transactions[i].surfaces.clone(),
+                ));
+                self.transactions.remove(i);
             } else {
                 // this transaction is to be applied, yay!
-                ready_transactions.push(self.transactions.remove(i));
+                actions.push(TransactionQueueAction::Apply(self.transactions.remove(i)));
             }
         }
 
-        ready_transactions
+        actions
     }
 }

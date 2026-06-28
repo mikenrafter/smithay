@@ -146,6 +146,24 @@ impl Cacheable for SurfaceAttributes {
         into.frame_callbacks.extend(self.frame_callbacks);
         into.client_scale = self.client_scale;
     }
+
+    fn discard(self, current: &mut Self) {
+        if let Some(BufferAssignment::NewBuffer(buffer)) = self.buffer {
+            if !current.references_buffer(&buffer) {
+                buffer.release();
+            }
+        }
+    }
+
+    fn discard_with_retained(self, current: &mut Self, retained: &[&Self]) {
+        if let Some(BufferAssignment::NewBuffer(buffer)) = self.buffer {
+            let buffer_is_retained = current.references_buffer(&buffer)
+                || retained.iter().any(|state| state.references_buffer(&buffer));
+            if !buffer_is_retained {
+                buffer.release();
+            }
+        }
+    }
 }
 
 /// User data for WlSurface

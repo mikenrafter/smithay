@@ -393,4 +393,10 @@ impl Cacheable for FifoBarrierCachedState {
             barrier.signal();
         }
     }
+
+    fn discard(mut self, _current: &mut Self) {
+        if let Some(barrier) = self.barrier.take() {
+            barrier.signal();
+        }
+    }
 }

@@ -56,10 +56,24 @@ use crate::utils::Serial;
 /// be to copy `self` into the current state, but more complex cases require
 /// additional logic.
 pub trait Cacheable: Default {
+    /// Ordering priority when applying cached state; higher priorities apply first.
+    const APPLY_PRIORITY: i32 = 0;
+    /// Ordering priority when discarding cached state; higher priorities discard first.
+    const DISCARD_PRIORITY: i32 = 0;
+
     /// Produce a new state to be cached from the pending state
     fn commit(&mut self, dh: &DisplayHandle) -> Self;
     /// Merge a state update into the current state
     fn merge_into(self, into: &mut Self, dh: &DisplayHandle);
+    /// Discard a cached state update that will never become current.
+    fn discard(self, _current: &mut Self) {}
+    /// Discard a cached state update with access to retained queued states.
+    ///
+    /// This lets state that owns protocol resources avoid releasing a resource
+    /// while an older or newer queued state still references it.
+    fn discard_with_retained(self, current: &mut Self, _retained: &[&Self]) {
+        self.discard(current);
+    }
 }
 
 /// Double buffered cached state of type `T`
@@ -86,15 +100,31 @@ impl<T> CachedState<T> {
         &mut self.current
     }
 
+    /// Access the current state for `T` immutably.
+    #[allow(dead_code)]
+    pub(crate) fn current_ref(&self) -> &T {
+        &self.current
+    }
+
     /// Access the pending state for `T`
     pub fn pending(&mut self) -> &mut T {
         &mut self.pending
+    }
+
+    /// Iterate over queued cached states for `T`.
+    #[allow(dead_code)]
+    pub(crate) fn cached(&self) -> impl Iterator<Item = &T> {
+        self.cache.iter().map(|(_, state)| state)
     }
 }
 
 trait Cache: Downcast {
     fn commit(&self, commit_id: Option<Serial>, dh: &DisplayHandle);
     fn apply_state(&self, commit_id: Serial, dh: &DisplayHandle);
+    fn discard_state_range(&self, start_id: Serial, end_id: Serial);
+    fn discard_all_states(&self);
+    fn apply_priority(&self) -> i32;
+    fn discard_priority(&self) -> i32;
 }
 
 impl_downcast!(Cache);
@@ -126,6 +156,42 @@ impl<T: Cacheable + 'static> Cache for Mutex<CachedState<T>> {
             }
             me.cache.pop_front().unwrap().1.merge_into(&mut me.current, dh);
         }
+    }
+
+    fn discard_state_range(&self, start_id: Serial, end_id: Serial) {
+        let mut me = self.lock().unwrap();
+        let mut index = 0;
+        while index < me.cache.len() {
+            let id = me.cache[index].0;
+            if id < start_id {
+                index += 1;
+            } else if id <= end_id {
+                let state = me.cache.remove(index).unwrap().1;
+                let CachedState { current, cache, .. } = &mut *me;
+                let retained = cache.iter().map(|(_, state)| state).collect::<Vec<_>>();
+                state.discard_with_retained(current, &retained);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn discard_all_states(&self) {
+        let mut me = self.lock().unwrap();
+        let mut states = me.cache.drain(..).map(|(_, state)| state).collect::<Vec<_>>();
+        while !states.is_empty() {
+            let state = states.remove(0);
+            let retained = states.iter().collect::<Vec<_>>();
+            state.discard_with_retained(&mut me.current, &retained);
+        }
+    }
+
+    fn apply_priority(&self) -> i32 {
+        T::APPLY_PRIORITY
+    }
+
+    fn discard_priority(&self) -> i32 {
+        T::DISCARD_PRIORITY
     }
 }
 
@@ -206,7 +272,9 @@ impl MultiCache {
     pub(crate) fn commit(&mut self, commit_id: Option<Serial>, dh: &DisplayHandle) {
         // none of the underlying borrow_mut() can panic, as we hold
         // a &mut reference to the container, non are borrowed.
-        for cache in &self.caches {
+        let mut caches: Vec<_> = self.caches.iter().collect();
+        caches.sort_by_key(|cache| std::cmp::Reverse((**cache).apply_priority()));
+        for cache in caches {
             cache.commit(commit_id, dh);
         }
     }
@@ -217,8 +285,99 @@ impl MultiCache {
     pub(crate) fn apply_state(&self, commit_id: Serial, dh: &DisplayHandle) {
         // none of the underlying borrow_mut() can panic, as we hold
         // a &mut reference to the container, non are borrowed.
-        for cache in &self.caches {
+        let mut caches: Vec<_> = self.caches.iter().collect();
+        caches.sort_by_key(|cache| std::cmp::Reverse((**cache).apply_priority()));
+        for cache in caches {
             cache.apply_state(commit_id, dh);
         }
+    }
+
+    /// Discard queued cached states with ids in the inclusive range.
+    pub(crate) fn discard_state_range(&self, start_id: Serial, end_id: Serial) {
+        let mut caches: Vec<_> = self.caches.iter().collect();
+        caches.sort_by_key(|cache| std::cmp::Reverse((**cache).discard_priority()));
+        for cache in caches {
+            cache.discard_state_range(start_id, end_id);
+        }
+    }
+
+    /// Discard all queued cached states without changing current state.
+    pub(crate) fn discard_all_states(&self) {
+        let mut caches: Vec<_> = self.caches.iter().collect();
+        caches.sort_by_key(|cache| std::cmp::Reverse((**cache).discard_priority()));
+        for cache in caches {
+            cache.discard_all_states();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static DISCARD_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static DISCARD_OBSERVATIONS: Mutex<Vec<(u32, Vec<u32>)>> = Mutex::new(Vec::new());
+
+    #[derive(Default)]
+    struct DiscardProbe {
+        id: u32,
+    }
+
+    impl Cacheable for DiscardProbe {
+        fn commit(&mut self, _dh: &DisplayHandle) -> Self {
+            Self { id: self.id }
+        }
+
+        fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
+            into.id = self.id;
+        }
+
+        fn discard_with_retained(self, _current: &mut Self, retained: &[&Self]) {
+            DISCARD_OBSERVATIONS
+                .lock()
+                .unwrap()
+                .push((self.id, retained.iter().map(|state| state.id).collect()));
+        }
+    }
+
+    #[test]
+    fn discard_state_range_exposes_retained_queued_states() {
+        let _guard = DISCARD_TEST_LOCK.lock().unwrap();
+        DISCARD_OBSERVATIONS.lock().unwrap().clear();
+        let cache = Mutex::new(CachedState {
+            pending: DiscardProbe::default(),
+            current: DiscardProbe { id: 0 },
+            cache: VecDeque::from([
+                (Serial::from(1), DiscardProbe { id: 1 }),
+                (Serial::from(2), DiscardProbe { id: 2 }),
+                (Serial::from(3), DiscardProbe { id: 1 }),
+            ]),
+        });
+
+        Cache::discard_state_range(&cache, Serial::from(1), Serial::from(1));
+
+        assert_eq!(&*DISCARD_OBSERVATIONS.lock().unwrap(), &[(1, vec![2, 1])]);
+    }
+
+    #[test]
+    fn discard_all_states_exposes_later_retained_states() {
+        let _guard = DISCARD_TEST_LOCK.lock().unwrap();
+        DISCARD_OBSERVATIONS.lock().unwrap().clear();
+        let cache = Mutex::new(CachedState {
+            pending: DiscardProbe::default(),
+            current: DiscardProbe { id: 0 },
+            cache: VecDeque::from([
+                (Serial::from(1), DiscardProbe { id: 1 }),
+                (Serial::from(2), DiscardProbe { id: 2 }),
+                (Serial::from(3), DiscardProbe { id: 1 }),
+            ]),
+        });
+
+        Cache::discard_all_states(&cache);
+
+        assert_eq!(
+            &*DISCARD_OBSERVATIONS.lock().unwrap(),
+            &[(1, vec![2, 1]), (2, vec![1]), (1, vec![])]
+        );
     }
 }

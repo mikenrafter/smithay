@@ -10,7 +10,7 @@ use super::{
     BufferAssignment, CompositorHandler, SurfaceAttributes, SurfaceData,
     cache::MultiCache,
     handlers::{SurfaceUserData, is_effectively_sync},
-    transaction::{Blocker, PendingTransaction, TransactionQueue},
+    transaction::{Blocker, PendingTransaction, TransactionQueue, TransactionQueueAction},
 };
 use std::{
     any::Any,
@@ -146,6 +146,15 @@ impl PrivateSurfaceData {
             let mut child_guard = child_mutex.lock().unwrap();
             child_guard.parent = None;
         }
+        my_data.public_data.cached_state.discard_all_states();
+        let hooks = my_data.destruction_hooks.clone();
+        // don't hold the mutex while the hooks are invoked
+        drop(my_data);
+        for hook in hooks {
+            (hook.cb)(state, surface)
+        }
+
+        let my_data = my_data_mutex.lock().unwrap();
         let mut guard = my_data.public_data.cached_state.get::<SurfaceAttributes>();
         if let Some(BufferAssignment::NewBuffer(buffer)) = guard.current().buffer.take() {
             buffer.release();
@@ -153,14 +162,6 @@ impl PrivateSurfaceData {
         if let Some(BufferAssignment::NewBuffer(buffer)) = guard.pending().buffer.take() {
             buffer.release();
         };
-
-        let hooks = my_data.destruction_hooks.clone();
-        // don't hold the mutex while the hooks are invoked
-        drop(guard);
-        drop(my_data);
-        for hook in hooks {
-            (hook.cb)(state, surface)
-        }
     }
 
     pub fn lock_user_data(surface: &WlSurface) -> MutexGuard<'_, PrivateSurfaceData> {
@@ -324,12 +325,23 @@ impl PrivateSurfaceData {
             // release the mutex, as applying the transaction will try to lock it
             std::mem::drop(my_data);
             // trigger the queue
-            let transactions = queue.take_ready();
+            let actions = queue.take_ready();
             // release the queue lock
             std::mem::drop(queue_guard);
             // apply might call commit, which might call blocker_cleared, so we need to free the queue before applying
-            for transaction in transactions {
-                transaction.apply(dh, state)
+            for action in actions {
+                match action {
+                    TransactionQueueAction::Apply(transaction) => transaction.apply(dh, state),
+                    TransactionQueueAction::Discard(cancelled_states) => {
+                        for (surface, start_id, end_id) in cancelled_states {
+                            if let Ok(surface) = surface.upgrade() {
+                                PrivateSurfaceData::with_states(&surface, |states| {
+                                    states.cached_state.discard_state_range(start_id, end_id);
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
     }

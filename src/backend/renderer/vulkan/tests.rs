@@ -358,6 +358,20 @@ fn assert_buffer_release_point_matches_for_tests(
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+fn stage_surface_sync_points_for_renderer_fixture(
+    surface: &WlSurface,
+    acquire_point: &DrmSyncPoint,
+    release_point: &DrmSyncPoint,
+) {
+    crate::wayland::compositor::with_states(surface, |states| {
+        let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+        let pending = cached.pending();
+        pending.acquire_point = Some(acquire_point.clone());
+        pending.release_point = Some(release_point.clone());
+    });
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 fn import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
     dmabuf: Dmabuf,
     acquire_point: DrmSyncPoint,
@@ -385,17 +399,8 @@ fn import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
         &client,
         &display_handle,
     );
-    let _syncobj_surface = crate::wayland::drm_syncobj::test_utils::install_surface_for_tests::<
-        DmabufBufferTestState,
-    >(&display_handle, &surface);
-
     let mut state = DmabufBufferTestState;
-    crate::wayland::drm_syncobj::test_utils::set_surface_points_for_tests::<DmabufBufferTestState>(
-        &display_handle,
-        &surface,
-        &acquire_point,
-        &release_point,
-    );
+    stage_surface_sync_points_for_renderer_fixture(&surface, &acquire_point, &release_point);
     crate::wayland::compositor::test_utils::commit_buffer_assignment(
         &mut state,
         &display_handle,
@@ -460,9 +465,6 @@ fn import_surface_commit_helper_exposes_pending_dmabuf_and_sync_to_pre_commit_ho
         &client,
         &display_handle,
     );
-    let _syncobj_surface = crate::wayland::drm_syncobj::test_utils::install_surface_for_tests::<
-        DmabufBufferTestState,
-    >(&display_handle, &surface);
     let (acquire_point, release_point) =
         DrmSyncPoint::invalid_timeline_pair_for_tests(0x1_0000_0065, 0x1_0000_0066).unwrap();
     let expected_acquire_point = acquire_point.clone();
@@ -526,12 +528,7 @@ fn import_surface_commit_helper_exposes_pending_dmabuf_and_sync_to_pre_commit_ho
         },
     );
 
-    crate::wayland::drm_syncobj::test_utils::set_surface_points_for_tests::<DmabufBufferTestState>(
-        &display_handle,
-        &surface,
-        &acquire_point,
-        &release_point,
-    );
+    stage_surface_sync_points_for_renderer_fixture(&surface, &acquire_point, &release_point);
     let mut state = DmabufBufferTestState;
     crate::wayland::compositor::test_utils::commit_buffer_assignment(
         &mut state,
@@ -584,9 +581,9 @@ fn update_import_wl_surface_dmabuf_buffer_with_sync_points_for_tests(
     acquire_point: DrmSyncPoint,
     release_point: DrmSyncPoint,
 ) -> crate::backend::renderer::utils::Buffer {
-    // Focused renderer tests bypass client socket dispatch, but the original fixture installs the
-    // server-side DRM syncobj surface object/hooks. Updates still stage pending sync points through
-    // server-side DRM syncobj timeline resources and drive Smithay's normal compositor commit lifecycle.
+    // Focused renderer tests bypass client socket dispatch and stage cached sync points directly.
+    // Updates still drive Smithay's normal compositor commit lifecycle so renderer-utils sees the
+    // committed dmabuf buffer and sync metadata without exercising drm-syncobj protocol validation.
     // The wl_buffer is created for the same
     // client/display as `surface` so the fixture models a later commit on the same WlSurface instead
     // of a detached SurfaceData update.
@@ -597,12 +594,7 @@ fn update_import_wl_surface_dmabuf_buffer_with_sync_points_for_tests(
         .create_resource::<WlBuffer, Dmabuf, DmabufBufferTestState>(display_handle, 1, dmabuf)
         .expect("create updated dmabuf wl_buffer for test WlSurface client");
     let mut state = DmabufBufferTestState;
-    crate::wayland::drm_syncobj::test_utils::set_surface_points_for_tests::<DmabufBufferTestState>(
-        display_handle,
-        surface,
-        &acquire_point,
-        &release_point,
-    );
+    stage_surface_sync_points_for_renderer_fixture(surface, &acquire_point, &release_point);
     crate::wayland::compositor::test_utils::commit_buffer_assignment(
         &mut state,
         display_handle,
@@ -4301,6 +4293,77 @@ fn runtime_drm_syncobj_invalid_commit_signals_pending_release_point() {
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
+#[ignore = "requires a working Vulkan loader, physical device and DRM syncobj"]
+fn runtime_drm_syncobj_cached_discard_signals_release_point() {
+    let test_name = "DRM syncobj cached discard release signal test";
+    let instance = match Instance::new(Version::VERSION_1_3, None) {
+        Ok(instance) => instance,
+        Err(err) => {
+            eprintln!("skipping {test_name}: failed to create instance: {err:?}");
+            return;
+        }
+    };
+    let devices = match PhysicalDevice::enumerate(&instance) {
+        Ok(devices) => devices,
+        Err(err) => {
+            eprintln!("skipping {test_name}: failed to enumerate devices: {err:?}");
+            return;
+        }
+    };
+
+    let display = match Display::<DmabufBufferTestState>::new() {
+        Ok(display) => display,
+        Err(InitError::NoWaylandLib) => return,
+        Err(err) => panic!("failed to create test Wayland display: {err}"),
+    };
+    let display_handle = display.handle();
+
+    let mut setup_errors = Vec::new();
+    for physical_device in devices {
+        let Some(drm_device) = runtime_drm_syncobj_device_for_tests(&physical_device, test_name) else {
+            continue;
+        };
+        let (acquire_point, release_point) = match DrmSyncPoint::timeline_pair_for_tests(&drm_device, 41, 42)
+        {
+            Ok(points) => points,
+            Err(err) => {
+                setup_errors.push(format!("{} syncobj timeline pair: {err}", physical_device.name()));
+                continue;
+            }
+        };
+
+        let mut surface = SurfaceData {
+            role: None,
+            data_map: Default::default(),
+            cached_state: MultiCache::new(),
+        };
+        {
+            let mut syncobj = surface.cached_state.get::<DrmSyncobjCachedState>();
+            let pending = syncobj.pending();
+            pending.acquire_point = Some(acquire_point);
+            pending.release_point = Some(release_point.clone());
+        }
+        assert!(
+            release_point.wait(0).is_err(),
+            "fresh queued release point should not be signaled before cached discard"
+        );
+        surface.cached_state.commit(Some(7u32.into()), &display_handle);
+        surface.cached_state.discard_state_range(7u32.into(), 7u32.into());
+        release_point
+            .wait(1_000_000_000)
+            .expect("discarded cached syncobj state should signal release point");
+        return;
+    }
+
+    if setup_errors.is_empty() {
+        eprintln!("skipping {test_name}: no Vulkan physical device exposed a usable DRM node");
+    } else {
+        eprintln!("skipping {test_name}: {}", setup_errors.join("; "));
+    }
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
 #[ignore = "requires a working Vulkan loader, physical device, DRM syncobj and Wayland test display"]
 fn runtime_drm_syncobj_dmabuf_attach_commit_promotes_sync_points() {
     let test_name = "DRM syncobj client dmabuf attach commit protocol test";
@@ -4369,8 +4432,8 @@ fn runtime_drm_syncobj_dmabuf_attach_commit_promotes_sync_points() {
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device, DRM syncobj eventfd and Wayland test display"]
-fn runtime_drm_syncobj_dmabuf_acquire_blocker_releases_after_signal() {
-    let test_name = "DRM syncobj dmabuf acquire blocker runtime test";
+fn runtime_drm_syncobj_dmabuf_commit_waits_for_transaction_acquire_blocker() {
+    let test_name = "DRM syncobj dmabuf transaction acquire blocker runtime test";
     let Some(candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
         return;
     };
@@ -4383,8 +4446,8 @@ fn runtime_drm_syncobj_dmabuf_acquire_blocker_releases_after_signal() {
         return;
     }
 
-    let acquire_point = 0x3_0000_0200;
-    let release_point = 0x3_0000_0201;
+    let acquire_point = 0x3_0000_0400;
+    let release_point = 0x3_0000_0401;
     let timeline_fd = match runtime_syncobj_timeline_fd_for_tests(&drm_device) {
         Ok(fd) => fd,
         Err(err) => {
@@ -4393,7 +4456,7 @@ fn runtime_drm_syncobj_dmabuf_acquire_blocker_releases_after_signal() {
         }
     };
 
-    let Some(evidence) = crate::wayland::drm_syncobj::test_utils::commit_dmabuf_surface_and_probe_acquire_blocker_through_client_for_tests(
+    let Some(evidence) = crate::wayland::drm_syncobj::test_utils::commit_dmabuf_surface_and_probe_transaction_acquire_blocker_through_client_for_tests(
         drm_device,
         timeline_fd,
         candidate.dmabuf.clone(),
@@ -4405,43 +4468,48 @@ fn runtime_drm_syncobj_dmabuf_acquire_blocker_releases_after_signal() {
     };
     assert_eq!(
         evidence.known_timeline_count, 1,
-        "client import_timeline should install exactly one live server timeline before probing the acquire blocker"
+        "client import_timeline should install exactly one live server timeline before transaction blocking"
     );
     assert!(
         evidence.imported_dmabuf_syncable,
-        "client-created linux-dmabuf wl_buffer should be backed by a kernel dma-buf fd before probing the acquire blocker"
+        "transaction-blocked commit should still use a kernel dma-buf backed wl_buffer"
     );
     assert!(
         evidence.imported_dmabuf_matches_expected,
-        "client-created linux-dmabuf wl_buffer should preserve exported dmabuf metadata before probing the acquire blocker"
+        "transaction-blocked commit should preserve exported dmabuf metadata"
+    );
+    assert_eq!(
+        evidence.transaction_acquire_source_installed,
+        Some(true),
+        "valid explicit-sync commit should install the acquire event source through DrmSyncobjHandler"
+    );
+    assert_eq!(
+        evidence.transaction_pending_before_acquire_signal,
+        Some(true),
+        "valid explicit-sync commit should remain transaction-pending before the acquire point signals"
+    );
+    assert_eq!(
+        evidence.transaction_released_after_acquire_signal,
+        Some(true),
+        "signaling the acquire point and dispatching its source should release and apply the transaction"
     );
     assert!(
         evidence.current_has_dmabuf,
-        "client-created linux-dmabuf wl_buffer should become the current surface buffer"
+        "transaction should apply the dmabuf-backed buffer after the acquire blocker releases"
     );
     assert_eq!(
         evidence.acquire_point,
         Some(acquire_point),
-        "valid dmabuf commit should promote the exact acquire point before probing its blocker"
+        "released transaction should promote the exact acquire point"
     );
     assert_eq!(
         evidence.release_point,
         Some(release_point),
-        "valid dmabuf commit should preserve the exact release point while probing the acquire blocker"
+        "released transaction should promote the exact release point"
     );
     assert!(
         evidence.acquire_release_same_timeline,
-        "valid dmabuf commit should preserve imported timeline identity while probing the acquire blocker"
-    );
-    assert_eq!(
-        evidence.acquire_blocker_pending_before_signal,
-        Some(true),
-        "acquire blocker should remain pending after a pre-signal event-source dispatch"
-    );
-    assert_eq!(
-        evidence.acquire_blocker_released_after_signal,
-        Some(true),
-        "acquire blocker should release after the timeline point signals and the event source dispatches"
+        "released transaction should preserve imported timeline identity"
     );
 }
 

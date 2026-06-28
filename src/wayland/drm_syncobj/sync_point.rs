@@ -1,13 +1,14 @@
 use calloop::generic::Generic;
 use calloop::{EventSource, Interest, Mode, Poll, PostAction, Readiness, Token, TokenFactory};
 use drm::control::Device;
+use rustix::ioctl::Updater;
 use std::sync::{Mutex, Weak};
 use std::{
     io,
-    os::unix::io::{AsFd, BorrowedFd, OwnedFd},
+    os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
 };
 
@@ -15,6 +16,41 @@ use crate::backend::drm::{DrmDeviceFd, WeakDrmDeviceFd};
 use crate::backend::renderer::sync::{Fence, Interrupted};
 use crate::wayland::compositor::{Blocker, BlockerState};
 
+const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: rustix::ioctl::Opcode =
+    rustix::ioctl::opcode::read_write::<drm_ffi::drm_syncobj_handle>(drm_ffi::DRM_IOCTL_BASE, 0xC2);
+const SYNC_POINT_BLOCKER_PENDING: u8 = 0;
+const SYNC_POINT_BLOCKER_RELEASED: u8 = 1;
+const SYNC_POINT_BLOCKER_CANCELLED: u8 = 2;
+
+fn import_sync_file_into_timeline_point(
+    device: &DrmDeviceFd,
+    syncobj: drm::control::syncobj::Handle,
+    point: u64,
+    fd: BorrowedFd<'_>,
+) -> io::Result<()> {
+    let mut args = drm_ffi::drm_syncobj_handle {
+        handle: syncobj.into(),
+        flags: drm_ffi::DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE
+            | drm_ffi::DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE,
+        fd: fd.as_raw_fd(),
+        pad: 0,
+        point,
+    };
+
+    unsafe {
+        // SAFETY: `DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE` expects a mutable `drm_syncobj_handle`.
+        // The target handle is an existing syncobj owned by `device`, `point` is the destination
+        // timeline point, and `fd` is a borrowed sync-file fence descriptor that remains valid for
+        // the duration of the ioctl and is not consumed by DRM sync-file import.
+        rustix::ioctl::ioctl(
+            device.as_fd(),
+            Updater::<DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, _>::new(&mut args),
+        )
+    }
+    .map_err(io::Error::from)?;
+
+    Ok(())
+}
 #[derive(Debug)]
 pub(super) struct DrmTimelineInner {
     timeline_fd: OwnedFd,
@@ -66,7 +102,7 @@ impl DrmTimelineDeviceSpecific {
         self.device = WeakDrmDeviceFd::new();
         // trigger event fds
         for eventfd in self.event_fds.drain(..).filter_map(|(_, x)| Weak::upgrade(&x)) {
-            let _ = rustix::io::write(&eventfd, &[1]);
+            let _ = rustix::io::write(&eventfd, &1u64.to_ne_bytes());
         }
     }
 }
@@ -274,59 +310,16 @@ impl DrmSyncPoint {
     /// timeline point. Symmetric counterpart of
     /// [`DrmSyncPoint::export_sync_file`].
     ///
-    /// Internally creates a fresh binary syncobj, imports the sync
-    /// file fence into it via the `IMPORT_SYNC_FILE` ioctl (raw
-    /// because the `drm` crate's public wrapper hardcodes the
-    /// destination handle to `0`, which the kernel rejects with
-    /// `ENOENT` — only the two-step `drmSyncobjCreate` +
-    /// `drmSyncobjImportSyncFile(existing_handle, fd)` pattern is
-    /// supported, mirroring libdrm). Then transfers the temp's
-    /// point 0 into this timeline at `self.point` and destroys the
-    /// temp.
-    ///
-    /// Mirrors `wlr_drm_syncobj_timeline_import_sync_file`. Used by
-    /// compositors that drive Vulkan explicit sync via
-    /// `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT` and need to
-    /// inject the resulting sync-file fence into the client's
-    /// release point.
+    /// Uses `DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE` with `IMPORT_SYNC_FILE | TIMELINE`
+    /// against the existing timeline handle. The `drm` crate's public wrapper
+    /// hardcodes destination handle `0`, which the kernel rejects with `ENOENT`.
     pub fn import_sync_file(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
-        use rustix::ioctl::{Updater, ioctl, opcode::read_write};
-        use std::os::fd::AsRawFd;
-
         let ctx = self.timeline.0.dev_ctx.lock().unwrap();
         let Some(device) = ctx.device.upgrade() else {
             return Err(io::ErrorKind::InvalidInput.into());
         };
 
-        let tmp = device.create_syncobj(false)?;
-
-        const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: rustix::ioctl::Opcode =
-            read_write::<drm_ffi::drm_syncobj_handle>(drm_ffi::DRM_IOCTL_BASE, 0xC2);
-
-        let mut args = drm_ffi::drm_syncobj_handle {
-            handle: tmp.into(),
-            flags: drm_ffi::DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE,
-            fd: fd.as_raw_fd(),
-            pad: 0,
-            point: 0,
-        };
-        // SAFETY: `device.as_fd()` is a valid DRM device fd;
-        // `drm_ffi::drm_syncobj_handle` is the type expected by the
-        // DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE ioctl.
-        let res = unsafe {
-            ioctl(
-                device.as_fd(),
-                Updater::<DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, _>::new(&mut args),
-            )
-        };
-        if let Err(err) = res {
-            let _ = device.destroy_syncobj(tmp);
-            return Err(err.into());
-        }
-
-        let res = device.syncobj_timeline_transfer(tmp, ctx.syncobj, 0, self.point);
-        let _ = device.destroy_syncobj(tmp);
-        res
+        import_sync_file_into_timeline_point(&device, ctx.syncobj, self.point, fd)
     }
 
     /// Create an [`calloop::EventSource`] and [`Blocker`] for this sync point.
@@ -335,13 +328,12 @@ impl DrmSyncPoint {
     /// [`supports_syncobj_eventfd`](super::supports_syncobj_eventfd).
     pub fn generate_blocker(&self) -> io::Result<(DrmSyncPointBlocker, DrmSyncPointSource)> {
         let fd = self.eventfd()?;
-        let signal = Arc::new(AtomicBool::new(false));
-        let blocker = DrmSyncPointBlocker {
-            signal: signal.clone(),
-        };
+        let state = Arc::new(AtomicU8::new(SYNC_POINT_BLOCKER_PENDING));
+        let blocker = DrmSyncPointBlocker { state: state.clone() };
         let source = DrmSyncPointSource {
             source: Generic::new(fd, Interest::READ, Mode::Level),
-            signal,
+            sync_point: self.clone(),
+            state,
         };
         Ok((blocker, source))
     }
@@ -372,7 +364,8 @@ impl Fence for DrmSyncPoint {
 #[derive(Debug)]
 pub struct DrmSyncPointSource {
     source: Generic<Arc<OwnedFd>>,
-    signal: Arc<AtomicBool>,
+    sync_point: DrmSyncPoint,
+    state: Arc<AtomicU8>,
 }
 
 impl EventSource for DrmSyncPointSource {
@@ -390,9 +383,13 @@ impl EventSource for DrmSyncPointSource {
     where
         C: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
     {
-        self.signal.store(true, Ordering::SeqCst);
         self.source
             .process_events(readiness, token, |_, _| Ok(PostAction::Remove))?;
+        if self.sync_point.is_signaled() {
+            self.state.store(SYNC_POINT_BLOCKER_RELEASED, Ordering::SeqCst);
+        } else {
+            self.state.store(SYNC_POINT_BLOCKER_CANCELLED, Ordering::SeqCst);
+        }
         callback((), &mut ())?;
         Ok(PostAction::Remove)
     }
@@ -416,15 +413,16 @@ impl EventSource for DrmSyncPointSource {
 /// [`Blocker`] implementation for an accompanying [`DrmSyncPointSource`]
 #[derive(Debug)]
 pub struct DrmSyncPointBlocker {
-    signal: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
 }
 
 impl Blocker for DrmSyncPointBlocker {
     fn state(&self) -> BlockerState {
-        if self.signal.load(Ordering::SeqCst) {
-            BlockerState::Released
-        } else {
-            BlockerState::Pending
+        match self.state.load(Ordering::SeqCst) {
+            SYNC_POINT_BLOCKER_PENDING => BlockerState::Pending,
+            SYNC_POINT_BLOCKER_RELEASED => BlockerState::Released,
+            SYNC_POINT_BLOCKER_CANCELLED => BlockerState::Cancelled,
+            _ => BlockerState::Cancelled,
         }
     }
 }

@@ -117,8 +117,8 @@ use std::{any::Any, sync::Mutex};
 
 pub use self::cache::{Cacheable, CachedState, MultiCache};
 pub use self::handlers::{RegionUserData, SubsurfaceCachedState, SubsurfaceUserData, SurfaceUserData};
-use self::transaction::TransactionQueue;
 pub use self::transaction::{Barrier, Blocker, BlockerState};
+use self::transaction::{TransactionQueue, TransactionQueueAction};
 pub use self::tree::{AlreadyHasRole, TraversalAction};
 use self::tree::{PrivateSurfaceData, SuggestedSurfaceState};
 use crate::input::touch::FrameMarker;
@@ -250,6 +250,12 @@ pub struct SurfaceAttributes {
     pub frame_callbacks: Vec<wl_callback::WlCallback>,
 
     pub(crate) client_scale: f64,
+}
+
+impl SurfaceAttributes {
+    pub(crate) fn references_buffer(&self, buffer: &wl_buffer::WlBuffer) -> bool {
+        matches!(self.buffer.as_ref(), Some(BufferAssignment::NewBuffer(current)) if current == buffer)
+    }
 }
 
 impl Default for SurfaceAttributes {
@@ -703,14 +709,25 @@ impl CompositorClientState {
     /// got `Released` or `Cancelled` from being `Pending` previously for any
     /// surface belonging to this client.
     pub fn blocker_cleared<D: CompositorHandler + 'static>(&self, state: &mut D, dh: &DisplayHandle) {
-        let transactions = if let Some(queue) = self.queue.lock().unwrap().as_mut() {
+        let actions = if let Some(queue) = self.queue.lock().unwrap().as_mut() {
             queue.take_ready()
         } else {
             Vec::new()
         };
 
-        for transaction in transactions {
-            transaction.apply(dh, state)
+        for action in actions {
+            match action {
+                TransactionQueueAction::Apply(transaction) => transaction.apply(dh, state),
+                TransactionQueueAction::Discard(cancelled_states) => {
+                    for (surface, start_id, end_id) in cancelled_states {
+                        if let Ok(surface) = surface.upgrade() {
+                            self::tree::PrivateSurfaceData::with_states(&surface, |states| {
+                                states.cached_state.discard_state_range(start_id, end_id);
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
 

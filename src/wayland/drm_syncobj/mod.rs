@@ -3,12 +3,17 @@
 //! This module implement the `linux-drm-syncobj-v1` protocol, used to support
 //! explicit sync.
 //!
-//! Currently, the implementation here assumes acquire fences are already signalled
-//! when the surface transaction is ready. Use [`DrmSyncPointBlocker`].
+//! Acquire fences can delay the surface transaction through [`DrmSyncPointBlocker`]
+//! when the compositor installs the accompanying [`DrmSyncPointSource`] from
+//! [`DrmSyncobjHandler::drm_syncobj_install_acquire_point_source`]. Compositors that
+//! do not install the source may only accept already-signalled acquire points; unsignalled
+//! acquire commits fail closed before the buffer becomes current.
 //!
 //! The server should only expose the protocol if [`supports_syncobj_eventfd`] returns
-//! `true`. Or it won't be possible to create the blocker. This is similar to other
-//! implementations.
+//! `true` and the compositor installs acquire sources through
+//! [`DrmSyncobjHandler::drm_syncobj_install_acquire_point_source`]. Otherwise normal
+//! unsignalled acquire commits cannot be delayed safely and will fail closed before the
+//! buffer becomes current.
 //!
 //! The committed release fence is signalled when all references to a
 //! [`Buffer`][crate::backend::renderer::utils::Buffer] are dropped. Pending
@@ -31,7 +36,8 @@
 //! # let mut display = wayland_server::Display::<State>::new().unwrap();
 //! # let display_handle = display.handle();
 //! # let import_device = todo!();
-//! let syncobj_state = if supports_syncobj_eventfd(&import_device) {
+//! # let can_install_acquire_sources = false;
+//! let syncobj_state = if supports_syncobj_eventfd(&import_device) && can_install_acquire_sources {
 //!     Some(DrmSyncobjState::new::<State>(&display_handle, import_device))
 //! } else {
 //!     None
@@ -61,7 +67,7 @@ use super::{
     dmabuf::get_dmabuf,
 };
 use crate::{
-    backend::drm::DrmDeviceFd,
+    backend::{drm::DrmDeviceFd, renderer::sync::Fence},
     wayland::{Dispatch2, GlobalData, GlobalDispatch2},
 };
 
@@ -83,6 +89,23 @@ pub fn supports_syncobj_eventfd(device: &DrmDeviceFd) -> bool {
 pub trait DrmSyncobjHandler {
     /// Returns a mutable reference to the [`DrmSyncobjState`] delegate type
     fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState>;
+
+    /// Install the event source for a pending acquire sync point.
+    ///
+    /// Returning `true` tells the protocol implementation that the source has been registered and will
+    /// arrange for [`compositor::CompositorClientState::blocker_cleared`] to be called when it fires, so
+    /// the current commit may be delayed with the matching [`DrmSyncPointBlocker`]. Returning `false`
+    /// means no source was installed; the commit will then proceed only if the acquire point is already
+    /// signalled, otherwise the pending commit is discarded instead of exposing an unsignalled buffer.
+    fn drm_syncobj_install_acquire_point_source(
+        &mut self,
+        _dh: &DisplayHandle,
+        _surface: &WlSurface,
+        _acquire_point: &DrmSyncPoint,
+        _source: DrmSyncPointSource,
+    ) -> bool {
+        false
+    }
 }
 
 /// Data associated with a drm syncobj global
@@ -110,17 +133,37 @@ fn discard_invalid_pending_sync_points(pending: &mut DrmSyncobjCachedState) {
 }
 
 fn discard_invalid_pending_commit(
-    surface_pending: &mut SurfaceAttributes,
+    surface_cached: &mut compositor::CachedState<SurfaceAttributes>,
     syncobj_pending: &mut DrmSyncobjCachedState,
     discard_buffer: bool,
 ) {
-    if discard_buffer {
-        surface_pending.buffer = None;
-    }
+    let discarded_buffer = discard_buffer
+        .then(|| surface_cached.pending().buffer.take())
+        .flatten();
     discard_invalid_pending_sync_points(syncobj_pending);
+    if let Some(BufferAssignment::NewBuffer(buffer)) = discarded_buffer {
+        let buffer_is_retained = surface_cached.current_ref().references_buffer(&buffer)
+            || surface_cached
+                .cached()
+                .any(|state| state.references_buffer(&buffer));
+        if !buffer_is_retained {
+            buffer.release();
+        }
+    }
+}
+
+fn discard_unwaitable_acquire_commit(surface: &WlSurface) {
+    compositor::with_states(surface, |states| {
+        let mut surface_cached = states.cached_state.get::<SurfaceAttributes>();
+        let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+        discard_invalid_pending_commit(&mut surface_cached, cached.pending(), true);
+    });
 }
 
 impl Cacheable for DrmSyncobjCachedState {
+    const APPLY_PRIORITY: i32 = 100;
+    const DISCARD_PRIORITY: i32 = 100;
+
     fn commit(&mut self, _dh: &DisplayHandle) -> Self {
         Self {
             acquire_point: self.acquire_point.take(),
@@ -137,6 +180,14 @@ impl Cacheable for DrmSyncobjCachedState {
             }
             into.acquire_point = self.acquire_point;
             into.release_point = self.release_point;
+        }
+    }
+
+    fn discard(self, _current: &mut Self) {
+        if let Some(release_point) = self.release_point {
+            if let Err(err) = release_point.signal() {
+                tracing::error!("Failed to signal discarded syncobj release point: {}", err);
+            }
         }
     }
 }
@@ -266,18 +317,22 @@ where
     }
 }
 
-fn commit_hook<D: DrmSyncobjHandler>(_data: &mut D, _dh: &DisplayHandle, surface: &WlSurface) {
-    compositor::with_states(surface, |states| {
+fn commit_hook<D: DrmSyncobjHandler>(data: &mut D, dh: &DisplayHandle, surface: &WlSurface) {
+    let acquire_blocker_point = compositor::with_states(surface, |states| {
         let mut surface_cached = states.cached_state.get::<SurfaceAttributes>();
-        let surface_pending = surface_cached.pending();
-        let new_buffer = surface_pending.buffer.as_ref().and_then(|buffer| match buffer {
-            BufferAssignment::NewBuffer(buffer) => Some(buffer),
-            _ => None,
-        });
-        let has_new_buffer = new_buffer.is_some();
-        let new_buffer_is_unsupported = new_buffer
-            .map(|buffer| get_dmabuf(buffer).is_err())
-            .unwrap_or(false);
+        let (has_new_buffer, new_buffer_is_unsupported) = {
+            let surface_pending = surface_cached.pending();
+            let new_buffer = surface_pending.buffer.as_ref().and_then(|buffer| match buffer {
+                BufferAssignment::NewBuffer(buffer) => Some(buffer),
+                _ => None,
+            });
+            (
+                new_buffer.is_some(),
+                new_buffer
+                    .map(|buffer| get_dmabuf(buffer).is_err())
+                    .unwrap_or(false),
+            )
+        };
         if let Some(data) = states
             .data_map
             .get::<RefCell<Option<WpLinuxDrmSyncobjSurfaceV1>>>()
@@ -292,19 +347,19 @@ fn commit_hook<D: DrmSyncobjHandler>(_data: &mut D, _dh: &DisplayHandle, surface
                         wp_linux_drm_syncobj_surface_v1::Error::NoBuffer,
                         "sync point without buffer".to_string(),
                     );
-                    discard_invalid_pending_commit(surface_pending, pending, true);
+                    discard_invalid_pending_commit(&mut surface_cached, pending, true);
                 } else if has_new_buffer && !has_acquire_point {
                     syncobj_surface.post_error(
                         wp_linux_drm_syncobj_surface_v1::Error::NoAcquirePoint,
                         "buffer without acquire point".to_string(),
                     );
-                    discard_invalid_pending_commit(surface_pending, pending, true);
+                    discard_invalid_pending_commit(&mut surface_cached, pending, true);
                 } else if has_new_buffer && !has_release_point {
                     syncobj_surface.post_error(
                         wp_linux_drm_syncobj_surface_v1::Error::NoReleasePoint,
                         "buffer without release point".to_string(),
                     );
-                    discard_invalid_pending_commit(surface_pending, pending, true);
+                    discard_invalid_pending_commit(&mut surface_cached, pending, true);
                 } else if let (Some(acquire), Some(release)) =
                     (pending.acquire_point.as_ref(), pending.release_point.as_ref())
                 {
@@ -316,18 +371,56 @@ fn commit_hook<D: DrmSyncobjHandler>(_data: &mut D, _dh: &DisplayHandle, surface
                                 release.point, acquire.point
                             ),
                         );
-                        discard_invalid_pending_commit(surface_pending, pending, true);
+                        discard_invalid_pending_commit(&mut surface_cached, pending, true);
                     } else if new_buffer_is_unsupported {
                         syncobj_surface.post_error(
                             wp_linux_drm_syncobj_surface_v1::Error::UnsupportedBuffer,
                             "sync points with non-dmabuf buffer".to_string(),
                         );
-                        discard_invalid_pending_commit(surface_pending, pending, true);
+                        discard_invalid_pending_commit(&mut surface_cached, pending, true);
+                    } else {
+                        return pending.acquire_point.clone();
                     }
                 }
             }
         }
+        None
     });
+
+    let Some(acquire_point) = acquire_blocker_point else {
+        return;
+    };
+
+    match acquire_point.generate_blocker() {
+        Ok((blocker, source)) => {
+            if data.drm_syncobj_install_acquire_point_source(dh, surface, &acquire_point, source) {
+                compositor::add_blocker(surface, blocker);
+            } else if acquire_point.is_signaled() {
+                warn!(
+                    "DRM syncobj acquire point source was not installed, but acquire point is already signalled"
+                );
+            } else {
+                warn!(
+                    "DRM syncobj acquire point source was not installed; discarding unsignalled acquire buffer/sync state"
+                );
+                discard_unwaitable_acquire_commit(surface);
+            }
+        }
+        Err(err) => {
+            if acquire_point.is_signaled() {
+                warn!(
+                    ?err,
+                    "failed to create DRM syncobj acquire point blocker for already-signalled point"
+                );
+            } else {
+                warn!(
+                    ?err,
+                    "failed to create DRM syncobj acquire point blocker; discarding unsignalled acquire buffer/sync state"
+                );
+                discard_unwaitable_acquire_commit(surface);
+            }
+        }
+    }
 }
 
 fn destruction_hook<D: DrmSyncobjHandler>(_data: &mut D, surface: &WlSurface) {
@@ -488,8 +581,8 @@ pub(crate) mod test_utils {
     };
 
     use super::{
-        DrmSyncPoint, DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState, DrmSyncobjSurfaceData,
-        DrmSyncobjTimelineData, PendingSyncPointKind, commit_hook, destruction_hook,
+        DrmSyncPoint, DrmSyncPointSource, DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState,
+        DrmSyncobjSurfaceData, DrmSyncobjTimelineData, PendingSyncPointKind, commit_hook, destruction_hook,
         set_pending_sync_point_from_timeline_resource,
     };
     use crate::backend::allocator::{
@@ -526,8 +619,9 @@ pub(crate) mod test_utils {
         pub(crate) acquire_point: Option<u64>,
         pub(crate) release_point: Option<u64>,
         pub(crate) acquire_release_same_timeline: bool,
-        pub(crate) acquire_blocker_pending_before_signal: Option<bool>,
-        pub(crate) acquire_blocker_released_after_signal: Option<bool>,
+        pub(crate) transaction_acquire_source_installed: Option<bool>,
+        pub(crate) transaction_pending_before_acquire_signal: Option<bool>,
+        pub(crate) transaction_released_after_acquire_signal: Option<bool>,
     }
 
     #[derive(Debug)]
@@ -613,6 +707,10 @@ pub(crate) mod test_utils {
         expected_dmabuf: Option<Dmabuf>,
         last_imported_dmabuf_syncable: bool,
         last_imported_dmabuf_matches_expected: bool,
+        install_acquire_sources: bool,
+        installed_acquire_points: Vec<DrmSyncPoint>,
+        acquire_sources: Vec<DrmSyncPointSource>,
+        committed_surfaces: usize,
         surfaces: Vec<wayland_server::protocol::wl_surface::WlSurface>,
     }
 
@@ -635,12 +733,30 @@ pub(crate) mod test_utils {
             self.surfaces.push(surface.clone());
         }
 
-        fn commit(&mut self, _surface: &wayland_server::protocol::wl_surface::WlSurface) {}
+        fn commit(&mut self, _surface: &wayland_server::protocol::wl_surface::WlSurface) {
+            self.committed_surfaces += 1;
+        }
     }
 
     impl DrmSyncobjHandler for SurfacePointProtocolServerState {
         fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
             self.syncobj_state.as_mut()
+        }
+
+        fn drm_syncobj_install_acquire_point_source(
+            &mut self,
+            _dh: &DisplayHandle,
+            _surface: &wayland_server::protocol::wl_surface::WlSurface,
+            acquire_point: &DrmSyncPoint,
+            source: DrmSyncPointSource,
+        ) -> bool {
+            if self.install_acquire_sources {
+                self.installed_acquire_points.push(acquire_point.clone());
+                self.acquire_sources.push(source);
+                true
+            } else {
+                false
+            }
         }
     }
 
@@ -913,6 +1029,10 @@ pub(crate) mod test_utils {
             expected_dmabuf: None,
             last_imported_dmabuf_syncable: false,
             last_imported_dmabuf_matches_expected: false,
+            install_acquire_sources: false,
+            installed_acquire_points: Vec::new(),
+            acquire_sources: Vec::new(),
+            committed_surfaces: 0,
             surfaces: Vec::new(),
         };
         let (client_side, server_side) = UnixStream::pair().unwrap();
@@ -1014,6 +1134,10 @@ pub(crate) mod test_utils {
             expected_dmabuf: None,
             last_imported_dmabuf_syncable: false,
             last_imported_dmabuf_matches_expected: false,
+            install_acquire_sources: false,
+            installed_acquire_points: Vec::new(),
+            acquire_sources: Vec::new(),
+            committed_surfaces: 0,
             surfaces: Vec::new(),
         };
         let (client_side, server_side) = UnixStream::pair().unwrap();
@@ -1101,6 +1225,10 @@ pub(crate) mod test_utils {
             expected_dmabuf: None,
             last_imported_dmabuf_syncable: false,
             last_imported_dmabuf_matches_expected: false,
+            install_acquire_sources: false,
+            installed_acquire_points: Vec::new(),
+            acquire_sources: Vec::new(),
+            committed_surfaces: 0,
             surfaces: Vec::new(),
         };
         let (client_side, server_side) = UnixStream::pair().unwrap();
@@ -1207,7 +1335,7 @@ pub(crate) mod test_utils {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn commit_dmabuf_surface_and_probe_acquire_blocker_through_client_for_tests(
+    pub(crate) fn commit_dmabuf_surface_and_probe_transaction_acquire_blocker_through_client_for_tests(
         import_device: DrmDeviceFd,
         timeline_fd: OwnedFd,
         source_dmabuf: Dmabuf,
@@ -1230,7 +1358,7 @@ pub(crate) mod test_utils {
         source_dmabuf: Dmabuf,
         acquire_point: u64,
         release_point: u64,
-        probe_acquire_blocker: bool,
+        install_transaction_acquire_source: bool,
     ) -> Option<ClientDmabufCommitEvidence> {
         let mut display = match Display::<SurfacePointProtocolServerState>::new() {
             Ok(display) => display,
@@ -1253,6 +1381,10 @@ pub(crate) mod test_utils {
             expected_dmabuf: Some(source_dmabuf.clone()),
             last_imported_dmabuf_syncable: false,
             last_imported_dmabuf_matches_expected: false,
+            install_acquire_sources: install_transaction_acquire_source,
+            installed_acquire_points: Vec::new(),
+            acquire_sources: Vec::new(),
+            committed_surfaces: 0,
             surfaces: Vec::new(),
         };
         let (client_side, server_side) = UnixStream::pair().unwrap();
@@ -1311,6 +1443,28 @@ pub(crate) mod test_utils {
         let (release_hi, release_lo) = (((release_point >> 32) as u32), release_point as u32);
         syncobj_surface.set_acquire_point(&timeline, acquire_hi, acquire_lo);
         syncobj_surface.set_release_point(&timeline, release_hi, release_lo);
+        if !install_transaction_acquire_source {
+            client_connection
+                .flush()
+                .expect("flush dmabuf setup and syncobj surface point requests");
+            pump_surface_point_protocol_server(&mut display, &mut server_state);
+            let server_surface = server_state
+                .surfaces
+                .first()
+                .expect("client create_surface should reach server state");
+            let pending_acquire = with_states(server_surface, |states| {
+                let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+                cached
+                    .pending()
+                    .acquire_point
+                    .as_ref()
+                    .expect("set_acquire_point should stage a pending acquire point")
+                    .clone()
+            });
+            pending_acquire
+                .signal()
+                .expect("signal acquire point for non-blocking explicit-sync commit helper");
+        }
         surface.attach(Some(&buffer), 0, 0);
         surface.commit();
         client_state.surface = Some(surface);
@@ -1323,77 +1477,114 @@ pub(crate) mod test_utils {
             .expect("flush dmabuf surface commit request");
         pump_surface_point_protocol_server(&mut display, &mut server_state);
 
+        let (transaction_acquire_source_installed, transaction_pending_before_acquire_signal) =
+            if install_transaction_acquire_source {
+                assert_eq!(
+                    server_state.installed_acquire_points.len(),
+                    1,
+                    "valid explicit-sync commit should install exactly one acquire point source"
+                );
+                assert_eq!(
+                    server_state.acquire_sources.len(),
+                    1,
+                    "valid explicit-sync commit should store exactly one acquire event source"
+                );
+                let server_surface = server_state
+                    .surfaces
+                    .first()
+                    .expect("client create_surface should reach server state");
+                let current_has_dmabuf_before_signal = with_states(server_surface, |states| {
+                    let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                    attributes
+                        .current()
+                        .buffer
+                        .as_ref()
+                        .and_then(|assignment| match assignment {
+                            BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).ok(),
+                            BufferAssignment::Removed => None,
+                        })
+                        .is_some()
+                });
+                (
+                    Some(true),
+                    Some(server_state.committed_surfaces == 0 && !current_has_dmabuf_before_signal),
+                )
+            } else {
+                (None, None)
+            };
+
+        if install_transaction_acquire_source {
+            let acquire = server_state
+                .installed_acquire_points
+                .first()
+                .expect("valid explicit-sync commit should install an acquire point")
+                .clone();
+            let source = server_state
+                .acquire_sources
+                .pop()
+                .expect("valid explicit-sync commit should install an acquire event source");
+            let server_surface = server_state
+                .surfaces
+                .first()
+                .cloned()
+                .expect("client create_surface should reach server state");
+            let server_client = server_surface
+                .client()
+                .expect("test surface should remain attached to a client");
+            let display_handle = display.handle();
+            let mut event_loop = calloop::EventLoop::<SurfacePointProtocolServerState>::try_new()
+                .expect("create acquire blocker test event loop");
+            event_loop
+                .handle()
+                .insert_source(source, move |(), (), state| {
+                    server_client
+                        .get_data::<SurfacePointProtocolClientData>()
+                        .expect("test client should carry compositor state")
+                        .compositor_state
+                        .blocker_cleared(state, &display_handle);
+                    Ok(())
+                })
+                .expect("insert acquire blocker event source");
+            acquire.signal().expect("signal transaction acquire point");
+            event_loop
+                .dispatch(Duration::from_millis(100), &mut server_state)
+                .expect("dispatch transaction acquire event source");
+        }
+
         let server_surface = server_state
             .surfaces
             .first()
             .expect("client create_surface should reach server state");
-        let (
-            current_has_dmabuf,
-            staged_acquire_point,
-            staged_release_point,
-            acquire_release_same_timeline,
-            current_acquire_sync_point,
-        ) = with_states(server_surface, |states| {
-            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
-            let current_buffer =
-                attributes
-                    .current()
-                    .buffer
-                    .as_ref()
-                    .and_then(|assignment| match assignment {
-                        BufferAssignment::NewBuffer(buffer) => Some(buffer),
-                        BufferAssignment::Removed => None,
-                    });
-            let current_has_dmabuf = current_buffer
-                .map(|buffer| get_dmabuf(buffer).is_ok())
-                .unwrap_or(false);
+        let (current_has_dmabuf, staged_acquire_point, staged_release_point, acquire_release_same_timeline) =
+            with_states(server_surface, |states| {
+                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                let current_buffer =
+                    attributes
+                        .current()
+                        .buffer
+                        .as_ref()
+                        .and_then(|assignment| match assignment {
+                            BufferAssignment::NewBuffer(buffer) => Some(buffer),
+                            BufferAssignment::Removed => None,
+                        });
+                let current_has_dmabuf = current_buffer
+                    .map(|buffer| get_dmabuf(buffer).is_ok())
+                    .unwrap_or(false);
 
-            let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
-            let current = cached.current();
-            let acquire = current.acquire_point.as_ref();
-            let release = current.release_point.as_ref();
-            (
-                current_has_dmabuf,
-                acquire.map(|point| point.point),
-                release.map(|point| point.point),
-                acquire
-                    .zip(release)
-                    .map(|(acquire, release)| acquire.timeline == release.timeline)
-                    .unwrap_or(false),
-                acquire.cloned(),
-            )
-        });
-        let (acquire_blocker_pending_before_signal, acquire_blocker_released_after_signal) =
-            if probe_acquire_blocker {
-                let acquire = current_acquire_sync_point
-                    .as_ref()
-                    .expect("valid dmabuf commit should promote a current acquire sync point");
-                let (blocker, source) = acquire
-                    .generate_blocker()
-                    .expect("test device should support syncobj eventfd");
-                let mut event_loop =
-                    calloop::EventLoop::<()>::try_new().expect("create test calloop event loop");
-                event_loop
-                    .handle()
-                    .insert_source(source, |(), (), ()| Ok(()))
-                    .expect("insert syncobj eventfd source");
-                event_loop
-                    .dispatch(Duration::from_millis(10), &mut ())
-                    .expect("dispatch syncobj eventfd source before signaling");
-                let pending_before_signal =
-                    compositor::Blocker::state(&blocker) == compositor::BlockerState::Pending;
-
-                acquire.signal().expect("signal test acquire sync point");
-                event_loop
-                    .dispatch(Duration::from_millis(100), &mut ())
-                    .expect("dispatch syncobj eventfd source");
-                let released_after_signal =
-                    compositor::Blocker::state(&blocker) == compositor::BlockerState::Released;
-
-                (Some(pending_before_signal), Some(released_after_signal))
-            } else {
-                (None, None)
-            };
+                let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+                let current = cached.current();
+                let acquire = current.acquire_point.as_ref();
+                let release = current.release_point.as_ref();
+                (
+                    current_has_dmabuf,
+                    acquire.map(|point| point.point),
+                    release.map(|point| point.point),
+                    acquire
+                        .zip(release)
+                        .map(|(acquire, release)| acquire.timeline == release.timeline)
+                        .unwrap_or(false),
+                )
+            });
         let known_timeline_count = server_state
             .syncobj_state
             .as_ref()
@@ -1402,6 +1593,8 @@ pub(crate) mod test_utils {
             .iter()
             .filter_map(Weak::upgrade)
             .count();
+        let transaction_released_after_acquire_signal = install_transaction_acquire_source
+            .then_some(server_state.committed_surfaces == 1 && current_has_dmabuf);
 
         Some(ClientDmabufCommitEvidence {
             known_timeline_count,
@@ -1411,8 +1604,9 @@ pub(crate) mod test_utils {
             acquire_point: staged_acquire_point,
             release_point: staged_release_point,
             acquire_release_same_timeline,
-            acquire_blocker_pending_before_signal,
-            acquire_blocker_released_after_signal,
+            transaction_acquire_source_installed,
+            transaction_pending_before_acquire_signal,
+            transaction_released_after_acquire_signal,
         })
     }
 
@@ -2048,6 +2242,30 @@ mod tests {
         let buffer = protocol_buffer(&server_client, &display_handle);
         let (acquire_point, release_point) =
             DrmSyncPoint::invalid_timeline_pair_for_tests(9, 10).expect("create ordered points");
+        stage_pending_sync_points(&surface, Some(acquire_point), Some(release_point));
+
+        compositor::test_utils::commit_buffer_assignment(
+            &mut server_state,
+            &display_handle,
+            &surface,
+            Some(buffer),
+        );
+
+        assert!(current_sync_points_are_empty(&surface));
+        assert!(current_buffer_is_none(&surface));
+    }
+
+    #[test]
+    fn commit_unwaitable_acquire_without_source_discards_buffer_and_sync_state() {
+        let Some((_display, display_handle, mut server_state, _client_side, server_client, surface)) =
+            focused_commit_state()
+        else {
+            return;
+        };
+        test_utils::install_surface_for_tests::<ProtocolServerState>(&display_handle, &surface);
+        let buffer = protocol_dmabuf_buffer(&server_client, &display_handle);
+        let (acquire_point, release_point) =
+            DrmSyncPoint::invalid_timeline_pair_for_tests(31, 32).expect("create invalid test sync points");
         stage_pending_sync_points(&surface, Some(acquire_point), Some(release_point));
 
         compositor::test_utils::commit_buffer_assignment(

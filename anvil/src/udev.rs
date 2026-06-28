@@ -480,7 +480,7 @@ pub fn run_udev() {
             });
         });
 
-    // Expose syncobj protocol if supported by primary GPU
+    // Keep syncobj protocol development-gated until Anvil owns acquire source registrations.
     if let Some(primary_node) = state
         .backend_data
         .primary_gpu
@@ -490,9 +490,10 @@ pub fn run_udev() {
         if let Some(backend) = state.backend_data.backends.get(&primary_node) {
             let import_device = backend.drm_output_manager.device().device_fd().clone();
             if supports_syncobj_eventfd(&import_device) {
-                let syncobj_state =
-                    DrmSyncobjState::new::<AnvilState<UdevData>>(&display_handle, import_device);
-                state.backend_data.syncobj_state = Some(syncobj_state);
+                // Development-gated: Smithay can model acquire-point transaction blockers, but
+                // Anvil still needs ownership/removal for registered acquire event sources before
+                // advertising linux-drm-syncobj-v1 to general clients.
+                debug!("not advertising linux-drm-syncobj-v1: acquire source ownership is development-gated");
             }
         }
     }
