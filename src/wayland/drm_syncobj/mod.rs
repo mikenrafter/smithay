@@ -10,8 +10,10 @@
 //! `true`. Or it won't be possible to create the blocker. This is similar to other
 //! implementations.
 //!
-//! The release fence is signalled when all references to a
-//! [`Buffer`][crate::backend::renderer::utils::Buffer] are dropped.
+//! The committed release fence is signalled when all references to a
+//! [`Buffer`][crate::backend::renderer::utils::Buffer] are dropped. Pending
+//! release points that are discarded before becoming current, such as invalid
+//! commits or syncobj-surface teardown, are signalled as part of the discard.
 //!
 //! ```no_run
 //! # use smithay::wayland::drm_syncobj::*;
@@ -535,6 +537,8 @@ pub(crate) mod test_utils {
         pub(crate) code: u32,
         pub(crate) current_acquire_point_present: bool,
         pub(crate) current_release_point_present: bool,
+        pub(crate) release_point_signaled_before_discard: Option<bool>,
+        pub(crate) release_point_signaled_after_discard: Option<bool>,
     }
 
     #[derive(Default)]
@@ -686,6 +690,14 @@ pub(crate) mod test_utils {
                         .sync_plane(idx, DmabufSyncFlags::READ | DmabufSyncFlags::END)
                         .is_ok()
             })
+    }
+
+    fn sync_point_signaled_for_tests(point: &DrmSyncPoint) -> bool {
+        point
+            .timeline
+            .query_signalled_point()
+            .expect("query test DRM syncobj timeline point")
+            >= point.point
     }
 
     impl AsMut<compositor::CompositorState> for SurfacePointProtocolServerState {
@@ -851,7 +863,30 @@ pub(crate) mod test_utils {
             code: protocol_error.code,
             current_acquire_point_present,
             current_release_point_present,
+            release_point_signaled_before_discard: None,
+            release_point_signaled_after_discard: None,
         }
+    }
+
+    fn read_surface_point_protocol_error_with_release_signal_evidence(
+        event_queue: &mut wayland_client::EventQueue<SurfacePointProtocolClientState>,
+        client_connection: &Connection,
+        client_state: &mut SurfacePointProtocolClientState,
+        current_acquire_point_present: bool,
+        current_release_point_present: bool,
+        release_point_signaled_before_discard: bool,
+        release_point_signaled_after_discard: bool,
+    ) -> ClientCommitProtocolErrorEvidence {
+        let mut evidence = read_surface_point_protocol_error(
+            event_queue,
+            client_connection,
+            client_state,
+            current_acquire_point_present,
+            current_release_point_present,
+        );
+        evidence.release_point_signaled_before_discard = Some(release_point_signaled_before_discard);
+        evidence.release_point_signaled_after_discard = Some(release_point_signaled_after_discard);
+        evidence
     }
 
     #[allow(dead_code)]
@@ -1039,6 +1074,117 @@ pub(crate) mod test_utils {
             &mut client_state,
             current_acquire_point_present,
             current_release_point_present,
+        ))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn commit_surface_points_without_buffer_and_probe_release_signal_through_client_for_tests(
+        import_device: DrmDeviceFd,
+        timeline_fd: OwnedFd,
+        acquire_point: u64,
+        release_point: u64,
+    ) -> Option<ClientCommitProtocolErrorEvidence> {
+        let mut display = match Display::<SurfacePointProtocolServerState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return None,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let mut display_handle = display.handle();
+        let compositor_state =
+            compositor::CompositorState::new::<SurfacePointProtocolServerState>(&display_handle);
+        let syncobj_state =
+            DrmSyncobjState::new::<SurfacePointProtocolServerState>(&display_handle, import_device);
+        let mut server_state = SurfacePointProtocolServerState {
+            compositor_state,
+            syncobj_state: Some(syncobj_state),
+            dmabuf_state: DmabufState::new(),
+            expected_dmabuf: None,
+            last_imported_dmabuf_syncable: false,
+            last_imported_dmabuf_matches_expected: false,
+            surfaces: Vec::new(),
+        };
+        let (client_side, server_side) = UnixStream::pair().unwrap();
+        let _server_client = display_handle
+            .insert_client(server_side, Arc::new(SurfacePointProtocolClientData::default()))
+            .expect("insert test client");
+
+        let client_connection = Connection::from_socket(client_side).expect("connect test client socket");
+        let mut event_queue = client_connection.new_event_queue();
+        let qh = event_queue.handle();
+        let mut client_state = SurfacePointProtocolClientState::default();
+
+        client_connection.display().get_registry(&qh, ());
+        client_connection.flush().expect("flush get_registry");
+        pump_surface_point_protocol_server(&mut display, &mut server_state);
+        event_queue
+            .blocking_dispatch(&mut client_state)
+            .expect("dispatch registry globals");
+
+        let compositor = client_state
+            .compositor
+            .as_ref()
+            .expect("test compositor global should be advertised");
+        let syncobj_manager = client_state
+            .syncobj_manager
+            .as_ref()
+            .expect("test syncobj global should be advertised");
+        let surface = compositor.create_surface(&qh, ());
+        let syncobj_surface = syncobj_manager.get_surface(&surface, &qh, ());
+        let timeline = syncobj_manager.import_timeline(timeline_fd.as_fd(), &qh, ());
+        let (acquire_hi, acquire_lo) = (((acquire_point >> 32) as u32), acquire_point as u32);
+        let (release_hi, release_lo) = (((release_point >> 32) as u32), release_point as u32);
+        syncobj_surface.set_acquire_point(&timeline, acquire_hi, acquire_lo);
+        syncobj_surface.set_release_point(&timeline, release_hi, release_lo);
+        client_state.surface = Some(surface);
+        client_state.syncobj_surface = Some(syncobj_surface);
+        client_state.timeline = Some(timeline);
+        client_connection
+            .flush()
+            .expect("flush syncobj surface point requests");
+        pump_surface_point_protocol_server(&mut display, &mut server_state);
+
+        let server_surface = server_state
+            .surfaces
+            .first()
+            .cloned()
+            .expect("client create_surface should reach server state");
+        let release_sync_point = with_states(&server_surface, |states| {
+            let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+            cached
+                .pending()
+                .release_point
+                .as_ref()
+                .expect("set_release_point should stage a pending release point")
+                .clone()
+        });
+        let release_point_signaled_before_discard = sync_point_signaled_for_tests(&release_sync_point);
+
+        let surface = client_state
+            .surface
+            .as_ref()
+            .expect("test surface should remain live");
+        surface.commit();
+        client_connection
+            .flush()
+            .expect("flush syncobj surface commit request");
+        pump_surface_point_protocol_server(&mut display, &mut server_state);
+
+        let (current_acquire_point_present, current_release_point_present) =
+            with_states(&server_surface, |states| {
+                let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+                let current = cached.current();
+                (current.acquire_point.is_some(), current.release_point.is_some())
+            });
+        let release_point_signaled_after_discard = sync_point_signaled_for_tests(&release_sync_point);
+
+        Some(read_surface_point_protocol_error_with_release_signal_evidence(
+            &mut event_queue,
+            &client_connection,
+            &mut client_state,
+            current_acquire_point_present,
+            current_release_point_present,
+            release_point_signaled_before_discard,
+            release_point_signaled_after_discard,
         ))
     }
 
