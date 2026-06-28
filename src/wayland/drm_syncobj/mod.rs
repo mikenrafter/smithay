@@ -464,6 +464,7 @@ pub(crate) mod test_utils {
         os::fd::{AsFd, OwnedFd},
         os::unix::net::UnixStream,
         sync::{Arc, Weak},
+        time::Duration,
     };
 
     use wayland_client::{
@@ -523,6 +524,8 @@ pub(crate) mod test_utils {
         pub(crate) acquire_point: Option<u64>,
         pub(crate) release_point: Option<u64>,
         pub(crate) acquire_release_same_timeline: bool,
+        pub(crate) acquire_blocker_pending_before_signal: Option<bool>,
+        pub(crate) acquire_blocker_released_after_signal: Option<bool>,
     }
 
     #[derive(Debug)]
@@ -1047,6 +1050,42 @@ pub(crate) mod test_utils {
         acquire_point: u64,
         release_point: u64,
     ) -> Option<ClientDmabufCommitEvidence> {
+        commit_dmabuf_surface_with_sync_points_through_client_for_tests_impl(
+            import_device,
+            timeline_fd,
+            source_dmabuf,
+            acquire_point,
+            release_point,
+            false,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn commit_dmabuf_surface_and_probe_acquire_blocker_through_client_for_tests(
+        import_device: DrmDeviceFd,
+        timeline_fd: OwnedFd,
+        source_dmabuf: Dmabuf,
+        acquire_point: u64,
+        release_point: u64,
+    ) -> Option<ClientDmabufCommitEvidence> {
+        commit_dmabuf_surface_with_sync_points_through_client_for_tests_impl(
+            import_device,
+            timeline_fd,
+            source_dmabuf,
+            acquire_point,
+            release_point,
+            true,
+        )
+    }
+
+    fn commit_dmabuf_surface_with_sync_points_through_client_for_tests_impl(
+        import_device: DrmDeviceFd,
+        timeline_fd: OwnedFd,
+        source_dmabuf: Dmabuf,
+        acquire_point: u64,
+        release_point: u64,
+        probe_acquire_blocker: bool,
+    ) -> Option<ClientDmabufCommitEvidence> {
         let mut display = match Display::<SurfacePointProtocolServerState>::new() {
             Ok(display) => display,
             Err(InitError::NoWaylandLib) => return None,
@@ -1142,36 +1181,73 @@ pub(crate) mod test_utils {
             .surfaces
             .first()
             .expect("client create_surface should reach server state");
-        let (current_has_dmabuf, staged_acquire_point, staged_release_point, acquire_release_same_timeline) =
-            with_states(server_surface, |states| {
-                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
-                let current_buffer =
-                    attributes
-                        .current()
-                        .buffer
-                        .as_ref()
-                        .and_then(|assignment| match assignment {
-                            BufferAssignment::NewBuffer(buffer) => Some(buffer),
-                            BufferAssignment::Removed => None,
-                        });
-                let current_has_dmabuf = current_buffer
-                    .map(|buffer| get_dmabuf(buffer).is_ok())
-                    .unwrap_or(false);
+        let (
+            current_has_dmabuf,
+            staged_acquire_point,
+            staged_release_point,
+            acquire_release_same_timeline,
+            current_acquire_sync_point,
+        ) = with_states(server_surface, |states| {
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            let current_buffer =
+                attributes
+                    .current()
+                    .buffer
+                    .as_ref()
+                    .and_then(|assignment| match assignment {
+                        BufferAssignment::NewBuffer(buffer) => Some(buffer),
+                        BufferAssignment::Removed => None,
+                    });
+            let current_has_dmabuf = current_buffer
+                .map(|buffer| get_dmabuf(buffer).is_ok())
+                .unwrap_or(false);
 
-                let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
-                let current = cached.current();
-                let acquire = current.acquire_point.as_ref();
-                let release = current.release_point.as_ref();
-                (
-                    current_has_dmabuf,
-                    acquire.map(|point| point.point),
-                    release.map(|point| point.point),
-                    acquire
-                        .zip(release)
-                        .map(|(acquire, release)| acquire.timeline == release.timeline)
-                        .unwrap_or(false),
-                )
-            });
+            let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+            let current = cached.current();
+            let acquire = current.acquire_point.as_ref();
+            let release = current.release_point.as_ref();
+            (
+                current_has_dmabuf,
+                acquire.map(|point| point.point),
+                release.map(|point| point.point),
+                acquire
+                    .zip(release)
+                    .map(|(acquire, release)| acquire.timeline == release.timeline)
+                    .unwrap_or(false),
+                acquire.cloned(),
+            )
+        });
+        let (acquire_blocker_pending_before_signal, acquire_blocker_released_after_signal) =
+            if probe_acquire_blocker {
+                let acquire = current_acquire_sync_point
+                    .as_ref()
+                    .expect("valid dmabuf commit should promote a current acquire sync point");
+                let (blocker, source) = acquire
+                    .generate_blocker()
+                    .expect("test device should support syncobj eventfd");
+                let mut event_loop =
+                    calloop::EventLoop::<()>::try_new().expect("create test calloop event loop");
+                event_loop
+                    .handle()
+                    .insert_source(source, |(), (), ()| Ok(()))
+                    .expect("insert syncobj eventfd source");
+                event_loop
+                    .dispatch(Duration::from_millis(10), &mut ())
+                    .expect("dispatch syncobj eventfd source before signaling");
+                let pending_before_signal =
+                    compositor::Blocker::state(&blocker) == compositor::BlockerState::Pending;
+
+                acquire.signal().expect("signal test acquire sync point");
+                event_loop
+                    .dispatch(Duration::from_millis(100), &mut ())
+                    .expect("dispatch syncobj eventfd source");
+                let released_after_signal =
+                    compositor::Blocker::state(&blocker) == compositor::BlockerState::Released;
+
+                (Some(pending_before_signal), Some(released_after_signal))
+            } else {
+                (None, None)
+            };
         let known_timeline_count = server_state
             .syncobj_state
             .as_ref()
@@ -1189,6 +1265,8 @@ pub(crate) mod test_utils {
             acquire_point: staged_acquire_point,
             release_point: staged_release_point,
             acquire_release_same_timeline,
+            acquire_blocker_pending_before_signal,
+            acquire_blocker_released_after_signal,
         })
     }
 
