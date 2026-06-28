@@ -1212,9 +1212,15 @@ mod tests {
     use wayland_server::{
         Display, DisplayHandle, Resource,
         backend::{ClientData, ClientId, DisconnectReason, InitError},
+        protocol::wl_buffer,
     };
 
     use super::*;
+    use crate::backend::allocator::{
+        Fourcc, Modifier,
+        dmabuf::{Dmabuf, DmabufFlags},
+    };
+    use crate::wayland::buffer::BufferHandler;
     use crate::wayland::compositor;
 
     #[derive(Default)]
@@ -1259,6 +1265,25 @@ mod tests {
     impl DrmSyncobjHandler for ProtocolServerState {
         fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
             self.syncobj_state.as_mut()
+        }
+    }
+
+    impl BufferHandler for ProtocolServerState {
+        fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
+    }
+
+    struct ProtocolBufferData;
+
+    impl crate::wayland::Dispatch2<wl_buffer::WlBuffer, ProtocolServerState> for ProtocolBufferData {
+        fn request(
+            &self,
+            _state: &mut ProtocolServerState,
+            _client: &wayland_server::Client,
+            _resource: &wl_buffer::WlBuffer,
+            _request: wl_buffer::Request,
+            _dhandle: &DisplayHandle,
+            _data_init: &mut wayland_server::DataInit<'_, ProtocolServerState>,
+        ) {
         }
     }
 
@@ -1359,6 +1384,236 @@ mod tests {
         }
         .expect("client request should disconnect with a protocol error");
         (protocol_error.object_interface, protocol_error.code)
+    }
+
+    fn focused_commit_state() -> Option<(
+        Display<ProtocolServerState>,
+        DisplayHandle,
+        ProtocolServerState,
+        UnixStream,
+        wayland_server::Client,
+        wayland_server::protocol::wl_surface::WlSurface,
+    )> {
+        let display = match Display::<ProtocolServerState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return None,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let mut display_handle = display.handle();
+        let compositor_state = compositor::CompositorState::new::<ProtocolServerState>(&display_handle);
+        let syncobj_state =
+            DrmSyncobjState::new_without_import_device_for_tests::<ProtocolServerState>(&display_handle);
+        let server_state = ProtocolServerState {
+            compositor_state,
+            syncobj_state: Some(syncobj_state),
+            surfaces: Vec::new(),
+        };
+        let (client_side, server_side) = UnixStream::pair().unwrap();
+        let server_client = display_handle
+            .insert_client(server_side, Arc::new(ProtocolClientData::default()))
+            .expect("insert test client");
+        let surface =
+            compositor::test_utils::create_surface::<ProtocolServerState>(&server_client, &display_handle);
+        Some((
+            display,
+            display_handle,
+            server_state,
+            client_side,
+            server_client,
+            surface,
+        ))
+    }
+
+    fn dmabuf_for_invalid_commit_tests() -> Dmabuf {
+        // This fd is intentionally inert: these tests only need `get_dmabuf()` to identify the
+        // buffer as dmabuf-backed so the pre-commit guard reaches the targeted syncobj branch.
+        // No renderer or kernel dmabuf importer consumes this buffer.
+        let plane_fd = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
+            .expect("create inert test dmabuf fd");
+        let mut builder = Dmabuf::builder((1, 1), Fourcc::Abgr8888, Modifier::Invalid, DmabufFlags::empty());
+        assert!(builder.add_plane(plane_fd, 0, 0, 4));
+        builder.build().expect("test dmabuf should have one plane")
+    }
+
+    fn protocol_dmabuf_buffer(
+        client: &wayland_server::Client,
+        display_handle: &DisplayHandle,
+    ) -> wl_buffer::WlBuffer {
+        client
+            .create_resource::<wl_buffer::WlBuffer, Dmabuf, ProtocolServerState>(
+                display_handle,
+                1,
+                dmabuf_for_invalid_commit_tests(),
+            )
+            .expect("create test dmabuf wl_buffer")
+    }
+
+    fn protocol_buffer(
+        client: &wayland_server::Client,
+        display_handle: &DisplayHandle,
+    ) -> wl_buffer::WlBuffer {
+        client
+            .create_resource::<wl_buffer::WlBuffer, ProtocolBufferData, ProtocolServerState>(
+                display_handle,
+                1,
+                ProtocolBufferData,
+            )
+            .expect("create test wl_buffer")
+    }
+
+    fn stage_pending_sync_points(
+        surface: &wayland_server::protocol::wl_surface::WlSurface,
+        acquire_point: Option<DrmSyncPoint>,
+        release_point: Option<DrmSyncPoint>,
+    ) {
+        compositor::with_states(surface, |states| {
+            let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+            let pending = cached.pending();
+            pending.acquire_point = acquire_point;
+            pending.release_point = release_point;
+        });
+    }
+
+    fn current_sync_points_are_empty(surface: &wayland_server::protocol::wl_surface::WlSurface) -> bool {
+        compositor::with_states(surface, |states| {
+            let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+            let current = cached.current();
+            current.acquire_point.is_none() && current.release_point.is_none()
+        })
+    }
+
+    fn current_buffer_is_some(surface: &wayland_server::protocol::wl_surface::WlSurface) -> bool {
+        compositor::with_states(surface, |states| {
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            matches!(attributes.current().buffer, Some(BufferAssignment::NewBuffer(_)))
+        })
+    }
+
+    fn current_buffer_is_none(surface: &wayland_server::protocol::wl_surface::WlSurface) -> bool {
+        compositor::with_states(surface, |states| {
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            attributes.current().buffer.is_none()
+        })
+    }
+
+    #[test]
+    fn invalid_commit_new_buffer_without_acquire_discards_buffer_and_sync_state() {
+        let Some((_display, display_handle, mut server_state, _client_side, server_client, surface)) =
+            focused_commit_state()
+        else {
+            return;
+        };
+        test_utils::install_surface_for_tests::<ProtocolServerState>(&display_handle, &surface);
+        let buffer = protocol_dmabuf_buffer(&server_client, &display_handle);
+        let release_point = DrmSyncPoint::invalid_for_tests(7).expect("create test release point");
+        stage_pending_sync_points(&surface, None, Some(release_point));
+
+        compositor::test_utils::commit_buffer_assignment(
+            &mut server_state,
+            &display_handle,
+            &surface,
+            Some(buffer),
+        );
+
+        assert!(current_sync_points_are_empty(&surface));
+        assert!(current_buffer_is_none(&surface));
+    }
+
+    #[test]
+    fn invalid_commit_new_buffer_without_release_discards_buffer_and_sync_state() {
+        let Some((_display, display_handle, mut server_state, _client_side, server_client, surface)) =
+            focused_commit_state()
+        else {
+            return;
+        };
+        test_utils::install_surface_for_tests::<ProtocolServerState>(&display_handle, &surface);
+        let buffer = protocol_dmabuf_buffer(&server_client, &display_handle);
+        let acquire_point = DrmSyncPoint::invalid_for_tests(7).expect("create test acquire point");
+        stage_pending_sync_points(&surface, Some(acquire_point), None);
+
+        compositor::test_utils::commit_buffer_assignment(
+            &mut server_state,
+            &display_handle,
+            &surface,
+            Some(buffer),
+        );
+
+        assert!(current_sync_points_are_empty(&surface));
+        assert!(current_buffer_is_none(&surface));
+    }
+
+    #[test]
+    fn invalid_commit_conflicting_points_discards_buffer_and_sync_state() {
+        let Some((_display, display_handle, mut server_state, _client_side, server_client, surface)) =
+            focused_commit_state()
+        else {
+            return;
+        };
+        test_utils::install_surface_for_tests::<ProtocolServerState>(&display_handle, &surface);
+        let buffer = protocol_dmabuf_buffer(&server_client, &display_handle);
+        let (acquire_point, release_point) =
+            DrmSyncPoint::invalid_timeline_pair_for_tests(9, 9).expect("create conflicting points");
+        stage_pending_sync_points(&surface, Some(acquire_point), Some(release_point));
+
+        compositor::test_utils::commit_buffer_assignment(
+            &mut server_state,
+            &display_handle,
+            &surface,
+            Some(buffer),
+        );
+
+        assert!(current_sync_points_are_empty(&surface));
+        assert!(current_buffer_is_none(&surface));
+    }
+
+    #[test]
+    fn invalid_commit_unsupported_buffer_discards_buffer_and_sync_state() {
+        let Some((_display, display_handle, mut server_state, _client_side, server_client, surface)) =
+            focused_commit_state()
+        else {
+            return;
+        };
+        test_utils::install_surface_for_tests::<ProtocolServerState>(&display_handle, &surface);
+        let buffer = protocol_buffer(&server_client, &display_handle);
+        let (acquire_point, release_point) =
+            DrmSyncPoint::invalid_timeline_pair_for_tests(9, 10).expect("create ordered points");
+        stage_pending_sync_points(&surface, Some(acquire_point), Some(release_point));
+
+        compositor::test_utils::commit_buffer_assignment(
+            &mut server_state,
+            &display_handle,
+            &surface,
+            Some(buffer),
+        );
+
+        assert!(current_sync_points_are_empty(&surface));
+        assert!(current_buffer_is_none(&surface));
+    }
+
+    #[test]
+    fn invalid_commit_attach_null_with_sync_points_preserves_current_buffer() {
+        let Some((_display, display_handle, mut server_state, _client_side, server_client, surface)) =
+            focused_commit_state()
+        else {
+            return;
+        };
+        let current_buffer = protocol_buffer(&server_client, &display_handle);
+        compositor::test_utils::commit_buffer_assignment(
+            &mut server_state,
+            &display_handle,
+            &surface,
+            Some(current_buffer),
+        );
+        assert!(current_buffer_is_some(&surface));
+
+        test_utils::install_surface_for_tests::<ProtocolServerState>(&display_handle, &surface);
+        let (acquire_point, release_point) =
+            DrmSyncPoint::invalid_timeline_pair_for_tests(11, 12).expect("create ordered points");
+        stage_pending_sync_points(&surface, Some(acquire_point), Some(release_point));
+        compositor::test_utils::commit_buffer_assignment(&mut server_state, &display_handle, &surface, None);
+
+        assert!(current_sync_points_are_empty(&surface));
+        assert!(current_buffer_is_some(&surface));
     }
 
     #[test]
