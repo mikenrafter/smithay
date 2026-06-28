@@ -4217,6 +4217,73 @@ fn runtime_drm_syncobj_surface_commit_without_buffer_reports_no_buffer() {
     }
 }
 
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device, DRM syncobj and Wayland test display"]
+fn runtime_drm_syncobj_dmabuf_attach_commit_promotes_sync_points() {
+    let test_name = "DRM syncobj client dmabuf attach commit protocol test";
+    let Some(candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
+        return;
+    };
+    let Some(drm_device) = candidate.drm_syncobj_device.clone() else {
+        eprintln!("skipping {test_name}: loopback Vulkan device has no usable DRM syncobj node");
+        return;
+    };
+    let acquire_point = 0x3_0000_0100;
+    let release_point = 0x3_0000_0101;
+
+    let timeline_fd = match runtime_syncobj_timeline_fd_for_tests(&drm_device) {
+        Ok(fd) => fd,
+        Err(err) => {
+            eprintln!("skipping {test_name}: syncobj timeline fd: {err}");
+            return;
+        }
+    };
+
+    let Some(evidence) =
+        crate::wayland::drm_syncobj::test_utils::commit_dmabuf_surface_with_sync_points_through_client_for_tests(
+            drm_device,
+            timeline_fd,
+            candidate.dmabuf.clone(),
+            acquire_point,
+            release_point,
+        )
+    else {
+        eprintln!("skipping {test_name}: failed to create Wayland test display");
+        return;
+    };
+    assert_eq!(
+        evidence.known_timeline_count, 1,
+        "client import_timeline should install exactly one live server timeline"
+    );
+    assert!(
+        evidence.imported_dmabuf_syncable,
+        "client-created linux-dmabuf wl_buffer should be backed by a kernel dma-buf fd"
+    );
+    assert!(
+        evidence.imported_dmabuf_matches_expected,
+        "client-created linux-dmabuf wl_buffer should preserve exported dmabuf format, flags, and plane layout"
+    );
+    assert!(
+        evidence.current_has_dmabuf,
+        "client-created linux-dmabuf wl_buffer should become the current surface buffer"
+    );
+    assert_eq!(
+        evidence.acquire_point,
+        Some(acquire_point),
+        "valid dmabuf commit should promote the exact acquire point"
+    );
+    assert_eq!(
+        evidence.release_point,
+        Some(release_point),
+        "valid dmabuf commit should promote the exact release point"
+    );
+    assert!(
+        evidence.acquire_release_same_timeline,
+        "valid dmabuf commit should preserve imported timeline identity"
+    );
+}
+
 fn runtime_dmabuf_loopback_candidate(test_name: &str) -> Option<RuntimeDmabufLoopbackCandidate> {
     let instance = match Instance::new(Version::VERSION_1_3, None) {
         Ok(instance) => instance,

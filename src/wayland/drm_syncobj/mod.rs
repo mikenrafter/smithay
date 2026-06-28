@@ -468,8 +468,9 @@ pub(crate) mod test_utils {
 
     use wayland_client::{
         Connection, Dispatch as ClientDispatch, QueueHandle, delegate_noop,
-        protocol::{wl_compositor, wl_registry, wl_surface},
+        protocol::{wl_buffer, wl_compositor, wl_registry, wl_surface},
     };
+    use wayland_protocols::wp::linux_dmabuf::zv1::client::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
     use wayland_protocols::wp::linux_drm_syncobj::v1::client::{
         wp_linux_drm_syncobj_manager_v1, wp_linux_drm_syncobj_surface_v1, wp_linux_drm_syncobj_timeline_v1,
     };
@@ -480,6 +481,7 @@ pub(crate) mod test_utils {
     use wayland_server::{
         Client, Dispatch as ServerDispatch, Display, DisplayHandle, Resource,
         backend::{ClientData, ClientId, DisconnectReason, InitError},
+        protocol::wl_buffer as server_wl_buffer,
     };
 
     use super::{
@@ -487,8 +489,14 @@ pub(crate) mod test_utils {
         DrmSyncobjTimelineData, PendingSyncPointKind, commit_hook, destruction_hook,
         set_pending_sync_point_from_timeline_resource,
     };
+    use crate::backend::allocator::{
+        Buffer as AllocatorBuffer,
+        dmabuf::{Dmabuf, DmabufSyncFlags},
+    };
     use crate::backend::drm::DrmDeviceFd;
-    use crate::wayland::compositor::{self, with_states};
+    use crate::wayland::buffer::BufferHandler;
+    use crate::wayland::compositor::{self, BufferAssignment, SurfaceAttributes, with_states};
+    use crate::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf};
 
     #[derive(Debug)]
     #[allow(dead_code)]
@@ -502,6 +510,18 @@ pub(crate) mod test_utils {
         pub(crate) known_timeline_count: usize,
         pub(crate) acquire_point: u64,
         pub(crate) release_point: u64,
+        pub(crate) acquire_release_same_timeline: bool,
+    }
+
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    pub(crate) struct ClientDmabufCommitEvidence {
+        pub(crate) known_timeline_count: usize,
+        pub(crate) imported_dmabuf_syncable: bool,
+        pub(crate) imported_dmabuf_matches_expected: bool,
+        pub(crate) current_has_dmabuf: bool,
+        pub(crate) acquire_point: Option<u64>,
+        pub(crate) release_point: Option<u64>,
         pub(crate) acquire_release_same_timeline: bool,
     }
 
@@ -582,6 +602,10 @@ pub(crate) mod test_utils {
     struct SurfacePointProtocolServerState {
         compositor_state: compositor::CompositorState,
         syncobj_state: Option<DrmSyncobjState>,
+        dmabuf_state: DmabufState,
+        expected_dmabuf: Option<Dmabuf>,
+        last_imported_dmabuf_syncable: bool,
+        last_imported_dmabuf_matches_expected: bool,
         surfaces: Vec<wayland_server::protocol::wl_surface::WlSurface>,
     }
 
@@ -613,6 +637,54 @@ pub(crate) mod test_utils {
         }
     }
 
+    impl BufferHandler for SurfacePointProtocolServerState {
+        fn buffer_destroyed(&mut self, _buffer: &server_wl_buffer::WlBuffer) {}
+    }
+
+    impl DmabufHandler for SurfacePointProtocolServerState {
+        fn dmabuf_state(&mut self) -> &mut DmabufState {
+            &mut self.dmabuf_state
+        }
+
+        fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
+            let syncable = dmabuf_is_kernel_syncable_for_tests(&dmabuf);
+            let matches_expected = self
+                .expected_dmabuf
+                .as_ref()
+                .map(|expected| dmabuf_matches_expected_metadata_for_tests(expected, &dmabuf))
+                .unwrap_or(true);
+            self.last_imported_dmabuf_syncable = syncable;
+            self.last_imported_dmabuf_matches_expected = matches_expected;
+
+            if syncable && matches_expected {
+                let _ = notifier.successful::<SurfacePointProtocolServerState>();
+            } else {
+                notifier.failed();
+            }
+        }
+    }
+
+    fn dmabuf_matches_expected_metadata_for_tests(expected: &Dmabuf, actual: &Dmabuf) -> bool {
+        expected.size() == actual.size()
+            && expected.format() == actual.format()
+            && expected.0.flags == actual.0.flags
+            && expected.num_planes() == actual.num_planes()
+            && expected.offsets().eq(actual.offsets())
+            && expected.strides().eq(actual.strides())
+    }
+
+    fn dmabuf_is_kernel_syncable_for_tests(dmabuf: &Dmabuf) -> bool {
+        dmabuf.num_planes() > 0
+            && (0..dmabuf.num_planes()).all(|idx| {
+                dmabuf
+                    .sync_plane(idx, DmabufSyncFlags::READ | DmabufSyncFlags::START)
+                    .is_ok()
+                    && dmabuf
+                        .sync_plane(idx, DmabufSyncFlags::READ | DmabufSyncFlags::END)
+                        .is_ok()
+            })
+    }
+
     impl AsMut<compositor::CompositorState> for SurfacePointProtocolServerState {
         fn as_mut(&mut self) -> &mut compositor::CompositorState {
             &mut self.compositor_state
@@ -625,7 +697,10 @@ pub(crate) mod test_utils {
     struct SurfacePointProtocolClientState {
         compositor: Option<wl_compositor::WlCompositor>,
         syncobj_manager: Option<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1>,
+        dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
         surface: Option<wl_surface::WlSurface>,
+        buffer: Option<wl_buffer::WlBuffer>,
+        params: Option<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1>,
         syncobj_surface: Option<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1>,
         timeline: Option<wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1>,
     }
@@ -656,6 +731,14 @@ pub(crate) mod test_utils {
                                 ),
                         );
                     }
+                    "zwp_linux_dmabuf_v1" => {
+                        state.dmabuf = Some(registry.bind::<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _, _>(
+                            name,
+                            3,
+                            qh,
+                            (),
+                        ));
+                    }
                     _ => {}
                 }
             }
@@ -664,6 +747,9 @@ pub(crate) mod test_utils {
 
     delegate_noop!(SurfacePointProtocolClientState: ignore wl_compositor::WlCompositor);
     delegate_noop!(SurfacePointProtocolClientState: ignore wl_surface::WlSurface);
+    delegate_noop!(SurfacePointProtocolClientState: ignore wl_buffer::WlBuffer);
+    delegate_noop!(SurfacePointProtocolClientState: ignore zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1);
+    delegate_noop!(SurfacePointProtocolClientState: ignore zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1);
     delegate_noop!(SurfacePointProtocolClientState: ignore wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1);
     delegate_noop!(SurfacePointProtocolClientState: ignore wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1);
     delegate_noop!(SurfacePointProtocolClientState: ignore wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1);
@@ -785,6 +871,10 @@ pub(crate) mod test_utils {
         let mut server_state = SurfacePointProtocolServerState {
             compositor_state,
             syncobj_state: Some(syncobj_state),
+            dmabuf_state: DmabufState::new(),
+            expected_dmabuf: None,
+            last_imported_dmabuf_syncable: false,
+            last_imported_dmabuf_matches_expected: false,
             surfaces: Vec::new(),
         };
         let (client_side, server_side) = UnixStream::pair().unwrap();
@@ -882,6 +972,10 @@ pub(crate) mod test_utils {
         let mut server_state = SurfacePointProtocolServerState {
             compositor_state,
             syncobj_state: Some(syncobj_state),
+            dmabuf_state: DmabufState::new(),
+            expected_dmabuf: None,
+            last_imported_dmabuf_syncable: false,
+            last_imported_dmabuf_matches_expected: false,
             surfaces: Vec::new(),
         };
         let (client_side, server_side) = UnixStream::pair().unwrap();
@@ -943,6 +1037,159 @@ pub(crate) mod test_utils {
             current_acquire_point_present,
             current_release_point_present,
         ))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn commit_dmabuf_surface_with_sync_points_through_client_for_tests(
+        import_device: DrmDeviceFd,
+        timeline_fd: OwnedFd,
+        source_dmabuf: Dmabuf,
+        acquire_point: u64,
+        release_point: u64,
+    ) -> Option<ClientDmabufCommitEvidence> {
+        let mut display = match Display::<SurfacePointProtocolServerState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return None,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let mut display_handle = display.handle();
+        let compositor_state =
+            compositor::CompositorState::new::<SurfacePointProtocolServerState>(&display_handle);
+        let syncobj_state =
+            DrmSyncobjState::new::<SurfacePointProtocolServerState>(&display_handle, import_device);
+        let dmabuf_format = source_dmabuf.format();
+        let dmabuf_size = source_dmabuf.size();
+        let mut dmabuf_state = DmabufState::new();
+        dmabuf_state.create_global::<SurfacePointProtocolServerState>(&display_handle, [dmabuf_format]);
+        let mut server_state = SurfacePointProtocolServerState {
+            compositor_state,
+            syncobj_state: Some(syncobj_state),
+            dmabuf_state,
+            expected_dmabuf: Some(source_dmabuf.clone()),
+            last_imported_dmabuf_syncable: false,
+            last_imported_dmabuf_matches_expected: false,
+            surfaces: Vec::new(),
+        };
+        let (client_side, server_side) = UnixStream::pair().unwrap();
+        let _server_client = display_handle
+            .insert_client(server_side, Arc::new(SurfacePointProtocolClientData::default()))
+            .expect("insert test client");
+
+        let client_connection = Connection::from_socket(client_side).expect("connect test client socket");
+        let mut event_queue = client_connection.new_event_queue();
+        let qh = event_queue.handle();
+        let mut client_state = SurfacePointProtocolClientState::default();
+
+        client_connection.display().get_registry(&qh, ());
+        client_connection.flush().expect("flush get_registry");
+        pump_surface_point_protocol_server(&mut display, &mut server_state);
+        event_queue
+            .blocking_dispatch(&mut client_state)
+            .expect("dispatch registry globals");
+
+        let compositor = client_state
+            .compositor
+            .as_ref()
+            .expect("test compositor global should be advertised");
+        let syncobj_manager = client_state
+            .syncobj_manager
+            .as_ref()
+            .expect("test syncobj global should be advertised");
+        let dmabuf_global = client_state
+            .dmabuf
+            .as_ref()
+            .expect("test dmabuf global should be advertised");
+        let surface = compositor.create_surface(&qh, ());
+        let syncobj_surface = syncobj_manager.get_surface(&surface, &qh, ());
+        let timeline = syncobj_manager.import_timeline(timeline_fd.as_fd(), &qh, ());
+        let params = dmabuf_global.create_params(&qh, ());
+        let modifier: u64 = dmabuf_format.modifier.into();
+        for plane in &source_dmabuf.0.planes {
+            params.add(
+                plane.fd.as_fd(),
+                plane.plane_idx,
+                plane.offset,
+                plane.stride,
+                (modifier >> 32) as u32,
+                modifier as u32,
+            );
+        }
+        let buffer = params.create_immed(
+            dmabuf_size.w,
+            dmabuf_size.h,
+            dmabuf_format.code as u32,
+            zwp_linux_buffer_params_v1::Flags::empty(),
+            &qh,
+            (),
+        );
+        let (acquire_hi, acquire_lo) = (((acquire_point >> 32) as u32), acquire_point as u32);
+        let (release_hi, release_lo) = (((release_point >> 32) as u32), release_point as u32);
+        syncobj_surface.set_acquire_point(&timeline, acquire_hi, acquire_lo);
+        syncobj_surface.set_release_point(&timeline, release_hi, release_lo);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        client_state.surface = Some(surface);
+        client_state.syncobj_surface = Some(syncobj_surface);
+        client_state.timeline = Some(timeline);
+        client_state.params = Some(params);
+        client_state.buffer = Some(buffer);
+        client_connection
+            .flush()
+            .expect("flush dmabuf surface commit request");
+        pump_surface_point_protocol_server(&mut display, &mut server_state);
+
+        let server_surface = server_state
+            .surfaces
+            .first()
+            .expect("client create_surface should reach server state");
+        let (current_has_dmabuf, staged_acquire_point, staged_release_point, acquire_release_same_timeline) =
+            with_states(server_surface, |states| {
+                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                let current_buffer =
+                    attributes
+                        .current()
+                        .buffer
+                        .as_ref()
+                        .and_then(|assignment| match assignment {
+                            BufferAssignment::NewBuffer(buffer) => Some(buffer),
+                            BufferAssignment::Removed => None,
+                        });
+                let current_has_dmabuf = current_buffer
+                    .map(|buffer| get_dmabuf(buffer).is_ok())
+                    .unwrap_or(false);
+
+                let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+                let current = cached.current();
+                let acquire = current.acquire_point.as_ref();
+                let release = current.release_point.as_ref();
+                (
+                    current_has_dmabuf,
+                    acquire.map(|point| point.point),
+                    release.map(|point| point.point),
+                    acquire
+                        .zip(release)
+                        .map(|(acquire, release)| acquire.timeline == release.timeline)
+                        .unwrap_or(false),
+                )
+            });
+        let known_timeline_count = server_state
+            .syncobj_state
+            .as_ref()
+            .expect("test syncobj state should remain installed")
+            .known_timelines
+            .iter()
+            .filter_map(Weak::upgrade)
+            .count();
+
+        Some(ClientDmabufCommitEvidence {
+            known_timeline_count,
+            imported_dmabuf_syncable: server_state.last_imported_dmabuf_syncable,
+            imported_dmabuf_matches_expected: server_state.last_imported_dmabuf_matches_expected,
+            current_has_dmabuf,
+            acquire_point: staged_acquire_point,
+            release_point: staged_release_point,
+            acquire_release_same_timeline,
+        })
     }
 
     /// Install a server-side DRM syncobj surface object for a focused test surface.
@@ -1212,7 +1459,7 @@ mod tests {
     use wayland_server::{
         Display, DisplayHandle, Resource,
         backend::{ClientData, ClientId, DisconnectReason, InitError},
-        protocol::wl_buffer,
+        protocol::wl_buffer as server_wl_buffer,
     };
 
     use super::*;
@@ -1269,18 +1516,18 @@ mod tests {
     }
 
     impl BufferHandler for ProtocolServerState {
-        fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
+        fn buffer_destroyed(&mut self, _buffer: &server_wl_buffer::WlBuffer) {}
     }
 
     struct ProtocolBufferData;
 
-    impl crate::wayland::Dispatch2<wl_buffer::WlBuffer, ProtocolServerState> for ProtocolBufferData {
+    impl crate::wayland::Dispatch2<server_wl_buffer::WlBuffer, ProtocolServerState> for ProtocolBufferData {
         fn request(
             &self,
             _state: &mut ProtocolServerState,
             _client: &wayland_server::Client,
-            _resource: &wl_buffer::WlBuffer,
-            _request: wl_buffer::Request,
+            _resource: &server_wl_buffer::WlBuffer,
+            _request: server_wl_buffer::Request,
             _dhandle: &DisplayHandle,
             _data_init: &mut wayland_server::DataInit<'_, ProtocolServerState>,
         ) {
@@ -1438,9 +1685,9 @@ mod tests {
     fn protocol_dmabuf_buffer(
         client: &wayland_server::Client,
         display_handle: &DisplayHandle,
-    ) -> wl_buffer::WlBuffer {
+    ) -> server_wl_buffer::WlBuffer {
         client
-            .create_resource::<wl_buffer::WlBuffer, Dmabuf, ProtocolServerState>(
+            .create_resource::<server_wl_buffer::WlBuffer, Dmabuf, ProtocolServerState>(
                 display_handle,
                 1,
                 dmabuf_for_invalid_commit_tests(),
@@ -1451,9 +1698,9 @@ mod tests {
     fn protocol_buffer(
         client: &wayland_server::Client,
         display_handle: &DisplayHandle,
-    ) -> wl_buffer::WlBuffer {
+    ) -> server_wl_buffer::WlBuffer {
         client
-            .create_resource::<wl_buffer::WlBuffer, ProtocolBufferData, ProtocolServerState>(
+            .create_resource::<server_wl_buffer::WlBuffer, ProtocolBufferData, ProtocolServerState>(
                 display_handle,
                 1,
                 ProtocolBufferData,
