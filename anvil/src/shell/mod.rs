@@ -116,18 +116,17 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
 
     fn new_surface(&mut self, surface: &WlSurface) {
         add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
-            #[cfg(feature = "udev")]
-            let mut acquire_point = None;
-            let maybe_dmabuf = with_states(surface, |surface_data| {
+            let (maybe_dmabuf, has_pending_syncobj_points) = with_states(surface, |surface_data| {
                 #[cfg(feature = "udev")]
-                acquire_point.clone_from(
-                    &surface_data
-                        .cached_state
-                        .get::<DrmSyncobjCachedState>()
-                        .pending()
-                        .acquire_point,
-                );
-                surface_data
+                let has_pending_syncobj_points = {
+                    let mut cached = surface_data.cached_state.get::<DrmSyncobjCachedState>();
+                    let pending = cached.pending();
+                    pending.acquire_point.is_some() || pending.release_point.is_some()
+                };
+                #[cfg(not(feature = "udev"))]
+                let has_pending_syncobj_points = false;
+
+                let maybe_dmabuf = surface_data
                     .cached_state
                     .get::<SurfaceAttributes>()
                     .pending()
@@ -136,33 +135,21 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
                     .and_then(|assignment| match assignment {
                         BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).cloned().ok(),
                         _ => None,
-                    })
+                    });
+                (maybe_dmabuf, has_pending_syncobj_points)
             });
-            if let Some(dmabuf) = maybe_dmabuf {
-                #[cfg(feature = "udev")]
-                if let Some(acquire_point) = acquire_point {
-                    if let Ok((blocker, source)) = acquire_point.generate_blocker() {
-                        let client = surface.client().unwrap();
-                        let res = state.handle.insert_source(source, move |_, _, data| {
-                            let dh = data.display_handle.clone();
-                            data.client_compositor_state(&client).blocker_cleared(data, &dh);
-                            Ok(())
-                        });
-                        if res.is_ok() {
-                            add_blocker(surface, blocker);
-                            return;
-                        }
-                    }
-                }
-                if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
-                    if let Some(client) = surface.client() {
-                        let res = state.handle.insert_source(source, move |_, _, data| {
-                            let dh = data.display_handle.clone();
-                            data.client_compositor_state(&client).blocker_cleared(data, &dh);
-                            Ok(())
-                        });
-                        if res.is_ok() {
-                            add_blocker(surface, blocker);
+            if !has_pending_syncobj_points {
+                if let Some(dmabuf) = maybe_dmabuf {
+                    if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
+                        if let Some(client) = surface.client() {
+                            let res = state.handle.insert_source(source, move |_, _, data| {
+                                let dh = data.display_handle.clone();
+                                data.client_compositor_state(&client).blocker_cleared(data, &dh);
+                                Ok(())
+                            });
+                            if res.is_ok() {
+                                add_blocker(surface, blocker);
+                            }
                         }
                     }
                 }

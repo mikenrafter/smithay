@@ -81,16 +81,18 @@ use smithay::{
             linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1,
             presentation_time::server::wp_presentation_feedback,
         },
-        wayland_server::{Display, DisplayHandle, backend::GlobalId, protocol::wl_surface},
+        wayland_server::{Display, DisplayHandle, Resource, backend::GlobalId, protocol::wl_surface},
     },
     utils::{DeviceFd, IsAlive, Logical, Monotonic, Point, Scale, Time, Transform},
     wayland::{
-        compositor,
+        compositor::{self, CompositorHandler},
         dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         drm_lease::{
             DrmLease, DrmLeaseBuilder, DrmLeaseHandler, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
         },
-        drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState, supports_syncobj_eventfd},
+        drm_syncobj::{
+            DrmSyncPoint, DrmSyncPointSource, DrmSyncobjHandler, DrmSyncobjState, supports_syncobj_eventfd,
+        },
         presentation::Refresh,
     },
 };
@@ -490,10 +492,12 @@ pub fn run_udev() {
         if let Some(backend) = state.backend_data.backends.get(&primary_node) {
             let import_device = backend.drm_output_manager.device().device_fd().clone();
             if supports_syncobj_eventfd(&import_device) {
-                // Development-gated: Smithay can model acquire-point transaction blockers, but
-                // Anvil still needs ownership/removal for registered acquire event sources before
-                // advertising linux-drm-syncobj-v1 to general clients.
-                debug!("not advertising linux-drm-syncobj-v1: acquire source ownership is development-gated");
+                // Development-gated: Anvil can install acquire sources through the Smithay hook,
+                // but still needs token ownership/removal for never-signalled sources and device
+                // hot-unplug before advertising linux-drm-syncobj-v1 to general clients.
+                debug!(
+                    "not advertising linux-drm-syncobj-v1: acquire source token lifecycle is development-gated"
+                );
             }
         }
     }
@@ -620,6 +624,24 @@ impl DrmLeaseHandler for AnvilState<UdevData> {
 impl DrmSyncobjHandler for AnvilState<UdevData> {
     fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
         self.backend_data.syncobj_state.as_mut()
+    }
+
+    fn drm_syncobj_install_acquire_point_source(
+        &mut self,
+        _dh: &DisplayHandle,
+        surface: &wl_surface::WlSurface,
+        _acquire_point: &DrmSyncPoint,
+        source: DrmSyncPointSource,
+    ) -> bool {
+        let Some(client) = surface.client() else {
+            return false;
+        };
+        let res = self.handle.insert_source(source, move |_, _, data| {
+            let dh = data.display_handle.clone();
+            data.client_compositor_state(&client).blocker_cleared(data, &dh);
+            Ok(())
+        });
+        res.is_ok()
     }
 }
 
