@@ -314,6 +314,10 @@ impl MultiCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     static DISCARD_TEST_LOCK: Mutex<()> = Mutex::new(());
     static DISCARD_OBSERVATIONS: Mutex<Vec<(u32, Vec<u32>)>> = Mutex::new(Vec::new());
@@ -321,6 +325,12 @@ mod tests {
     #[derive(Default)]
     struct DiscardProbe {
         id: u32,
+    }
+
+    #[derive(Default)]
+    struct ReleaseProbe {
+        buffer_id: Option<u32>,
+        releases: Option<Arc<AtomicUsize>>,
     }
 
     impl Cacheable for DiscardProbe {
@@ -337,6 +347,34 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((self.id, retained.iter().map(|state| state.id).collect()));
+        }
+    }
+
+    impl Cacheable for ReleaseProbe {
+        fn commit(&mut self, _dh: &DisplayHandle) -> Self {
+            Self {
+                buffer_id: self.buffer_id,
+                releases: self.releases.clone(),
+            }
+        }
+
+        fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
+            if self.buffer_id.is_some() {
+                *into = self;
+            }
+        }
+
+        fn discard_with_retained(self, current: &mut Self, retained: &[&Self]) {
+            let Some(buffer_id) = self.buffer_id else {
+                return;
+            };
+            let buffer_is_retained = current.buffer_id == Some(buffer_id)
+                || retained.iter().any(|state| state.buffer_id == Some(buffer_id));
+            if !buffer_is_retained {
+                self.releases
+                    .expect("release probe with a buffer should have a release counter")
+                    .fetch_add(1, Ordering::SeqCst);
+            }
         }
     }
 
@@ -378,6 +416,105 @@ mod tests {
         assert_eq!(
             &*DISCARD_OBSERVATIONS.lock().unwrap(),
             &[(1, vec![2, 1]), (2, vec![1]), (1, vec![])]
+        );
+    }
+
+    #[test]
+    fn discard_state_range_defers_release_until_last_queued_reference() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let cache = Mutex::new(CachedState {
+            pending: ReleaseProbe::default(),
+            current: ReleaseProbe::default(),
+            cache: VecDeque::from([
+                (
+                    Serial::from(1),
+                    ReleaseProbe {
+                        buffer_id: Some(7),
+                        releases: Some(releases.clone()),
+                    },
+                ),
+                (
+                    Serial::from(2),
+                    ReleaseProbe {
+                        buffer_id: Some(7),
+                        releases: Some(releases.clone()),
+                    },
+                ),
+            ]),
+        });
+
+        Cache::discard_state_range(&cache, Serial::from(1), Serial::from(1));
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            0,
+            "discarding one queued state must not release a buffer retained by another queued state"
+        );
+
+        Cache::discard_state_range(&cache, Serial::from(2), Serial::from(2));
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            1,
+            "discarding the last queued reference should release the buffer exactly once"
+        );
+    }
+
+    #[test]
+    fn discard_state_range_does_not_release_current_buffer() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let cache = Mutex::new(CachedState {
+            pending: ReleaseProbe::default(),
+            current: ReleaseProbe {
+                buffer_id: Some(7),
+                releases: Some(releases.clone()),
+            },
+            cache: VecDeque::from([(
+                Serial::from(1),
+                ReleaseProbe {
+                    buffer_id: Some(7),
+                    releases: Some(releases.clone()),
+                },
+            )]),
+        });
+
+        Cache::discard_state_range(&cache, Serial::from(1), Serial::from(1));
+
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            0,
+            "discarding queued state must not release a buffer retained by current state"
+        );
+    }
+
+    #[test]
+    fn discard_all_states_releases_after_last_queued_reference() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let cache = Mutex::new(CachedState {
+            pending: ReleaseProbe::default(),
+            current: ReleaseProbe::default(),
+            cache: VecDeque::from([
+                (
+                    Serial::from(1),
+                    ReleaseProbe {
+                        buffer_id: Some(7),
+                        releases: Some(releases.clone()),
+                    },
+                ),
+                (
+                    Serial::from(2),
+                    ReleaseProbe {
+                        buffer_id: Some(7),
+                        releases: Some(releases.clone()),
+                    },
+                ),
+            ]),
+        });
+
+        Cache::discard_all_states(&cache);
+
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            1,
+            "discarding all queued references should release a retained buffer exactly once"
         );
     }
 }
