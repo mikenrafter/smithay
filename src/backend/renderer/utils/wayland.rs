@@ -1513,6 +1513,87 @@ mod tests {
         assert_eq!(renderer.released, vec![151]);
     }
 
+    #[cfg(feature = "backend_drm")]
+    #[test]
+    fn different_buffer_recommit_retires_cached_texture_for_release() {
+        struct WrapperMarker;
+
+        let display = match Display::<SurfaceTreeTestState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let mut display_handle = display.handle();
+        let (_client_side, server_side) = UnixStream::pair().unwrap();
+        let client = display_handle
+            .insert_client(server_side, Arc::new(SurfaceTreeTestClientState::default()))
+            .unwrap();
+        let surface = crate::wayland::compositor::test_utils::create_surface::<SurfaceTreeTestState>(
+            &client,
+            &display_handle,
+        );
+        let first_buffer = test_dmabuf_buffer(&client, &display_handle);
+        let second_buffer = test_dmabuf_buffer(&client, &display_handle);
+        let context_id = ContextId::<TestTexture>::new();
+
+        crate::wayland::compositor::with_states(&surface, |states| {
+            {
+                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                attributes.current().buffer = Some(BufferAssignment::NewBuffer(first_buffer));
+            }
+
+            let mut state = RendererSurfaceState::default();
+            state.update_buffer(states);
+            let first_wrapper = state
+                .buffer()
+                .expect("first commit should install renderer-managed buffer")
+                .clone();
+            assert!(first_wrapper.user_data().insert_if_missing(|| WrapperMarker));
+
+            state
+                .textures
+                .insert(context_id.erased(), Box::new(TestTexture(152)));
+            state
+                .renderer_seen
+                .insert(context_id.erased(), state.current_commit());
+
+            {
+                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                attributes.current().buffer = Some(BufferAssignment::NewBuffer(second_buffer));
+            }
+
+            state.update_buffer(states);
+            let replacement_wrapper = state
+                .buffer()
+                .expect("different-buffer recommit should install a replacement renderer buffer");
+            assert!(replacement_wrapper.user_data().get::<WrapperMarker>().is_none());
+            assert!(state.textures.is_empty());
+            assert_eq!(
+                state.retired_textures.get(&context_id.erased()).map(Vec::len),
+                Some(1)
+            );
+
+            states.data_map.insert_if_missing_threadsafe(|| Mutex::new(state));
+        });
+
+        let mut renderer = HookRenderer {
+            context_id: context_id.clone(),
+            fail_releases: VecDeque::new(),
+            released: Vec::new(),
+        };
+        crate::wayland::compositor::with_states(&surface, |states| {
+            super::release_retired_surface_textures(&mut renderer, states).unwrap();
+            let state = states
+                .data_map
+                .get::<super::RendererSurfaceStateUserData>()
+                .unwrap()
+                .lock()
+                .unwrap();
+            assert!(!state.retired_textures.contains_key(&context_id.erased()));
+        });
+        assert_eq!(renderer.released, vec![152]);
+    }
+
     #[test]
     fn retired_textures_are_drained_through_release_hook() {
         let context_id = ContextId::<TestTexture>::new();
