@@ -3461,17 +3461,19 @@ impl VulkanRenderer {
     /// Keeping this as a distinct step makes the intended future API shape explicit: callers first
     /// produce a context carrying sync, external-state, and lifecycle evidence; the renderer then
     /// validates that context and only takes move-only release ownership at texture construction time.
+    /// The normal Wayland path binds that late take to the same renderer-managed buffer that produced
+    /// the context, rather than accepting an arbitrary release-ownership closure.
     #[cfg(feature = "wayland_frontend")]
-    fn import_wayland_dmabuf_with_context<F>(
+    fn import_wayland_dmabuf_with_context(
         &mut self,
         context: SampledDmabufImportContext<'_>,
-        release_ownership: F,
-    ) -> Result<VulkanTexture, VulkanError>
-    where
-        F: FnOnce() -> Result<SampledDmabufReleaseOwnership, VulkanError>,
-    {
+        buffer: &super::utils::Buffer,
+    ) -> Result<VulkanTexture, VulkanError> {
+        let dmabuf = context.dmabuf;
         let policy_context = context.wayland_policy_context();
-        self.import_wayland_dmabuf_with_policy_context(policy_context, release_ownership)
+        self.import_wayland_dmabuf_with_policy_context(policy_context, || {
+            Self::sampled_dmabuf_take_wayland_release_ownership(dmabuf, buffer)
+        })
     }
 
     /// Release an acquired dmabuf render target back to foreign ownership in `GENERAL` layout.
@@ -3987,10 +3989,7 @@ impl ImportDmaWl for VulkanRenderer {
         _damage: &[Rectangle<i32, BufferCoord>],
     ) -> Result<Self::TextureId, Self::Error> {
         let context = self.wayland_sampled_dmabuf_import_context(buffer, surface)?;
-        let dmabuf = context.dmabuf;
-        self.import_wayland_dmabuf_with_context(context, || {
-            Self::sampled_dmabuf_take_wayland_release_ownership(dmabuf, buffer)
-        })
+        self.import_wayland_dmabuf_with_context(context, buffer)
     }
 }
 
