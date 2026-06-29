@@ -732,6 +732,7 @@ pub(crate) mod test_utils {
         dmabuf::{Dmabuf, DmabufSyncFlags},
     };
     use crate::backend::drm::DrmDeviceFd;
+    use crate::backend::renderer::utils as renderer_utils;
     use crate::wayland::buffer::BufferHandler;
     use crate::wayland::compositor::{self, BufferAssignment, SurfaceAttributes, with_states};
     use crate::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf};
@@ -769,6 +770,61 @@ pub(crate) mod test_utils {
         pub(crate) removal_release_point_signaled_at_buffer_release_event: Option<bool>,
         pub(crate) removal_buffer_release_events: Option<usize>,
         pub(crate) current_has_dmabuf_after_removal: Option<bool>,
+    }
+
+    #[allow(dead_code)]
+    pub(crate) struct ClientRendererDmabufCommitHarness {
+        evidence: ClientDmabufCommitEvidence,
+        server_surface: wayland_server::protocol::wl_surface::WlSurface,
+        renderer_buffer: renderer_utils::Buffer,
+        display: Display<SurfacePointProtocolServerState>,
+        server_state: SurfacePointProtocolServerState,
+        client_connection: Connection,
+        event_queue: wayland_client::EventQueue<SurfacePointProtocolClientState>,
+        client_state: SurfacePointProtocolClientState,
+    }
+
+    impl ClientRendererDmabufCommitHarness {
+        pub(crate) fn evidence(&self) -> &ClientDmabufCommitEvidence {
+            &self.evidence
+        }
+
+        pub(crate) fn surface(&self) -> &wayland_server::protocol::wl_surface::WlSurface {
+            &self.server_surface
+        }
+
+        pub(crate) fn renderer_buffer(&self) -> &renderer_utils::Buffer {
+            &self.renderer_buffer
+        }
+
+        pub(crate) fn renderer_buffer_acquire_point(&self) -> Option<u64> {
+            self.renderer_buffer.acquire_point().map(|point| point.point)
+        }
+
+        pub(crate) fn renderer_buffer_release_point(&self) -> Option<u64> {
+            self.renderer_buffer.release_point().map(|point| point.point)
+        }
+
+        pub(crate) fn renderer_buffer_has_dmabuf(&self) -> bool {
+            get_dmabuf(self.renderer_buffer()).is_ok()
+        }
+    }
+
+    struct ClientDmabufCommitArtifacts {
+        evidence: ClientDmabufCommitEvidence,
+        display: Display<SurfacePointProtocolServerState>,
+        server_state: SurfacePointProtocolServerState,
+        client_connection: Connection,
+        event_queue: wayland_client::EventQueue<SurfacePointProtocolClientState>,
+        client_state: SurfacePointProtocolClientState,
+        server_surface: wayland_server::protocol::wl_surface::WlSurface,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct ClientDmabufCommitOptions {
+        install_transaction_acquire_source: bool,
+        remove_after_commit: bool,
+        run_renderer_commit_handler: bool,
     }
 
     #[derive(Debug)]
@@ -859,6 +915,7 @@ pub(crate) mod test_utils {
         acquire_sources: Vec<DrmSyncPointSource>,
         committed_surfaces: usize,
         surfaces: Vec<wayland_server::protocol::wl_surface::WlSurface>,
+        run_renderer_commit_handler: bool,
     }
 
     impl compositor::CompositorHandler for SurfacePointProtocolServerState {
@@ -880,7 +937,10 @@ pub(crate) mod test_utils {
             self.surfaces.push(surface.clone());
         }
 
-        fn commit(&mut self, _surface: &wayland_server::protocol::wl_surface::WlSurface) {
+        fn commit(&mut self, surface: &wayland_server::protocol::wl_surface::WlSurface) {
+            if self.run_renderer_commit_handler {
+                renderer_utils::on_commit_buffer_handler::<SurfacePointProtocolServerState>(surface);
+            }
             self.committed_surfaces += 1;
         }
     }
@@ -1216,6 +1276,7 @@ pub(crate) mod test_utils {
             acquire_sources: Vec::new(),
             committed_surfaces: 0,
             surfaces: Vec::new(),
+            run_renderer_commit_handler: false,
         };
         let (client_side, server_side) = UnixStream::pair().unwrap();
         let _server_client = display_handle
@@ -1322,6 +1383,7 @@ pub(crate) mod test_utils {
             acquire_sources: Vec::new(),
             committed_surfaces: 0,
             surfaces: Vec::new(),
+            run_renderer_commit_handler: false,
         };
         let (client_side, server_side) = UnixStream::pair().unwrap();
         let _server_client = display_handle
@@ -1414,6 +1476,7 @@ pub(crate) mod test_utils {
             acquire_sources: Vec::new(),
             committed_surfaces: 0,
             surfaces: Vec::new(),
+            run_renderer_commit_handler: false,
         };
         let (client_side, server_side) = UnixStream::pair().unwrap();
         let _server_client = display_handle
@@ -1514,9 +1577,48 @@ pub(crate) mod test_utils {
             source_dmabuf,
             acquire_point,
             release_point,
-            false,
-            false,
+            ClientDmabufCommitOptions::default(),
         )
+        .map(|artifacts| artifacts.evidence)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn commit_dmabuf_surface_with_renderer_buffer_through_client_for_tests(
+        import_device: DrmDeviceFd,
+        timeline_fd: OwnedFd,
+        source_dmabuf: Dmabuf,
+        acquire_point: u64,
+        release_point: u64,
+    ) -> Option<ClientRendererDmabufCommitHarness> {
+        let artifacts = commit_dmabuf_surface_with_sync_points_through_client_for_tests_impl(
+            import_device,
+            timeline_fd,
+            source_dmabuf,
+            acquire_point,
+            release_point,
+            ClientDmabufCommitOptions {
+                run_renderer_commit_handler: true,
+                ..ClientDmabufCommitOptions::default()
+            },
+        )?;
+
+        let renderer_buffer =
+            renderer_utils::with_renderer_surface_state(&artifacts.server_surface, |state| {
+                state.buffer().cloned()
+            })
+            .flatten()
+            .expect("renderer commit handler should install a renderer-managed dmabuf buffer");
+
+        Some(ClientRendererDmabufCommitHarness {
+            evidence: artifacts.evidence,
+            server_surface: artifacts.server_surface,
+            renderer_buffer,
+            display: artifacts.display,
+            server_state: artifacts.server_state,
+            client_connection: artifacts.client_connection,
+            event_queue: artifacts.event_queue,
+            client_state: artifacts.client_state,
+        })
     }
 
     #[allow(dead_code)]
@@ -1533,9 +1635,12 @@ pub(crate) mod test_utils {
             source_dmabuf,
             acquire_point,
             release_point,
-            false,
-            true,
+            ClientDmabufCommitOptions {
+                remove_after_commit: true,
+                ..ClientDmabufCommitOptions::default()
+            },
         )
+        .map(|artifacts| artifacts.evidence)
     }
 
     #[allow(dead_code)]
@@ -1552,9 +1657,12 @@ pub(crate) mod test_utils {
             source_dmabuf,
             acquire_point,
             release_point,
-            true,
-            false,
+            ClientDmabufCommitOptions {
+                install_transaction_acquire_source: true,
+                ..ClientDmabufCommitOptions::default()
+            },
         )
+        .map(|artifacts| artifacts.evidence)
     }
 
     fn commit_dmabuf_surface_with_sync_points_through_client_for_tests_impl(
@@ -1563,9 +1671,8 @@ pub(crate) mod test_utils {
         source_dmabuf: Dmabuf,
         acquire_point: u64,
         release_point: u64,
-        install_transaction_acquire_source: bool,
-        remove_after_commit: bool,
-    ) -> Option<ClientDmabufCommitEvidence> {
+        options: ClientDmabufCommitOptions,
+    ) -> Option<ClientDmabufCommitArtifacts> {
         let mut display = match Display::<SurfacePointProtocolServerState>::new() {
             Ok(display) => display,
             Err(InitError::NoWaylandLib) => return None,
@@ -1587,11 +1694,12 @@ pub(crate) mod test_utils {
             expected_dmabuf: Some(source_dmabuf.clone()),
             last_imported_dmabuf_syncable: false,
             last_imported_dmabuf_matches_expected: false,
-            install_acquire_sources: install_transaction_acquire_source,
+            install_acquire_sources: options.install_transaction_acquire_source,
             installed_acquire_points: Vec::new(),
             acquire_sources: Vec::new(),
             committed_surfaces: 0,
             surfaces: Vec::new(),
+            run_renderer_commit_handler: options.run_renderer_commit_handler,
         };
         let (client_side, server_side) = UnixStream::pair().unwrap();
         let _server_client = display_handle
@@ -1649,7 +1757,7 @@ pub(crate) mod test_utils {
         let (release_hi, release_lo) = (((release_point >> 32) as u32), release_point as u32);
         syncobj_surface.set_acquire_point(&timeline, acquire_hi, acquire_lo);
         syncobj_surface.set_release_point(&timeline, release_hi, release_lo);
-        if !install_transaction_acquire_source {
+        if !options.install_transaction_acquire_source {
             client_connection
                 .flush()
                 .expect("flush dmabuf setup and syncobj surface point requests");
@@ -1684,7 +1792,7 @@ pub(crate) mod test_utils {
         pump_surface_point_protocol_server(&mut display, &mut server_state);
 
         let (transaction_acquire_source_installed, transaction_pending_before_acquire_signal) =
-            if install_transaction_acquire_source {
+            if options.install_transaction_acquire_source {
                 assert_eq!(
                     server_state.installed_acquire_points.len(),
                     1,
@@ -1719,7 +1827,7 @@ pub(crate) mod test_utils {
                 (None, None)
             };
 
-        if install_transaction_acquire_source {
+        if options.install_transaction_acquire_source {
             let acquire = server_state
                 .installed_acquire_points
                 .first()
@@ -1804,7 +1912,7 @@ pub(crate) mod test_utils {
             removal_release_point_signaled_at_buffer_release_event,
             removal_buffer_release_events,
             current_has_dmabuf_after_removal,
-        ) = if remove_after_commit {
+        ) = if options.remove_after_commit {
             let release_sync_point = current_release_sync_point
                 .as_ref()
                 .expect("valid explicit-sync dmabuf commit should promote a release point")
@@ -1853,10 +1961,11 @@ pub(crate) mod test_utils {
             .iter()
             .filter_map(Weak::upgrade)
             .count();
-        let transaction_released_after_acquire_signal = install_transaction_acquire_source
+        let transaction_released_after_acquire_signal = options
+            .install_transaction_acquire_source
             .then_some(server_state.committed_surfaces == 1 && current_has_dmabuf);
 
-        Some(ClientDmabufCommitEvidence {
+        let evidence = ClientDmabufCommitEvidence {
             known_timeline_count,
             imported_dmabuf_syncable: server_state.last_imported_dmabuf_syncable,
             imported_dmabuf_matches_expected: server_state.last_imported_dmabuf_matches_expected,
@@ -1872,6 +1981,16 @@ pub(crate) mod test_utils {
             removal_release_point_signaled_at_buffer_release_event,
             removal_buffer_release_events,
             current_has_dmabuf_after_removal,
+        };
+
+        Some(ClientDmabufCommitArtifacts {
+            evidence,
+            display,
+            server_state,
+            client_connection,
+            event_queue,
+            client_state,
+            server_surface,
         })
     }
 

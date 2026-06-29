@@ -4432,6 +4432,85 @@ fn runtime_drm_syncobj_dmabuf_attach_commit_promotes_sync_points() {
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device, DRM syncobj and Wayland test display"]
+fn runtime_drm_syncobj_dmabuf_commit_reaches_renderer_managed_buffer() {
+    let test_name = "DRM syncobj client dmabuf renderer buffer protocol test";
+    let Some(candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
+        return;
+    };
+    let Some(drm_device) = candidate.drm_syncobj_device.clone() else {
+        eprintln!("skipping {test_name}: loopback Vulkan device has no usable DRM syncobj node");
+        return;
+    };
+    let acquire_point = 0x3_0000_0200;
+    let release_point = 0x3_0000_0201;
+
+    let timeline_fd = match runtime_syncobj_timeline_fd_for_tests(&drm_device) {
+        Ok(fd) => fd,
+        Err(err) => {
+            eprintln!("skipping {test_name}: syncobj timeline fd: {err}");
+            return;
+        }
+    };
+
+    let Some(harness) =
+        crate::wayland::drm_syncobj::test_utils::commit_dmabuf_surface_with_renderer_buffer_through_client_for_tests(
+            drm_device,
+            timeline_fd,
+            candidate.dmabuf.clone(),
+            acquire_point,
+            release_point,
+        )
+    else {
+        eprintln!("skipping {test_name}: failed to create Wayland test display");
+        return;
+    };
+    let evidence = harness.evidence();
+    assert!(
+        evidence.imported_dmabuf_syncable,
+        "renderer-buffer fixture should still use a kernel dma-buf backed wl_buffer"
+    );
+    assert!(
+        evidence.imported_dmabuf_matches_expected,
+        "renderer-buffer fixture should preserve exported dmabuf metadata"
+    );
+    assert!(
+        !evidence.current_has_dmabuf,
+        "renderer-utils on_commit_buffer_handler should consume SurfaceAttributes' current wl_buffer into renderer state"
+    );
+    assert_eq!(
+        evidence.acquire_point, None,
+        "renderer-utils should consume the promoted acquire point into the renderer-managed buffer"
+    );
+    assert_eq!(
+        evidence.release_point, None,
+        "renderer-utils should consume the promoted release point into the renderer-managed buffer"
+    );
+    assert_eq!(
+        harness.renderer_buffer_acquire_point(),
+        Some(acquire_point),
+        "renderer-utils on_commit_buffer_handler should copy the promoted acquire point into the renderer-managed buffer"
+    );
+    assert_eq!(
+        harness.renderer_buffer_release_point(),
+        Some(release_point),
+        "renderer-utils on_commit_buffer_handler should copy the promoted release point into the renderer-managed buffer"
+    );
+    assert!(
+        harness.renderer_buffer_has_dmabuf(),
+        "renderer-managed buffer should still dereference to the client-created dmabuf wl_buffer"
+    );
+    assert!(
+        crate::backend::renderer::utils::with_renderer_surface_state(harness.surface(), |state| {
+            state.buffer().is_some()
+        })
+        .unwrap_or(false),
+        "live harness should keep the surface renderer state available to a later ImportDmaWl probe"
+    );
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device, DRM syncobj and Wayland test display"]
 fn runtime_drm_syncobj_dmabuf_remove_signals_release_before_buffer_release() {
     let test_name = "DRM syncobj client dmabuf removal release protocol test";
     let Some(candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
@@ -5437,6 +5516,211 @@ fn runtime_import_dma_wl_loopback_samples_and_releases_with_drm_syncobj() {
                 &surface,
                 &release_point_probe,
                 "panic cleanup should signal sampled dmabuf Wayland release point",
+            );
+        }
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format, DRM syncobj and Wayland test display"]
+fn runtime_import_dma_wl_protocol_dmabuf_commit_samples_and_releases() {
+    let test_name = "Vulkan ImportDmaWl client-protocol dmabuf sampling test";
+    let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
+        return;
+    };
+    let Some(drm_device) = candidate.drm_syncobj_device.clone() else {
+        eprintln!("skipping {test_name}: no DRM device for syncobj timeline");
+        return;
+    };
+    let Some(render_format) =
+        runtime_offscreen_sample_render_format(&candidate.renderer, candidate.format.code, test_name)
+    else {
+        return;
+    };
+
+    let allocator_release = unsafe {
+        // SAFETY: The dmabuf was just exported from `candidate.image`, and this ignored runtime test
+        // does not hand it to any other API before asking the allocator to release the fresh image to
+        // FOREIGN/GENERAL for the renderer acquire below.
+        candidate
+            .allocator
+            .release_dmabuf_to_foreign_general(&candidate.image, &candidate.dmabuf)
+    }
+    .expect("release allocator dmabuf to foreign GENERAL");
+
+    let mut target = unsafe {
+        // SAFETY: `allocator_release` proves that the allocator-owned image backing this exported
+        // dmabuf was released to VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL layout. There is no
+        // intervening access before this renderer acquire.
+        candidate
+            .renderer
+            .bind_allocator_released_dmabuf_render_target(&mut candidate.dmabuf, allocator_release)
+    }
+    .expect("bind allocator-released dmabuf as Vulkan render target")
+    .expect("renderer should advertise the selected dmabuf render-target modifier");
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = candidate
+            .renderer
+            .render(&mut target, (4, 4).into(), Transform::Normal)
+            .expect("render into loopback dmabuf target");
+        frame
+            .clear(Color32F::new(0.25, 0.5, 0.875, 1.0), &full_damage)
+            .expect("clear loopback dmabuf render target");
+    }
+
+    let evidence = match candidate
+        .renderer
+        .release_dmabuf_render_target_for_sampled_loopback(&mut target, true)
+    {
+        Ok(Some(evidence)) => evidence,
+        Ok(None) => panic!("released loopback render target should produce sampled import evidence"),
+        Err(VulkanError::UnsupportedOperation("sync-file semaphore export")) => {
+            eprintln!("skipping {test_name}: sync-file export unsupported");
+            candidate
+                .renderer
+                .release_dmabuf_render_target_for_sampled_loopback(&mut target, false)
+                .expect("release loopback render target without exported sync after export skip");
+            return;
+        }
+        Err(err) => panic!("release loopback render target to foreign GENERAL with exported sync: {err:?}"),
+    };
+    drop(target);
+    assert!(evidence.is_for_dmabuf(&candidate.dmabuf));
+
+    evidence
+        .acquire_sync()
+        .wait()
+        .expect("wait for loopback release before protocol acquire signal");
+
+    let timeline_fd = match runtime_syncobj_timeline_fd_for_tests(&drm_device) {
+        Ok(fd) => fd,
+        Err(err) => {
+            eprintln!("skipping {test_name}: syncobj timeline fd: {err}");
+            return;
+        }
+    };
+    let acquire_point = 0x3_0000_0300;
+    let release_point = 0x3_0000_0301;
+    let Some(harness) =
+        crate::wayland::drm_syncobj::test_utils::commit_dmabuf_surface_with_renderer_buffer_through_client_for_tests(
+            drm_device,
+            timeline_fd,
+            candidate.dmabuf.clone(),
+            acquire_point,
+            release_point,
+        )
+    else {
+        eprintln!("skipping {test_name}: failed to create Wayland test display");
+        return;
+    };
+    assert!(harness.renderer_buffer_has_dmabuf());
+    assert!(
+        harness.evidence().imported_dmabuf_syncable,
+        "protocol-created wl_buffer should be backed by a kernel dma-buf fd"
+    );
+    assert!(
+        harness.evidence().imported_dmabuf_matches_expected,
+        "protocol-created wl_buffer should preserve the loopback dmabuf metadata"
+    );
+    assert_eq!(harness.renderer_buffer_acquire_point(), Some(acquire_point));
+    assert_eq!(harness.renderer_buffer_release_point(), Some(release_point));
+    let committed_dmabuf = crate::wayland::dmabuf::get_dmabuf(harness.renderer_buffer())
+        .expect("protocol renderer-managed buffer should contain a dmabuf")
+        .clone();
+    let release_point_probe = harness
+        .renderer_buffer()
+        .release_point()
+        .expect("protocol renderer-managed buffer should carry a release point");
+
+    unsafe {
+        // SAFETY: `evidence` above proves the Smithay-controlled loopback dmabuf was released to
+        // FOREIGN ownership in GENERAL layout. The client-protocol path recreates a Smithay `Dmabuf`
+        // identity around the same underlying dma-buf fds, so this test separately asserts that
+        // `create_immed` preserved the expected kernel-syncable metadata before marking the committed
+        // renderer-managed dmabuf identity. It also waits the loopback release sync before driving the
+        // client-protocol commit helper, whose non-blocking path explicitly signals the Wayland
+        // acquire point before the commit can become current. There is no intervening use before
+        // `import_surface`; public sampled-dmabuf advertisement remains closed.
+        candidate
+            .renderer
+            .assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import(
+                harness.surface(),
+                &committed_dmabuf,
+            )
+            .unwrap();
+        candidate
+            .renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+                harness.renderer_buffer(),
+                &committed_dmabuf,
+            )
+            .unwrap();
+    }
+
+    crate::wayland::compositor::with_states(harness.surface(), |states| {
+        crate::backend::renderer::utils::import_surface(&mut candidate.renderer, states)
+    })
+    .expect("protocol-driven ImportDmaWl import_surface should import sampled loopback dmabuf");
+    assert!(
+        harness.renderer_buffer().release_point().is_none(),
+        "successful protocol-driven ImportDmaWl texture construction must take Wayland release ownership"
+    );
+
+    let mut release_satisfied = false;
+    let sample_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let cached_texture = {
+            crate::wayland::compositor::with_states(harness.surface(), |states| {
+                let data = states
+                    .data_map
+                    .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
+                    .expect("protocol import_surface should preserve renderer surface state");
+                let data = data.lock().unwrap();
+                data.texture(candidate.renderer.context_id())
+                    .expect("protocol ImportDmaWl import_surface should cache a Vulkan texture")
+                    .clone()
+            })
+        };
+        runtime_sample_texture_to_offscreen_and_assert_non_black(
+            &mut candidate.renderer,
+            &cached_texture,
+            render_format,
+            test_name,
+        );
+        drop(cached_texture);
+        assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
+        assert!(matches!(
+            candidate
+                .renderer
+                .validate_sampled_dmabuf_public_advertisement_contract(),
+            Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        ));
+
+        retire_import_wl_surface_textures_and_wait_for_tests(
+            &mut candidate.renderer,
+            harness.surface(),
+            &release_point_probe,
+            "protocol sampled dmabuf release should signal Wayland release point",
+        );
+        release_satisfied = true;
+        assert_eq!(
+            candidate
+                .renderer
+                .sampled_dmabuf_layout_history(&committed_dmabuf),
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+        );
+    }));
+
+    if let Err(payload) = sample_result {
+        if !release_satisfied {
+            retire_import_wl_surface_textures_and_wait_for_tests(
+                &mut candidate.renderer,
+                harness.surface(),
+                &release_point_probe,
+                "panic cleanup should signal protocol sampled dmabuf Wayland release point",
             );
         }
         std::panic::resume_unwind(payload);
