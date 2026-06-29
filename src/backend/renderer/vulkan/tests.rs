@@ -7539,6 +7539,110 @@ fn sampled_dmabuf_wayland_policy_does_not_public_advertise_import_dma() {
 }
 
 #[test]
+fn sampled_dmabuf_import_context_preserves_wayland_policy_inputs() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.capabilities.external_memory.foreign_queue_family = true;
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let import = VulkanDmabufImportState::from_dmabuf(&dmabuf).unwrap();
+    let acquire_sync =
+        SampledDmabufAcquireSyncEvidence::new(&dmabuf, SyncPoint::from(SignaledExportableFence));
+    let release_evidence = renderer
+        .validate_sampled_dmabuf_wayland_release_point_contract(&dmabuf, true)
+        .unwrap();
+    let release_ownership = SampledDmabufReleaseOwnershipEvidence::new_for_tests(&dmabuf);
+    let first_import_layout = SampledDmabufWaylandFirstImportLayoutEvidence::new_for_tests(&dmabuf);
+    let first_import_foreign_general = unsafe {
+        // SAFETY: This no-GPU unit test only validates that the typed context preserves the evidence
+        // identities consumed by the policy validator. It does not import or sample the dmabuf.
+        SampledDmabufKnownLayoutEvidence::foreign_general(dmabuf.weak())
+    };
+    let context = SampledDmabufImportContext {
+        dmabuf: &dmabuf,
+        import,
+        acquire_sync,
+        release_evidence,
+        release_ownership,
+        per_commit_texture_import: true,
+        layout_history: SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+        external_state_sources: SampledDmabufWaylandExternalStateEvidenceSources {
+            first_import_layout: Some(first_import_layout),
+            first_import_foreign_general: Some(first_import_foreign_general),
+            current_reacquire_layout: None,
+            current_reacquire_foreign_general: None,
+        },
+        texture_cache_replacement_release_reachability:
+            SampledDmabufWaylandTextureCacheReplacementReleaseReachability::new_for_tests(&dmabuf),
+        texture_cache_release_hook: SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(&dmabuf),
+        texture_cache_release_lifecycle: Some(
+            SampledDmabufWaylandTextureCacheReleaseLifecycle::new_for_tests(&dmabuf),
+        ),
+    };
+
+    let policy_context = context.wayland_policy_context();
+    assert_eq!(policy_context.dmabuf, &dmabuf);
+    assert_eq!(policy_context.import, &context.import);
+    assert!(policy_context.acquire_sync.is_for_dmabuf(&dmabuf));
+    assert!(policy_context.release_evidence.is_for_dmabuf(&dmabuf));
+    assert!(
+        policy_context
+            .release_ownership
+            .as_ref()
+            .is_some_and(|evidence| evidence.is_for_dmabuf(&dmabuf))
+    );
+    assert_eq!(
+        policy_context.layout_history,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory
+    );
+    assert!(
+        policy_context
+            .first_import_layout
+            .as_ref()
+            .is_some_and(|evidence| evidence.is_for_dmabuf(&dmabuf))
+    );
+    assert!(
+        policy_context
+            .first_import_foreign_general
+            .as_ref()
+            .is_some_and(|evidence| evidence.is_for_dmabuf(&dmabuf))
+    );
+    assert!(
+        policy_context
+            .texture_cache_replacement_release_reachability
+            .as_ref()
+            .is_some_and(|evidence| evidence.is_for_dmabuf(&dmabuf))
+    );
+    assert!(
+        policy_context
+            .texture_cache_release_hook
+            .as_ref()
+            .is_some_and(|evidence| evidence.is_for_dmabuf(&dmabuf))
+    );
+    assert!(
+        policy_context
+            .texture_cache_release_lifecycle
+            .as_ref()
+            .is_some_and(|evidence| evidence.is_for_dmabuf(&dmabuf))
+    );
+
+    let known_layout = renderer
+        .validate_sampled_dmabuf_wayland_vulkan_interop_policy(&policy_context)
+        .and_then(|policy| renderer.validate_sampled_dmabuf_known_layout_contract(&dmabuf, policy))
+        .unwrap();
+    assert!(known_layout.is_for_dmabuf(&dmabuf));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+}
+
+#[test]
 fn sampled_dmabuf_import_validation_guards_metadata_before_device_lookup() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let valid_dmabuf = dmabuf_with_planes_for_tests(

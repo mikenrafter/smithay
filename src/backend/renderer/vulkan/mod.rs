@@ -786,6 +786,50 @@ impl<'a> SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
     }
 }
 
+/// Module-private typed context for validation-stage sampled dmabuf imports.
+///
+/// Raw [`ImportDma`] only receives a [`Dmabuf`] and damage, which is insufficient for Vulkan: it
+/// cannot carry acquire sync, release ownership, current external image state, or renderer cache
+/// lifecycle. This context is the internal Smithay-shaped contract that gathers those inputs before
+/// the Vulkan import core runs. It is intentionally not a public advertisement surface; public raw
+/// [`ImportDma`] remains fail-closed until an equivalent contract exists for arbitrary callers.
+#[allow(dead_code)]
+struct SampledDmabufImportContext<'a> {
+    dmabuf: &'a Dmabuf,
+    import: image::VulkanDmabufImportState,
+    acquire_sync: SampledDmabufAcquireSyncEvidence,
+    release_evidence: SampledDmabufReleaseEvidence,
+    release_ownership: SampledDmabufReleaseOwnershipEvidence,
+    per_commit_texture_import: bool,
+    layout_history: SampledDmabufWaylandLayoutHistory,
+    external_state_sources: SampledDmabufWaylandExternalStateEvidenceSources,
+    texture_cache_replacement_release_reachability:
+        SampledDmabufWaylandTextureCacheReplacementReleaseReachability,
+    texture_cache_release_hook: SampledDmabufWaylandTextureCacheReleaseHook,
+    texture_cache_release_lifecycle: Option<SampledDmabufWaylandTextureCacheReleaseLifecycle>,
+}
+
+#[allow(dead_code)]
+impl<'a> SampledDmabufImportContext<'a> {
+    fn wayland_policy_context(&self) -> SampledDmabufWaylandVulkanInteropPolicyContext<'_> {
+        SampledDmabufWaylandVulkanInteropPolicyContext::new(
+            self.dmabuf,
+            &self.import,
+            &self.acquire_sync,
+            &self.release_evidence,
+            self.per_commit_texture_import,
+            self.layout_history,
+        )
+        .with_external_state_sources(self.external_state_sources.clone())
+        .with_texture_cache_replacement_release_reachability(
+            self.texture_cache_replacement_release_reachability.clone(),
+        )
+        .with_texture_cache_release_hook(self.texture_cache_release_hook.clone())
+        .with_texture_cache_release_lifecycle(self.texture_cache_release_lifecycle.clone())
+        .with_release_ownership(self.release_ownership.clone())
+    }
+}
+
 /// Validation evidence for Smithay's normal Wayland dmabuf -> Vulkan sampled-image policy.
 ///
 /// Each field names one contract that must be backed by implementation and tests before the normal
@@ -3226,6 +3270,60 @@ impl VulkanRenderer {
         Ok((released, sync_point_from_sync_file(sync_file)))
     }
 
+    /// Build the typed sampled-dmabuf import context from renderer-managed Wayland buffer state.
+    ///
+    /// This is the internal boundary between Smithay's Wayland protocol/renderer-utils evidence and
+    /// Vulkan's explicit import requirements. The returned context owns the validation evidence that
+    /// can be checked without consuming the move-only Wayland release point; release ownership is still
+    /// taken later, after all policy guards accept the import.
+    #[cfg(feature = "wayland_frontend")]
+    fn wayland_sampled_dmabuf_import_context<'a>(
+        &mut self,
+        buffer: &'a super::utils::Buffer,
+        surface: Option<&crate::wayland::compositor::SurfaceData>,
+    ) -> Result<SampledDmabufImportContext<'a>, VulkanError> {
+        let dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
+            .expect("wayland_sampled_dmabuf_import_context without checking buffer type?");
+
+        let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
+        let layout_history = self.sampled_dmabuf_layout_history(dmabuf);
+        let wayland_external_state =
+            self.sampled_dmabuf_wayland_buffer_foreign_general_evidence(buffer, dmabuf)?;
+        let external_state_sources = self.sampled_dmabuf_wayland_external_state_evidence_sources(
+            dmabuf,
+            layout_history,
+            wayland_external_state.as_ref(),
+        )?;
+        let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_evidence(dmabuf, buffer)?;
+        let release_evidence = self.sampled_dmabuf_wayland_release_evidence(dmabuf, buffer)?;
+        let release_ownership = self.sampled_dmabuf_wayland_release_ownership_evidence(dmabuf, buffer)?;
+        let post_retired_release_import = surface
+            .map(super::utils::surface_import_after_retired_release)
+            .unwrap_or(false);
+        let texture_cache_replacement_release_reachability = self
+            .validate_sampled_dmabuf_wayland_texture_cache_replacement_reachability_contract(
+                dmabuf,
+                post_retired_release_import,
+            )?;
+        let texture_cache_release_hook = self.sampled_dmabuf_wayland_texture_cache_release_hook(dmabuf);
+        let texture_cache_release_lifecycle =
+            self.sampled_dmabuf_wayland_buffer_texture_cache_release_lifecycle(buffer, dmabuf)?;
+
+        Ok(SampledDmabufImportContext {
+            dmabuf,
+            import,
+            acquire_sync,
+            release_evidence,
+            release_ownership,
+            per_commit_texture_import: true,
+            layout_history,
+            external_state_sources,
+            texture_cache_replacement_release_reachability,
+            texture_cache_release_hook,
+            texture_cache_release_lifecycle,
+        })
+    }
+
     /// Complete the normal Wayland sampled-dmabuf import after evidence collection.
     ///
     /// This is the shared implementation core for [`ImportDmaWl`]. It deliberately still requires a
@@ -3266,6 +3364,24 @@ impl VulkanRenderer {
         } else {
             Err(VulkanError::MissingCapability("sampled dmabuf texture import"))
         }
+    }
+
+    /// Complete a contextual sampled-dmabuf import from the typed validation-stage contract.
+    ///
+    /// Keeping this as a distinct step makes the intended future API shape explicit: callers first
+    /// produce a context carrying sync, external-state, and lifecycle evidence; the renderer then
+    /// validates that context and only takes move-only release ownership at texture construction time.
+    #[cfg(feature = "wayland_frontend")]
+    fn import_wayland_dmabuf_with_context<F>(
+        &mut self,
+        context: SampledDmabufImportContext<'_>,
+        release_ownership: F,
+    ) -> Result<VulkanTexture, VulkanError>
+    where
+        F: FnOnce() -> Result<SampledDmabufReleaseOwnership, VulkanError>,
+    {
+        let policy_context = context.wayland_policy_context();
+        self.import_wayland_dmabuf_with_policy_context(policy_context, release_ownership)
     }
 
     /// Release an acquired dmabuf render target back to foreign ownership in `GENERAL` layout.
@@ -3780,47 +3896,9 @@ impl ImportDmaWl for VulkanRenderer {
         surface: Option<&crate::wayland::compositor::SurfaceData>,
         _damage: &[Rectangle<i32, BufferCoord>],
     ) -> Result<Self::TextureId, Self::Error> {
-        let dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
-            .expect("import_dma_buffer_from_surface_state without checking buffer type?");
-
-        let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
-
-        let layout_history = self.sampled_dmabuf_layout_history(dmabuf);
-        let wayland_external_state =
-            self.sampled_dmabuf_wayland_buffer_foreign_general_evidence(buffer, dmabuf)?;
-        let external_state_sources = self.sampled_dmabuf_wayland_external_state_evidence_sources(
-            dmabuf,
-            layout_history,
-            wayland_external_state.as_ref(),
-        )?;
-        let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_evidence(dmabuf, buffer)?;
-        let release_evidence = self.sampled_dmabuf_wayland_release_evidence(dmabuf, buffer)?;
-        let release_ownership = self.sampled_dmabuf_wayland_release_ownership_evidence(dmabuf, buffer)?;
-        let post_retired_release_import = surface
-            .map(super::utils::surface_import_after_retired_release)
-            .unwrap_or(false);
-        let replacement_release_reachability = self
-            .validate_sampled_dmabuf_wayland_texture_cache_replacement_reachability_contract(
-                dmabuf,
-                post_retired_release_import,
-            )?;
-        let texture_cache_release_hook = self.sampled_dmabuf_wayland_texture_cache_release_hook(dmabuf);
-        let texture_cache_release_lifecycle =
-            self.sampled_dmabuf_wayland_buffer_texture_cache_release_lifecycle(buffer, dmabuf)?;
-        let policy_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
-            dmabuf,
-            &import,
-            &acquire_sync,
-            &release_evidence,
-            true,
-            layout_history,
-        )
-        .with_external_state_sources(external_state_sources)
-        .with_texture_cache_replacement_release_reachability(replacement_release_reachability)
-        .with_texture_cache_release_hook(texture_cache_release_hook)
-        .with_texture_cache_release_lifecycle(texture_cache_release_lifecycle)
-        .with_release_ownership(release_ownership);
-        self.import_wayland_dmabuf_with_policy_context(policy_context, || {
+        let context = self.wayland_sampled_dmabuf_import_context(buffer, surface)?;
+        let dmabuf = context.dmabuf;
+        self.import_wayland_dmabuf_with_context(context, || {
             Self::sampled_dmabuf_take_wayland_release_ownership(dmabuf, buffer)
         })
     }
