@@ -3007,17 +3007,26 @@ impl VulkanRenderer {
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
         let Some(sampled_image) = (unsafe {
             // SAFETY: Forwarded from this method's caller.
-            device.create_acquired_dmabuf_sampled_image_resources_with_known_general_layout_and_sync_point(
-                dmabuf,
-                self.downscale_filter,
-                self.upscale_filter,
-                acquire_sync,
-            )
+            device
+                .create_acquired_dmabuf_sampled_image_resources_with_known_general_layout_and_sync_point_classified(
+                    dmabuf,
+                    self.downscale_filter,
+                    self.upscale_filter,
+                    acquire_sync,
+                )
+                .map_err(device::VulkanSampledDmabufForeignAcquireError::into_inner)
         })?
         else {
             return Ok(None);
         };
-        let release_ownership = release_ownership()?;
+        let release_ownership = match release_ownership() {
+            Ok(release_ownership) => release_ownership,
+            Err(err) => {
+                let cleanup =
+                    device.release_sampled_dmabuf_to_foreign_general_classified(sampled_image.image(), false);
+                return Err(Self::sampled_dmabuf_release_ownership_error_after_acquire_cleanup(err, cleanup));
+            }
+        };
         self.validate_sampled_dmabuf_release_lifecycle_contract(dmabuf, &release_ownership)?;
         let release = release_ownership.into_release();
 
@@ -3030,6 +3039,20 @@ impl VulkanRenderer {
                 release,
             ),
         ))
+    }
+
+    fn sampled_dmabuf_release_ownership_error_after_acquire_cleanup(
+        ownership_err: VulkanError,
+        cleanup: Result<(bool, Option<OwnedFd>), device::VulkanSampledDmabufForeignReleaseError>,
+    ) -> VulkanError {
+        match cleanup {
+            Ok((true, None)) => ownership_err,
+            Ok((true, Some(_))) => {
+                VulkanError::UnsupportedOperation("sampled dmabuf acquire cleanup sync file")
+            }
+            Ok((false, _)) => VulkanError::UnsupportedOperation("sampled dmabuf acquire cleanup release"),
+            Err(cleanup_err) => cleanup_err.into_inner(),
+        }
     }
 
     /// Import a dmabuf as a render target and acquire it for color-attachment rendering.

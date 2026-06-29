@@ -10190,6 +10190,42 @@ fn sampled_cache_release_maps_device_release_classification() {
 }
 
 #[test]
+fn sampled_import_release_ownership_failure_prefers_cleanup_proof() {
+    assert!(matches!(
+        VulkanRenderer::sampled_dmabuf_release_ownership_error_after_acquire_cleanup(
+            VulkanError::MissingCapability("release ownership"),
+            Ok((true, None)),
+        ),
+        VulkanError::MissingCapability("release ownership")
+    ));
+    assert!(matches!(
+        VulkanRenderer::sampled_dmabuf_release_ownership_error_after_acquire_cleanup(
+            VulkanError::MissingCapability("release ownership"),
+            Ok((false, None)),
+        ),
+        VulkanError::UnsupportedOperation("sampled dmabuf acquire cleanup release")
+    ));
+    assert!(matches!(
+        VulkanRenderer::sampled_dmabuf_release_ownership_error_after_acquire_cleanup(
+            VulkanError::MissingCapability("release ownership"),
+            Err(VulkanSampledDmabufForeignReleaseError::RetrySafe(
+                VulkanError::UnsupportedOperation("cleanup")
+            )),
+        ),
+        VulkanError::UnsupportedOperation("cleanup")
+    ));
+    assert!(matches!(
+        VulkanRenderer::sampled_dmabuf_release_ownership_error_after_acquire_cleanup(
+            VulkanError::MissingCapability("release ownership"),
+            Err(VulkanSampledDmabufForeignReleaseError::ReleaseSubmitted(
+                VulkanError::UnsupportedOperation("cleanup submitted")
+            )),
+        ),
+        VulkanError::UnsupportedOperation("cleanup submitted")
+    ));
+}
+
+#[test]
 fn public_export_mem_rejects_invalid_vulkan_targets_before_device_lookup() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let foreign_target = render_target_for_tests(

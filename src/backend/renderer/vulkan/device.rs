@@ -1499,23 +1499,58 @@ impl VulkanDeviceState {
         mag_filter: TextureFilter,
         acquire_sync: Option<&SyncPoint>,
     ) -> Result<Option<VulkanSampledImage>, VulkanError> {
-        let Some(image) = self.create_bound_dmabuf_import_image_with_sync(
-            dmabuf,
-            VulkanImageSyncState::foreign_known_general_for_dmabuf_import(),
-        )?
+        unsafe {
+            // SAFETY: Forwarded from this method's caller.
+            self.create_acquired_dmabuf_sampled_image_resources_with_known_general_layout_and_sync_point_classified(
+                dmabuf,
+                min_filter,
+                mag_filter,
+                acquire_sync,
+            )
+        }
+        .map_err(VulkanSampledDmabufForeignAcquireError::into_inner)
+    }
+
+    /// Create sampled resources for a known-layout dmabuf with classified acquire-submit errors.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy the same external-state and acquire-sync requirements as
+    /// [`VulkanDeviceState::create_acquired_dmabuf_sampled_image_resources_with_known_general_layout_and_sync_point`].
+    #[allow(dead_code)]
+    pub(crate) unsafe fn create_acquired_dmabuf_sampled_image_resources_with_known_general_layout_and_sync_point_classified(
+        &self,
+        dmabuf: &Dmabuf,
+        min_filter: TextureFilter,
+        mag_filter: TextureFilter,
+        acquire_sync: Option<&SyncPoint>,
+    ) -> Result<Option<VulkanSampledImage>, VulkanSampledDmabufForeignAcquireError> {
+        let Some(image) = self
+            .create_bound_dmabuf_import_image_with_sync(
+                dmabuf,
+                VulkanImageSyncState::foreign_known_general_for_dmabuf_import(),
+            )
+            .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?
         else {
             return Ok(None);
         };
-        let view = self.create_image_view(&image)?;
-        let sampler = self.create_sampler(min_filter, mag_filter)?;
+        let view = self
+            .create_image_view(&image)
+            .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?;
+        let sampler = self
+            .create_sampler(min_filter, mag_filter)
+            .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?;
 
         let acquire_semaphore = if let Some(acquire_sync) = acquire_sync {
-            unsafe { self.import_sync_point_wait_semaphore(acquire_sync)? }
+            unsafe { self.import_sync_point_wait_semaphore(acquire_sync) }
+                .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?
         } else {
             None
         };
-        if !self.submit_sampled_dmabuf_foreign_acquire(&image, acquire_semaphore.as_ref())? {
-            return Err(VulkanError::UnsupportedOperation("dmabuf external ownership"));
+        if !self.submit_sampled_dmabuf_foreign_acquire_classified(&image, acquire_semaphore.as_ref())? {
+            return Err(VulkanSampledDmabufForeignAcquireError::RetrySafe(
+                VulkanError::UnsupportedOperation("dmabuf external ownership"),
+            ));
         }
 
         Ok(Some(VulkanSampledImage { sampler, view, image }))
