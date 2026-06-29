@@ -81,6 +81,27 @@ impl VulkanSampledDmabufForeignReleaseError {
     }
 }
 
+/// Error classification for acquiring a sampled dmabuf image from foreign ownership.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum VulkanSampledDmabufForeignAcquireError {
+    /// The acquire was not submitted; no Vulkan ownership-transfer side effect occurred.
+    RetrySafe(VulkanError),
+    /// Queue acquire submission was accepted or completion became unknowable; ownership must not be
+    /// treated as still safely foreign without further device/context recovery, and acquire wait
+    /// semaphore payloads may have been consumed or left pending by the queue submission.
+    AcquireSubmitted(VulkanError),
+}
+
+impl VulkanSampledDmabufForeignAcquireError {
+    pub(crate) fn into_inner(self) -> VulkanError {
+        match self {
+            VulkanSampledDmabufForeignAcquireError::RetrySafe(err)
+            | VulkanSampledDmabufForeignAcquireError::AcquireSubmitted(err) => err,
+        }
+    }
+}
+
 pub(super) struct VulkanExternalMemoryDeviceFunctions {
     #[allow(dead_code)]
     pub(super) image_drm_format_modifier: ext::image_drm_format_modifier::Device,
@@ -1506,14 +1527,31 @@ impl VulkanDeviceState {
         image: &VulkanOwnedImage,
         acquire_semaphore: Option<&VulkanSyncFileSemaphore>,
     ) -> Result<bool, VulkanError> {
-        let mut command_buffer = self.allocate_graphics_command_buffer()?;
-        self.begin_command_buffer(&mut command_buffer)?;
-        if !self.record_sampled_dmabuf_foreign_acquire_barrier(&mut command_buffer, image)? {
+        self.submit_sampled_dmabuf_foreign_acquire_classified(image, acquire_semaphore)
+            .map_err(VulkanSampledDmabufForeignAcquireError::into_inner)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn submit_sampled_dmabuf_foreign_acquire_classified(
+        &self,
+        image: &VulkanOwnedImage,
+        acquire_semaphore: Option<&VulkanSyncFileSemaphore>,
+    ) -> Result<bool, VulkanSampledDmabufForeignAcquireError> {
+        let mut command_buffer = self
+            .allocate_graphics_command_buffer()
+            .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?;
+        self.begin_command_buffer(&mut command_buffer)
+            .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?;
+        if !self
+            .record_sampled_dmabuf_foreign_acquire_barrier(&mut command_buffer, image)
+            .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?
+        {
             return Ok(false);
         }
-        self.end_command_buffer(&mut command_buffer)?;
+        self.end_command_buffer(&mut command_buffer)
+            .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?;
 
-        if let Some(acquire_semaphore) = acquire_semaphore {
+        let acquire_result = if let Some(acquire_semaphore) = acquire_semaphore {
             let synchronization = VulkanSubmitSynchronization::default()
                 .wait_sync_file(acquire_semaphore, vk::PipelineStageFlags::TOP_OF_PIPE);
             // SAFETY: This helper fixes the wait stage to TOP_OF_PIPE, which is supported by every
@@ -1524,11 +1562,14 @@ impl VulkanDeviceState {
                 self.submit_graphics_command_buffer_and_wait_with_synchronization(
                     &mut command_buffer,
                     &synchronization,
-                )?
-            };
+                )
+            }
         } else {
-            self.submit_graphics_command_buffer_and_wait(&mut command_buffer)?;
-        }
+            self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
+        };
+
+        acquire_result
+            .map_err(|err| classify_sampled_dmabuf_acquire_submit_error(command_buffer.state, err))?;
 
         Ok(true)
     }
@@ -5768,6 +5809,21 @@ fn classify_sampled_dmabuf_release_submit_error(
     }
 }
 
+fn classify_sampled_dmabuf_acquire_submit_error(
+    state: VulkanCommandBufferState,
+    err: VulkanError,
+) -> VulkanSampledDmabufForeignAcquireError {
+    match state {
+        VulkanCommandBufferState::Submitted | VulkanCommandBufferState::SubmitCompletionUnknown => {
+            VulkanSampledDmabufForeignAcquireError::AcquireSubmitted(err)
+        }
+        VulkanCommandBufferState::Initial
+        | VulkanCommandBufferState::Recording
+        | VulkanCommandBufferState::Executable
+        | VulkanCommandBufferState::Invalid => VulkanSampledDmabufForeignAcquireError::RetrySafe(err),
+    }
+}
+
 #[cfg(test)]
 pub(super) fn classify_sampled_dmabuf_release_submit_error_for_tests(
     submitted: bool,
@@ -5780,6 +5836,20 @@ pub(super) fn classify_sampled_dmabuf_release_submit_error_for_tests(
         (false, false) => VulkanCommandBufferState::Executable,
     };
     classify_sampled_dmabuf_release_submit_error(state, err)
+}
+
+#[cfg(test)]
+pub(super) fn classify_sampled_dmabuf_acquire_submit_error_for_tests(
+    submitted: bool,
+    completion_unknown: bool,
+    err: VulkanError,
+) -> VulkanSampledDmabufForeignAcquireError {
+    let state = match (submitted, completion_unknown) {
+        (_, true) => VulkanCommandBufferState::SubmitCompletionUnknown,
+        (true, false) => VulkanCommandBufferState::Submitted,
+        (false, false) => VulkanCommandBufferState::Executable,
+    };
+    classify_sampled_dmabuf_acquire_submit_error(state, err)
 }
 
 #[allow(dead_code)]

@@ -62,9 +62,10 @@ use super::capabilities::{
     should_query_modifier_properties,
 };
 use super::device::{
-    VulkanDeviceState, VulkanDmabufExternalImageFormatProperties, VulkanSampledDmabufForeignReleaseError,
-    VulkanSampledTexturePipelineShaders, VulkanShaderSpirv, VulkanSharedImageSyncState,
-    VulkanSubmitSynchronization, VulkanSyncFileImport, VulkanSyncFileSemaphorePayloadState,
+    VulkanDeviceState, VulkanDmabufExternalImageFormatProperties, VulkanSampledDmabufForeignAcquireError,
+    VulkanSampledDmabufForeignReleaseError, VulkanSampledTexturePipelineShaders, VulkanShaderSpirv,
+    VulkanSharedImageSyncState, VulkanSubmitSynchronization, VulkanSyncFileImport,
+    VulkanSyncFileSemaphorePayloadState, classify_sampled_dmabuf_acquire_submit_error_for_tests,
     classify_sampled_dmabuf_release_submit_error_for_tests, dmabuf_import_memory_type_bits,
     dmabuf_plane_layouts, dmabuf_render_target_foreign_acquire_barrier,
     dmabuf_render_target_foreign_release_barrier, find_memory_type_index, image_copy_buffer_offset,
@@ -10139,6 +10140,34 @@ fn sampled_release_submit_errors_are_classified_by_queue_acceptance() {
             VulkanError::UnsupportedOperation("submit")
         ),
         VulkanSampledDmabufForeignReleaseError::ReleaseSubmitted(VulkanError::UnsupportedOperation("submit"))
+    ));
+}
+
+#[test]
+fn sampled_acquire_submit_errors_are_classified_by_queue_acceptance() {
+    assert!(matches!(
+        classify_sampled_dmabuf_acquire_submit_error_for_tests(
+            false,
+            false,
+            VulkanError::UnsupportedOperation("submit")
+        ),
+        VulkanSampledDmabufForeignAcquireError::RetrySafe(VulkanError::UnsupportedOperation("submit"))
+    ));
+    assert!(matches!(
+        classify_sampled_dmabuf_acquire_submit_error_for_tests(
+            true,
+            false,
+            VulkanError::UnsupportedOperation("submit")
+        ),
+        VulkanSampledDmabufForeignAcquireError::AcquireSubmitted(VulkanError::UnsupportedOperation("submit"))
+    ));
+    assert!(matches!(
+        classify_sampled_dmabuf_acquire_submit_error_for_tests(
+            false,
+            true,
+            VulkanError::UnsupportedOperation("submit")
+        ),
+        VulkanSampledDmabufForeignAcquireError::AcquireSubmitted(VulkanError::UnsupportedOperation("submit"))
     ));
 }
 
