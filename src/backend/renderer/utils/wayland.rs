@@ -1123,12 +1123,19 @@ mod tests {
     #[cfg(feature = "backend_drm")]
     use super::ReleasePointSlot;
     use super::{RendererSurfaceState, should_replace_renderer_buffer};
+    #[cfg(feature = "backend_drm")]
+    use crate::backend::allocator::{
+        Fourcc, Modifier,
+        dmabuf::{Dmabuf, DmabufFlags},
+    };
     use crate::backend::renderer::sync::SyncPoint;
     use crate::backend::renderer::{
         Color32F, ContextId, Frame, ImportAll, Renderer, RendererSuper, SurfaceCacheTextureReleaseError,
         Texture,
     };
     use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
+    #[cfg(feature = "backend_drm")]
+    use crate::wayland::buffer::BufferHandler;
     use crate::wayland::compositor::{
         BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, MultiCache,
         SurfaceAttributes, SurfaceData,
@@ -1191,6 +1198,11 @@ mod tests {
         }
 
         fn commit(&mut self, _surface: &WlSurface) {}
+    }
+
+    #[cfg(feature = "backend_drm")]
+    impl BufferHandler for SurfaceTreeTestState {
+        fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
     }
 
     impl AsMut<CompositorState> for SurfaceTreeTestState {
@@ -1392,12 +1404,113 @@ mod tests {
         Some((display, client_side, parent, child))
     }
 
+    #[cfg(feature = "backend_drm")]
+    fn inert_test_dmabuf() -> Dmabuf {
+        let plane_fd = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
+            .expect("create inert test dmabuf fd");
+        let mut builder = Dmabuf::builder((1, 1), Fourcc::Abgr8888, Modifier::Invalid, DmabufFlags::empty());
+        assert!(builder.add_plane(plane_fd, 0, 0, 4));
+        builder.build().expect("test dmabuf should have one plane")
+    }
+
+    #[cfg(feature = "backend_drm")]
+    fn test_dmabuf_buffer(client: &Client, display_handle: &wayland_server::DisplayHandle) -> WlBuffer {
+        client
+            .create_resource::<WlBuffer, Dmabuf, SurfaceTreeTestState>(display_handle, 1, inert_test_dmabuf())
+            .expect("create test dmabuf wl_buffer")
+    }
+
     #[test]
     fn explicit_sync_points_refresh_same_renderer_buffer() {
         assert!(!should_replace_renderer_buffer(false, false));
         assert!(should_replace_renderer_buffer(true, false));
         assert!(should_replace_renderer_buffer(false, true));
         assert!(should_replace_renderer_buffer(true, true));
+    }
+
+    #[cfg(feature = "backend_drm")]
+    #[test]
+    fn same_buffer_explicit_sync_recommit_retires_cached_texture_for_release() {
+        struct WrapperMarker;
+
+        let display = match Display::<SurfaceTreeTestState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let mut display_handle = display.handle();
+        let (_client_side, server_side) = UnixStream::pair().unwrap();
+        let client = display_handle
+            .insert_client(server_side, Arc::new(SurfaceTreeTestClientState::default()))
+            .unwrap();
+        let surface = crate::wayland::compositor::test_utils::create_surface::<SurfaceTreeTestState>(
+            &client,
+            &display_handle,
+        );
+        let buffer = test_dmabuf_buffer(&client, &display_handle);
+        let context_id = ContextId::<TestTexture>::new();
+
+        crate::wayland::compositor::with_states(&surface, |states| {
+            {
+                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                attributes.current().buffer = Some(BufferAssignment::NewBuffer(buffer.clone()));
+            }
+
+            let mut state = RendererSurfaceState::default();
+            state.update_buffer(states);
+            let first_wrapper = state
+                .buffer()
+                .expect("first commit should install renderer-managed buffer")
+                .clone();
+            assert!(first_wrapper.user_data().insert_if_missing(|| WrapperMarker));
+
+            state
+                .textures
+                .insert(context_id.erased(), Box::new(TestTexture(151)));
+            state
+                .renderer_seen
+                .insert(context_id.erased(), state.current_commit());
+
+            {
+                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                attributes.current().buffer = Some(BufferAssignment::NewBuffer(buffer.clone()));
+                let mut syncobj = states
+                    .cached_state
+                    .get::<crate::wayland::drm_syncobj::DrmSyncobjCachedState>();
+                syncobj.current().acquire_point = Some(DrmSyncPoint::invalid_for_tests(1).unwrap());
+                syncobj.current().release_point = Some(DrmSyncPoint::invalid_for_tests(2).unwrap());
+            }
+
+            state.update_buffer(states);
+            let refreshed_wrapper = state
+                .buffer()
+                .expect("same-buffer explicit-sync recommit should keep a renderer buffer");
+            assert!(refreshed_wrapper.user_data().get::<WrapperMarker>().is_none());
+            assert!(state.textures.is_empty());
+            assert_eq!(
+                state.retired_textures.get(&context_id.erased()).map(Vec::len),
+                Some(1)
+            );
+
+            states.data_map.insert_if_missing_threadsafe(|| Mutex::new(state));
+        });
+
+        let mut renderer = HookRenderer {
+            context_id: context_id.clone(),
+            fail_releases: VecDeque::new(),
+            released: Vec::new(),
+        };
+        crate::wayland::compositor::with_states(&surface, |states| {
+            super::release_retired_surface_textures(&mut renderer, states).unwrap();
+            let state = states
+                .data_map
+                .get::<super::RendererSurfaceStateUserData>()
+                .unwrap()
+                .lock()
+                .unwrap();
+            assert!(!state.retired_textures.contains_key(&context_id.erased()));
+        });
+        assert_eq!(renderer.released, vec![151]);
     }
 
     #[test]
