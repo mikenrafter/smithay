@@ -5363,6 +5363,13 @@ fn runtime_import_dma_wl_loopback_samples_and_releases_with_drm_syncobj() {
             .renderer
             .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &candidate.dmabuf)
             .unwrap();
+        candidate
+            .renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+                &buffer,
+                &candidate.dmabuf,
+            )
+            .unwrap();
     }
     assert!(buffer.release_point().is_some());
 
@@ -5534,6 +5541,13 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
             .renderer
             .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &candidate.dmabuf)
             .unwrap();
+        candidate
+            .renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+                &first_buffer,
+                &candidate.dmabuf,
+            )
+            .unwrap();
     }
 
     crate::wayland::compositor::with_states(&surface, |states| {
@@ -5615,6 +5629,13 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
             candidate
                 .renderer
                 .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &candidate.dmabuf)
+                .unwrap();
+            candidate
+                .renderer
+                .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+                    &second_buffer,
+                    &candidate.dmabuf,
+                )
                 .unwrap();
         }
         assert_eq!(
@@ -5808,6 +5829,13 @@ fn runtime_import_dma_wl_loopback_removed_buffer_releases_cached_dmabuf() {
             .renderer
             .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &candidate.dmabuf)
             .unwrap();
+        candidate
+            .renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+                &buffer,
+                &candidate.dmabuf,
+            )
+            .unwrap();
     }
 
     crate::wayland::compositor::with_states(&surface, |states| {
@@ -5994,6 +6022,13 @@ fn runtime_import_dma_wl_loopback_surface_tree_teardown_releases_cached_dmabuf()
             .renderer
             .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &candidate.dmabuf)
             .unwrap();
+        candidate
+            .renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+                &buffer,
+                &candidate.dmabuf,
+            )
+            .unwrap();
     }
 
     crate::wayland::compositor::with_states(&surface, |states| {
@@ -6174,6 +6209,13 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
             .renderer
             .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &candidate.dmabuf)
             .unwrap();
+        candidate
+            .renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+                &first_buffer,
+                &candidate.dmabuf,
+            )
+            .unwrap();
     }
 
     crate::wayland::compositor::with_states(&surface, |states| {
@@ -6328,6 +6370,13 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
             candidate
                 .renderer
                 .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &second_dmabuf)
+                .unwrap();
+            candidate
+                .renderer
+                .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+                    &second_buffer,
+                    &second_dmabuf,
+                )
                 .unwrap();
         }
         assert!(second_buffer.release_point().is_some());
@@ -8826,7 +8875,7 @@ fn import_dma_wl_real_buffer_requires_import_surface_reachability() {
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
-fn import_surface_real_buffer_reaches_texture_cache_lifecycle_guard() {
+fn import_surface_real_buffer_reaches_device_import_boundary() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
         Fourcc::Abgr8888,
@@ -8854,15 +8903,65 @@ fn import_surface_real_buffer_reaches_texture_cache_lifecycle_guard() {
     };
     unsafe {
         // SAFETY: This validation-stage fixture supplies explicit current-commit external-state
-        // evidence so normal renderer-utils import_surface can be driven past the direct-call-site
-        // guard. The test still fails before sampled-dmabuf texture import or public advertisement.
+        // evidence and explicit renderer-utils lifecycle coverage so normal renderer-utils
+        // import_surface can be driven to the scaffold device boundary. The scaffold renderer still
+        // fails before sampled-dmabuf texture import or public advertisement.
         VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &dmabuf).unwrap();
+        renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
+            .unwrap();
     }
     assert_buffer_release_point_matches_for_tests(
         &buffer,
         &expected_release_point,
         "import_surface fixture should keep initial release point",
     );
+
+    let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
+    assert!(matches!(import_result, Err(VulkanError::VulkanUnavailable)));
+    assert_buffer_release_point_matches_for_tests(
+        &buffer,
+        &expected_release_point,
+        "scaffold device boundary must not consume Wayland release ownership before texture construction",
+    );
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_surface_external_state_marker_requires_separate_lifecycle_evidence() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
+    renderer.capabilities.external_memory.foreign_queue_family = true;
+
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let (acquire_point, release_point) = DrmSyncPoint::invalid_timeline_pair_for_tests(71, 72).unwrap();
+    let expected_release_point = release_point.clone();
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_buffer_with_sync_points_for_tests(dmabuf.clone(), acquire_point, release_point)
+    else {
+        return;
+    };
+    unsafe {
+        // SAFETY: This fixture supplies only current-commit external-state evidence. It deliberately
+        // omits the separate renderer-utils lifecycle marker to prove post-retired-release import
+        // reachability is not treated as no-next-import/teardown lifecycle coverage.
+        renderer
+            .mark_wayland_dmabuf_current_commit_for_sampled_import(&buffer, &dmabuf)
+            .unwrap();
+    }
 
     let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
     assert!(matches!(
@@ -8874,7 +8973,48 @@ fn import_surface_real_buffer_reaches_texture_cache_lifecycle_guard() {
     assert_buffer_release_point_matches_for_tests(
         &buffer,
         &expected_release_point,
-        "normal import_surface guard must not consume Wayland release ownership before lifecycle evidence",
+        "lifecycle guard must not consume Wayland release ownership",
+    );
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn current_commit_marker_does_not_record_texture_cache_lifecycle() {
+    let renderer = VulkanRenderer::new_scaffold_for_tests();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let (acquire_point, release_point) = DrmSyncPoint::invalid_timeline_pair_for_tests(69, 70).unwrap();
+    let Some((_display, _client_side, _surface, buffer)) =
+        import_surface_dmabuf_buffer_with_sync_points_for_tests(dmabuf.clone(), acquire_point, release_point)
+    else {
+        return;
+    };
+
+    unsafe {
+        // SAFETY: This focused marker test does not perform a Vulkan import. It only proves the
+        // validation marker now records external-state evidence without also installing lifecycle
+        // evidence, keeping renderer-utils lifecycle as a normal import_surface call-site contract.
+        renderer
+            .mark_wayland_dmabuf_current_commit_for_sampled_import(&buffer, &dmabuf)
+            .unwrap();
+    }
+
+    assert!(
+        renderer
+            .sampled_dmabuf_wayland_user_data_foreign_general_evidence(buffer.user_data(), &dmabuf)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        renderer
+            .sampled_dmabuf_wayland_user_data_texture_cache_release_lifecycle(buffer.user_data(), &dmabuf)
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -8907,9 +9047,10 @@ fn import_surface_lifecycle_evidence_does_not_imply_first_import_external_state(
         return;
     };
     unsafe {
-        // SAFETY: This fixture supplies only the compositor texture-cache release lifecycle contract.
-        // It deliberately does not supply current-commit Vulkan external-state evidence, proving that
-        // linux-dmabuf metadata plus explicit sync points do not imply the first-import image layout.
+        // SAFETY: This fixture supplies only explicit renderer-utils texture-cache release lifecycle
+        // coverage. It deliberately does not supply current-commit Vulkan external-state evidence,
+        // proving that linux-dmabuf metadata plus explicit sync points do not imply the first-import
+        // image layout.
         renderer
             .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
             .unwrap();
@@ -8969,10 +9110,10 @@ fn import_surface_lifecycle_evidence_does_not_imply_reacquire_external_state() {
         return;
     };
     unsafe {
-        // SAFETY: This fixture supplies only renderer-local prior release history and compositor
-        // texture-cache release lifecycle. It deliberately omits fresh current-commit producer-return
-        // evidence, proving that prior release history plus explicit sync does not imply reacquire
-        // layout/ownership for the next Wayland commit.
+        // SAFETY: This fixture supplies only renderer-local prior release history and explicit
+        // renderer-utils texture-cache release lifecycle coverage. It deliberately omits fresh
+        // current-commit producer-return evidence, proving that prior release history plus explicit
+        // sync does not imply reacquire layout/ownership for the next Wayland commit.
         renderer
             .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
             .unwrap();
@@ -9037,6 +9178,9 @@ fn import_surface_lifecycle_evidence_reaches_device_import_boundary() {
         renderer
             .mark_wayland_dmabuf_current_commit_for_sampled_import(&buffer, &dmabuf)
             .unwrap();
+        renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
+            .unwrap();
     }
     assert_buffer_release_point_matches_for_tests(
         &buffer,
@@ -9087,10 +9231,14 @@ fn import_surface_current_surface_marker_reaches_device_import_boundary() {
     };
     unsafe {
         // SAFETY: This validation-stage fixture treats the current WlSurface commit as the exact
-        // dmabuf returned to FOREIGN/GENERAL and covered by renderer-utils release lifecycle. The
-        // helper must locate the current renderer-managed buffer before recording that evidence.
+        // dmabuf returned to FOREIGN/GENERAL and separately marks renderer-utils release lifecycle.
+        // The helper must locate the current renderer-managed buffer before recording external-state
+        // evidence.
         renderer
             .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &dmabuf)
+            .unwrap();
+        renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
             .unwrap();
     }
     assert_buffer_release_point_matches_for_tests(

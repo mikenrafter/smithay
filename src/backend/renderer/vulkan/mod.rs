@@ -1235,22 +1235,20 @@ impl VulkanRenderer {
         }
     }
 
-    /// Mark a renderer-managed Wayland dmabuf commit for validation-stage sampled import.
+    /// Mark a renderer-managed Wayland dmabuf commit's external state for validation-stage sampled import.
     ///
-    /// This is the intended development contract for the normal [`ImportDmaWl`] path. It stores both
-    /// pieces of compositor-provided evidence that cannot be inferred from Wayland protocol metadata:
-    /// current-commit `FOREIGN + GENERAL` Vulkan external image state and renderer-utils
-    /// texture-cache release lifecycle coverage for this renderer context. It does not consume the
-    /// Wayland release point, create a Vulkan image, or public-advertise generic sampled [`ImportDma`]
-    /// support.
+    /// This is the remaining development contract for the normal [`ImportDmaWl`] path. It stores the
+    /// current-commit `FOREIGN + GENERAL` Vulkan external image state that cannot be inferred from
+    /// Wayland protocol metadata. Renderer-utils texture-cache release lifecycle coverage is a
+    /// separate explicit marker, so this function cannot be used to smuggle no-next-import or teardown
+    /// release assumptions. It does not consume the Wayland release point, create a Vulkan image, or
+    /// public-advertise generic sampled [`ImportDma`] support.
     ///
     /// # Safety
     ///
-    /// The caller must satisfy both lower-level contracts for this same `buffer`/`dmabuf` pair and
-    /// this renderer context: current-commit external-state evidence and renderer-utils
-    /// texture-cache release lifecycle coverage. In particular, the proof of `FOREIGN + GENERAL`
-    /// ownership/layout must be current for this commit, and the compositor must preserve or retry any
-    /// cache-release obligation before dropping/resetting the surface state.
+    /// The caller must prove that this same `buffer`/`dmabuf` pair is currently in `FOREIGN + GENERAL`
+    /// ownership/layout for this commit. The compositor must still use the normal renderer-utils
+    /// lifecycle hooks for cache release; that lifecycle evidence is validated separately.
     #[cfg(feature = "wayland_frontend")]
     pub unsafe fn mark_wayland_dmabuf_current_commit_for_sampled_import(
         &self,
@@ -1258,16 +1256,8 @@ impl VulkanRenderer {
         dmabuf: &Dmabuf,
     ) -> Result<(), VulkanError> {
         unsafe {
-            // SAFETY: Forwarded from this combined validation contract's caller.
-            Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
-                buffer.user_data(),
-                dmabuf,
-            )?;
-            // SAFETY: Forwarded from this combined validation contract's caller.
-            self.mark_wayland_dmabuf_user_data_texture_cache_release_lifecycle_for_sampled_import(
-                buffer.user_data(),
-                dmabuf,
-            )
+            // SAFETY: Forwarded from this validation contract's caller.
+            Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(buffer.user_data(), dmabuf)
         }
     }
 
@@ -1278,20 +1268,17 @@ impl VulkanRenderer {
     /// [`mark_wayland_dmabuf_current_commit_for_sampled_import`](Self::mark_wayland_dmabuf_current_commit_for_sampled_import)
     /// for compositors that use Smithay's normal [`super::utils::on_commit_buffer_handler`] path. It
     /// looks up the current renderer-managed buffer stored for `surface`, verifies that it is the same
-    /// dmabuf identity as `dmabuf`, and then records the combined current-commit external-state and
-    /// texture-cache release lifecycle contract on that buffer wrapper. It does not consume the
-    /// Wayland release point, create a Vulkan image, or public-advertise generic sampled [`ImportDma`]
-    /// support.
+    /// dmabuf identity as `dmabuf`, and then records the current-commit external-state contract on
+    /// that buffer wrapper. It does not consume the Wayland release point,
+    /// create a Vulkan image, or public-advertise generic sampled [`ImportDma`] support.
     ///
     /// # Safety
     ///
     /// The caller must prove that the surface's current renderer-managed buffer is the current commit
     /// represented by `dmabuf`, that the producer released that image to
     /// `VK_QUEUE_FAMILY_FOREIGN_EXT` in `VK_IMAGE_LAYOUT_GENERAL`, and that the buffer's acquire
-    /// synchronization orders the producer writes and ownership release for this exact commit. The
-    /// caller must also satisfy the renderer-utils texture-cache release lifecycle contract for this
-    /// renderer context, preserving or retrying any cache-release obligation before dropping/resetting
-    /// the surface state.
+    /// synchronization orders the producer writes and ownership release for this exact commit. This
+    /// marker does not record renderer-utils texture-cache release lifecycle evidence.
     #[cfg(feature = "wayland_frontend")]
     pub unsafe fn mark_wayland_surface_current_dmabuf_commit_for_sampled_import(
         &self,
@@ -1322,6 +1309,41 @@ impl VulkanRenderer {
         )))
     }
 
+    /// Mark a renderer-managed Wayland dmabuf buffer as covered by texture-cache release call sites.
+    ///
+    /// This is a development-stage lifecycle evidence API for the normal [`ImportDmaWl`] path. It is
+    /// intentionally separate from the external-state marker because the normal `import_surface`
+    /// replacement-release point does not by itself prove no-next-import, reset, unmap, destruction, or
+    /// renderer teardown release call sites.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prove that imports of `buffer` for this exact renderer context go through the
+    /// normal renderer-utils surface cache, and that before any no-next-import, reset, unmap, surface
+    /// destruction, renderer teardown, or compositor decision to stop importing the surface with this
+    /// renderer, the compositor will call
+    /// [`super::utils::retire_and_release_surface_textures`] or
+    /// [`super::utils::retire_and_release_surface_tree_textures`] while this renderer is still
+    /// available. If renderer-utils has already retired the texture for this renderer context, such as
+    /// after a removed-buffer commit or replacement update, the compositor may instead call
+    /// [`super::utils::release_retired_surface_textures`] before the retired texture is dropped. If
+    /// release returns a retry-safe error, the caller must not reset/drop the affected surface state
+    /// until the obligation is retried or otherwise preserved.
+    #[cfg(feature = "wayland_frontend")]
+    pub unsafe fn mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+        &self,
+        buffer: &super::utils::Buffer,
+        dmabuf: &Dmabuf,
+    ) -> Result<(), VulkanError> {
+        unsafe {
+            // SAFETY: Forwarded from this explicit lifecycle-marking helper's caller.
+            self.mark_wayland_dmabuf_user_data_texture_cache_release_lifecycle_for_sampled_import(
+                buffer.user_data(),
+                dmabuf,
+            )
+        }
+    }
+
     #[cfg(feature = "wayland_frontend")]
     unsafe fn mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
         user_data: &UserDataMap,
@@ -1337,44 +1359,6 @@ impl VulkanRenderer {
             SampledDmabufWaylandForeignGeneralEvidence::new(dmabuf.weak())
         });
         Ok(())
-    }
-
-    /// Mark a renderer-managed Wayland dmabuf buffer as covered by texture-cache release call sites.
-    ///
-    /// This is a development-stage lifecycle evidence API for the normal [`ImportDmaWl`] path. It
-    /// does not public-advertise sampled [`ImportDma`] support and is not inferred from Wayland
-    /// protocol state. This marker proves only that the compositor has wired the no-next-import and
-    /// teardown release call sites for this renderer/context; it does not prove external image state,
-    /// acquire synchronization, release synchronization, or public import support.
-    ///
-    /// # Safety
-    ///
-    /// The caller must prove that imports of `buffer` for this exact renderer context go through the
-    /// normal renderer-utils surface cache, and that before any no-next-import, reset, unmap, surface
-    /// destruction, renderer teardown, or compositor decision to stop importing the surface with this
-    /// renderer, the compositor will call
-    /// [`super::utils::retire_and_release_surface_textures`] or
-    /// [`super::utils::retire_and_release_surface_tree_textures`] while this renderer is still
-    /// available. If renderer-utils has already retired the texture for this renderer context, such as
-    /// after a removed-buffer commit or replacement update, the compositor may instead call
-    /// [`super::utils::release_retired_surface_textures`] before the retired texture is dropped. If
-    /// release returns a retry-safe error, the caller must not reset/drop the affected surface state
-    /// until the obligation is retried or otherwise preserved. No active frame, render element, clone,
-    /// or external user may sample the cached texture after the teardown release helper has retired and
-    /// released it.
-    #[cfg(all(test, feature = "wayland_frontend"))]
-    unsafe fn mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-        &self,
-        buffer: &super::utils::Buffer,
-        dmabuf: &Dmabuf,
-    ) -> Result<(), VulkanError> {
-        unsafe {
-            // SAFETY: Forwarded from this test-only unsafe lifecycle-marking helper's caller.
-            self.mark_wayland_dmabuf_user_data_texture_cache_release_lifecycle_for_sampled_import(
-                buffer.user_data(),
-                dmabuf,
-            )
-        }
     }
 
     #[cfg(feature = "wayland_frontend")]
@@ -2022,7 +2006,7 @@ impl VulkanRenderer {
         Ok(None)
     }
 
-    /// Read compositor-provided texture-cache release lifecycle evidence from the renderer buffer wrapper.
+    /// Read explicit texture-cache release lifecycle evidence from the renderer buffer wrapper.
     #[cfg(feature = "wayland_frontend")]
     fn sampled_dmabuf_wayland_buffer_texture_cache_release_lifecycle(
         &self,
@@ -2082,9 +2066,8 @@ impl VulkanRenderer {
     /// This preserves the production fail-closed order before sync evidence is considered: first the
     /// first-import layout and known-state sources, then the current-reacquire layout and known-state
     /// sources. The helper is intentionally still validation-stage: caller-provided
-    /// `FOREIGN + GENERAL` evidence may now satisfy the external-state source, but public
-    /// advertisement and the release lifecycle remain development-gated at their exact missing
-    /// contracts.
+    /// `FOREIGN + GENERAL` evidence may now satisfy the external-state source, while public
+    /// advertisement remains closed until the full generic sampled-dmabuf contract is implemented.
     #[allow(dead_code)]
     fn sampled_dmabuf_wayland_external_state_evidence_sources(
         &self,
@@ -3630,12 +3613,13 @@ impl ImportDmaWl for VulkanRenderer {
         let acquire_sync = self.sampled_dmabuf_wayland_acquire_sync_evidence(dmabuf, buffer)?;
         let release_evidence = self.sampled_dmabuf_wayland_release_evidence(dmabuf, buffer)?;
         let release_ownership = self.sampled_dmabuf_wayland_release_ownership_evidence(dmabuf, buffer)?;
+        let post_retired_release_import = surface
+            .map(super::utils::surface_import_after_retired_release)
+            .unwrap_or(false);
         let replacement_release_reachability = self
             .validate_sampled_dmabuf_wayland_texture_cache_replacement_reachability_contract(
                 dmabuf,
-                surface
-                    .map(super::utils::surface_import_after_retired_release)
-                    .unwrap_or(false),
+                post_retired_release_import,
             )?;
         let texture_cache_release_hook = self.sampled_dmabuf_wayland_texture_cache_release_hook(dmabuf);
         let texture_cache_release_lifecycle =
