@@ -4431,6 +4431,72 @@ fn runtime_drm_syncobj_dmabuf_attach_commit_promotes_sync_points() {
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
+#[ignore = "requires a working Vulkan loader, physical device, DRM syncobj and Wayland test display"]
+fn runtime_drm_syncobj_dmabuf_remove_signals_release_before_buffer_release() {
+    let test_name = "DRM syncobj client dmabuf removal release protocol test";
+    let Some(candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
+        return;
+    };
+    let Some(drm_device) = candidate.drm_syncobj_device.clone() else {
+        eprintln!("skipping {test_name}: loopback Vulkan device has no usable DRM syncobj node");
+        return;
+    };
+    let acquire_point = 0x3_0000_0500;
+    let release_point = 0x3_0000_0501;
+
+    let timeline_fd = match runtime_syncobj_timeline_fd_for_tests(&drm_device) {
+        Ok(fd) => fd,
+        Err(err) => {
+            eprintln!("skipping {test_name}: syncobj timeline fd: {err}");
+            return;
+        }
+    };
+
+    let Some(evidence) =
+        crate::wayland::drm_syncobj::test_utils::commit_dmabuf_surface_remove_and_probe_release_through_client_for_tests(
+            drm_device,
+            timeline_fd,
+            candidate.dmabuf.clone(),
+            acquire_point,
+            release_point,
+        )
+    else {
+        eprintln!("skipping {test_name}: failed to create Wayland test display");
+        return;
+    };
+    assert!(
+        evidence.current_has_dmabuf,
+        "client-created linux-dmabuf wl_buffer should become current before removal"
+    );
+    assert_eq!(
+        evidence.removal_release_point_signaled_before_commit,
+        Some(false),
+        "fresh release point should not be signaled before the removal commit"
+    );
+    assert_eq!(
+        evidence.removal_release_point_signaled_after_commit,
+        Some(true),
+        "removing the current explicit-sync buffer should signal the release point"
+    );
+    assert_eq!(
+        evidence.removal_release_point_signaled_at_buffer_release_event,
+        Some(true),
+        "the release point should be signaled by the time the client observes wl_buffer.release"
+    );
+    assert_eq!(
+        evidence.removal_buffer_release_events,
+        Some(1),
+        "removing the current explicit-sync buffer should send one client-observed wl_buffer.release"
+    );
+    assert_eq!(
+        evidence.current_has_dmabuf_after_removal,
+        Some(false),
+        "the removal commit should leave no current dmabuf buffer"
+    );
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
 #[ignore = "requires a working Vulkan loader, physical device, DRM syncobj eventfd and Wayland test display"]
 fn runtime_drm_syncobj_dmabuf_commit_waits_for_transaction_acquire_blocker() {
     let test_name = "DRM syncobj dmabuf transaction acquire blocker runtime test";

@@ -346,6 +346,16 @@ impl PrivateSurfaceData {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn commit_pending_state_with_serial_for_tests(
+        surface: &WlSurface,
+        dh: &DisplayHandle,
+        serial: Serial,
+    ) {
+        let mut data = Self::lock_user_data(surface);
+        data.public_data.cached_state.commit(Some(serial), dh);
+    }
+
     /// Checks if the first surface is an ancestor of the second
     pub fn is_ancestor(a: &WlSurface, b: &WlSurface) -> bool {
         let b_guard = Self::lock_user_data(b);

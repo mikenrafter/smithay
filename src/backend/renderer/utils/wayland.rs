@@ -168,9 +168,9 @@ struct InnerBuffer {
 impl Drop for InnerBuffer {
     #[inline]
     fn drop(&mut self) {
-        self.buffer.release();
         #[cfg(feature = "backend_drm")]
         self.release_point.signal_on_drop();
+        self.buffer.release();
     }
 }
 

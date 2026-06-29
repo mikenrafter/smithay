@@ -470,6 +470,14 @@ pub(crate) mod test_utils {
         PrivateSurfaceData::commit(surface, handle, state);
     }
 
+    pub(crate) fn commit_pending_state_with_serial(surface: &WlSurface, handle: &DisplayHandle, serial: u32) {
+        PrivateSurfaceData::commit_pending_state_with_serial_for_tests(
+            surface,
+            handle,
+            crate::utils::Serial::from(serial),
+        );
+    }
+
     pub(crate) fn set_parent(child: &WlSurface, parent: &WlSurface) {
         PrivateSurfaceData::set_parent(child, parent).unwrap();
     }
