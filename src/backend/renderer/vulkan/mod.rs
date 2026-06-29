@@ -1309,6 +1309,37 @@ impl VulkanRenderer {
         )))
     }
 
+    /// Mark a renderer-managed Wayland dmabuf commit using Smithay loopback release evidence.
+    ///
+    /// This test-only helper keeps the runtime `ImportDmaWl` loopback probes tied to evidence that was
+    /// produced by [`release_dmabuf_render_target_for_sampled_loopback`](Self::release_dmabuf_render_target_for_sampled_loopback)
+    /// for the same Smithay dmabuf identity. It still records the same validation-stage current-commit
+    /// `FOREIGN + GENERAL` marker as
+    /// [`mark_wayland_surface_current_dmabuf_commit_for_sampled_import`](Self::mark_wayland_surface_current_dmabuf_commit_for_sampled_import),
+    /// and it still does not public-advertise generic sampled [`ImportDma`] support.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prove there was no intervening access, acquire, release, or layout/ownership
+    /// transition of `dmabuf` after `evidence` was produced, and that the Wayland acquire point for
+    /// this current commit waits for or otherwise orders `evidence.acquire_sync()` before
+    /// `import_surface` can import the buffer.
+    #[cfg(all(test, feature = "wayland_frontend"))]
+    unsafe fn mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
+        &self,
+        surface: &WlSurface,
+        dmabuf: &Dmabuf,
+        evidence: &VulkanDmabufLoopbackImportEvidence,
+    ) -> Result<(), VulkanError> {
+        self.validate_dmabuf_loopback_import_evidence(dmabuf, evidence)?;
+        unsafe {
+            // SAFETY: Forwarded from this test-only helper's caller. The evidence identity check
+            // above is only an additional guard; the caller still proves current external state,
+            // no-intervening-use, and acquire ordering for this Wayland commit.
+            self.mark_wayland_surface_current_dmabuf_commit_for_sampled_import(surface, dmabuf)
+        }
+    }
+
     /// Mark a renderer-managed Wayland dmabuf buffer as covered by texture-cache release call sites.
     ///
     /// This is a development-stage lifecycle evidence API for the normal [`ImportDmaWl`] path. It is

@@ -5361,7 +5361,11 @@ fn runtime_import_dma_wl_loopback_samples_and_releases_with_drm_syncobj() {
         // while the renderer is still available before dropping the surface state.
         candidate
             .renderer
-            .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &candidate.dmabuf)
+            .mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
+                &surface,
+                &candidate.dmabuf,
+                &evidence,
+            )
             .unwrap();
         candidate
             .renderer
@@ -5539,7 +5543,11 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
         // normal ImportDmaWl commit on that same WlSurface.
         candidate
             .renderer
-            .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &candidate.dmabuf)
+            .mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
+                &surface,
+                &candidate.dmabuf,
+                &evidence,
+            )
             .unwrap();
         candidate
             .renderer
@@ -5827,7 +5835,11 @@ fn runtime_import_dma_wl_loopback_removed_buffer_releases_cached_dmabuf() {
         // to retire_and_release_surface_textures.
         candidate
             .renderer
-            .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &candidate.dmabuf)
+            .mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
+                &surface,
+                &candidate.dmabuf,
+                &evidence,
+            )
             .unwrap();
         candidate
             .renderer
@@ -6020,7 +6032,11 @@ fn runtime_import_dma_wl_loopback_surface_tree_teardown_releases_cached_dmabuf()
         // dropping the surface tree state.
         candidate
             .renderer
-            .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &candidate.dmabuf)
+            .mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
+                &surface,
+                &candidate.dmabuf,
+                &evidence,
+            )
             .unwrap();
         candidate
             .renderer
@@ -6207,7 +6223,11 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
         // surface-level helper before replacing it with a second dmabuf commit on the same WlSurface.
         candidate
             .renderer
-            .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &candidate.dmabuf)
+            .mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
+                &surface,
+                &candidate.dmabuf,
+                &first_evidence,
+            )
             .unwrap();
         candidate
             .renderer
@@ -6369,7 +6389,11 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
             // importing this second buffer.
             candidate
                 .renderer
-                .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &second_dmabuf)
+                .mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
+                    &surface,
+                    &second_dmabuf,
+                    &second_evidence,
+                )
                 .unwrap();
             candidate
                 .renderer
@@ -9358,6 +9382,90 @@ fn import_surface_current_surface_marker_rejects_mismatched_dmabuf() {
         ))
     ));
     assert!(buffer.release_point().is_some());
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_surface_loopback_evidence_marker_requires_same_dmabuf_evidence() {
+    let renderer = VulkanRenderer::new_scaffold_for_tests();
+    let committed_dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let unrelated_dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Xrgb8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+            committed_dmabuf.clone(),
+            DrmSyncPoint::invalid_for_tests(41).unwrap(),
+            DrmSyncPoint::invalid_for_tests(42).unwrap(),
+        )
+    else {
+        return;
+    };
+
+    let committed_evidence = unsafe {
+        // SAFETY: This unit test only validates evidence identity routing and marker storage; it does
+        // not import, acquire, sample, or release a Vulkan image with the constructed evidence.
+        VulkanDmabufLoopbackImportEvidence::new(committed_dmabuf.weak(), SyncPoint::signaled())
+    };
+    unsafe {
+        // SAFETY: This unit test performs no Vulkan import. It checks that same-dmabuf loopback
+        // evidence may record the validation-stage marker on the current renderer-managed buffer.
+        renderer
+            .mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
+                &surface,
+                &committed_dmabuf,
+                &committed_evidence,
+            )
+            .unwrap();
+    }
+    let stored_evidence = renderer
+        .sampled_dmabuf_wayland_buffer_foreign_general_evidence(&buffer, &committed_dmabuf)
+        .unwrap()
+        .unwrap();
+    assert!(stored_evidence.is_for_dmabuf(&committed_dmabuf));
+
+    let unrelated_evidence = unsafe {
+        // SAFETY: This unit test intentionally constructs unrelated evidence to prove the loopback
+        // marker rejects identity mismatches before recording current-commit external-state evidence.
+        VulkanDmabufLoopbackImportEvidence::new(unrelated_dmabuf.weak(), SyncPoint::signaled())
+    };
+    let Some((_negative_display, _negative_client_side, negative_surface, negative_buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+            committed_dmabuf.clone(),
+            DrmSyncPoint::invalid_for_tests(43).unwrap(),
+            DrmSyncPoint::invalid_for_tests(44).unwrap(),
+        )
+    else {
+        return;
+    };
+    let result = unsafe {
+        // SAFETY: This negative test supplies mismatched evidence, so the helper must reject it before
+        // relying on any external-state assumption.
+        renderer.mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
+            &negative_surface,
+            &committed_dmabuf,
+            &unrelated_evidence,
+        )
+    };
+    assert!(matches!(
+        result,
+        Err(VulkanError::UnsupportedOperation("dmabuf loopback evidence"))
+    ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_buffer_foreign_general_evidence(&negative_buffer, &committed_dmabuf,),
+        Ok(None)
+    ));
     assert!(renderer.dmabuf_formats().iter().next().is_none());
 }
 
