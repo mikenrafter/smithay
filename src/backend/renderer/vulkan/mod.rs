@@ -113,8 +113,62 @@ pub use self::{
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SampledDmabufExternalImageState {
+    queue_owner: SampledDmabufExternalQueueOwner,
+    layout: SampledDmabufExternalImageLayout,
+}
+
+#[allow(dead_code)]
+impl SampledDmabufExternalImageState {
+    fn foreign_general() -> Self {
+        Self {
+            queue_owner: SampledDmabufExternalQueueOwner::Foreign,
+            layout: SampledDmabufExternalImageLayout::General,
+        }
+    }
+
+    fn is_foreign_general(&self) -> bool {
+        *self == Self::foreign_general()
+    }
+
+    #[cfg(test)]
+    fn external_general_for_tests() -> Self {
+        Self {
+            queue_owner: SampledDmabufExternalQueueOwner::External,
+            layout: SampledDmabufExternalImageLayout::General,
+        }
+    }
+
+    #[cfg(test)]
+    fn foreign_shader_read_only_for_tests() -> Self {
+        Self {
+            queue_owner: SampledDmabufExternalQueueOwner::Foreign,
+            layout: SampledDmabufExternalImageLayout::ShaderReadOnlyOptimal,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampledDmabufExternalQueueOwner {
+    Foreign,
+    #[cfg(test)]
+    External,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampledDmabufExternalImageLayout {
+    General,
+    #[cfg(test)]
+    ShaderReadOnlyOptimal,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufKnownLayoutEvidence {
     dmabuf: WeakDmabuf,
+    external_state: SampledDmabufExternalImageState,
 }
 
 #[allow(dead_code)]
@@ -126,11 +180,26 @@ impl SampledDmabufKnownLayoutEvidence {
     /// The caller must ensure the producer released the image to `VK_QUEUE_FAMILY_FOREIGN_EXT` in
     /// `VK_IMAGE_LAYOUT_GENERAL` before this renderer acquires it.
     unsafe fn foreign_general(dmabuf: WeakDmabuf) -> Self {
-        Self { dmabuf }
+        Self {
+            dmabuf,
+            external_state: SampledDmabufExternalImageState::foreign_general(),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_tests(dmabuf: WeakDmabuf, external_state: SampledDmabufExternalImageState) -> Self {
+        Self {
+            dmabuf,
+            external_state,
+        }
     }
 
     fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
         self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+
+    fn has_foreign_general_state(&self) -> bool {
+        self.external_state.is_foreign_general()
     }
 }
 
@@ -277,12 +346,13 @@ enum SampledDmabufLayoutEvidence {
 
 /// Opaque evidence that a normal Wayland dmabuf commit satisfies Smithay's Vulkan interop policy.
 ///
-/// This is deliberately private and currently unconstructable in production code. The surrounding
-/// scaffold already models the policy inputs separately: first-import/reacquire external state,
-/// queue-family ownership, acquire synchronization, release synchronization, and per-commit texture
-/// cache behavior. Keeping this as a separate evidence token prevents future work from treating
-/// `linux-dmabuf` protocol metadata or explicit sync alone as a Vulkan layout/ownership proof, and
-/// keeps the remaining production evidence sources and release lifecycle hooks explicit.
+/// This is deliberately private and constructable only through validation-stage Smithay
+/// Wayland/Vulkan evidence. The surrounding scaffold models the policy inputs separately:
+/// first-import/reacquire external state, queue-family ownership, acquire synchronization, release
+/// synchronization, and per-commit texture cache behavior. Keeping this as a separate evidence token
+/// prevents future work from treating `linux-dmabuf` protocol metadata or explicit sync alone as a
+/// Vulkan layout/ownership proof, and keeps the remaining production evidence sources and release
+/// lifecycle hooks explicit.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandVulkanInteropPolicy {
@@ -2010,6 +2080,11 @@ impl VulkanRenderer {
                         "sampled dmabuf Wayland foreign GENERAL identity",
                     ));
                 }
+                if !evidence.has_foreign_general_state() {
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf Wayland foreign GENERAL state",
+                    ));
+                }
 
                 Ok(evidence.clone())
             }
@@ -2024,6 +2099,11 @@ impl VulkanRenderer {
                 if !evidence.is_for_dmabuf(context.dmabuf) {
                     return Err(VulkanError::UnsupportedOperation(
                         "sampled dmabuf Wayland foreign GENERAL identity",
+                    ));
+                }
+                if !evidence.has_foreign_general_state() {
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf Wayland foreign GENERAL state",
                     ));
                 }
 
@@ -2712,6 +2792,11 @@ impl VulkanRenderer {
                         "sampled dmabuf known-layout identity",
                     ));
                 }
+                if !evidence.has_foreign_general_state() {
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf known external state",
+                    ));
+                }
                 Ok(evidence)
             }
             SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(policy) => {
@@ -2723,6 +2808,11 @@ impl VulkanRenderer {
                 if !policy.foreign_general.is_for_dmabuf(dmabuf) {
                     return Err(VulkanError::UnsupportedOperation(
                         "sampled dmabuf Wayland foreign GENERAL identity",
+                    ));
+                }
+                if !policy.foreign_general.has_foreign_general_state() {
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf Wayland foreign GENERAL state",
                     ));
                 }
                 Ok(policy.foreign_general)

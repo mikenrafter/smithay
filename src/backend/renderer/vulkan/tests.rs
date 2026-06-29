@@ -9105,6 +9105,23 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland foreign GENERAL identity"
         ))
     ));
+    let mismatched_wayland_external_state_policy =
+        SampledDmabufLayoutEvidence::SmithayWaylandVulkanPolicy(SampledDmabufWaylandVulkanInteropPolicy {
+            dmabuf: policy_dmabuf.weak(),
+            foreign_general: SampledDmabufKnownLayoutEvidence::new_for_tests(
+                policy_dmabuf.weak(),
+                SampledDmabufExternalImageState::foreign_shader_read_only_for_tests(),
+            ),
+        });
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_known_layout_contract(
+            &policy_dmabuf,
+            mismatched_wayland_external_state_policy,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland foreign GENERAL state"
+        ))
+    ));
     assert!(
         renderer
             .validate_sampled_dmabuf_known_layout_contract(&policy_dmabuf, smithay_wayland_policy)
@@ -9130,6 +9147,28 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             .validate_sampled_dmabuf_known_layout_contract(&policy_dmabuf, mismatched_known_layout_evidence),
         Err(VulkanError::UnsupportedOperation(
             "sampled dmabuf known-layout identity"
+        ))
+    ));
+    let mismatched_known_queue_owner =
+        SampledDmabufLayoutEvidence::KnownForeignGeneral(SampledDmabufKnownLayoutEvidence::new_for_tests(
+            policy_dmabuf.weak(),
+            SampledDmabufExternalImageState::external_general_for_tests(),
+        ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_known_layout_contract(&policy_dmabuf, mismatched_known_queue_owner),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf known external state"
+        ))
+    ));
+    let mismatched_known_layout =
+        SampledDmabufLayoutEvidence::KnownForeignGeneral(SampledDmabufKnownLayoutEvidence::new_for_tests(
+            policy_dmabuf.weak(),
+            SampledDmabufExternalImageState::foreign_shader_read_only_for_tests(),
+        ));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_known_layout_contract(&policy_dmabuf, mismatched_known_layout),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf known external state"
         ))
     ));
     assert!(matches!(
