@@ -1267,7 +1267,7 @@ impl VulkanRenderer {
         }
     }
 
-    /// Mark a renderer-managed Wayland dmabuf commit's external state for validation-stage sampled import.
+    /// Assume a renderer-managed Wayland dmabuf commit's external state for validation-stage sampled import.
     ///
     /// This is the remaining development contract for the normal [`ImportDmaWl`] path. It stores the
     /// current-commit `FOREIGN + GENERAL` Vulkan external image state that cannot be inferred from
@@ -1282,7 +1282,7 @@ impl VulkanRenderer {
     /// ownership/layout for this commit. The compositor must still use the normal renderer-utils
     /// lifecycle hooks for cache release; that lifecycle evidence is validated separately.
     #[cfg(feature = "wayland_frontend")]
-    pub unsafe fn mark_wayland_dmabuf_current_commit_for_sampled_import(
+    pub unsafe fn assume_wayland_dmabuf_current_commit_foreign_general_for_sampled_import(
         &self,
         buffer: &super::utils::Buffer,
         dmabuf: &Dmabuf,
@@ -1293,11 +1293,36 @@ impl VulkanRenderer {
         }
     }
 
-    /// Mark the current renderer-managed dmabuf commit on a [`WlSurface`] for validation-stage
+    /// Mark a renderer-managed Wayland dmabuf commit's external state for validation-stage sampled import.
+    ///
+    /// Prefer
+    /// [`assume_wayland_dmabuf_current_commit_foreign_general_for_sampled_import`](Self::assume_wayland_dmabuf_current_commit_foreign_general_for_sampled_import)
+    /// so callers explicitly acknowledge the unsafe `FOREIGN + GENERAL` external-state assumption.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy the same safety contract as
+    /// [`assume_wayland_dmabuf_current_commit_foreign_general_for_sampled_import`](Self::assume_wayland_dmabuf_current_commit_foreign_general_for_sampled_import).
+    #[cfg(feature = "wayland_frontend")]
+    #[deprecated(
+        note = "use assume_wayland_dmabuf_current_commit_foreign_general_for_sampled_import to make the unsafe external-state assumption explicit"
+    )]
+    pub unsafe fn mark_wayland_dmabuf_current_commit_for_sampled_import(
+        &self,
+        buffer: &super::utils::Buffer,
+        dmabuf: &Dmabuf,
+    ) -> Result<(), VulkanError> {
+        unsafe {
+            // SAFETY: Forwarded from this compatibility wrapper's caller.
+            self.assume_wayland_dmabuf_current_commit_foreign_general_for_sampled_import(buffer, dmabuf)
+        }
+    }
+
+    /// Assume the current renderer-managed dmabuf commit on a [`WlSurface`] for validation-stage
     /// sampled import.
     ///
     /// This is a convenience wrapper around
-    /// [`mark_wayland_dmabuf_current_commit_for_sampled_import`](Self::mark_wayland_dmabuf_current_commit_for_sampled_import)
+    /// [`assume_wayland_dmabuf_current_commit_foreign_general_for_sampled_import`](Self::assume_wayland_dmabuf_current_commit_foreign_general_for_sampled_import)
     /// for compositors that use Smithay's normal [`super::utils::on_commit_buffer_handler`] path. It
     /// looks up the current renderer-managed buffer stored for `surface`, verifies that it is the same
     /// dmabuf identity as `dmabuf`, and then records the current-commit external-state contract on
@@ -1312,7 +1337,7 @@ impl VulkanRenderer {
     /// synchronization orders the producer writes and ownership release for this exact commit. This
     /// marker does not record renderer-utils texture-cache release lifecycle evidence.
     #[cfg(feature = "wayland_frontend")]
-    pub unsafe fn mark_wayland_surface_current_dmabuf_commit_for_sampled_import(
+    pub unsafe fn assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import(
         &self,
         surface: &WlSurface,
         dmabuf: &Dmabuf,
@@ -1333,12 +1358,39 @@ impl VulkanRenderer {
             unsafe {
                 // SAFETY: Forwarded from this surface-level validation contract's caller after
                 // verifying that the current renderer-managed buffer is the requested dmabuf.
-                self.mark_wayland_dmabuf_current_commit_for_sampled_import(buffer, dmabuf)
+                self.assume_wayland_dmabuf_current_commit_foreign_general_for_sampled_import(buffer, dmabuf)
             }
         })
         .unwrap_or(Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland renderer surface state",
         )))
+    }
+
+    /// Mark the current renderer-managed dmabuf commit on a [`WlSurface`] for validation-stage sampled import.
+    ///
+    /// Prefer
+    /// [`assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import`](Self::assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import)
+    /// so callers explicitly acknowledge the unsafe `FOREIGN + GENERAL` external-state assumption.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy the same safety contract as
+    /// [`assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import`](Self::assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import).
+    #[cfg(feature = "wayland_frontend")]
+    #[deprecated(
+        note = "use assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import to make the unsafe external-state assumption explicit"
+    )]
+    pub unsafe fn mark_wayland_surface_current_dmabuf_commit_for_sampled_import(
+        &self,
+        surface: &WlSurface,
+        dmabuf: &Dmabuf,
+    ) -> Result<(), VulkanError> {
+        unsafe {
+            // SAFETY: Forwarded from this compatibility wrapper's caller.
+            self.assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import(
+                surface, dmabuf,
+            )
+        }
     }
 
     /// Mark a renderer-managed Wayland dmabuf commit using Smithay loopback release evidence.
@@ -1347,7 +1399,7 @@ impl VulkanRenderer {
     /// produced by [`release_dmabuf_render_target_for_sampled_loopback`](Self::release_dmabuf_render_target_for_sampled_loopback)
     /// for the same Smithay dmabuf identity. It still records the same validation-stage current-commit
     /// `FOREIGN + GENERAL` marker as
-    /// [`mark_wayland_surface_current_dmabuf_commit_for_sampled_import`](Self::mark_wayland_surface_current_dmabuf_commit_for_sampled_import),
+    /// [`assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import`](Self::assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import),
     /// and it still does not public-advertise generic sampled [`ImportDma`] support.
     ///
     /// # Safety
@@ -1368,7 +1420,9 @@ impl VulkanRenderer {
             // SAFETY: Forwarded from this test-only helper's caller. The evidence identity check
             // above is only an additional guard; the caller still proves current external state,
             // no-intervening-use, and acquire ordering for this Wayland commit.
-            self.mark_wayland_surface_current_dmabuf_commit_for_sampled_import(surface, dmabuf)
+            self.assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import(
+                surface, dmabuf,
+            )
         }
     }
 
@@ -1433,7 +1487,9 @@ impl VulkanRenderer {
             // SAFETY: Forwarded from this test-only helper's caller. The renderer release evidence
             // proves only this renderer's prior release and identity; the caller still proves current
             // acquire ordering and no intervening external-state change for this Wayland commit.
-            self.mark_wayland_surface_current_dmabuf_commit_for_sampled_import(surface, dmabuf)
+            self.assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import(
+                surface, dmabuf,
+            )
         }
     }
 

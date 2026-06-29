@@ -8993,7 +8993,7 @@ fn import_surface_external_state_marker_requires_separate_lifecycle_evidence() {
         // omits the separate renderer-utils lifecycle marker to prove post-retired-release import
         // reachability is not treated as no-next-import/teardown lifecycle coverage.
         renderer
-            .mark_wayland_dmabuf_current_commit_for_sampled_import(&buffer, &dmabuf)
+            .assume_wayland_dmabuf_current_commit_foreign_general_for_sampled_import(&buffer, &dmabuf)
             .unwrap();
     }
 
@@ -9034,7 +9034,7 @@ fn current_commit_marker_does_not_record_texture_cache_lifecycle() {
         // validation marker now records external-state evidence without also installing lifecycle
         // evidence, keeping renderer-utils lifecycle as a normal import_surface call-site contract.
         renderer
-            .mark_wayland_dmabuf_current_commit_for_sampled_import(&buffer, &dmabuf)
+            .assume_wayland_dmabuf_current_commit_foreign_general_for_sampled_import(&buffer, &dmabuf)
             .unwrap();
     }
 
@@ -9210,7 +9210,7 @@ fn import_surface_lifecycle_evidence_reaches_device_import_boundary() {
         // and compositor lifecycle evidence so normal import_surface can be driven to the scaffold's
         // device-import boundary without public-advertising sampled-dmabuf import.
         renderer
-            .mark_wayland_dmabuf_current_commit_for_sampled_import(&buffer, &dmabuf)
+            .assume_wayland_dmabuf_current_commit_foreign_general_for_sampled_import(&buffer, &dmabuf)
             .unwrap();
         renderer
             .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
@@ -9269,7 +9269,9 @@ fn import_surface_current_surface_marker_reaches_device_import_boundary() {
         // The helper must locate the current renderer-managed buffer before recording external-state
         // evidence.
         renderer
-            .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &dmabuf)
+            .assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import(
+                &surface, &dmabuf,
+            )
             .unwrap();
         renderer
             .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
@@ -9312,7 +9314,9 @@ fn import_surface_current_surface_marker_rejects_missing_current_buffer() {
     let result = unsafe {
         // SAFETY: This negative test supplies no current buffer, so the helper must reject the surface
         // state before recording any sampled-import evidence.
-        renderer.mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &dmabuf)
+        renderer.assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import(
+            &surface, &dmabuf,
+        )
     };
     assert!(matches!(
         result,
@@ -9341,7 +9345,9 @@ fn import_surface_current_surface_marker_rejects_missing_renderer_surface_state(
     let result = unsafe {
         // SAFETY: This negative test deliberately skips on_commit_buffer_handler, so the helper must
         // reject the unprocessed surface before recording any sampled-import evidence.
-        renderer.mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &dmabuf)
+        renderer.assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import(
+            &surface, &dmabuf,
+        )
     };
     assert!(matches!(
         result,
@@ -9383,7 +9389,10 @@ fn import_surface_current_surface_marker_rejects_mismatched_dmabuf() {
     let result = unsafe {
         // SAFETY: This negative test deliberately asks the helper to mark a different dmabuf than the
         // surface's current renderer-managed buffer, which must be rejected before evidence is stored.
-        renderer.mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &mismatched_dmabuf)
+        renderer.assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import(
+            &surface,
+            &mismatched_dmabuf,
+        )
     };
     assert!(matches!(
         result,
