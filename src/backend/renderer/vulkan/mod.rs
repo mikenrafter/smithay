@@ -20,14 +20,13 @@
 //! target abstraction as the other renderers once the validation-stage gate is true. Generic
 //! texture `ExportMem`, `ExportDma`, broad explicit sync, blit/copy, and full presentation remain
 //! unsupported until their corresponding capability bits can become true with coverage. Sampled dmabuf
-//! import is validation-reachable through the explicit known-layout development helper and the normal
-//! `ImportDmaWl` path's staged guards. The safe generic `ImportDma` path fails closed until Smithay has
-//! a contract for the producer's external state, acquire sync, and release lifecycle. The normal
-//! Wayland path now models the policy context, explicit acquire/release sync evidence, first-import vs.
-//! reacquire history, known-layout evidence identity, and renderer cache-release hook evidence. Public
-//! sampled `ImportDma` advertisement still remains closed until production external-state evidence,
-//! acquire/release lifecycle, teardown cache release, and direct import implementation contracts are
-//! proven by tests.
+//! import is validation-stage implemented for the normal `ImportDmaWl` path when callers provide
+//! commit-local external-state and texture-cache lifecycle evidence; ignored runtime probes drive real
+//! linux-dmabuf, drm-syncobj, `wl_surface.commit`, renderer-utils cache import, sampling, and release
+//! point signaling. The safe generic `ImportDma` path still fails closed because it receives only a raw
+//! [`Dmabuf`] and damage, without Wayland acquire/release points or renderer-utils cache lifecycle.
+//! Public sampled `ImportDma` advertisement remains closed until production external-state evidence and
+//! direct generic import lifecycle contracts are proven by tests.
 //!
 //! Intended implementation order:
 //!
