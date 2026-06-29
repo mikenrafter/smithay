@@ -5609,6 +5609,10 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
                 .sampled_dmabuf_layout_history(&candidate.dmabuf),
             SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
         );
+        let renderer_release_evidence = candidate
+            .renderer
+            .sampled_dmabuf_wayland_renderer_foreign_general_release_evidence_for_tests(&candidate.dmabuf)
+            .expect("first cache release should produce same-dmabuf reacquire evidence");
 
         let (second_acquire_point, second_release_point) =
             DrmSyncPoint::timeline_pair_for_tests(&drm_device, 43, 44)
@@ -5630,13 +5634,19 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
             second_release_point,
         );
         unsafe {
-            // SAFETY: the previous cache release returned this exact dmabuf to FOREIGN ownership in
-            // GENERAL layout and signaled the first Wayland release point. This test then attaches or
-            // signals a current Wayland acquire point before the same dmabuf is reacquired through the
-            // normal ImportDmaWl path on the same WlSurface.
+            // SAFETY: the immediately preceding renderer-utils cache release returned this exact
+            // dmabuf to FOREIGN ownership in GENERAL layout, and `renderer_release_evidence` records the
+            // resulting renderer release history. The test waited the first release point and attached
+            // or signaled a current Wayland acquire point before the same dmabuf is reacquired through
+            // the normal ImportDmaWl path on the same WlSurface, with no intervening producer use in
+            // this loopback probe.
             candidate
                 .renderer
-                .mark_wayland_surface_current_dmabuf_commit_for_sampled_import(&surface, &candidate.dmabuf)
+                .mark_wayland_surface_current_dmabuf_commit_from_renderer_release_evidence_for_sampled_import(
+                    &surface,
+                    &candidate.dmabuf,
+                    &renderer_release_evidence,
+                )
                 .unwrap();
             candidate
                 .renderer
@@ -9464,6 +9474,123 @@ fn import_surface_loopback_evidence_marker_requires_same_dmabuf_evidence() {
     ));
     assert!(matches!(
         renderer.sampled_dmabuf_wayland_buffer_foreign_general_evidence(&negative_buffer, &committed_dmabuf,),
+        Ok(None)
+    ));
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_surface_renderer_release_marker_requires_released_history() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let unrelated_renderer = VulkanRenderer::new_scaffold_for_tests();
+    let committed_dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let unrelated_dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Xrgb8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+
+    assert!(matches!(
+        renderer
+            .sampled_dmabuf_wayland_renderer_foreign_general_release_evidence_for_tests(&committed_dmabuf,),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan renderer release evidence"
+        ))
+    ));
+    renderer.record_sampled_dmabuf_locally_acquired(&committed_dmabuf);
+    assert!(matches!(
+        renderer
+            .sampled_dmabuf_wayland_renderer_foreign_general_release_evidence_for_tests(&committed_dmabuf,),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan unreleased local acquire"
+        ))
+    ));
+    renderer.record_sampled_dmabuf_released_to_foreign_general(&committed_dmabuf);
+    let renderer_release_evidence = renderer
+        .sampled_dmabuf_wayland_renderer_foreign_general_release_evidence_for_tests(&committed_dmabuf)
+        .unwrap();
+    assert!(renderer_release_evidence.is_for_dmabuf(&committed_dmabuf));
+    assert!(!renderer_release_evidence.is_for_dmabuf(&unrelated_dmabuf));
+
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+            committed_dmabuf.clone(),
+            DrmSyncPoint::invalid_for_tests(45).unwrap(),
+            DrmSyncPoint::invalid_for_tests(46).unwrap(),
+        )
+    else {
+        return;
+    };
+    unsafe {
+        // SAFETY: This unit test validates marker routing only. It models a current commit whose
+        // acquire point is ordered after the renderer's release evidence and performs no Vulkan import
+        // or sampling with the constructed marker.
+        renderer
+            .mark_wayland_surface_current_dmabuf_commit_from_renderer_release_evidence_for_sampled_import(
+                &surface,
+                &committed_dmabuf,
+                &renderer_release_evidence,
+            )
+            .unwrap();
+    }
+    let stored_evidence = renderer
+        .sampled_dmabuf_wayland_buffer_foreign_general_evidence(&buffer, &committed_dmabuf)
+        .unwrap()
+        .unwrap();
+    assert!(stored_evidence.is_for_dmabuf(&committed_dmabuf));
+
+    let wrong_renderer_result = unsafe {
+        // SAFETY: This negative test supplies evidence from a different renderer context, so the
+        // helper must reject it before relying on any external-state assumption.
+        unrelated_renderer
+            .mark_wayland_surface_current_dmabuf_commit_from_renderer_release_evidence_for_sampled_import(
+                &surface,
+                &committed_dmabuf,
+                &renderer_release_evidence,
+            )
+    };
+    assert!(matches!(
+        wrong_renderer_result,
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland renderer release evidence renderer identity"
+        ))
+    ));
+
+    let Some((_negative_display, _negative_client_side, negative_surface, negative_buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+            unrelated_dmabuf.clone(),
+            DrmSyncPoint::invalid_for_tests(47).unwrap(),
+            DrmSyncPoint::invalid_for_tests(48).unwrap(),
+        )
+    else {
+        return;
+    };
+    let wrong_dmabuf_result = unsafe {
+        // SAFETY: This negative test supplies same-renderer evidence for a different dmabuf, so the
+        // helper must reject it before storing current-commit external-state evidence.
+        renderer.mark_wayland_surface_current_dmabuf_commit_from_renderer_release_evidence_for_sampled_import(
+            &negative_surface,
+            &unrelated_dmabuf,
+            &renderer_release_evidence,
+        )
+    };
+    assert!(matches!(
+        wrong_dmabuf_result,
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland renderer release evidence identity"
+        ))
+    ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_buffer_foreign_general_evidence(&negative_buffer, &unrelated_dmabuf,),
         Ok(None)
     ));
     assert!(renderer.dmabuf_formats().iter().next().is_none());

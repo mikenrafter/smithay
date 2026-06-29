@@ -385,6 +385,38 @@ impl SampledDmabufWaylandCurrentReacquireLayoutEvidence {
     }
 }
 
+/// Evidence that this renderer recorded a Wayland sampled dmabuf release to foreign `GENERAL` state.
+///
+/// This is a test-only development token for runtime loopback probes. It is deliberately narrower
+/// than a production producer-return policy: it records that Smithay's Vulkan renderer released the
+/// previously imported texture, but callers must still prove the current Wayland acquire point orders
+/// the relevant release call site and that no foreign producer changed the image layout/ownership
+/// before reacquire.
+#[cfg(all(test, feature = "wayland_frontend"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SampledDmabufWaylandRendererForeignGeneralReleaseEvidence {
+    dmabuf: WeakDmabuf,
+    renderer_context: ContextId<VulkanTexture>,
+}
+
+#[cfg(all(test, feature = "wayland_frontend"))]
+impl SampledDmabufWaylandRendererForeignGeneralReleaseEvidence {
+    fn new(dmabuf: WeakDmabuf, renderer_context: ContextId<VulkanTexture>) -> Self {
+        Self {
+            dmabuf,
+            renderer_context,
+        }
+    }
+
+    fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+
+    fn is_for_renderer_context(&self, renderer_context: &ContextId<VulkanTexture>) -> bool {
+        &self.renderer_context == renderer_context
+    }
+}
+
 /// Evidence for the layout/ownership contract used by a normal Wayland sampled-dmabuf commit.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1336,6 +1368,71 @@ impl VulkanRenderer {
             // SAFETY: Forwarded from this test-only helper's caller. The evidence identity check
             // above is only an additional guard; the caller still proves current external state,
             // no-intervening-use, and acquire ordering for this Wayland commit.
+            self.mark_wayland_surface_current_dmabuf_commit_for_sampled_import(surface, dmabuf)
+        }
+    }
+
+    /// Produce test-only evidence from this renderer's sampled-dmabuf release history.
+    ///
+    /// This helper is intentionally limited to tests because renderer-local history only proves what
+    /// this renderer released; it does not prove what an arbitrary Wayland producer did before the
+    /// next commit. Runtime loopback probes use the returned token together with an explicitly ordered
+    /// Wayland reacquire point to replace raw current-commit marking for same-dmabuf reacquire.
+    #[cfg(all(test, feature = "wayland_frontend"))]
+    fn sampled_dmabuf_wayland_renderer_foreign_general_release_evidence_for_tests(
+        &mut self,
+        dmabuf: &Dmabuf,
+    ) -> Result<SampledDmabufWaylandRendererForeignGeneralReleaseEvidence, VulkanError> {
+        match self.sampled_dmabuf_layout_history(dmabuf) {
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => {
+                Ok(SampledDmabufWaylandRendererForeignGeneralReleaseEvidence::new(
+                    dmabuf.weak(),
+                    self.context_id.clone(),
+                ))
+            }
+            SampledDmabufWaylandLayoutHistory::LocallyAcquired => Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan unreleased local acquire",
+            )),
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory => Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan renderer release evidence",
+            )),
+        }
+    }
+
+    /// Mark a renderer-managed Wayland dmabuf commit from this renderer's release-history evidence.
+    ///
+    /// This test-only helper lets the same-dmabuf reacquire loopback probe use release evidence that
+    /// the probe obtained immediately after the renderer-utils cache release hook, instead of stale
+    /// render-target loopback evidence. It still records the same validation-stage current-commit
+    /// marker and does not public-advertise generic sampled [`ImportDma`] support.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prove the current Wayland acquire point is ordered after the release that
+    /// produced `evidence`, and that no foreign producer access changed the dmabuf's queue-family
+    /// ownership or image layout before this current commit is imported.
+    #[cfg(all(test, feature = "wayland_frontend"))]
+    unsafe fn mark_wayland_surface_current_dmabuf_commit_from_renderer_release_evidence_for_sampled_import(
+        &self,
+        surface: &WlSurface,
+        dmabuf: &Dmabuf,
+        evidence: &SampledDmabufWaylandRendererForeignGeneralReleaseEvidence,
+    ) -> Result<(), VulkanError> {
+        if !evidence.is_for_renderer_context(&self.context_id) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland renderer release evidence renderer identity",
+            ));
+        }
+        if !evidence.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland renderer release evidence identity",
+            ));
+        }
+
+        unsafe {
+            // SAFETY: Forwarded from this test-only helper's caller. The renderer release evidence
+            // proves only this renderer's prior release and identity; the caller still proves current
+            // acquire ordering and no intervening external-state change for this Wayland commit.
             self.mark_wayland_surface_current_dmabuf_commit_for_sampled_import(surface, dmabuf)
         }
     }
