@@ -3354,6 +3354,7 @@ impl VulkanRenderer {
         preserve_contents: bool,
         acquire_semaphore: Option<&VulkanSyncFileSemaphore>,
     ) -> Result<Option<VulkanRenderTarget<'static>>, VulkanError> {
+        self.validate_no_pending_sampled_dmabuf_import_obligation(dmabuf)?;
         let import = validate_dmabuf_render_target_metadata(dmabuf)?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
         let Some(color_image) = (unsafe {
@@ -3397,6 +3398,7 @@ impl VulkanRenderer {
         preserve_contents: bool,
         acquire_sync: Option<&SyncPoint>,
     ) -> Result<Option<VulkanRenderTarget<'target>>, VulkanError> {
+        self.validate_no_pending_sampled_dmabuf_import_obligation(dmabuf)?;
         let import = validate_dmabuf_render_target_metadata(dmabuf)?;
         let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
         let Some(color_image) = (unsafe {

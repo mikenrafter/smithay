@@ -3765,6 +3765,120 @@ fn public_dmabuf_bind_uses_discard_acquire_path() {
 }
 
 #[test]
+fn sampled_pending_obligations_block_dmabuf_render_target_acquire_paths() {
+    fn dmabuf() -> Dmabuf {
+        dmabuf_with_planes_for_tests(
+            (4, 3).into(),
+            Fourcc::Abgr8888,
+            Modifier::Linear,
+            DmabufFlags::empty(),
+            &[(0, 0, 16)],
+        )
+    }
+
+    fn retain_release_only(renderer: &mut VulkanRenderer, dmabuf: &Dmabuf) {
+        renderer.retain_pending_sampled_dmabuf_import_obligation(
+            PendingSampledDmabufImportObligation::ReleaseOnly(SampledDmabufReleaseOwnership::new_for_tests(
+                dmabuf,
+            )),
+        );
+    }
+
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let direct_dmabuf = dmabuf();
+    retain_release_only(&mut renderer, &direct_dmabuf);
+    assert!(matches!(
+        // SAFETY: The pending-obligation guard must reject before any Vulkan acquire operation can run.
+        unsafe { renderer.create_acquired_dmabuf_render_target(&direct_dmabuf, false, None) },
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+
+    let sync_point_dmabuf = dmabuf();
+    retain_release_only(&mut renderer, &sync_point_dmabuf);
+    assert!(matches!(
+        // SAFETY: The pending-obligation guard must reject before sync-point or Vulkan acquire work.
+        unsafe {
+            renderer.create_acquired_dmabuf_render_target_with_sync_point(
+                &sync_point_dmabuf,
+                false,
+                Some(&SyncPoint::signaled()),
+            )
+        },
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+
+    let mut explicit_dmabuf = dmabuf();
+    retain_release_only(&mut renderer, &explicit_dmabuf);
+    assert!(matches!(
+        // SAFETY: The pending-obligation guard must reject before public explicit acquire work.
+        unsafe {
+            renderer
+                .bind_dmabuf_render_target(&mut explicit_dmabuf, VulkanDmabufRenderTargetAcquire::discard())
+        },
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+
+    let mut allocator_dmabuf = dmabuf();
+    retain_release_only(&mut renderer, &allocator_dmabuf);
+    let allocator_evidence = unsafe {
+        // SAFETY: This scaffold test only checks that matching evidence still reaches the guarded
+        // render-target acquire path before any Vulkan operation can run.
+        VulkanAllocatorDmabufForeignReleaseEvidence::new_for_tests(&allocator_dmabuf)
+    };
+    assert!(matches!(
+        // SAFETY: Matching allocator evidence is intentionally routed to the guarded bind path.
+        unsafe {
+            renderer.bind_allocator_released_dmabuf_render_target(&mut allocator_dmabuf, allocator_evidence)
+        },
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+
+    let mut borrowed_wrapper_dmabuf = dmabuf();
+    retain_release_only(&mut renderer, &borrowed_wrapper_dmabuf);
+    let mut borrowed_target = unsafe {
+        // SAFETY: The pending-obligation guard must reject before the wrapper can acquire Vulkan ownership.
+        VulkanDmabufRenderTarget::discard(&mut borrowed_wrapper_dmabuf)
+    };
+    assert!(matches!(
+        <VulkanRenderer as Bind<VulkanDmabufRenderTarget<'_, '_>>>::bind(&mut renderer, &mut borrowed_target),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+
+    let owned_wrapper_dmabuf = dmabuf();
+    retain_release_only(&mut renderer, &owned_wrapper_dmabuf);
+    let mut owned_target = unsafe {
+        // SAFETY: The pending-obligation guard must reject before the wrapper can acquire Vulkan ownership.
+        VulkanOwnedDmabufRenderTarget::discard(owned_wrapper_dmabuf)
+    };
+    assert!(matches!(
+        <VulkanRenderer as Bind<VulkanOwnedDmabufRenderTarget<'_>>>::bind(&mut renderer, &mut owned_target),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+
+    let mut generic_dmabuf = dmabuf();
+    renderer.capabilities.rendering.dmabuf_target_development = true;
+    retain_release_only(&mut renderer, &generic_dmabuf);
+    assert!(matches!(
+        <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut generic_dmabuf),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+}
+
+#[test]
 fn dmabuf_loopback_evidence_is_identity_bound_and_not_public_advertised() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let dmabuf = dmabuf_with_planes_for_tests(
