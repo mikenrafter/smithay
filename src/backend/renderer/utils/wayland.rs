@@ -2170,6 +2170,7 @@ mod tests {
                 .lock()
                 .unwrap();
             assert!(state.textures.is_empty());
+            assert!(!state.renderer_seen.contains_key(&context_id.erased()));
             assert_eq!(
                 state.retired_textures.get(&context_id.erased()).map(Vec::len),
                 Some(1)
@@ -2183,6 +2184,7 @@ mod tests {
                 .lock()
                 .unwrap();
             assert!(state.textures.is_empty());
+            assert!(!state.renderer_seen.contains_key(&context_id.erased()));
             assert!(!state.retired_textures.contains_key(&context_id.erased()));
         });
     }
