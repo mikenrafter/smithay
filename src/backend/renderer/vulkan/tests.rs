@@ -5137,6 +5137,93 @@ fn runtime_dmabuf_loopback_imports_released_render_target_as_sampled_texture() {
 
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
+fn runtime_cleanup_texture_cache_releases_pending_sampled_acquire() {
+    let test_name = "Vulkan cleanup_texture_cache sampled acquire release test";
+    let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
+        return;
+    };
+
+    let allocator_release = unsafe {
+        // SAFETY: The dmabuf was just exported from `candidate.image`, and this ignored runtime test
+        // does not hand it to any other API before asking the allocator to release the fresh image to
+        // FOREIGN/GENERAL for the renderer acquire below.
+        candidate
+            .allocator
+            .release_dmabuf_to_foreign_general(&candidate.image, &candidate.dmabuf)
+    }
+    .expect("release allocator dmabuf to foreign GENERAL");
+
+    let mut target = unsafe {
+        // SAFETY: `allocator_release` proves that the allocator-owned image backing this exported
+        // dmabuf was released to VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL layout. There is no
+        // intervening access before this renderer acquire.
+        candidate
+            .renderer
+            .bind_allocator_released_dmabuf_render_target(&mut candidate.dmabuf, allocator_release)
+    }
+    .expect("bind allocator-released dmabuf as Vulkan render target")
+    .expect("renderer should advertise the selected dmabuf render-target modifier");
+
+    let evidence = candidate
+        .renderer
+        .release_dmabuf_render_target_for_sampled_loopback(&mut target, false)
+        .expect("release loopback render target to foreign GENERAL")
+        .expect("released loopback render target should produce sampled import evidence");
+    drop(target);
+
+    let mut texture = unsafe {
+        // SAFETY: `evidence` was produced by releasing the same Smithay dmabuf identity immediately
+        // above, and there is no intervening access, acquire, release, or layout/ownership transition
+        // before this sampled loopback import.
+        candidate
+            .renderer
+            .import_dmabuf_texture_from_loopback(&candidate.dmabuf, evidence)
+    }
+    .expect("import released loopback dmabuf as sampled texture")
+    .expect("selected modifier should support sampled dmabuf import");
+    assert!(texture.has_sampled_image_for_tests());
+    assert_eq!(
+        candidate
+            .renderer
+            .sampled_dmabuf_layout_history(&candidate.dmabuf),
+        SampledDmabufWaylandLayoutHistory::LocallyAcquired
+    );
+
+    texture.sampled_dmabuf_release =
+        Some(VulkanSampledDmabufRelease::validation_stage_without_wayland_point());
+    candidate
+        .renderer
+        .retain_pending_sampled_dmabuf_import_obligation(
+            PendingSampledDmabufImportObligation::AcquiredTexture(texture),
+        );
+    assert!(matches!(
+        candidate
+            .renderer
+            .validate_no_pending_sampled_dmabuf_import_obligation(&candidate.dmabuf),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+
+    Renderer::cleanup_texture_cache(&mut candidate.renderer)
+        .expect("cleanup_texture_cache should release pending sampled acquire through Vulkan");
+    assert!(
+        candidate
+            .renderer
+            .validate_no_pending_sampled_dmabuf_import_obligation(&candidate.dmabuf)
+            .is_ok()
+    );
+    assert_eq!(
+        candidate
+            .renderer
+            .sampled_dmabuf_layout_history(&candidate.dmabuf),
+        SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+    );
+    assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
 fn runtime_import_dma_known_layout_helper_samples_released_loopback_dmabuf() {
     let test_name = "Vulkan known-layout sampled dmabuf loopback sampling test";
     let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
