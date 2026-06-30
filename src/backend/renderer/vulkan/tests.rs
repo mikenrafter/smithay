@@ -10581,6 +10581,107 @@ fn sampled_pending_import_obligations_block_same_dmabuf_reimport() {
 }
 
 #[test]
+fn cleanup_texture_cache_drains_or_retains_pending_sampled_obligations() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let release_only_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    renderer.retain_pending_sampled_dmabuf_import_obligation(
+        PendingSampledDmabufImportObligation::ReleaseOnly(SampledDmabufReleaseOwnership::new_for_tests(
+            &release_only_dmabuf,
+        )),
+    );
+    assert!(matches!(
+        renderer.validate_no_pending_sampled_dmabuf_import_obligation(&release_only_dmabuf),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+    Renderer::cleanup_texture_cache(&mut renderer).expect("validation-stage release-only cleanup succeeds");
+    assert!(
+        renderer
+            .validate_no_pending_sampled_dmabuf_import_obligation(&release_only_dmabuf)
+            .is_ok()
+    );
+
+    let acquired_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let mut acquired_texture = texture_for_tests((4, 3).into(), Some(Fourcc::Abgr8888));
+    acquired_texture.context_id = renderer.context_id();
+    acquired_texture.image.source = VulkanImageSource::DmabufImport;
+    acquired_texture.sampled_dmabuf = Some(acquired_dmabuf.weak());
+    renderer.retain_pending_sampled_dmabuf_import_obligation(
+        PendingSampledDmabufImportObligation::AcquiredTexture(acquired_texture),
+    );
+    let trailing_release_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    renderer.retain_pending_sampled_dmabuf_import_obligation(
+        PendingSampledDmabufImportObligation::ReleaseOnly(SampledDmabufReleaseOwnership::new_for_tests(
+            &trailing_release_dmabuf,
+        )),
+    );
+    assert!(matches!(
+        Renderer::cleanup_texture_cache(&mut renderer),
+        Err(VulkanError::UnsupportedOperation("dmabuf texture sampled image"))
+    ));
+    assert!(matches!(
+        renderer.validate_no_pending_sampled_dmabuf_import_obligation(&acquired_dmabuf),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+    assert!(matches!(
+        renderer.validate_no_pending_sampled_dmabuf_import_obligation(&trailing_release_dmabuf),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+    renderer.pending_sampled_dmabuf_import_obligations.clear();
+
+    let release_unknown_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let mut release_unknown_texture = texture_for_tests((4, 3).into(), Some(Fourcc::Abgr8888));
+    release_unknown_texture.context_id = renderer.context_id();
+    release_unknown_texture.image.source = VulkanImageSource::DmabufImport;
+    release_unknown_texture.sampled_dmabuf = Some(release_unknown_dmabuf.weak());
+    renderer.retain_pending_sampled_dmabuf_import_obligation(
+        PendingSampledDmabufImportObligation::ReleaseCompletionUnknownTexture(release_unknown_texture),
+    );
+    assert!(matches!(
+        Renderer::cleanup_texture_cache(&mut renderer),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf release completion unknown"
+        ))
+    ));
+    assert!(matches!(
+        renderer.validate_no_pending_sampled_dmabuf_import_obligation(&release_unknown_dmabuf),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+    renderer.pending_sampled_dmabuf_import_obligations.clear();
+}
+
+#[test]
 fn public_export_mem_rejects_invalid_vulkan_targets_before_device_lookup() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     let foreign_target = render_target_for_tests(
@@ -12162,7 +12263,7 @@ fn renderer_debug_flags_roundtrip() {
 }
 
 #[test]
-fn renderer_cleanup_texture_cache_is_noop() {
+fn renderer_cleanup_texture_cache_without_pending_obligations_succeeds() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     assert!(renderer.cleanup_texture_cache().is_ok());
 }

@@ -1887,6 +1887,127 @@ impl VulkanRenderer {
     }
 
     #[allow(dead_code)]
+    fn cleanup_pending_sampled_dmabuf_import_obligations(&mut self) -> Result<(), VulkanError> {
+        let mut obligations = std::mem::take(&mut self.pending_sampled_dmabuf_import_obligations).into_iter();
+        while let Some(obligation) = obligations.next() {
+            match obligation {
+                PendingSampledDmabufImportObligation::ReleaseOnly(release_ownership) => {
+                    if let Err(err) = release_ownership.signal_wayland_release_once() {
+                        self.retain_pending_sampled_dmabuf_import_obligation(
+                            PendingSampledDmabufImportObligation::ReleaseOnly(release_ownership),
+                        );
+                        self.pending_sampled_dmabuf_import_obligations.extend(obligations);
+                        return Err(err);
+                    }
+                }
+                PendingSampledDmabufImportObligation::AcquiredTexture(mut texture) => {
+                    if texture.context_id != self.context_id {
+                        self.retain_pending_sampled_dmabuf_import_obligation(
+                            PendingSampledDmabufImportObligation::AcquiredTexture(texture),
+                        );
+                        self.pending_sampled_dmabuf_import_obligations.extend(obligations);
+                        return Err(VulkanError::UnsupportedOperation("foreign dmabuf texture"));
+                    }
+                    if texture.image.source != image::VulkanImageSource::DmabufImport {
+                        self.retain_pending_sampled_dmabuf_import_obligation(
+                            PendingSampledDmabufImportObligation::AcquiredTexture(texture),
+                        );
+                        self.pending_sampled_dmabuf_import_obligations.extend(obligations);
+                        return Err(VulkanError::UnsupportedOperation("dmabuf texture"));
+                    }
+                    let Some(dmabuf) = texture.sampled_dmabuf.as_ref().and_then(WeakDmabuf::upgrade) else {
+                        self.retain_pending_sampled_dmabuf_import_obligation(
+                            PendingSampledDmabufImportObligation::AcquiredTexture(texture),
+                        );
+                        self.pending_sampled_dmabuf_import_obligations.extend(obligations);
+                        return Err(VulkanError::UnsupportedOperation("sampled dmabuf identity"));
+                    };
+                    if texture.sampled_image.is_none() {
+                        self.retain_pending_sampled_dmabuf_import_obligation(
+                            PendingSampledDmabufImportObligation::AcquiredTexture(texture),
+                        );
+                        self.pending_sampled_dmabuf_import_obligations.extend(obligations);
+                        return Err(VulkanError::UnsupportedOperation("dmabuf texture sampled image"));
+                    }
+                    let cleanup = {
+                        let Some(device) = self.device.as_ref() else {
+                            self.retain_pending_sampled_dmabuf_import_obligation(
+                                PendingSampledDmabufImportObligation::AcquiredTexture(texture),
+                            );
+                            self.pending_sampled_dmabuf_import_obligations.extend(obligations);
+                            return Err(VulkanError::VulkanUnavailable);
+                        };
+                        let sampled_image = texture
+                            .sampled_image
+                            .as_ref()
+                            .expect("sampled image checked before pending cleanup release");
+                        device.release_sampled_dmabuf_to_foreign_general_classified(
+                            sampled_image.image(),
+                            false,
+                        )
+                    };
+
+                    match cleanup {
+                        Ok((true, _)) => {}
+                        Ok((false, _)) => {
+                            self.retain_pending_sampled_dmabuf_import_obligation(
+                                PendingSampledDmabufImportObligation::AcquiredTexture(texture),
+                            );
+                            self.pending_sampled_dmabuf_import_obligations.extend(obligations);
+                            return Err(VulkanError::UnsupportedOperation(
+                                "sampled dmabuf pending import cleanup release",
+                            ));
+                        }
+                        Err(device::VulkanSampledDmabufForeignReleaseError::RetrySafe(err)) => {
+                            self.retain_pending_sampled_dmabuf_import_obligation(
+                                PendingSampledDmabufImportObligation::AcquiredTexture(texture),
+                            );
+                            self.pending_sampled_dmabuf_import_obligations.extend(obligations);
+                            return Err(err);
+                        }
+                        Err(device::VulkanSampledDmabufForeignReleaseError::ReleaseSubmitted(err)) => {
+                            self.retain_pending_sampled_dmabuf_import_obligation(
+                                PendingSampledDmabufImportObligation::ReleaseCompletionUnknownTexture(
+                                    texture,
+                                ),
+                            );
+                            self.pending_sampled_dmabuf_import_obligations.extend(obligations);
+                            return Err(err);
+                        }
+                    }
+                    if let Err(err) = texture.signal_sampled_dmabuf_release_point(None) {
+                        if let Some(release) = texture.sampled_dmabuf_release.take() {
+                            self.retain_pending_sampled_dmabuf_import_obligation(
+                                PendingSampledDmabufImportObligation::ReleaseOnly(
+                                    SampledDmabufReleaseOwnership {
+                                        dmabuf: dmabuf.weak(),
+                                        release,
+                                    },
+                                ),
+                            );
+                        }
+                        self.record_sampled_dmabuf_released_to_foreign_general(&dmabuf);
+                        self.pending_sampled_dmabuf_import_obligations.extend(obligations);
+                        return Err(err);
+                    }
+                    self.record_sampled_dmabuf_released_to_foreign_general(&dmabuf);
+                }
+                PendingSampledDmabufImportObligation::ReleaseCompletionUnknownTexture(texture) => {
+                    self.retain_pending_sampled_dmabuf_import_obligation(
+                        PendingSampledDmabufImportObligation::ReleaseCompletionUnknownTexture(texture),
+                    );
+                    self.pending_sampled_dmabuf_import_obligations.extend(obligations);
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf release completion unknown",
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     fn record_sampled_dmabuf_released_to_foreign_general(&mut self, dmabuf: &Dmabuf) {
         self.prune_sampled_dmabuf_layout_history();
         self.sampled_dmabuf_layout_history.insert(
@@ -4136,7 +4257,7 @@ impl Renderer for VulkanRenderer {
     }
 
     fn cleanup_texture_cache(&mut self) -> Result<(), Self::Error> {
-        Ok(())
+        self.cleanup_pending_sampled_dmabuf_import_obligations()
     }
 }
 
