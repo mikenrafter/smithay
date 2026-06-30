@@ -105,6 +105,61 @@ impl VulkanSampledDmabufForeignAcquireError {
     }
 }
 
+#[allow(dead_code)]
+#[derive(Debug)]
+enum VulkanReadySubmitError<T> {
+    /// The ready callback was not called and no queue submit was attempted.
+    ReservationFailed(VulkanError),
+    /// The ready callback returned an error and no queue submit was attempted.
+    ReadyCallbackFailed(VulkanError),
+    /// The ready callback succeeded, but `vkQueueSubmit` was not accepted.
+    ReadyCallbackCommitted { err: VulkanError, ready: T },
+    /// Queue submit was accepted, or completion became unknowable, after the ready callback.
+    Submitted { err: VulkanError, ready: T },
+}
+
+impl<T> VulkanReadySubmitError<T> {
+    fn into_inner(self) -> VulkanError {
+        match self {
+            VulkanReadySubmitError::ReservationFailed(err)
+            | VulkanReadySubmitError::ReadyCallbackFailed(err)
+            | VulkanReadySubmitError::ReadyCallbackCommitted { err, .. }
+            | VulkanReadySubmitError::Submitted { err, .. } => err,
+        }
+    }
+}
+
+/// Error classification for acquiring a sampled dmabuf after an external ready callback ran.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum VulkanSampledDmabufReadyAcquireError<T> {
+    /// The ready callback was not called; no Vulkan ownership-transfer side effect occurred.
+    RetrySafe(VulkanError),
+    /// The ready callback failed before queue submit was attempted.
+    ReadyCallbackFailed(VulkanError),
+    /// The ready callback succeeded, but queue submit was not accepted. The callback's side effect
+    /// must be treated as committed by the caller.
+    ReadyCallbackCommitted { err: VulkanError, ready: T },
+    /// Queue acquire submission was accepted or completion became unknowable after the callback.
+    AcquireSubmitted {
+        err: VulkanError,
+        sampled_image: VulkanSampledImage,
+        ready: T,
+    },
+}
+
+#[allow(dead_code)]
+impl<T> VulkanSampledDmabufReadyAcquireError<T> {
+    pub(crate) fn into_inner(self) -> VulkanError {
+        match self {
+            VulkanSampledDmabufReadyAcquireError::RetrySafe(err)
+            | VulkanSampledDmabufReadyAcquireError::ReadyCallbackFailed(err)
+            | VulkanSampledDmabufReadyAcquireError::ReadyCallbackCommitted { err, .. }
+            | VulkanSampledDmabufReadyAcquireError::AcquireSubmitted { err, .. } => err,
+        }
+    }
+}
+
 pub(super) struct VulkanExternalMemoryDeviceFunctions {
     #[allow(dead_code)]
     pub(super) image_drm_format_modifier: ext::image_drm_format_modifier::Device,
@@ -1627,6 +1682,42 @@ impl VulkanDeviceState {
         &self,
         prepared: VulkanPreparedSampledDmabufAcquire,
     ) -> Result<VulkanSampledImage, VulkanSampledDmabufForeignAcquireError> {
+        match self.submit_prepared_sampled_dmabuf_foreign_acquire_ready(prepared, || Ok(())) {
+            Ok((sampled_image, ())) => Ok(sampled_image),
+            Err(VulkanSampledDmabufReadyAcquireError::RetrySafe(err))
+            | Err(VulkanSampledDmabufReadyAcquireError::ReadyCallbackFailed(err))
+            | Err(VulkanSampledDmabufReadyAcquireError::ReadyCallbackCommitted { err, .. }) => {
+                Err(VulkanSampledDmabufForeignAcquireError::RetrySafe(err))
+            }
+            Err(VulkanSampledDmabufReadyAcquireError::AcquireSubmitted {
+                err, sampled_image, ..
+            }) => Err(VulkanSampledDmabufForeignAcquireError::AcquireSubmitted {
+                err,
+                sampled_image: Some(sampled_image),
+            }),
+        }
+    }
+
+    /// Submit a prepared sampled dmabuf acquire after running a callback at the ready-to-submit point.
+    ///
+    /// The callback is called only after submit validation, fence creation, host-access locking, and
+    /// semaphore payload reservation have succeeded. It runs while the submit state is reserved and
+    /// immediately before `vkQueueSubmit`; callers may use it for move-only obligations that must not
+    /// be consumed by retry-safe setup failures. If the callback succeeds, any later error is reported
+    /// with the callback's return value so the caller can complete or compensate that obligation.
+    ///
+    /// The callback runs while semaphore, command-pool, and queue host-access locks are held. It must
+    /// be short, must not call back into Vulkan submit/import/export paths, and must not invoke
+    /// arbitrary renderer code that could re-enter this device.
+    #[allow(dead_code)]
+    pub(crate) fn submit_prepared_sampled_dmabuf_foreign_acquire_ready<T, F>(
+        &self,
+        prepared: VulkanPreparedSampledDmabufAcquire,
+        before_submit: F,
+    ) -> Result<(VulkanSampledImage, T), VulkanSampledDmabufReadyAcquireError<T>>
+    where
+        F: FnOnce() -> Result<T, VulkanError>,
+    {
         let VulkanPreparedSampledDmabufAcquire {
             sampler,
             view,
@@ -1635,7 +1726,7 @@ impl VulkanDeviceState {
             mut command_buffer,
         } = prepared;
 
-        let acquire_result = if let Some(acquire_semaphore) = acquire_semaphore.as_ref() {
+        let ready_result = if let Some(acquire_semaphore) = acquire_semaphore.as_ref() {
             let synchronization = VulkanSubmitSynchronization::default()
                 .wait_sync_file(acquire_semaphore, vk::PipelineStageFlags::TOP_OF_PIPE);
             // SAFETY: This helper fixes the wait stage to TOP_OF_PIPE, which is supported by every
@@ -1643,30 +1734,40 @@ impl VulkanDeviceState {
             // to this device, is not duplicated in the submit, and has a waitable tracked payload
             // before the queue operation is attempted.
             unsafe {
-                self.submit_graphics_command_buffer_and_wait_with_synchronization(
+                self.submit_graphics_command_buffer_and_wait_with_synchronization_after_reservation(
                     &mut command_buffer,
                     &synchronization,
+                    before_submit,
                 )
             }
         } else {
-            self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
+            unsafe {
+                self.submit_graphics_command_buffer_and_wait_after_reservation(
+                    &mut command_buffer,
+                    before_submit,
+                )
+            }
         };
 
-        if let Err(err) = acquire_result {
-            return Err(
-                match classify_sampled_dmabuf_acquire_submit_error(command_buffer.state, err) {
-                    VulkanSampledDmabufForeignAcquireError::AcquireSubmitted { err, .. } => {
-                        VulkanSampledDmabufForeignAcquireError::AcquireSubmitted {
-                            err,
-                            sampled_image: Some(VulkanSampledImage { sampler, view, image }),
-                        }
-                    }
-                    err => err,
-                },
-            );
+        match ready_result {
+            Ok(ready) => Ok((VulkanSampledImage { sampler, view, image }, ready)),
+            Err(VulkanReadySubmitError::ReservationFailed(err)) => {
+                Err(VulkanSampledDmabufReadyAcquireError::RetrySafe(err))
+            }
+            Err(VulkanReadySubmitError::ReadyCallbackFailed(err)) => {
+                Err(VulkanSampledDmabufReadyAcquireError::ReadyCallbackFailed(err))
+            }
+            Err(VulkanReadySubmitError::ReadyCallbackCommitted { err, ready }) => {
+                Err(VulkanSampledDmabufReadyAcquireError::ReadyCallbackCommitted { err, ready })
+            }
+            Err(VulkanReadySubmitError::Submitted { err, ready }) => {
+                Err(VulkanSampledDmabufReadyAcquireError::AcquireSubmitted {
+                    err,
+                    sampled_image: VulkanSampledImage { sampler, view, image },
+                    ready,
+                })
+            }
         }
-
-        Ok(VulkanSampledImage { sampler, view, image })
     }
 
     #[allow(dead_code)]
@@ -2059,16 +2160,40 @@ impl VulkanDeviceState {
         &self,
         command_buffer: &mut VulkanCommandBuffer,
     ) -> Result<(), VulkanError> {
+        unsafe { self.submit_graphics_command_buffer_and_wait_after_reservation(command_buffer, || Ok(())) }
+            .map_err(VulkanReadySubmitError::into_inner)
+    }
+
+    #[allow(dead_code)]
+    unsafe fn submit_graphics_command_buffer_and_wait_after_reservation<T, F>(
+        &self,
+        command_buffer: &mut VulkanCommandBuffer,
+        before_submit: F,
+    ) -> Result<T, VulkanReadySubmitError<T>>
+    where
+        F: FnOnce() -> Result<T, VulkanError>,
+    {
         let logical_device = self
             .logical_device
             .as_ref()
-            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
-        let queue =
-            self.queues.graphics.as_ref().ok_or_else(|| {
-                VulkanError::DeviceInitializationFailed("missing graphics queue".to_owned())
-            })?;
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))
+            .map_err(VulkanReadySubmitError::ReservationFailed)?;
+        let queue = self
+            .queues
+            .graphics
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing graphics queue".to_owned()))
+            .map_err(VulkanReadySubmitError::ReservationFailed)?;
 
-        submit_command_buffer_and_wait_without_synchronization(logical_device, queue, command_buffer)
+        unsafe {
+            submit_command_buffer_and_wait_after_reservation(
+                logical_device,
+                queue,
+                command_buffer,
+                &VulkanSubmitSynchronization::default(),
+                before_submit,
+            )
+        }
     }
 
     /// Submit a graphics command buffer with binary semaphore waits/signals and wait for completion.
@@ -2087,19 +2212,58 @@ impl VulkanDeviceState {
         command_buffer: &mut VulkanCommandBuffer,
         synchronization: &VulkanSubmitSynchronization<'_>,
     ) -> Result<(), VulkanError> {
+        unsafe {
+            self.submit_graphics_command_buffer_and_wait_with_synchronization_after_reservation(
+                command_buffer,
+                synchronization,
+                || Ok(()),
+            )
+        }
+        .map_err(VulkanReadySubmitError::into_inner)
+    }
+
+    /// Submit a graphics command buffer with a ready callback after all pre-submit reservation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the same semaphore payload-state and stage-mask valid-usage contract as
+    /// [`VulkanDeviceState::submit_graphics_command_buffer_and_wait_with_synchronization`]. The
+    /// callback runs while queue, command-pool, and semaphore host-access locks are held; it must be
+    /// short and must not re-enter this Vulkan device submit path.
+    #[allow(dead_code)]
+    unsafe fn submit_graphics_command_buffer_and_wait_with_synchronization_after_reservation<T, F>(
+        &self,
+        command_buffer: &mut VulkanCommandBuffer,
+        synchronization: &VulkanSubmitSynchronization<'_>,
+        before_submit: F,
+    ) -> Result<T, VulkanReadySubmitError<T>>
+    where
+        F: FnOnce() -> Result<T, VulkanError>,
+    {
         let logical_device = self
             .logical_device
             .as_ref()
-            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
-        let queue =
-            self.queues.graphics.as_ref().ok_or_else(|| {
-                VulkanError::DeviceInitializationFailed("missing graphics queue".to_owned())
-            })?;
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))
+            .map_err(VulkanReadySubmitError::ReservationFailed)?;
+        let queue = self
+            .queues
+            .graphics
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing graphics queue".to_owned()))
+            .map_err(VulkanReadySubmitError::ReservationFailed)?;
 
         // SAFETY: The caller upholds the semaphore payload-state and stage-mask valid-usage
         // requirements for the supplied synchronization description. This method selected the
         // graphics queue matching the command buffer's queue-family check below.
-        unsafe { submit_command_buffer_and_wait(logical_device, queue, command_buffer, synchronization) }
+        unsafe {
+            submit_command_buffer_and_wait_after_reservation(
+                logical_device,
+                queue,
+                command_buffer,
+                synchronization,
+                before_submit,
+            )
+        }
     }
 
     #[cfg(test)]
@@ -3564,18 +3728,47 @@ unsafe fn submit_command_buffer_and_wait(
     command_buffer: &mut VulkanCommandBuffer,
     synchronization: &VulkanSubmitSynchronization<'_>,
 ) -> Result<(), VulkanError> {
-    ensure_command_buffer_executable(command_buffer)?;
+    unsafe {
+        submit_command_buffer_and_wait_after_reservation(
+            logical_device,
+            queue,
+            command_buffer,
+            synchronization,
+            || Ok(()),
+        )
+    }
+    .map_err(VulkanReadySubmitError::into_inner)
+}
+
+unsafe fn submit_command_buffer_and_wait_after_reservation<T, F>(
+    logical_device: &VulkanLogicalDevice,
+    queue: &VulkanQueue,
+    command_buffer: &mut VulkanCommandBuffer,
+    synchronization: &VulkanSubmitSynchronization<'_>,
+    before_submit: F,
+) -> Result<T, VulkanReadySubmitError<T>>
+where
+    F: FnOnce() -> Result<T, VulkanError>,
+{
+    ensure_command_buffer_executable(command_buffer).map_err(VulkanReadySubmitError::ReservationFailed)?;
     if !logical_device.is_same_device(&command_buffer.command_pool.logical_device) {
-        return Err(VulkanError::UnsupportedOperation("command buffer device"));
+        return Err(VulkanReadySubmitError::ReservationFailed(
+            VulkanError::UnsupportedOperation("command buffer device"),
+        ));
     }
     if command_buffer.queue_family_index() != queue.queue_family_index() {
-        return Err(VulkanError::UnsupportedOperation("command buffer queue family"));
+        return Err(VulkanReadySubmitError::ReservationFailed(
+            VulkanError::UnsupportedOperation("command buffer queue family"),
+        ));
     }
-    synchronization.validate(logical_device)?;
+    synchronization
+        .validate(logical_device)
+        .map_err(VulkanReadySubmitError::ReservationFailed)?;
 
     let fence_info = vk::FenceCreateInfo::default();
-    let fence =
-        unsafe { logical_device.handle().create_fence(&fence_info, None) }.map_err(VulkanError::from)?;
+    let fence = unsafe { logical_device.handle().create_fence(&fence_info, None) }
+        .map_err(VulkanError::from)
+        .map_err(VulkanReadySubmitError::ReservationFailed)?;
     let command_buffers = [command_buffer.handle];
     let wait_semaphores = synchronization.wait_handles();
     let wait_stage_masks = synchronization.wait_stage_masks();
@@ -3589,7 +3782,7 @@ unsafe fn submit_command_buffer_and_wait(
         Ok(guards) => guards,
         Err(err) => {
             unsafe { logical_device.handle().destroy_fence(fence, None) };
-            return Err(err);
+            return Err(VulkanReadySubmitError::ReservationFailed(err));
         }
     };
     let pending_semaphore_payloads = match synchronization.mark_payloads_pending_submit() {
@@ -3597,30 +3790,72 @@ unsafe fn submit_command_buffer_and_wait(
         Err(err) => {
             drop(semaphore_guards);
             unsafe { logical_device.handle().destroy_fence(fence, None) };
-            return Err(err);
+            return Err(VulkanReadySubmitError::ReservationFailed(err));
         }
     };
 
-    let submit_result = command_buffer
-        .command_pool
-        .lock_host_access()
-        .and_then(|_pool_guard| {
-            queue.lock_host_access().and_then(|_queue_guard| {
-                // SAFETY: `logical_device`, `queue.handle`, `command_buffer.handle`, `fence`, and
-                // all semaphores in `submit_infos` belong to the same live device and are kept alive
-                // through the fence wait below. The queue host-access mutex externally synchronizes
-                // host access to the queue. Semaphore host-access mutexes prevent concurrent
-                // import/export/destroy while the submit is pending. Slice storage used by
-                // `submit_infos` lives until `queue_submit` returns. The caller of this unsafe
-                // helper upholds binary semaphore payload-state and wait-stage valid usage.
-                unsafe {
-                    logical_device
-                        .handle()
-                        .queue_submit(queue.handle, &submit_infos, fence)
-                }
-                .map_err(VulkanError::from)
-            })
-        });
+    let command_pool = command_buffer.command_pool.clone();
+    let pool_guard = match command_pool.lock_host_access() {
+        Ok(guard) => guard,
+        Err(err) => {
+            let _ = restore_pending_semaphore_payloads(&pending_semaphore_payloads);
+            let abort_result = command_buffer.abort_pending_image_syncs();
+            command_buffer.state = VulkanCommandBufferState::Invalid;
+            drop(semaphore_guards);
+            unsafe { logical_device.handle().destroy_fence(fence, None) };
+            if let Err(abort_err) = abort_result {
+                return Err(VulkanReadySubmitError::ReservationFailed(abort_err));
+            }
+            return Err(VulkanReadySubmitError::ReservationFailed(err));
+        }
+    };
+    let queue_guard = match queue.lock_host_access() {
+        Ok(guard) => guard,
+        Err(err) => {
+            let _ = restore_pending_semaphore_payloads(&pending_semaphore_payloads);
+            let abort_result = command_buffer.abort_pending_image_syncs();
+            command_buffer.state = VulkanCommandBufferState::Invalid;
+            drop(pool_guard);
+            drop(semaphore_guards);
+            unsafe { logical_device.handle().destroy_fence(fence, None) };
+            if let Err(abort_err) = abort_result {
+                return Err(VulkanReadySubmitError::ReservationFailed(abort_err));
+            }
+            return Err(VulkanReadySubmitError::ReservationFailed(err));
+        }
+    };
+
+    let ready = match before_submit() {
+        Ok(ready) => ready,
+        Err(err) => {
+            let _ = restore_pending_semaphore_payloads(&pending_semaphore_payloads);
+            let abort_result = command_buffer.abort_pending_image_syncs();
+            command_buffer.state = VulkanCommandBufferState::Invalid;
+            drop(queue_guard);
+            drop(pool_guard);
+            drop(semaphore_guards);
+            unsafe { logical_device.handle().destroy_fence(fence, None) };
+            if let Err(abort_err) = abort_result {
+                return Err(VulkanReadySubmitError::ReadyCallbackFailed(abort_err));
+            }
+            return Err(VulkanReadySubmitError::ReadyCallbackFailed(err));
+        }
+    };
+
+    // SAFETY: `logical_device`, `queue.handle`, `command_buffer.handle`, `fence`, and all semaphores
+    // in `submit_infos` belong to the same live device and are kept alive through the fence wait below.
+    // The queue host-access mutex externally synchronizes host access to the queue. Semaphore
+    // host-access mutexes prevent concurrent import/export/destroy while the submit is pending. Slice
+    // storage used by `submit_infos` lives until `queue_submit` returns. The caller of this unsafe
+    // helper upholds binary semaphore payload-state and wait-stage valid usage.
+    let submit_result = unsafe {
+        logical_device
+            .handle()
+            .queue_submit(queue.handle, &submit_infos, fence)
+    }
+    .map_err(VulkanError::from);
+    drop(queue_guard);
+    drop(pool_guard);
 
     if let Err(err) = submit_result {
         let _ = restore_pending_semaphore_payloads(&pending_semaphore_payloads);
@@ -3628,8 +3863,13 @@ unsafe fn submit_command_buffer_and_wait(
         command_buffer.state = VulkanCommandBufferState::Invalid;
         drop(semaphore_guards);
         unsafe { logical_device.handle().destroy_fence(fence, None) };
-        abort_result?;
-        return Err(err);
+        if let Err(abort_err) = abort_result {
+            return Err(VulkanReadySubmitError::ReadyCallbackCommitted {
+                err: abort_err,
+                ready,
+            });
+        }
+        return Err(VulkanReadySubmitError::ReadyCallbackCommitted { err, ready });
     }
 
     command_buffer.state = VulkanCommandBufferState::Submitted;
@@ -3694,13 +3934,34 @@ unsafe fn submit_command_buffer_and_wait(
 
     if let Some(err) = wait_error {
         if let Some(image_result) = image_result {
-            image_result?;
+            if let Err(image_err) = image_result {
+                return Err(VulkanReadySubmitError::Submitted {
+                    err: image_err,
+                    ready,
+                });
+            }
         }
-        complete_result?;
-        return Err(err);
+        if let Err(complete_err) = complete_result {
+            return Err(VulkanReadySubmitError::Submitted {
+                err: complete_err,
+                ready,
+            });
+        }
+        return Err(VulkanReadySubmitError::Submitted { err, ready });
     }
-    image_result.expect("queue completion proven without wait error")?;
-    complete_result
+    if let Err(image_err) = image_result.expect("queue completion proven without wait error") {
+        return Err(VulkanReadySubmitError::Submitted {
+            err: image_err,
+            ready,
+        });
+    }
+    if let Err(complete_err) = complete_result {
+        return Err(VulkanReadySubmitError::Submitted {
+            err: complete_err,
+            ready,
+        });
+    }
+    Ok(ready)
 }
 
 unsafe fn submit_owned_command_buffer(
