@@ -10100,9 +10100,17 @@ fn internal_dmabuf_texture_release_rejects_preconditions_before_device_lookup() 
 #[test]
 fn sampled_cache_release_point_failure_is_committed_side_effect() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
     let mut texture = texture_for_tests((1, 1).into(), Some(Fourcc::Abgr8888));
     texture.context_id = renderer.context_id();
     texture.image.source = VulkanImageSource::DmabufImport;
+    texture.sampled_dmabuf = Some(dmabuf.weak());
     texture.sampled_dmabuf_release = Some(VulkanSampledDmabufRelease::wayland_syncobj(
         DrmSyncPoint::invalid_for_tests(1).unwrap(),
     ));
@@ -10113,6 +10121,16 @@ fn sampled_cache_release_point_failure_is_committed_side_effect() {
             VulkanError::UnsupportedOperation("sampled dmabuf release point signal")
         ))
     ));
+    assert!(matches!(
+        renderer.validate_no_pending_sampled_dmabuf_import_obligation(&dmabuf),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+    assert_eq!(
+        renderer.sampled_dmabuf_layout_history(&dmabuf),
+        SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+    );
 }
 
 #[test]
@@ -10293,6 +10311,102 @@ fn sampled_import_release_ownership_failure_prefers_cleanup_proof() {
         renderer.sampled_dmabuf_layout_history(&cleanup_sync_file_dmabuf),
         SampledDmabufWaylandLayoutHistory::NoRendererHistory
     );
+}
+
+#[test]
+fn sampled_pending_import_obligations_block_same_dmabuf_reimport() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let release_only_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    renderer.retain_pending_sampled_dmabuf_import_obligation(
+        PendingSampledDmabufImportObligation::ReleaseOnly(SampledDmabufReleaseOwnership::new_for_tests(
+            &release_only_dmabuf,
+        )),
+    );
+    assert!(matches!(
+        renderer.validate_no_pending_sampled_dmabuf_import_obligation(&release_only_dmabuf),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+    assert_eq!(
+        renderer.sampled_dmabuf_layout_history(&release_only_dmabuf),
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory
+    );
+
+    let acquired_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let mut acquired_texture = texture_for_tests((4, 3).into(), Some(Fourcc::Abgr8888));
+    acquired_texture.context_id = renderer.context_id();
+    acquired_texture.image.source = VulkanImageSource::DmabufImport;
+    acquired_texture.sampled_dmabuf = Some(acquired_dmabuf.weak());
+    renderer.retain_pending_sampled_dmabuf_import_obligation(
+        PendingSampledDmabufImportObligation::AcquiredTexture(acquired_texture),
+    );
+    assert!(matches!(
+        renderer.validate_no_pending_sampled_dmabuf_import_obligation(&acquired_dmabuf),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+    assert_eq!(
+        renderer.sampled_dmabuf_layout_history(&acquired_dmabuf),
+        SampledDmabufWaylandLayoutHistory::LocallyAcquired
+    );
+    assert!(matches!(
+        unsafe { renderer.import_dmabuf_texture_with_known_general_layout(&acquired_dmabuf, None) },
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+    let loopback_evidence = unsafe {
+        // SAFETY: This test validates that the renderer-private pending-obligation guard rejects the
+        // route before the scaffold renderer can reach Vulkan import or ownership-transfer work.
+        VulkanDmabufLoopbackImportEvidence::new(acquired_dmabuf.weak(), SyncPoint::signaled())
+    };
+    assert!(matches!(
+        unsafe { renderer.import_dmabuf_texture_from_loopback(&acquired_dmabuf, loopback_evidence) },
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+
+    let release_submitted_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let mut release_submitted_texture = texture_for_tests((4, 3).into(), Some(Fourcc::Abgr8888));
+    release_submitted_texture.context_id = renderer.context_id();
+    release_submitted_texture.image.source = VulkanImageSource::DmabufImport;
+    release_submitted_texture.sampled_dmabuf = Some(release_submitted_dmabuf.weak());
+    renderer.retain_pending_sampled_dmabuf_import_obligation(
+        PendingSampledDmabufImportObligation::ReleaseCompletionUnknownTexture(release_submitted_texture),
+    );
+    assert!(matches!(
+        renderer.validate_no_pending_sampled_dmabuf_import_obligation(&release_submitted_dmabuf),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+    assert_eq!(
+        renderer.sampled_dmabuf_layout_history(&release_submitted_dmabuf),
+        SampledDmabufWaylandLayoutHistory::LocallyAcquired
+    );
+
+    renderer.pending_sampled_dmabuf_import_obligations.clear();
 }
 
 #[test]

@@ -1607,8 +1607,9 @@ impl VulkanDeviceState {
     /// Submit validation, fence creation, host-access locking, and semaphore payload reservation still
     /// happen in [`VulkanDeviceState::submit_prepared_sampled_dmabuf_foreign_acquire_classified`].
     /// Higher layers must not consume move-only Wayland release ownership merely because this
-    /// preparation succeeded; that needs a later ready-to-submit reservation token that eliminates or
-    /// reserves those remaining pre-submit failure points first.
+    /// preparation succeeded; use
+    /// [`VulkanDeviceState::submit_prepared_sampled_dmabuf_foreign_acquire_ready`] to run that
+    /// transfer only after those remaining pre-submit failure points have been reserved.
     ///
     /// # Safety
     ///
