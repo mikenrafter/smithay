@@ -318,6 +318,17 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
         self.dmabuf.upgrade().as_ref() == Some(dmabuf)
     }
 
+    fn layout_history_for_policy(&self) -> SampledDmabufWaylandLayoutHistory {
+        match self.use_case {
+            SampledDmabufWaylandExternalStateUse::FirstImport => {
+                SampledDmabufWaylandLayoutHistory::NoRendererHistory
+            }
+            SampledDmabufWaylandExternalStateUse::CurrentReacquire => {
+                SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+            }
+        }
+    }
+
     fn validate_for_use(
         &self,
         dmabuf: &Dmabuf,
@@ -788,12 +799,14 @@ impl SampledDmabufWaylandTextureCacheReleaseLifecycleEvidence {
     }
 }
 
-/// Renderer-local layout history available for a normal Wayland sampled-dmabuf commit.
+/// Layout-policy phase available for a normal Wayland sampled-dmabuf commit.
 ///
 /// Wayland explicit sync can order producer completion, but it does not describe Vulkan image
-/// layout. This history is intentionally separate from sync evidence so future reacquire work must
-/// prove when the renderer is relying on its own prior foreign release rather than first-import
-/// protocol metadata.
+/// layout. Raw renderer-local history starts with this shape, but normal context construction may
+/// replace it with the phase carried by attached Smithay-owned external-state evidence. That keeps
+/// controlled first-import loopback evidence and controlled current-reacquire release evidence from
+/// being reclassified by stale sampled history, while still treating unreleased local ownership as a
+/// hard fail-closed state.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SampledDmabufWaylandLayoutHistory {
@@ -818,6 +831,8 @@ struct SampledDmabufWaylandVulkanInteropPolicyContext<'a> {
     release_evidence: &'a SampledDmabufReleaseEvidence,
     release_ownership: Option<SampledDmabufReleaseOwnershipEvidence>,
     per_commit_texture_import: bool,
+    /// The policy phase selected for this current commit. In production context construction this may
+    /// come from attached typed external-state evidence rather than raw renderer-local history.
     layout_history: SampledDmabufWaylandLayoutHistory,
     first_import_layout: Option<SampledDmabufWaylandFirstImportLayoutEvidence>,
     first_import_foreign_general: Option<SampledDmabufKnownLayoutEvidence>,
@@ -1614,6 +1629,34 @@ impl VulkanRenderer {
         surface: &WlSurface,
         dmabuf: &Dmabuf,
     ) -> Result<(), VulkanError> {
+        let use_case = match self.sampled_dmabuf_layout_history_snapshot(dmabuf) {
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory => {
+                SampledDmabufWaylandExternalStateUse::FirstImport
+            }
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => {
+                SampledDmabufWaylandExternalStateUse::CurrentReacquire
+            }
+            SampledDmabufWaylandLayoutHistory::LocallyAcquired => {
+                return Err(VulkanError::MissingCapability(
+                    "sampled dmabuf Wayland Vulkan unreleased local acquire",
+                ));
+            }
+        };
+        unsafe {
+            // SAFETY: Forwarded from this surface-level validation contract's caller.
+            self.mark_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import_use(
+                surface, dmabuf, use_case,
+            )
+        }
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    unsafe fn mark_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import_use(
+        &self,
+        surface: &WlSurface,
+        dmabuf: &Dmabuf,
+        use_case: SampledDmabufWaylandExternalStateUse,
+    ) -> Result<(), VulkanError> {
         super::utils::with_renderer_surface_state(surface, |state| {
             let buffer = state.buffer().ok_or(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland current buffer",
@@ -1628,9 +1671,13 @@ impl VulkanRenderer {
             }
 
             unsafe {
-                // SAFETY: Forwarded from this surface-level validation contract's caller after
-                // verifying that the current renderer-managed buffer is the requested dmabuf.
-                self.assume_wayland_dmabuf_current_commit_foreign_general_for_sampled_import(buffer, dmabuf)
+                // SAFETY: Forwarded from this helper's caller after verifying that the current
+                // renderer-managed buffer is the requested dmabuf.
+                Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+                    buffer.user_data(),
+                    dmabuf,
+                    use_case,
+                )
             }
         })
         .unwrap_or(Err(VulkanError::MissingCapability(
@@ -1669,10 +1716,9 @@ impl VulkanRenderer {
     ///
     /// This test-only helper keeps the runtime `ImportDmaWl` loopback probes tied to evidence that was
     /// produced by [`release_dmabuf_render_target_for_sampled_loopback`](Self::release_dmabuf_render_target_for_sampled_loopback)
-    /// for the same Smithay dmabuf identity. It still records the same validation-stage current-commit
-    /// `FOREIGN + GENERAL` marker as
-    /// [`assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import`](Self::assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import),
-    /// and it still does not public-advertise generic sampled [`ImportDma`] support.
+    /// for the same Smithay dmabuf identity. It records typed first-import `FOREIGN + GENERAL`
+    /// evidence directly from that controlled release, rather than reclassifying the commit from
+    /// renderer history, and it still does not public-advertise generic sampled [`ImportDma`] support.
     ///
     /// # Safety
     ///
@@ -1692,8 +1738,10 @@ impl VulkanRenderer {
             // SAFETY: Forwarded from this test-only helper's caller. The evidence identity check
             // above is only an additional guard; the caller still proves current external state,
             // no-intervening-use, and acquire ordering for this Wayland commit.
-            self.assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import(
-                surface, dmabuf,
+            self.mark_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import_use(
+                surface,
+                dmabuf,
+                SampledDmabufWaylandExternalStateUse::FirstImport,
             )
         }
     }
@@ -1729,8 +1777,9 @@ impl VulkanRenderer {
     ///
     /// This test-only helper lets the same-dmabuf reacquire loopback probe use release evidence that
     /// the probe obtained immediately after the renderer-utils cache release hook, instead of stale
-    /// render-target loopback evidence. It still records the same validation-stage current-commit
-    /// marker and does not public-advertise generic sampled [`ImportDma`] support.
+    /// render-target loopback evidence. It records typed current-reacquire `FOREIGN + GENERAL`
+    /// evidence directly from that release-history token and does not public-advertise generic sampled
+    /// [`ImportDma`] support.
     ///
     /// # Safety
     ///
@@ -1759,8 +1808,10 @@ impl VulkanRenderer {
             // SAFETY: Forwarded from this test-only helper's caller. The renderer release evidence
             // proves only this renderer's prior release and identity; the caller still proves current
             // acquire ordering and no intervening external-state change for this Wayland commit.
-            self.assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import(
-                surface, dmabuf,
+            self.mark_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import_use(
+                surface,
+                dmabuf,
+                SampledDmabufWaylandExternalStateUse::CurrentReacquire,
             )
         }
     }
@@ -2735,6 +2786,23 @@ impl VulkanRenderer {
             current_reacquire_layout,
             current_reacquire_foreign_general,
         })
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    fn sampled_dmabuf_wayland_policy_layout_history(
+        &self,
+        renderer_history: SampledDmabufWaylandLayoutHistory,
+        external_state: Option<&SampledDmabufWaylandForeignGeneralEvidence>,
+    ) -> Result<SampledDmabufWaylandLayoutHistory, VulkanError> {
+        if renderer_history == SampledDmabufWaylandLayoutHistory::LocallyAcquired {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf Wayland Vulkan unreleased local acquire",
+            ));
+        }
+
+        Ok(external_state
+            .map(SampledDmabufWaylandForeignGeneralEvidence::layout_history_for_policy)
+            .unwrap_or(renderer_history))
     }
 
     /// Validate the reacquire external image layout policy for a normal Wayland dmabuf.
@@ -3913,9 +3981,13 @@ impl VulkanRenderer {
         self.validate_no_pending_sampled_dmabuf_import_obligation(dmabuf)?;
 
         let import = self.validate_sampled_dmabuf_import_metadata(dmabuf)?;
-        let layout_history = self.sampled_dmabuf_layout_history(dmabuf);
+        let renderer_layout_history = self.sampled_dmabuf_layout_history(dmabuf);
         let wayland_external_state =
             self.sampled_dmabuf_wayland_buffer_foreign_general_evidence(buffer, dmabuf)?;
+        let layout_history = self.sampled_dmabuf_wayland_policy_layout_history(
+            renderer_layout_history,
+            wayland_external_state.as_ref(),
+        )?;
         let external_state_sources = self.sampled_dmabuf_wayland_external_state_evidence_sources(
             dmabuf,
             layout_history,

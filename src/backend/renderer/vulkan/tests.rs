@@ -8232,6 +8232,15 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(first_import_sources.first_import_foreign_general.is_some());
     assert!(first_import_sources.current_reacquire_layout.is_none());
     assert!(first_import_sources.current_reacquire_foreign_general.is_none());
+    assert_eq!(
+        renderer
+            .sampled_dmabuf_wayland_policy_layout_history(
+                SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+                Some(&wayland_external_state),
+            )
+            .unwrap(),
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory
+    );
     assert!(matches!(
         renderer.sampled_dmabuf_wayland_external_state_evidence_sources(
             &policy_dmabuf,
@@ -8622,6 +8631,24 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     ));
     let current_reacquire_external_state =
         SampledDmabufWaylandForeignGeneralEvidence::current_reacquire_for_tests(&policy_dmabuf);
+    assert_eq!(
+        renderer
+            .sampled_dmabuf_wayland_policy_layout_history(
+                SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+                Some(&current_reacquire_external_state),
+            )
+            .unwrap(),
+        SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+    );
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_policy_layout_history(
+            SampledDmabufWaylandLayoutHistory::LocallyAcquired,
+            Some(&current_reacquire_external_state),
+        ),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan unreleased local acquire"
+        ))
+    ));
     assert!(matches!(
         renderer.sampled_dmabuf_wayland_external_state_evidence_sources(
             &policy_dmabuf,
@@ -10160,6 +10187,25 @@ fn import_surface_loopback_evidence_marker_requires_same_dmabuf_evidence() {
         .unwrap()
         .unwrap();
     assert!(stored_evidence.is_for_dmabuf(&committed_dmabuf));
+    assert!(
+        renderer
+            .sampled_dmabuf_wayland_external_state_evidence_sources(
+                &committed_dmabuf,
+                SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+                Some(&stored_evidence),
+            )
+            .is_ok()
+    );
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_external_state_evidence_sources(
+            &committed_dmabuf,
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            Some(&stored_evidence),
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland external-state use"
+        ))
+    ));
 
     let unrelated_evidence = unsafe {
         // SAFETY: This unit test intentionally constructs unrelated evidence to prove the loopback
@@ -10263,6 +10309,25 @@ fn import_surface_renderer_release_marker_requires_released_history() {
         .unwrap()
         .unwrap();
     assert!(stored_evidence.is_for_dmabuf(&committed_dmabuf));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_external_state_evidence_sources(
+            &committed_dmabuf,
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+            Some(&stored_evidence),
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland external-state use"
+        ))
+    ));
+    assert!(
+        renderer
+            .sampled_dmabuf_wayland_external_state_evidence_sources(
+                &committed_dmabuf,
+                SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+                Some(&stored_evidence),
+            )
+            .is_ok()
+    );
 
     let wrong_renderer_result = unsafe {
         // SAFETY: This negative test supplies evidence from a different renderer context, so the
