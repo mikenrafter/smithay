@@ -5136,9 +5136,9 @@ fn runtime_dmabuf_loopback_imports_released_render_target_as_sampled_texture() {
 }
 
 #[test]
-#[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
-fn runtime_cleanup_texture_cache_releases_pending_sampled_acquire() {
-    let test_name = "Vulkan cleanup_texture_cache sampled acquire release test";
+#[ignore = "requires a working Vulkan loader, physical device, DRM syncobj and dmabuf-exportable loopback format"]
+fn runtime_cleanup_texture_cache_releases_pending_sampled_release_point() {
+    let test_name = "Vulkan cleanup_texture_cache sampled acquire release-point test";
     let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
         return;
     };
@@ -5189,8 +5189,41 @@ fn runtime_cleanup_texture_cache_releases_pending_sampled_acquire() {
         SampledDmabufWaylandLayoutHistory::LocallyAcquired
     );
 
-    texture.sampled_dmabuf_release =
-        Some(VulkanSampledDmabufRelease::validation_stage_without_wayland_point());
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    let release_point = {
+        let Some(drm_device) = candidate.drm_syncobj_device.as_ref() else {
+            eprintln!("skipping {test_name}: no Vulkan DRM node exposed a usable DRM syncobj device");
+            return;
+        };
+        let (_acquire_point, release_point) = match DrmSyncPoint::timeline_pair_for_tests(drm_device, 47, 48)
+        {
+            Ok(points) => points,
+            Err(err) => {
+                eprintln!("skipping {test_name}: failed to create DRM syncobj timeline points: {err}");
+                return;
+            }
+        };
+        assert!(
+            !release_point.is_signaled(),
+            "release point should not be signaled before cleanup"
+        );
+        release_point
+    };
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    let expected_release_point = release_point.clone();
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    {
+        texture.sampled_dmabuf_release = Some(VulkanSampledDmabufRelease::wayland_syncobj(release_point));
+    }
+
+    #[cfg(not(all(feature = "wayland_frontend", feature = "backend_drm")))]
+    {
+        texture.sampled_dmabuf_release =
+            Some(VulkanSampledDmabufRelease::validation_stage_without_wayland_point());
+    }
+
     candidate
         .renderer
         .retain_pending_sampled_dmabuf_import_obligation(
@@ -5219,6 +5252,13 @@ fn runtime_cleanup_texture_cache_releases_pending_sampled_acquire() {
             .sampled_dmabuf_layout_history(&candidate.dmabuf),
         SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
     );
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    {
+        expected_release_point
+            .wait(1_000_000_000)
+            .expect("cleanup_texture_cache should signal sampled dmabuf Wayland release point");
+        assert!(expected_release_point.is_signaled());
+    }
     assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
 }
 
