@@ -10191,22 +10191,61 @@ fn sampled_cache_release_maps_device_release_classification() {
 
 #[test]
 fn sampled_import_release_ownership_failure_prefers_cleanup_proof() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    assert_eq!(
+        renderer.sampled_dmabuf_layout_history(&dmabuf),
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory
+    );
     assert!(matches!(
-        VulkanRenderer::sampled_dmabuf_release_ownership_error_after_acquire_cleanup(
+        renderer.sampled_dmabuf_release_ownership_error_after_acquire_cleanup(
+            &dmabuf,
             VulkanError::MissingCapability("release ownership"),
             Ok((true, None)),
         ),
         VulkanError::MissingCapability("release ownership")
     ));
+    assert_eq!(
+        renderer.sampled_dmabuf_layout_history(&dmabuf),
+        SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+    );
+
+    let no_release_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
     assert!(matches!(
-        VulkanRenderer::sampled_dmabuf_release_ownership_error_after_acquire_cleanup(
+        renderer.sampled_dmabuf_release_ownership_error_after_acquire_cleanup(
+            &no_release_dmabuf,
             VulkanError::MissingCapability("release ownership"),
             Ok((false, None)),
         ),
         VulkanError::UnsupportedOperation("sampled dmabuf acquire cleanup release")
     ));
+    assert_eq!(
+        renderer.sampled_dmabuf_layout_history(&no_release_dmabuf),
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory
+    );
+
+    let cleanup_error_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
     assert!(matches!(
-        VulkanRenderer::sampled_dmabuf_release_ownership_error_after_acquire_cleanup(
+        renderer.sampled_dmabuf_release_ownership_error_after_acquire_cleanup(
+            &cleanup_error_dmabuf,
             VulkanError::MissingCapability("release ownership"),
             Err(VulkanSampledDmabufForeignReleaseError::RetrySafe(
                 VulkanError::UnsupportedOperation("cleanup")
@@ -10215,7 +10254,8 @@ fn sampled_import_release_ownership_failure_prefers_cleanup_proof() {
         VulkanError::UnsupportedOperation("cleanup")
     ));
     assert!(matches!(
-        VulkanRenderer::sampled_dmabuf_release_ownership_error_after_acquire_cleanup(
+        renderer.sampled_dmabuf_release_ownership_error_after_acquire_cleanup(
+            &cleanup_error_dmabuf,
             VulkanError::MissingCapability("release ownership"),
             Err(VulkanSampledDmabufForeignReleaseError::ReleaseSubmitted(
                 VulkanError::UnsupportedOperation("cleanup submitted")
@@ -10223,6 +10263,30 @@ fn sampled_import_release_ownership_failure_prefers_cleanup_proof() {
         ),
         VulkanError::UnsupportedOperation("cleanup submitted")
     ));
+    assert_eq!(
+        renderer.sampled_dmabuf_layout_history(&cleanup_error_dmabuf),
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory
+    );
+
+    let cleanup_sync_file_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    assert!(matches!(
+        renderer.sampled_dmabuf_release_ownership_error_after_acquire_cleanup(
+            &cleanup_sync_file_dmabuf,
+            VulkanError::MissingCapability("release ownership"),
+            Ok((true, Some(File::open("/dev/null").unwrap().into()))),
+        ),
+        VulkanError::UnsupportedOperation("sampled dmabuf acquire cleanup sync file")
+    ));
+    assert_eq!(
+        renderer.sampled_dmabuf_layout_history(&cleanup_sync_file_dmabuf),
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory
+    );
 }
 
 #[test]

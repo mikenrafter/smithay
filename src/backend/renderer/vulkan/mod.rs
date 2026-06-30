@@ -3024,7 +3024,9 @@ impl VulkanRenderer {
             Err(err) => {
                 let cleanup =
                     device.release_sampled_dmabuf_to_foreign_general_classified(sampled_image.image(), false);
-                return Err(Self::sampled_dmabuf_release_ownership_error_after_acquire_cleanup(err, cleanup));
+                return Err(
+                    self.sampled_dmabuf_release_ownership_error_after_acquire_cleanup(dmabuf, err, cleanup)
+                );
             }
         };
         self.validate_sampled_dmabuf_release_lifecycle_contract(dmabuf, &release_ownership)?;
@@ -3042,11 +3044,16 @@ impl VulkanRenderer {
     }
 
     fn sampled_dmabuf_release_ownership_error_after_acquire_cleanup(
+        &mut self,
+        dmabuf: &Dmabuf,
         ownership_err: VulkanError,
         cleanup: Result<(bool, Option<OwnedFd>), device::VulkanSampledDmabufForeignReleaseError>,
     ) -> VulkanError {
         match cleanup {
-            Ok((true, None)) => ownership_err,
+            Ok((true, None)) => {
+                self.record_sampled_dmabuf_released_to_foreign_general(dmabuf);
+                ownership_err
+            }
             Ok((true, Some(_))) => {
                 VulkanError::UnsupportedOperation("sampled dmabuf acquire cleanup sync file")
             }
