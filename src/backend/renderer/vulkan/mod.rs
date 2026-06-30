@@ -950,7 +950,8 @@ impl SampledDmabufReleaseEvidence {
 ///
 /// This cloneable token is a precondition marker, not the moved release obligation. The actual
 /// `Buffer::take_release_point_for_renderer()` transfer stays at the late texture-construction
-/// boundary, after earlier policy guards have accepted the import path.
+/// boundary, after earlier policy guards and the current Vulkan acquire helper have accepted the
+/// import path. Moving it earlier requires a separate ready-to-submit reservation contract.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct SampledDmabufReleaseOwnershipEvidence {
@@ -2481,7 +2482,9 @@ impl VulkanRenderer {
     /// The release evidence proves that a Wayland release point exists for this dmabuf. It is not an
     /// ownership transfer by itself; the ownership-transfer policy is deliberately validated later,
     /// after cache release lifecycle evidence, so the eventual `take_release_point_for_renderer()`
-    /// operation happens only after all earlier guards pass.
+    /// operation happens only after all earlier guards pass. It still remains a late texture-attachment
+    /// step until Vulkan has a ready-to-submit reservation token that removes the remaining fallible
+    /// pre-submit work before `vkQueueSubmit`.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_release_sync_policy(
         &self,
@@ -2528,7 +2531,10 @@ impl VulkanRenderer {
     /// create a sampled dmabuf texture with a release obligation. Production supplies this token from
     /// the current Wayland buffer's release-point state, but the actual
     /// `Buffer::take_release_point_for_renderer()` transfer remains a separate fallible move at the
-    /// late texture-construction boundary.
+    /// late texture-construction boundary. Moving that transfer immediately before Vulkan acquire
+    /// submit requires a device-level ready-to-submit reservation token so submit validation, fence
+    /// creation, host locking, and semaphore payload reservation cannot consume the release point on a
+    /// retry-safe Vulkan setup failure.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_release_ownership_policy(
         &self,
@@ -3395,7 +3401,9 @@ impl VulkanRenderer {
     /// This is the internal boundary between Smithay's Wayland protocol/renderer-utils evidence and
     /// Vulkan's explicit import requirements. The returned context owns the validation evidence that
     /// can be checked without consuming the move-only Wayland release point; release ownership is still
-    /// taken later, after all policy guards accept the import.
+    /// taken later, after all policy guards and the current Vulkan acquire helper accept the import.
+    /// This remains intentionally late until the device layer exposes a ready-to-submit acquire token
+    /// that reserves all fallible pre-submit state before ownership is moved from the buffer.
     #[cfg(feature = "wayland_frontend")]
     fn wayland_sampled_dmabuf_import_context<'a>(
         &mut self,
@@ -3448,7 +3456,8 @@ impl VulkanRenderer {
     ///
     /// This is the shared implementation core for [`ImportDmaWl`]. It deliberately still requires a
     /// late-bound release-ownership transfer closure so the renderer-managed Wayland buffer wrapper
-    /// remains the production owner of the move-only release point until all policy guards have passed.
+    /// remains the production owner of the move-only release point until all policy guards and the
+    /// current Vulkan acquire helper have passed.
     /// Extracting this helper keeps the intended Wayland path testable while generic `ImportDma`
     /// remains fail-closed and without inventing a side-channel advertisement surface.
     #[cfg(feature = "wayland_frontend")]
@@ -3468,8 +3477,10 @@ impl VulkanRenderer {
         let texture = unsafe {
             // SAFETY: The validation-stage Wayland policy above is the only production source of
             // layout evidence for this helper. The release-ownership closure is late-bound so the
-            // move-only Wayland release point is not taken until all policy guards have accepted the
-            // import and texture construction is ready to attach the release obligation.
+            // move-only Wayland release point is not taken until all policy guards and the current
+            // Vulkan acquire helper have accepted the import and texture construction is ready to
+            // attach the release obligation. Moving this earlier requires a device ready-to-submit
+            // token so remaining pre-submit Vulkan failures cannot consume the release point.
             self.create_imported_dmabuf_texture_with_known_general_layout_release_and_sync_point(
                 dmabuf,
                 foreign_general,
@@ -3491,6 +3502,8 @@ impl VulkanRenderer {
     /// Keeping this as a distinct step makes the intended future API shape explicit: callers first
     /// produce a context carrying sync, external-state, and lifecycle evidence; the renderer then
     /// validates that context and only takes move-only release ownership at texture construction time.
+    /// That late take is intentional until Vulkan submit reservation is modeled separately from queue
+    /// submission.
     /// The normal Wayland path binds that late take to the same renderer-managed buffer that produced
     /// the context, rather than accepting an arbitrary release-ownership closure.
     #[cfg(feature = "wayland_frontend")]

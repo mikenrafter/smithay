@@ -1545,12 +1545,15 @@ impl VulkanDeviceState {
             .map(Some)
     }
 
-    /// Prepare sampled dmabuf resources up to the last retry-safe point before Vulkan acquire submit.
+    /// Prepare sampled dmabuf resources and record the Vulkan acquire command buffer.
     ///
     /// The returned bundle owns the imported image, view, sampler, optional acquire semaphore, and
-    /// recorded acquire command buffer, but no queue ownership transfer has been submitted yet. This
-    /// boundary lets higher layers take non-retryable ownership obligations immediately before queue
-    /// submit without consuming them on retry-safe resource setup failures.
+    /// recorded acquire command buffer, but no queue ownership transfer has been submitted yet.
+    /// Submit validation, fence creation, host-access locking, and semaphore payload reservation still
+    /// happen in [`VulkanDeviceState::submit_prepared_sampled_dmabuf_foreign_acquire_classified`].
+    /// Higher layers must not consume move-only Wayland release ownership merely because this
+    /// preparation succeeded; that needs a later ready-to-submit reservation token that eliminates or
+    /// reserves those remaining pre-submit failure points first.
     ///
     /// # Safety
     ///
@@ -1613,6 +1616,12 @@ impl VulkanDeviceState {
     }
 
     /// Submit a prepared sampled dmabuf acquire bundle.
+    ///
+    /// This is the first helper that may call `vkQueueSubmit`, but it still performs fallible
+    /// pre-submit validation/allocation and semaphore payload reservation before that call. Callers
+    /// that have consumed external move-only obligations must treat any error from this helper as
+    /// non-retryable for those obligations unless a narrower ready-to-submit token has already
+    /// reserved the submit state.
     #[allow(dead_code)]
     pub(crate) fn submit_prepared_sampled_dmabuf_foreign_acquire_classified(
         &self,
