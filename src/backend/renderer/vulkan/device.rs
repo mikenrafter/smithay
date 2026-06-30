@@ -1528,6 +1528,42 @@ impl VulkanDeviceState {
         mag_filter: TextureFilter,
         acquire_sync: Option<&SyncPoint>,
     ) -> Result<Option<VulkanSampledImage>, VulkanSampledDmabufForeignAcquireError> {
+        let Some(prepared) = (unsafe {
+            // SAFETY: Forwarded from this method's caller.
+            self.prepare_sampled_dmabuf_foreign_acquire_with_known_general_layout(
+                dmabuf,
+                min_filter,
+                mag_filter,
+                acquire_sync,
+            )
+        })?
+        else {
+            return Ok(None);
+        };
+
+        self.submit_prepared_sampled_dmabuf_foreign_acquire_classified(prepared)
+            .map(Some)
+    }
+
+    /// Prepare sampled dmabuf resources up to the last retry-safe point before Vulkan acquire submit.
+    ///
+    /// The returned bundle owns the imported image, view, sampler, optional acquire semaphore, and
+    /// recorded acquire command buffer, but no queue ownership transfer has been submitted yet. This
+    /// boundary lets higher layers take non-retryable ownership obligations immediately before queue
+    /// submit without consuming them on retry-safe resource setup failures.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy the same external-state and acquire-sync requirements as
+    /// [`VulkanDeviceState::create_acquired_dmabuf_sampled_image_resources_with_known_general_layout_and_sync_point`].
+    #[allow(dead_code)]
+    pub(crate) unsafe fn prepare_sampled_dmabuf_foreign_acquire_with_known_general_layout(
+        &self,
+        dmabuf: &Dmabuf,
+        min_filter: TextureFilter,
+        mag_filter: TextureFilter,
+        acquire_sync: Option<&SyncPoint>,
+    ) -> Result<Option<VulkanPreparedSampledDmabufAcquire>, VulkanSampledDmabufForeignAcquireError> {
         let Some(image) = self
             .create_bound_dmabuf_import_image_with_sync(
                 dmabuf,
@@ -1550,23 +1586,78 @@ impl VulkanDeviceState {
         } else {
             None
         };
-        match self.submit_sampled_dmabuf_foreign_acquire_classified(&image, acquire_semaphore.as_ref()) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(VulkanSampledDmabufForeignAcquireError::RetrySafe(
-                    VulkanError::UnsupportedOperation("dmabuf external ownership"),
-                ));
+
+        let mut command_buffer = self
+            .allocate_graphics_command_buffer()
+            .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?;
+        self.begin_command_buffer(&mut command_buffer)
+            .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?;
+        if !self
+            .record_sampled_dmabuf_foreign_acquire_barrier(&mut command_buffer, &image)
+            .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?
+        {
+            return Err(VulkanSampledDmabufForeignAcquireError::RetrySafe(
+                VulkanError::UnsupportedOperation("dmabuf external ownership"),
+            ));
+        }
+        self.end_command_buffer(&mut command_buffer)
+            .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?;
+
+        Ok(Some(VulkanPreparedSampledDmabufAcquire {
+            sampler,
+            view,
+            image,
+            acquire_semaphore,
+            command_buffer,
+        }))
+    }
+
+    /// Submit a prepared sampled dmabuf acquire bundle.
+    #[allow(dead_code)]
+    pub(crate) fn submit_prepared_sampled_dmabuf_foreign_acquire_classified(
+        &self,
+        prepared: VulkanPreparedSampledDmabufAcquire,
+    ) -> Result<VulkanSampledImage, VulkanSampledDmabufForeignAcquireError> {
+        let VulkanPreparedSampledDmabufAcquire {
+            sampler,
+            view,
+            image,
+            acquire_semaphore,
+            mut command_buffer,
+        } = prepared;
+
+        let acquire_result = if let Some(acquire_semaphore) = acquire_semaphore.as_ref() {
+            let synchronization = VulkanSubmitSynchronization::default()
+                .wait_sync_file(acquire_semaphore, vk::PipelineStageFlags::TOP_OF_PIPE);
+            // SAFETY: This helper fixes the wait stage to TOP_OF_PIPE, which is supported by every
+            // graphics queue. `submit_command_buffer_and_wait` validates that the semaphore belongs
+            // to this device, is not duplicated in the submit, and has a waitable tracked payload
+            // before the queue operation is attempted.
+            unsafe {
+                self.submit_graphics_command_buffer_and_wait_with_synchronization(
+                    &mut command_buffer,
+                    &synchronization,
+                )
             }
-            Err(VulkanSampledDmabufForeignAcquireError::AcquireSubmitted { err, .. }) => {
-                return Err(VulkanSampledDmabufForeignAcquireError::AcquireSubmitted {
-                    err,
-                    sampled_image: Some(VulkanSampledImage { sampler, view, image }),
-                });
-            }
-            Err(err) => return Err(err),
+        } else {
+            self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
+        };
+
+        if let Err(err) = acquire_result {
+            return Err(
+                match classify_sampled_dmabuf_acquire_submit_error(command_buffer.state, err) {
+                    VulkanSampledDmabufForeignAcquireError::AcquireSubmitted { err, .. } => {
+                        VulkanSampledDmabufForeignAcquireError::AcquireSubmitted {
+                            err,
+                            sampled_image: Some(VulkanSampledImage { sampler, view, image }),
+                        }
+                    }
+                    err => err,
+                },
+            );
         }
 
-        Ok(Some(VulkanSampledImage { sampler, view, image }))
+        Ok(VulkanSampledImage { sampler, view, image })
     }
 
     #[allow(dead_code)]
@@ -7560,6 +7651,17 @@ pub(crate) struct VulkanSampledImage {
     sampler: VulkanSampler,
     view: VulkanImageView,
     image: VulkanOwnedImage,
+}
+
+/// Sampled dmabuf resources prepared before the Vulkan foreign acquire queue submission.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanPreparedSampledDmabufAcquire {
+    sampler: VulkanSampler,
+    view: VulkanImageView,
+    image: VulkanOwnedImage,
+    acquire_semaphore: Option<VulkanSyncFileSemaphore>,
+    command_buffer: VulkanCommandBuffer,
 }
 
 #[allow(dead_code)]
