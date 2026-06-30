@@ -10159,7 +10159,10 @@ fn sampled_acquire_submit_errors_are_classified_by_queue_acceptance() {
             false,
             VulkanError::UnsupportedOperation("submit")
         ),
-        VulkanSampledDmabufForeignAcquireError::AcquireSubmitted(VulkanError::UnsupportedOperation("submit"))
+        VulkanSampledDmabufForeignAcquireError::AcquireSubmitted {
+            err: VulkanError::UnsupportedOperation("submit"),
+            sampled_image: None,
+        }
     ));
     assert!(matches!(
         classify_sampled_dmabuf_acquire_submit_error_for_tests(
@@ -10167,7 +10170,10 @@ fn sampled_acquire_submit_errors_are_classified_by_queue_acceptance() {
             true,
             VulkanError::UnsupportedOperation("submit")
         ),
-        VulkanSampledDmabufForeignAcquireError::AcquireSubmitted(VulkanError::UnsupportedOperation("submit"))
+        VulkanSampledDmabufForeignAcquireError::AcquireSubmitted {
+            err: VulkanError::UnsupportedOperation("submit"),
+            sampled_image: None,
+        }
     ));
 }
 

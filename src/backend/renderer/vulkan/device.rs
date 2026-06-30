@@ -90,14 +90,17 @@ pub(crate) enum VulkanSampledDmabufForeignAcquireError {
     /// Queue acquire submission was accepted or completion became unknowable; ownership must not be
     /// treated as still safely foreign without further device/context recovery, and acquire wait
     /// semaphore payloads may have been consumed or left pending by the queue submission.
-    AcquireSubmitted(VulkanError),
+    AcquireSubmitted {
+        err: VulkanError,
+        sampled_image: Option<VulkanSampledImage>,
+    },
 }
 
 impl VulkanSampledDmabufForeignAcquireError {
     pub(crate) fn into_inner(self) -> VulkanError {
         match self {
             VulkanSampledDmabufForeignAcquireError::RetrySafe(err)
-            | VulkanSampledDmabufForeignAcquireError::AcquireSubmitted(err) => err,
+            | VulkanSampledDmabufForeignAcquireError::AcquireSubmitted { err, .. } => err,
         }
     }
 }
@@ -1547,10 +1550,20 @@ impl VulkanDeviceState {
         } else {
             None
         };
-        if !self.submit_sampled_dmabuf_foreign_acquire_classified(&image, acquire_semaphore.as_ref())? {
-            return Err(VulkanSampledDmabufForeignAcquireError::RetrySafe(
-                VulkanError::UnsupportedOperation("dmabuf external ownership"),
-            ));
+        match self.submit_sampled_dmabuf_foreign_acquire_classified(&image, acquire_semaphore.as_ref()) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(VulkanSampledDmabufForeignAcquireError::RetrySafe(
+                    VulkanError::UnsupportedOperation("dmabuf external ownership"),
+                ));
+            }
+            Err(VulkanSampledDmabufForeignAcquireError::AcquireSubmitted { err, .. }) => {
+                return Err(VulkanSampledDmabufForeignAcquireError::AcquireSubmitted {
+                    err,
+                    sampled_image: Some(VulkanSampledImage { sampler, view, image }),
+                });
+            }
+            Err(err) => return Err(err),
         }
 
         Ok(Some(VulkanSampledImage { sampler, view, image }))
@@ -5850,7 +5863,10 @@ fn classify_sampled_dmabuf_acquire_submit_error(
 ) -> VulkanSampledDmabufForeignAcquireError {
     match state {
         VulkanCommandBufferState::Submitted | VulkanCommandBufferState::SubmitCompletionUnknown => {
-            VulkanSampledDmabufForeignAcquireError::AcquireSubmitted(err)
+            VulkanSampledDmabufForeignAcquireError::AcquireSubmitted {
+                err,
+                sampled_image: None,
+            }
         }
         VulkanCommandBufferState::Initial
         | VulkanCommandBufferState::Recording
