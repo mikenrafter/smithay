@@ -253,6 +253,13 @@ struct SampledDmabufWaylandForeignGeneralEvidenceSlot {
     evidence: Mutex<Option<SampledDmabufWaylandForeignGeneralEvidence>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum SampledDmabufWaylandExternalStateUse {
+    FirstImport,
+    CurrentReacquire,
+}
+
 /// Commit-local proof that a Wayland dmabuf is ready for Vulkan sampled import.
 ///
 /// This evidence is stored on Smithay's renderer-managed Wayland buffer wrapper. It is deliberately
@@ -263,18 +270,47 @@ struct SampledDmabufWaylandForeignGeneralEvidenceSlot {
 #[allow(dead_code)]
 struct SampledDmabufWaylandForeignGeneralEvidence {
     dmabuf: WeakDmabuf,
+    use_case: SampledDmabufWaylandExternalStateUse,
+    external_state: SampledDmabufExternalImageState,
 }
 
 #[allow(dead_code)]
 impl SampledDmabufWaylandForeignGeneralEvidence {
-    unsafe fn new(dmabuf: WeakDmabuf) -> Self {
-        Self { dmabuf }
+    unsafe fn new(dmabuf: WeakDmabuf, use_case: SampledDmabufWaylandExternalStateUse) -> Self {
+        Self {
+            dmabuf,
+            use_case,
+            external_state: SampledDmabufExternalImageState::foreign_general(),
+        }
     }
 
     #[cfg(test)]
     fn new_for_tests(dmabuf: &Dmabuf) -> Self {
         Self {
             dmabuf: dmabuf.weak(),
+            use_case: SampledDmabufWaylandExternalStateUse::FirstImport,
+            external_state: SampledDmabufExternalImageState::foreign_general(),
+        }
+    }
+
+    #[cfg(test)]
+    fn current_reacquire_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+            use_case: SampledDmabufWaylandExternalStateUse::CurrentReacquire,
+            external_state: SampledDmabufExternalImageState::foreign_general(),
+        }
+    }
+
+    #[cfg(test)]
+    fn first_import_with_state_for_tests(
+        dmabuf: &Dmabuf,
+        external_state: SampledDmabufExternalImageState,
+    ) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+            use_case: SampledDmabufWaylandExternalStateUse::FirstImport,
+            external_state,
         }
     }
 
@@ -282,15 +318,35 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
         self.dmabuf.upgrade().as_ref() == Some(dmabuf)
     }
 
-    fn first_import_layout(
+    fn validate_for_use(
         &self,
         dmabuf: &Dmabuf,
-    ) -> Result<SampledDmabufWaylandFirstImportLayoutEvidence, VulkanError> {
+        use_case: SampledDmabufWaylandExternalStateUse,
+    ) -> Result<(), VulkanError> {
         if !self.is_for_dmabuf(dmabuf) {
             return Err(VulkanError::UnsupportedOperation(
                 "sampled dmabuf Wayland external-state identity",
             ));
         }
+        if self.use_case != use_case {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland external-state use",
+            ));
+        }
+        if !self.external_state.is_foreign_general() {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland external-state",
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn first_import_layout(
+        &self,
+        dmabuf: &Dmabuf,
+    ) -> Result<SampledDmabufWaylandFirstImportLayoutEvidence, VulkanError> {
+        self.validate_for_use(dmabuf, SampledDmabufWaylandExternalStateUse::FirstImport)?;
         Ok(SampledDmabufWaylandFirstImportLayoutEvidence {
             dmabuf: self.dmabuf.clone(),
         })
@@ -300,25 +356,17 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
         &self,
         dmabuf: &Dmabuf,
     ) -> Result<SampledDmabufWaylandCurrentReacquireLayoutEvidence, VulkanError> {
-        if !self.is_for_dmabuf(dmabuf) {
-            return Err(VulkanError::UnsupportedOperation(
-                "sampled dmabuf Wayland external-state identity",
-            ));
-        }
+        self.validate_for_use(dmabuf, SampledDmabufWaylandExternalStateUse::CurrentReacquire)?;
         Ok(SampledDmabufWaylandCurrentReacquireLayoutEvidence {
             dmabuf: self.dmabuf.clone(),
         })
     }
 
-    fn known_foreign_general(
+    fn first_import_known_foreign_general(
         &self,
         dmabuf: &Dmabuf,
     ) -> Result<SampledDmabufKnownLayoutEvidence, VulkanError> {
-        if !self.is_for_dmabuf(dmabuf) {
-            return Err(VulkanError::UnsupportedOperation(
-                "sampled dmabuf Wayland external-state identity",
-            ));
-        }
+        self.validate_for_use(dmabuf, SampledDmabufWaylandExternalStateUse::FirstImport)?;
         Ok(unsafe {
             // SAFETY: Creating this storage token is unsafe and requires the caller to prove the
             // current Wayland buffer's dmabuf was released to FOREIGN ownership in GENERAL layout.
@@ -1466,7 +1514,11 @@ impl VulkanRenderer {
     ) -> Result<(), VulkanError> {
         unsafe {
             // SAFETY: Forwarded from this test-only unsafe evidence-marking helper's caller.
-            Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(buffer.user_data(), dmabuf)
+            Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+                buffer.user_data(),
+                dmabuf,
+                SampledDmabufWaylandExternalStateUse::FirstImport,
+            )
         }
     }
 
@@ -1490,9 +1542,26 @@ impl VulkanRenderer {
         buffer: &super::utils::Buffer,
         dmabuf: &Dmabuf,
     ) -> Result<(), VulkanError> {
+        let use_case = match self.sampled_dmabuf_layout_history_snapshot(dmabuf) {
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory => {
+                SampledDmabufWaylandExternalStateUse::FirstImport
+            }
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => {
+                SampledDmabufWaylandExternalStateUse::CurrentReacquire
+            }
+            SampledDmabufWaylandLayoutHistory::LocallyAcquired => {
+                return Err(VulkanError::MissingCapability(
+                    "sampled dmabuf Wayland Vulkan unreleased local acquire",
+                ));
+            }
+        };
         unsafe {
             // SAFETY: Forwarded from this validation contract's caller.
-            Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(buffer.user_data(), dmabuf)
+            Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+                buffer.user_data(),
+                dmabuf,
+                use_case,
+            )
         }
     }
 
@@ -1735,6 +1804,7 @@ impl VulkanRenderer {
     unsafe fn mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
         user_data: &UserDataMap,
         dmabuf: &Dmabuf,
+        use_case: SampledDmabufWaylandExternalStateUse,
     ) -> Result<(), VulkanError> {
         let slot =
             user_data.get_or_insert_threadsafe(SampledDmabufWaylandForeignGeneralEvidenceSlot::default);
@@ -1743,7 +1813,7 @@ impl VulkanRenderer {
         })?;
         *evidence = Some(unsafe {
             // SAFETY: Forwarded from this unsafe evidence-marking helper's caller.
-            SampledDmabufWaylandForeignGeneralEvidence::new(dmabuf.weak())
+            SampledDmabufWaylandForeignGeneralEvidence::new(dmabuf.weak(), use_case)
         });
         Ok(())
     }
@@ -1839,6 +1909,10 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn sampled_dmabuf_layout_history(&mut self, dmabuf: &Dmabuf) -> SampledDmabufWaylandLayoutHistory {
         self.prune_sampled_dmabuf_layout_history();
+        self.sampled_dmabuf_layout_history_snapshot(dmabuf)
+    }
+
+    fn sampled_dmabuf_layout_history_snapshot(&self, dmabuf: &Dmabuf) -> SampledDmabufWaylandLayoutHistory {
         if self
             .pending_sampled_dmabuf_import_obligations
             .iter()
@@ -2447,7 +2521,7 @@ impl VulkanRenderer {
     ) -> Result<Option<SampledDmabufKnownLayoutEvidence>, VulkanError> {
         match layout_history {
             SampledDmabufWaylandLayoutHistory::NoRendererHistory => external_state
-                .map(|evidence| evidence.known_foreign_general(dmabuf))
+                .map(|evidence| evidence.first_import_known_foreign_general(dmabuf))
                 .transpose()?
                 .ok_or(VulkanError::MissingCapability(
                     "sampled dmabuf Wayland Vulkan foreign GENERAL policy",

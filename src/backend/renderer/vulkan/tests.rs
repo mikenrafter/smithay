@@ -8232,6 +8232,16 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert!(first_import_sources.first_import_foreign_general.is_some());
     assert!(first_import_sources.current_reacquire_layout.is_none());
     assert!(first_import_sources.current_reacquire_foreign_general.is_none());
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_external_state_evidence_sources(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            Some(&wayland_external_state),
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland external-state use"
+        ))
+    ));
     let mut external_state_lifecycle_renderer = VulkanRenderer::new_scaffold_for_tests();
     external_state_lifecycle_renderer
         .capabilities
@@ -8314,6 +8324,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         VulkanRenderer::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
             &user_data_external_state,
             &policy_dmabuf,
+            SampledDmabufWaylandExternalStateUse::FirstImport,
         )
         .unwrap();
     }
@@ -8330,6 +8341,21 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         ),
         Err(VulkanError::UnsupportedOperation(
             "sampled dmabuf Wayland external-state identity"
+        ))
+    ));
+    let non_foreign_general_external_state =
+        SampledDmabufWaylandForeignGeneralEvidence::first_import_with_state_for_tests(
+            &policy_dmabuf,
+            SampledDmabufExternalImageState::external_general_for_tests(),
+        );
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_external_state_evidence_sources(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+            Some(&non_foreign_general_external_state),
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland external-state"
         ))
     ));
     let user_data_lifecycle = UserDataMap::new();
@@ -8594,11 +8620,23 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland Vulkan current reacquire layout policy"
         ))
     ));
+    let current_reacquire_external_state =
+        SampledDmabufWaylandForeignGeneralEvidence::current_reacquire_for_tests(&policy_dmabuf);
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_external_state_evidence_sources(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+            Some(&current_reacquire_external_state),
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland external-state use"
+        ))
+    ));
     let current_reacquire_sources = renderer
         .sampled_dmabuf_wayland_external_state_evidence_sources(
             &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
-            Some(&wayland_external_state),
+            Some(&current_reacquire_external_state),
         )
         .unwrap();
     assert!(current_reacquire_sources.first_import_layout.is_none());
