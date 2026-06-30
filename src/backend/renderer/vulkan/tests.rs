@@ -10313,6 +10313,63 @@ fn sampled_import_release_ownership_failure_prefers_cleanup_proof() {
     );
 }
 
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn sampled_ready_callback_error_retains_failed_release_only_obligation() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let successful_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let submit_err = VulkanError::UnsupportedOperation("ready callback submit");
+
+    assert!(matches!(
+        renderer.sampled_dmabuf_release_only_error_after_ready_callback(
+            submit_err,
+            SampledDmabufReleaseOwnership::new_for_tests(&successful_dmabuf),
+        ),
+        VulkanError::UnsupportedOperation("ready callback submit")
+    ));
+    assert!(
+        renderer
+            .validate_no_pending_sampled_dmabuf_import_obligation(&successful_dmabuf)
+            .is_ok()
+    );
+
+    let failed_release_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let release_ownership = SampledDmabufReleaseOwnership::wayland_syncobj(
+        &failed_release_dmabuf,
+        DrmSyncPoint::invalid_for_tests(1).unwrap(),
+    );
+
+    assert!(matches!(
+        renderer.sampled_dmabuf_release_only_error_after_ready_callback(
+            VulkanError::UnsupportedOperation("ready callback committed"),
+            release_ownership,
+        ),
+        VulkanError::UnsupportedOperation("sampled dmabuf release point signal")
+    ));
+    assert!(matches!(
+        renderer.validate_no_pending_sampled_dmabuf_import_obligation(&failed_release_dmabuf),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf pending import obligation"
+        ))
+    ));
+    assert_eq!(
+        renderer.sampled_dmabuf_layout_history(&failed_release_dmabuf),
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory
+    );
+}
+
 #[test]
 fn sampled_pending_import_obligations_block_same_dmabuf_reimport() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
