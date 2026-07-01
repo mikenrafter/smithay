@@ -5888,6 +5888,16 @@ fn runtime_import_dma_wl_protocol_dmabuf_commit_samples_and_releases() {
         )
         .unwrap()
     };
+    let renderer_utils_lifecycle = unsafe {
+        // SAFETY: The runtime probe drives the normal renderer-utils surface-cache path and validates
+        // release through the same cache/release hooks before the current surface state is dropped.
+        VulkanWaylandDmabufSampledImportRendererUtilsLifecycleProof::assume_renderer_utils_lifecycle(
+            &candidate.renderer,
+            harness.renderer_buffer(),
+            &committed_dmabuf,
+        )
+        .unwrap()
+    };
     let release_point_probe = harness
         .renderer_buffer()
         .release_point()
@@ -5898,7 +5908,7 @@ fn runtime_import_dma_wl_protocol_dmabuf_commit_samples_and_releases() {
             .with_imported_syncable(imported_syncable)
             .with_imported_view(imported_view)
             .with_acquire_ordering(acquire_ordering)
-            .with_renderer_utils_lifecycle_declared();
+            .with_renderer_utils_lifecycle(renderer_utils_lifecycle);
     unsafe {
         // SAFETY: The admission object owns the validation-stage assertion. It has checked the
         // controlled Vulkan producer evidence, protocol dmabuf metadata preservation, explicit commit
@@ -10363,13 +10373,42 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         )
         .unwrap()
     };
+    let renderer_utils_lifecycle = unsafe {
+        // SAFETY: This non-runtime admission test validates that lifecycle proof is required and bound
+        // to the expected renderer/buffer token; it does not exercise renderer-utils teardown paths.
+        VulkanWaylandDmabufSampledImportRendererUtilsLifecycleProof::assume_renderer_utils_lifecycle(
+            &renderer, &buffer, &dmabuf,
+        )
+        .unwrap()
+    };
+    let stale_buffer_lifecycle = unsafe {
+        // SAFETY: This negative fixture intentionally binds lifecycle proof to another
+        // renderer-managed buffer wrapper for the same dmabuf.
+        VulkanWaylandDmabufSampledImportRendererUtilsLifecycleProof::assume_renderer_utils_lifecycle(
+            &renderer,
+            &other_buffer,
+            &dmabuf,
+        )
+        .unwrap()
+    };
+    let unrelated_renderer = VulkanRenderer::new_scaffold_for_tests();
+    let unrelated_renderer_lifecycle = unsafe {
+        // SAFETY: This negative fixture intentionally binds lifecycle proof to another renderer
+        // context while keeping the same current buffer token.
+        VulkanWaylandDmabufSampledImportRendererUtilsLifecycleProof::assume_renderer_utils_lifecycle(
+            &unrelated_renderer,
+            &buffer,
+            &dmabuf,
+        )
+        .unwrap()
+    };
 
     let mismatched_admission =
         VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &unrelated_evidence)
             .with_imported_syncable(imported_syncable.clone())
             .with_imported_view(imported_view.clone())
             .with_acquire_ordering(acquire_ordering.clone())
-            .with_renderer_utils_lifecycle_declared();
+            .with_renderer_utils_lifecycle(renderer_utils_lifecycle.clone());
     assert!(matches!(
         unsafe {
             // SAFETY: This negative test supplies mismatched producer evidence, so admission must
@@ -10398,7 +10437,7 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
             .with_imported_syncable(unrelated_syncable)
             .with_imported_view(imported_view.clone())
             .with_acquire_ordering(acquire_ordering.clone())
-            .with_renderer_utils_lifecycle_declared();
+            .with_renderer_utils_lifecycle(renderer_utils_lifecycle.clone());
     assert!(matches!(
         unsafe {
             // SAFETY: This negative test supplies syncability proof for another dmabuf wrapper.
@@ -10426,7 +10465,7 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
             .with_imported_syncable(imported_syncable.clone())
             .with_imported_view(unrelated_view)
             .with_acquire_ordering(acquire_ordering.clone())
-            .with_renderer_utils_lifecycle_declared();
+            .with_renderer_utils_lifecycle(renderer_utils_lifecycle.clone());
     assert!(matches!(
         unsafe {
             // SAFETY: This negative test supplies an imported-view proof for another dmabuf pair.
@@ -10442,7 +10481,7 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
             .with_imported_syncable(imported_syncable.clone())
             .with_imported_view(same_view_other_wrapper_proof)
             .with_acquire_ordering(acquire_ordering.clone())
-            .with_renderer_utils_lifecycle_declared();
+            .with_renderer_utils_lifecycle(renderer_utils_lifecycle.clone());
     assert!(matches!(
         unsafe {
             // SAFETY: This negative test proves matching metadata is not enough if the proof is not
@@ -10473,7 +10512,7 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
             .with_imported_syncable(imported_syncable.clone())
             .with_imported_view(imported_view.clone())
             .with_acquire_ordering(second_evidence_acquire_ordering)
-            .with_renderer_utils_lifecycle_declared();
+            .with_renderer_utils_lifecycle(renderer_utils_lifecycle.clone());
     assert!(matches!(
         unsafe {
             // SAFETY: This negative test supplies acquire-ordering proof for another producer evidence
@@ -10490,7 +10529,7 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
             .with_imported_syncable(imported_syncable.clone())
             .with_imported_view(imported_view.clone())
             .with_acquire_ordering(stale_buffer_acquire_ordering)
-            .with_renderer_utils_lifecycle_declared();
+            .with_renderer_utils_lifecycle(renderer_utils_lifecycle.clone());
     assert!(matches!(
         unsafe {
             // SAFETY: This negative test supplies acquire-ordering proof from another current-buffer
@@ -10517,12 +10556,44 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         ))
     ));
 
+    let stale_buffer_lifecycle_admission =
+        VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
+            .with_imported_syncable(imported_syncable.clone())
+            .with_imported_view(imported_view.clone())
+            .with_acquire_ordering(acquire_ordering.clone())
+            .with_renderer_utils_lifecycle(stale_buffer_lifecycle);
+    assert!(matches!(
+        unsafe {
+            // SAFETY: This negative test supplies lifecycle proof from another current-buffer token.
+            stale_buffer_lifecycle_admission.admit_current_surface_commit(&renderer, &surface, &dmabuf)
+        },
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf producer lifecycle commit token"
+        ))
+    ));
+
+    let wrong_renderer_lifecycle_admission =
+        VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
+            .with_imported_syncable(imported_syncable.clone())
+            .with_imported_view(imported_view.clone())
+            .with_acquire_ordering(acquire_ordering.clone())
+            .with_renderer_utils_lifecycle(unrelated_renderer_lifecycle);
+    assert!(matches!(
+        unsafe {
+            // SAFETY: This negative test supplies lifecycle proof for another renderer context.
+            wrong_renderer_lifecycle_admission.admit_current_surface_commit(&renderer, &surface, &dmabuf)
+        },
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf producer lifecycle renderer identity"
+        ))
+    ));
+
     let complete_admission =
         VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
             .with_imported_syncable(imported_syncable)
             .with_imported_view(imported_view)
             .with_acquire_ordering(acquire_ordering)
-            .with_renderer_utils_lifecycle_declared();
+            .with_renderer_utils_lifecycle(renderer_utils_lifecycle);
     unsafe {
         // SAFETY: This positive fixture provides every policy claim needed to mark the current surface
         // commit; no Vulkan device import is attempted by this unit test.

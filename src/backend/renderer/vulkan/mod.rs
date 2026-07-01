@@ -1374,7 +1374,7 @@ impl VulkanDmabufLoopbackImportEvidence {
 ///
 /// This keeps producer/compositor policy separate from raw linux-dmabuf metadata. The producer evidence
 /// proves a controlled Smithay Vulkan producer released the source dmabuf to `FOREIGN + GENERAL`; the
-/// remaining flags are explicit compositor assertions about the committed Wayland buffer and its normal
+/// remaining proofs are explicit compositor assertions about the committed Wayland buffer and its normal
 /// renderer-utils lifecycle. The admission helper validates those assertions against the current
 /// renderer-managed surface buffer before recording the wrapper-local evidence consumed by [`ImportDmaWl`].
 ///
@@ -1390,7 +1390,7 @@ pub(crate) struct VulkanWaylandDmabufSampledImportAdmission<'a> {
     imported_syncable: Option<VulkanWaylandDmabufSampledImportSyncableProof>,
     imported_view: Option<VulkanWaylandDmabufSampledImportViewProof>,
     acquire_ordering: Option<VulkanWaylandDmabufSampledImportAcquireOrderingProof<'a>>,
-    renderer_utils_lifecycle_declared: bool,
+    renderer_utils_lifecycle: Option<VulkanWaylandDmabufSampledImportRendererUtilsLifecycleProof>,
 }
 
 /// Validation-stage proof that an imported Wayland dmabuf supports dma-buf synchronization ioctls.
@@ -1547,6 +1547,90 @@ impl<'a> VulkanWaylandDmabufSampledImportAcquireOrderingProof<'a> {
     }
 }
 
+/// Validation-stage proof that renderer-utils release lifecycle is covered for this current commit.
+///
+/// This is an explicit compositor assertion bound to the importing renderer context, current imported
+/// dmabuf wrapper, and renderer-managed buffer token. It does not by itself release anything; admission
+/// validates the token against the current surface buffer before recording the lifecycle evidence later
+/// consumed by the normal [`ImportDmaWl`] path.
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[derive(Debug, Clone)]
+pub(crate) struct VulkanWaylandDmabufSampledImportRendererUtilsLifecycleProof {
+    renderer_context: ContextId<VulkanTexture>,
+    imported_dmabuf: WeakDmabuf,
+    commit_token: Weak<()>,
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[allow(dead_code)]
+impl VulkanWaylandDmabufSampledImportRendererUtilsLifecycleProof {
+    /// Assert that renderer-utils release lifecycle call sites cover this current buffer commit.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prove that imports of `buffer` for `renderer` go through Smithay's normal
+    /// renderer-utils surface cache, and that all no-next-import/reset/drop/teardown paths for this
+    /// surface and renderer satisfy the lifecycle contract documented on
+    /// [`VulkanRenderer::mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import`].
+    pub(crate) unsafe fn assume_renderer_utils_lifecycle(
+        renderer: &VulkanRenderer,
+        buffer: &super::utils::Buffer,
+        imported_dmabuf: &Dmabuf,
+    ) -> Result<Self, VulkanError> {
+        let current_dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
+            .map_err(|_| VulkanError::UnsupportedOperation("sampled dmabuf producer lifecycle buffer"))?;
+        if current_dmabuf != imported_dmabuf {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer lifecycle buffer identity",
+            ));
+        }
+        let commit_token_slot = buffer
+            .user_data()
+            .get_or_insert_threadsafe(SampledDmabufWaylandCommitTokenSlot::default);
+
+        Ok(Self {
+            renderer_context: renderer.context_id.clone(),
+            imported_dmabuf: imported_dmabuf.weak(),
+            commit_token: Arc::downgrade(&commit_token_slot.token),
+        })
+    }
+
+    fn validate_for(
+        &self,
+        renderer: &VulkanRenderer,
+        imported_dmabuf: &Dmabuf,
+        buffer: &super::utils::Buffer,
+    ) -> Result<(), VulkanError> {
+        if self.renderer_context != renderer.context_id {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer lifecycle renderer identity",
+            ));
+        }
+        if self.imported_dmabuf.upgrade().as_ref() != Some(imported_dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer lifecycle identity",
+            ));
+        }
+        let Some(stored_token) = self.commit_token.upgrade() else {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer lifecycle commit token",
+            ));
+        };
+        let Some(current_slot) = buffer.user_data().get::<SampledDmabufWaylandCommitTokenSlot>() else {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer lifecycle commit token",
+            ));
+        };
+        if !Arc::ptr_eq(&stored_token, &current_slot.token) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer lifecycle commit token",
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// Validation-stage proof that a protocol-created dmabuf preserves the producer's import view.
 ///
 /// This is intentionally a *view* proof, not a Vulkan external-state or portable kernel storage proof.
@@ -1606,7 +1690,7 @@ impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
             imported_syncable: None,
             imported_view: None,
             acquire_ordering: None,
-            renderer_utils_lifecycle_declared: false,
+            renderer_utils_lifecycle: None,
         }
     }
 
@@ -1637,9 +1721,12 @@ impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
         self
     }
 
-    /// Declare that the compositor will use normal renderer-utils release hooks for this surface cache.
-    pub(crate) fn with_renderer_utils_lifecycle_declared(mut self) -> Self {
-        self.renderer_utils_lifecycle_declared = true;
+    /// Attach proof that renderer-utils release lifecycle is covered for this surface cache.
+    pub(crate) fn with_renderer_utils_lifecycle(
+        mut self,
+        renderer_utils_lifecycle: VulkanWaylandDmabufSampledImportRendererUtilsLifecycleProof,
+    ) -> Self {
+        self.renderer_utils_lifecycle = Some(renderer_utils_lifecycle);
         self
     }
 
@@ -1692,11 +1779,12 @@ impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
             .ok_or(VulkanError::MissingCapability(
                 "sampled dmabuf producer acquire ordering",
             ))?;
-        if !self.renderer_utils_lifecycle_declared {
-            return Err(VulkanError::MissingCapability(
-                "sampled dmabuf producer lifecycle policy",
-            ));
-        }
+        let renderer_utils_lifecycle =
+            self.renderer_utils_lifecycle
+                .as_ref()
+                .ok_or(VulkanError::MissingCapability(
+                    "sampled dmabuf producer lifecycle policy",
+                ))?;
 
         super::utils::with_renderer_surface_state(surface, |state| {
             let buffer = state.buffer().ok_or(VulkanError::MissingCapability(
@@ -1715,6 +1803,7 @@ impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
                 committed_dmabuf,
                 buffer,
             )?;
+            renderer_utils_lifecycle.validate_for(renderer, committed_dmabuf, buffer)?;
             if buffer.release_point().is_none() {
                 return Err(VulkanError::MissingCapability(
                     "sampled dmabuf producer release point",
