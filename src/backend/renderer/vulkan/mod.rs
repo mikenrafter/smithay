@@ -289,6 +289,7 @@ struct SampledDmabufWaylandForeignGeneralEvidence {
     use_case: SampledDmabufWaylandExternalStateUse,
     external_state: SampledDmabufExternalImageState,
     commit_token: Option<Weak<()>>,
+    release_generation: Option<u64>,
 }
 
 #[allow(dead_code)]
@@ -297,12 +298,14 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
         dmabuf: WeakDmabuf,
         use_case: SampledDmabufWaylandExternalStateUse,
         commit_token: Weak<()>,
+        release_generation: Option<u64>,
     ) -> Self {
         Self {
             dmabuf,
             use_case,
             external_state: SampledDmabufExternalImageState::foreign_general(),
             commit_token: Some(commit_token),
+            release_generation,
         }
     }
 
@@ -313,6 +316,7 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
             use_case: SampledDmabufWaylandExternalStateUse::FirstImport,
             external_state: SampledDmabufExternalImageState::foreign_general(),
             commit_token: None,
+            release_generation: None,
         }
     }
 
@@ -323,6 +327,7 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
             use_case: SampledDmabufWaylandExternalStateUse::CurrentReacquire,
             external_state: SampledDmabufExternalImageState::foreign_general(),
             commit_token: None,
+            release_generation: None,
         }
     }
 
@@ -336,6 +341,7 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
             use_case: SampledDmabufWaylandExternalStateUse::FirstImport,
             external_state,
             commit_token: None,
+            release_generation: None,
         }
     }
 
@@ -376,6 +382,30 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
                 SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
             }
         }
+    }
+
+    fn validate_release_generation(&self, release_generation: Option<u64>) -> Result<(), VulkanError> {
+        match self.use_case {
+            SampledDmabufWaylandExternalStateUse::FirstImport => {
+                if self.release_generation.is_some() {
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf Wayland external-state release generation",
+                    ));
+                }
+            }
+            SampledDmabufWaylandExternalStateUse::CurrentReacquire => {
+                match (self.release_generation, release_generation) {
+                    (Some(stored), Some(current)) if stored == current => {}
+                    _ => {
+                        return Err(VulkanError::UnsupportedOperation(
+                            "sampled dmabuf Wayland external-state release generation",
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn validate_for_use(
@@ -574,14 +604,16 @@ impl SampledDmabufWaylandCurrentReacquireLayoutEvidence {
 struct SampledDmabufWaylandRendererForeignGeneralReleaseEvidence {
     dmabuf: WeakDmabuf,
     renderer_context: ContextId<VulkanTexture>,
+    release_generation: u64,
 }
 
 #[cfg(all(test, feature = "wayland_frontend"))]
 impl SampledDmabufWaylandRendererForeignGeneralReleaseEvidence {
-    fn new(dmabuf: WeakDmabuf, renderer_context: ContextId<VulkanTexture>) -> Self {
+    fn new(dmabuf: WeakDmabuf, renderer_context: ContextId<VulkanTexture>, release_generation: u64) -> Self {
         Self {
             dmabuf,
             renderer_context,
+            release_generation,
         }
     }
 
@@ -591,6 +623,10 @@ impl SampledDmabufWaylandRendererForeignGeneralReleaseEvidence {
 
     fn is_for_renderer_context(&self, renderer_context: &ContextId<VulkanTexture>) -> bool {
         &self.renderer_context == renderer_context
+    }
+
+    fn is_current_release_generation(&self, release_generation: Option<u64>) -> bool {
+        release_generation == Some(self.release_generation)
     }
 }
 
@@ -865,6 +901,13 @@ enum SampledDmabufWaylandLayoutHistory {
     LocallyAcquired,
     /// The renderer previously released this dmabuf to foreign ownership in GENERAL.
     ReleasedByRendererToForeignGeneral,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SampledDmabufWaylandLayoutHistoryRecord {
+    history: SampledDmabufWaylandLayoutHistory,
+    release_generation: u64,
 }
 
 /// Validated normal-path inputs available to Smithay's Wayland/Vulkan sampled-dmabuf policy.
@@ -1869,6 +1912,13 @@ impl<'a> VulkanWaylandDmabufSampledReacquireAcquireOrderingProof<'a> {
                 "sampled dmabuf renderer-release reacquire evidence identity",
             ));
         }
+        if !renderer_release_evidence.is_current_release_generation(
+            renderer.sampled_dmabuf_release_generation_snapshot(imported_dmabuf),
+        ) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf renderer-release reacquire evidence generation",
+            ));
+        }
         let current_dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer).map_err(|_| {
             VulkanError::UnsupportedOperation("sampled dmabuf renderer-release reacquire buffer")
         })?;
@@ -1909,6 +1959,13 @@ impl<'a> VulkanWaylandDmabufSampledReacquireAcquireOrderingProof<'a> {
         {
             return Err(VulkanError::UnsupportedOperation(
                 "sampled dmabuf renderer-release reacquire ordering identity",
+            ));
+        }
+        if !renderer_release_evidence.is_current_release_generation(
+            renderer.sampled_dmabuf_release_generation_snapshot(imported_dmabuf),
+        ) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf renderer-release reacquire ordering generation",
             ));
         }
         if buffer.acquire_point().is_none() {
@@ -2014,6 +2071,13 @@ impl<'a> VulkanWaylandDmabufSampledReacquireAdmission<'a> {
                 "sampled dmabuf renderer-release reacquire evidence identity",
             ));
         }
+        if !self.renderer_release_evidence.is_current_release_generation(
+            renderer.sampled_dmabuf_release_generation_snapshot(committed_dmabuf),
+        ) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf renderer-release reacquire evidence generation",
+            ));
+        }
         let imported_syncable = self
             .imported_syncable
             .as_ref()
@@ -2080,6 +2144,7 @@ impl<'a> VulkanWaylandDmabufSampledReacquireAdmission<'a> {
                     buffer.user_data(),
                     committed_dmabuf,
                     SampledDmabufWaylandExternalStateUse::CurrentReacquire,
+                    Some(self.renderer_release_evidence.release_generation),
                 )?;
                 renderer.mark_wayland_dmabuf_user_data_texture_cache_release_lifecycle_for_sampled_import(
                     buffer.user_data(),
@@ -2180,7 +2245,7 @@ pub struct VulkanRenderer {
     upscale_filter: TextureFilter,
     capabilities: VulkanRendererCapabilities,
     device: Option<VulkanDeviceState>,
-    sampled_dmabuf_layout_history: HashMap<WeakDmabuf, SampledDmabufWaylandLayoutHistory>,
+    sampled_dmabuf_layout_history: HashMap<WeakDmabuf, SampledDmabufWaylandLayoutHistoryRecord>,
     pending_sampled_dmabuf_import_obligations: Vec<PendingSampledDmabufImportObligation>,
 }
 
@@ -2309,6 +2374,7 @@ impl VulkanRenderer {
                 buffer.user_data(),
                 dmabuf,
                 SampledDmabufWaylandExternalStateUse::FirstImport,
+                None,
             )
         }
     }
@@ -2333,13 +2399,14 @@ impl VulkanRenderer {
         buffer: &super::utils::Buffer,
         dmabuf: &Dmabuf,
     ) -> Result<(), VulkanError> {
-        let use_case = match self.sampled_dmabuf_layout_history_snapshot(dmabuf) {
+        let (use_case, release_generation) = match self.sampled_dmabuf_layout_history_snapshot(dmabuf) {
             SampledDmabufWaylandLayoutHistory::NoRendererHistory => {
-                SampledDmabufWaylandExternalStateUse::FirstImport
+                (SampledDmabufWaylandExternalStateUse::FirstImport, None)
             }
-            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => {
-                SampledDmabufWaylandExternalStateUse::CurrentReacquire
-            }
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => (
+                SampledDmabufWaylandExternalStateUse::CurrentReacquire,
+                self.sampled_dmabuf_release_generation_snapshot(dmabuf),
+            ),
             SampledDmabufWaylandLayoutHistory::LocallyAcquired => {
                 return Err(VulkanError::MissingCapability(
                     "sampled dmabuf Wayland Vulkan unreleased local acquire",
@@ -2352,6 +2419,7 @@ impl VulkanRenderer {
                 buffer.user_data(),
                 dmabuf,
                 use_case,
+                release_generation,
             )
         }
     }
@@ -2405,13 +2473,14 @@ impl VulkanRenderer {
         surface: &WlSurface,
         dmabuf: &Dmabuf,
     ) -> Result<(), VulkanError> {
-        let use_case = match self.sampled_dmabuf_layout_history_snapshot(dmabuf) {
+        let (use_case, release_generation) = match self.sampled_dmabuf_layout_history_snapshot(dmabuf) {
             SampledDmabufWaylandLayoutHistory::NoRendererHistory => {
-                SampledDmabufWaylandExternalStateUse::FirstImport
+                (SampledDmabufWaylandExternalStateUse::FirstImport, None)
             }
-            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => {
-                SampledDmabufWaylandExternalStateUse::CurrentReacquire
-            }
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => (
+                SampledDmabufWaylandExternalStateUse::CurrentReacquire,
+                self.sampled_dmabuf_release_generation_snapshot(dmabuf),
+            ),
             SampledDmabufWaylandLayoutHistory::LocallyAcquired => {
                 return Err(VulkanError::MissingCapability(
                     "sampled dmabuf Wayland Vulkan unreleased local acquire",
@@ -2421,7 +2490,10 @@ impl VulkanRenderer {
         unsafe {
             // SAFETY: Forwarded from this surface-level validation contract's caller.
             self.mark_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import_use(
-                surface, dmabuf, use_case,
+                surface,
+                dmabuf,
+                use_case,
+                release_generation,
             )
         }
     }
@@ -2432,6 +2504,7 @@ impl VulkanRenderer {
         surface: &WlSurface,
         dmabuf: &Dmabuf,
         use_case: SampledDmabufWaylandExternalStateUse,
+        release_generation: Option<u64>,
     ) -> Result<(), VulkanError> {
         Self::with_wayland_surface_current_dmabuf_buffer(surface, dmabuf, |buffer| {
             unsafe {
@@ -2441,6 +2514,7 @@ impl VulkanRenderer {
                     buffer.user_data(),
                     dmabuf,
                     use_case,
+                    release_generation,
                 )
             }
         })
@@ -2532,6 +2606,7 @@ impl VulkanRenderer {
                 surface,
                 dmabuf,
                 SampledDmabufWaylandExternalStateUse::FirstImport,
+                None,
             )
         }
     }
@@ -2549,9 +2624,15 @@ impl VulkanRenderer {
     ) -> Result<SampledDmabufWaylandRendererForeignGeneralReleaseEvidence, VulkanError> {
         match self.sampled_dmabuf_layout_history(dmabuf) {
             SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => {
+                let release_generation = self.sampled_dmabuf_release_generation_snapshot(dmabuf).ok_or(
+                    VulkanError::MissingCapability(
+                        "sampled dmabuf Wayland Vulkan renderer release generation",
+                    ),
+                )?;
                 Ok(SampledDmabufWaylandRendererForeignGeneralReleaseEvidence::new(
                     dmabuf.weak(),
                     self.context_id.clone(),
+                    release_generation,
                 ))
             }
             SampledDmabufWaylandLayoutHistory::LocallyAcquired => Err(VulkanError::MissingCapability(
@@ -2593,6 +2674,11 @@ impl VulkanRenderer {
                 "sampled dmabuf Wayland renderer release evidence identity",
             ));
         }
+        if !evidence.is_current_release_generation(self.sampled_dmabuf_release_generation_snapshot(dmabuf)) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland renderer release evidence generation",
+            ));
+        }
 
         unsafe {
             // SAFETY: Forwarded from this test-only helper's caller. The renderer release evidence
@@ -2602,6 +2688,7 @@ impl VulkanRenderer {
                 surface,
                 dmabuf,
                 SampledDmabufWaylandExternalStateUse::CurrentReacquire,
+                Some(evidence.release_generation),
             )
         }
     }
@@ -2676,6 +2763,7 @@ impl VulkanRenderer {
         user_data: &UserDataMap,
         dmabuf: &Dmabuf,
         use_case: SampledDmabufWaylandExternalStateUse,
+        release_generation: Option<u64>,
     ) -> Result<(), VulkanError> {
         let slot =
             user_data.get_or_insert_threadsafe(SampledDmabufWaylandForeignGeneralEvidenceSlot::default);
@@ -2690,6 +2778,7 @@ impl VulkanRenderer {
                 dmabuf.weak(),
                 use_case,
                 Arc::downgrade(&commit_token_slot.token),
+                release_generation,
             )
         });
         Ok(())
@@ -2799,8 +2888,23 @@ impl VulkanRenderer {
         }
         self.sampled_dmabuf_layout_history
             .get(&dmabuf.weak())
-            .copied()
+            .map(|record| record.history)
             .unwrap_or(SampledDmabufWaylandLayoutHistory::NoRendererHistory)
+    }
+
+    #[allow(dead_code)]
+    fn sampled_dmabuf_release_generation_snapshot(&self, dmabuf: &Dmabuf) -> Option<u64> {
+        if self.sampled_dmabuf_layout_history_snapshot(dmabuf)
+            != SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+        {
+            return None;
+        }
+        self.sampled_dmabuf_layout_history
+            .get(&dmabuf.weak())
+            .and_then(|record| {
+                (record.history == SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral)
+                    .then_some(record.release_generation)
+            })
     }
 
     #[allow(dead_code)]
@@ -2961,17 +3065,40 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn record_sampled_dmabuf_released_to_foreign_general(&mut self, dmabuf: &Dmabuf) {
         self.prune_sampled_dmabuf_layout_history();
+        let release_generation = self
+            .sampled_dmabuf_layout_history
+            .get(&dmabuf.weak())
+            .map(|record| {
+                record
+                    .release_generation
+                    .checked_add(1)
+                    .expect("sampled dmabuf release generation overflow")
+            })
+            .unwrap_or(1);
         self.sampled_dmabuf_layout_history.insert(
             dmabuf.weak(),
-            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            SampledDmabufWaylandLayoutHistoryRecord {
+                history: SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+                release_generation,
+            },
         );
     }
 
     #[allow(dead_code)]
     fn record_sampled_dmabuf_locally_acquired(&mut self, dmabuf: &Dmabuf) {
         self.prune_sampled_dmabuf_layout_history();
-        self.sampled_dmabuf_layout_history
-            .insert(dmabuf.weak(), SampledDmabufWaylandLayoutHistory::LocallyAcquired);
+        let release_generation = self
+            .sampled_dmabuf_layout_history
+            .get(&dmabuf.weak())
+            .map(|record| record.release_generation)
+            .unwrap_or(0);
+        self.sampled_dmabuf_layout_history.insert(
+            dmabuf.weak(),
+            SampledDmabufWaylandLayoutHistoryRecord {
+                history: SampledDmabufWaylandLayoutHistory::LocallyAcquired,
+                release_generation,
+            },
+        );
     }
 
     #[allow(dead_code)]
@@ -3549,6 +3676,7 @@ impl VulkanRenderer {
             ));
         }
         evidence.validate_commit_token(user_data)?;
+        evidence.validate_release_generation(self.sampled_dmabuf_release_generation_snapshot(dmabuf))?;
         Ok(Some(evidence.clone()))
     }
 

@@ -8372,6 +8372,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             &user_data_external_state,
             &policy_dmabuf,
             SampledDmabufWaylandExternalStateUse::FirstImport,
+            None,
         )
         .unwrap();
     }
@@ -8417,6 +8418,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
                 &orphaned_user_data_external_state,
                 &policy_dmabuf,
                 SampledDmabufWaylandExternalStateUse::FirstImport,
+                None,
             )
             .unwrap();
         }
@@ -10724,6 +10726,101 @@ fn import_surface_reacquire_admission_rejects_stale_current_buffer_token() {
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
+fn import_surface_reacquire_admission_rejects_stale_release_generation() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    renderer.record_sampled_dmabuf_released_to_foreign_general(&dmabuf);
+    assert_eq!(
+        renderer.sampled_dmabuf_release_generation_snapshot(&dmabuf),
+        Some(1)
+    );
+    let stale_release_evidence = renderer
+        .sampled_dmabuf_wayland_renderer_foreign_general_release_evidence_for_tests(&dmabuf)
+        .unwrap();
+    let Some((_display, _client_side, surface, current_buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+            dmabuf.clone(),
+            DrmSyncPoint::invalid_for_tests(105).unwrap(),
+            DrmSyncPoint::invalid_for_tests(106).unwrap(),
+        )
+    else {
+        return;
+    };
+    let imported_syncable = unsafe {
+        // SAFETY: This non-runtime admission test uses a synthetic `/dev/null` dmabuf and validates
+        // only renderer-release generation binding, not kernel DMA_BUF_SYNC support.
+        VulkanWaylandDmabufSampledImportSyncableProof::assume_for_imported_dmabuf(&dmabuf)
+    };
+    let imported_view = VulkanWaylandDmabufSampledImportViewProof::new(&dmabuf, &dmabuf).unwrap();
+    let acquire_ordering = unsafe {
+        // SAFETY: This fixture is intentionally made stale after construction by recording another
+        // local acquire/release cycle for the same dmabuf.
+        VulkanWaylandDmabufSampledReacquireAcquireOrderingProof::assume_wayland_acquire_orders_renderer_release(
+            &renderer,
+            &stale_release_evidence,
+            &dmabuf,
+            &current_buffer,
+        )
+        .unwrap()
+    };
+    let renderer_utils_lifecycle = unsafe {
+        // SAFETY: This non-runtime admission test validates that stale release generation is rejected
+        // before any current-buffer marker is stored.
+        VulkanWaylandDmabufSampledImportRendererUtilsLifecycleProof::assume_renderer_utils_lifecycle(
+            &renderer,
+            &current_buffer,
+            &dmabuf,
+        )
+        .unwrap()
+    };
+    renderer.record_sampled_dmabuf_locally_acquired(&dmabuf);
+    assert_eq!(renderer.sampled_dmabuf_release_generation_snapshot(&dmabuf), None);
+    renderer.record_sampled_dmabuf_released_to_foreign_general(&dmabuf);
+    assert_eq!(
+        renderer.sampled_dmabuf_release_generation_snapshot(&dmabuf),
+        Some(2)
+    );
+    let fresh_release_evidence = renderer
+        .sampled_dmabuf_wayland_renderer_foreign_general_release_evidence_for_tests(&dmabuf)
+        .unwrap();
+    assert_ne!(stale_release_evidence, fresh_release_evidence);
+
+    let stale_generation_admission =
+        VulkanWaylandDmabufSampledReacquireAdmission::from_renderer_release_evidence(&stale_release_evidence)
+            .with_imported_syncable(imported_syncable)
+            .with_imported_view(imported_view)
+            .with_acquire_ordering(acquire_ordering)
+            .with_renderer_utils_lifecycle(renderer_utils_lifecycle);
+
+    assert!(matches!(
+        unsafe {
+            // SAFETY: This negative test supplies release evidence from an earlier renderer release
+            // generation for the same dmabuf, so admission must reject before recording evidence.
+            stale_generation_admission.admit_current_surface_commit(&renderer, &surface, &dmabuf)
+        },
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf renderer-release reacquire evidence generation"
+        ))
+    ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_buffer_foreign_general_evidence(&current_buffer, &dmabuf),
+        Ok(None)
+    ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_buffer_texture_cache_release_lifecycle(&current_buffer, &dmabuf),
+        Ok(None)
+    ));
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
 fn import_surface_loopback_evidence_marker_requires_same_dmabuf_evidence() {
     let renderer = VulkanRenderer::new_scaffold_for_tests();
     let committed_dmabuf = dmabuf_with_planes_for_tests(
@@ -10957,6 +11054,76 @@ fn import_surface_renderer_release_marker_requires_released_history() {
     assert!(matches!(
         renderer.sampled_dmabuf_wayland_buffer_foreign_general_evidence(&negative_buffer, &unrelated_dmabuf,),
         Ok(None)
+    ));
+
+    renderer.record_sampled_dmabuf_locally_acquired(&committed_dmabuf);
+    renderer.record_sampled_dmabuf_released_to_foreign_general(&committed_dmabuf);
+    let fresh_renderer_release_evidence = renderer
+        .sampled_dmabuf_wayland_renderer_foreign_general_release_evidence_for_tests(&committed_dmabuf)
+        .unwrap();
+    assert_ne!(renderer_release_evidence, fresh_renderer_release_evidence);
+    let Some((_stale_display, _stale_client_side, stale_surface, stale_buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+            committed_dmabuf.clone(),
+            DrmSyncPoint::invalid_for_tests(49).unwrap(),
+            DrmSyncPoint::invalid_for_tests(50).unwrap(),
+        )
+    else {
+        return;
+    };
+    let stale_generation_result = unsafe {
+        // SAFETY: This negative test supplies release evidence from an earlier renderer release
+        // generation, so the helper must reject before storing current-commit external-state evidence.
+        renderer.mark_wayland_surface_current_dmabuf_commit_from_renderer_release_evidence_for_sampled_import(
+            &stale_surface,
+            &committed_dmabuf,
+            &renderer_release_evidence,
+        )
+    };
+    assert!(matches!(
+        stale_generation_result,
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland renderer release evidence generation"
+        ))
+    ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_buffer_foreign_general_evidence(&stale_buffer, &committed_dmabuf,),
+        Ok(None)
+    ));
+
+    let Some((_bound_display, _bound_client_side, bound_surface, bound_buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+            committed_dmabuf.clone(),
+            DrmSyncPoint::invalid_for_tests(51).unwrap(),
+            DrmSyncPoint::invalid_for_tests(52).unwrap(),
+        )
+    else {
+        return;
+    };
+    unsafe {
+        // SAFETY: This unit test validates only generation binding for a stored current-reacquire
+        // marker. It does not import or sample a Vulkan image with the constructed marker.
+        renderer
+            .mark_wayland_surface_current_dmabuf_commit_from_renderer_release_evidence_for_sampled_import(
+                &bound_surface,
+                &committed_dmabuf,
+                &fresh_renderer_release_evidence,
+            )
+            .unwrap();
+    }
+    assert!(
+        renderer
+            .sampled_dmabuf_wayland_buffer_foreign_general_evidence(&bound_buffer, &committed_dmabuf)
+            .unwrap()
+            .is_some()
+    );
+    renderer.record_sampled_dmabuf_locally_acquired(&committed_dmabuf);
+    renderer.record_sampled_dmabuf_released_to_foreign_general(&committed_dmabuf);
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_buffer_foreign_general_evidence(&bound_buffer, &committed_dmabuf),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland external-state release generation"
+        ))
     ));
     assert!(renderer.dmabuf_formats().iter().next().is_none());
 }
@@ -11335,6 +11502,11 @@ fn sampled_pending_import_obligations_block_same_dmabuf_reimport() {
     acquired_texture.context_id = renderer.context_id();
     acquired_texture.image.source = VulkanImageSource::DmabufImport;
     acquired_texture.sampled_dmabuf = Some(acquired_dmabuf.weak());
+    renderer.record_sampled_dmabuf_released_to_foreign_general(&acquired_dmabuf);
+    assert_eq!(
+        renderer.sampled_dmabuf_release_generation_snapshot(&acquired_dmabuf),
+        Some(1)
+    );
     renderer.retain_pending_sampled_dmabuf_import_obligation(
         PendingSampledDmabufImportObligation::AcquiredTexture(acquired_texture),
     );
@@ -11347,6 +11519,10 @@ fn sampled_pending_import_obligations_block_same_dmabuf_reimport() {
     assert_eq!(
         renderer.sampled_dmabuf_layout_history(&acquired_dmabuf),
         SampledDmabufWaylandLayoutHistory::LocallyAcquired
+    );
+    assert_eq!(
+        renderer.sampled_dmabuf_release_generation_snapshot(&acquired_dmabuf),
+        None
     );
     assert!(matches!(
         unsafe { renderer.import_dmabuf_texture_with_known_general_layout(&acquired_dmabuf, None) },
@@ -11377,6 +11553,11 @@ fn sampled_pending_import_obligations_block_same_dmabuf_reimport() {
     release_submitted_texture.context_id = renderer.context_id();
     release_submitted_texture.image.source = VulkanImageSource::DmabufImport;
     release_submitted_texture.sampled_dmabuf = Some(release_submitted_dmabuf.weak());
+    renderer.record_sampled_dmabuf_released_to_foreign_general(&release_submitted_dmabuf);
+    assert_eq!(
+        renderer.sampled_dmabuf_release_generation_snapshot(&release_submitted_dmabuf),
+        Some(1)
+    );
     renderer.retain_pending_sampled_dmabuf_import_obligation(
         PendingSampledDmabufImportObligation::ReleaseCompletionUnknownTexture(release_submitted_texture),
     );
@@ -11389,6 +11570,10 @@ fn sampled_pending_import_obligations_block_same_dmabuf_reimport() {
     assert_eq!(
         renderer.sampled_dmabuf_layout_history(&release_submitted_dmabuf),
         SampledDmabufWaylandLayoutHistory::LocallyAcquired
+    );
+    assert_eq!(
+        renderer.sampled_dmabuf_release_generation_snapshot(&release_submitted_dmabuf),
+        None
     );
 
     renderer.pending_sampled_dmabuf_import_obligations.clear();
