@@ -848,6 +848,7 @@ impl SampledDmabufWaylandTextureCachePolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandTextureCacheReplacementReleaseReachability {
     dmabuf: WeakDmabuf,
+    renderer_context: Option<ContextId<VulkanTexture>>,
 }
 
 #[allow(dead_code)]
@@ -856,11 +857,26 @@ impl SampledDmabufWaylandTextureCacheReplacementReleaseReachability {
     fn new_for_tests(dmabuf: &Dmabuf) -> Self {
         Self {
             dmabuf: dmabuf.weak(),
+            renderer_context: None,
         }
     }
 
     fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
         self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+
+    fn validate_renderer_context(
+        &self,
+        renderer_context: &ContextId<VulkanTexture>,
+    ) -> Result<(), VulkanError> {
+        match self.renderer_context.as_ref() {
+            Some(stored_context) if stored_context != renderer_context => {
+                Err(VulkanError::UnsupportedOperation(
+                    "sampled dmabuf Wayland import_surface post-retired-release renderer identity",
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -4071,6 +4087,7 @@ impl VulkanRenderer {
         if post_retired_release_import {
             Ok(SampledDmabufWaylandTextureCacheReplacementReleaseReachability {
                 dmabuf: dmabuf.weak(),
+                renderer_context: Some(self.context_id.clone()),
             })
         } else {
             Err(VulkanError::MissingCapability(
@@ -4233,6 +4250,7 @@ impl VulkanRenderer {
                 "sampled dmabuf Wayland import_surface post-retired-release call site identity",
             ));
         }
+        replacement_release_reachability.validate_renderer_context(&self.context_id)?;
 
         let Some(release_hook) = context.texture_cache_release_hook.as_ref() else {
             return Err(VulkanError::MissingCapability(

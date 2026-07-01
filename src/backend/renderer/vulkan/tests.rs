@@ -9343,6 +9343,26 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland import_surface post-retired-release call site identity"
         ))
     ));
+    let other_renderer_replacement_reachability = VulkanRenderer::new_scaffold_for_tests();
+    let foreign_renderer_replacement_reachability = other_renderer_replacement_reachability
+        .validate_sampled_dmabuf_wayland_texture_cache_replacement_reachability_contract(&policy_dmabuf, true)
+        .unwrap();
+    let mut foreign_renderer_replacement_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
+        &policy_import,
+        &policy_acquire_evidence,
+        &policy_release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    foreign_renderer_replacement_context.texture_cache_replacement_release_reachability =
+        Some(foreign_renderer_replacement_reachability);
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&foreign_renderer_replacement_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland import_surface post-retired-release renderer identity"
+        ))
+    ));
     let mut missing_cache_hook_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
         &policy_dmabuf,
         &policy_import,
