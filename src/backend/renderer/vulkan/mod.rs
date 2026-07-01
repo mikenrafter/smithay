@@ -1389,7 +1389,7 @@ pub(crate) struct VulkanWaylandDmabufSampledImportAdmission<'a> {
     producer_evidence: &'a VulkanDmabufLoopbackImportEvidence,
     imported_syncable: Option<VulkanWaylandDmabufSampledImportSyncableProof>,
     imported_view: Option<VulkanWaylandDmabufSampledImportViewProof>,
-    acquire_sync_orders_producer_release: bool,
+    acquire_ordering: Option<VulkanWaylandDmabufSampledImportAcquireOrderingProof<'a>>,
     renderer_utils_lifecycle_declared: bool,
 }
 
@@ -1440,6 +1440,110 @@ impl VulkanWaylandDmabufSampledImportSyncableProof {
                         .sync_plane(idx, DmabufSyncFlags::READ | DmabufSyncFlags::END)
                         .is_ok()
             })
+    }
+}
+
+/// Validation-stage proof that a Wayland acquire point orders the controlled producer release.
+///
+/// This is an explicit compositor/producer assertion bound to the producer evidence and imported
+/// Smithay dmabuf wrapper. It does not infer ordering from the presence of a drm-syncobj acquire point
+/// alone, and it does not prove Vulkan image layout or queue-family ownership. Admission separately
+/// verifies that the current renderer-managed buffer still carries an acquire point before recording
+/// sampled-import evidence.
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[derive(Debug, Clone)]
+pub(crate) struct VulkanWaylandDmabufSampledImportAcquireOrderingProof<'a> {
+    producer_dmabuf: WeakDmabuf,
+    producer_evidence: &'a VulkanDmabufLoopbackImportEvidence,
+    imported_dmabuf: WeakDmabuf,
+    commit_token: Weak<()>,
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[allow(dead_code)]
+impl<'a> VulkanWaylandDmabufSampledImportAcquireOrderingProof<'a> {
+    /// Assert that `buffer`'s Wayland acquire point orders `producer_evidence.acquire_sync()`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prove that `buffer` belongs to the same current Wayland commit as
+    /// `imported_dmabuf`, and that waiting for its acquire point orders the release dependency exposed by
+    /// `producer_evidence.acquire_sync()` for `producer_dmabuf`. This constructor does not inspect or
+    /// transfer syncobj timelines and does not derive Vulkan external state from Wayland protocol data.
+    pub(crate) unsafe fn assume_wayland_acquire_orders_loopback_release(
+        producer_dmabuf: &Dmabuf,
+        producer_evidence: &'a VulkanDmabufLoopbackImportEvidence,
+        imported_dmabuf: &Dmabuf,
+        buffer: &super::utils::Buffer,
+    ) -> Result<Self, VulkanError> {
+        if !producer_evidence.is_for_dmabuf(producer_dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer acquire ordering evidence",
+            ));
+        }
+        let current_dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer).map_err(|_| {
+            VulkanError::UnsupportedOperation("sampled dmabuf producer acquire ordering buffer")
+        })?;
+        if current_dmabuf != imported_dmabuf {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer acquire ordering buffer identity",
+            ));
+        }
+        if buffer.acquire_point().is_none() {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf producer acquire point",
+            ));
+        }
+        let commit_token_slot = buffer
+            .user_data()
+            .get_or_insert_threadsafe(SampledDmabufWaylandCommitTokenSlot::default);
+
+        Ok(Self {
+            producer_dmabuf: producer_dmabuf.weak(),
+            producer_evidence,
+            imported_dmabuf: imported_dmabuf.weak(),
+            commit_token: Arc::downgrade(&commit_token_slot.token),
+        })
+    }
+
+    fn validate_for(
+        &self,
+        producer_dmabuf: &Dmabuf,
+        producer_evidence: &VulkanDmabufLoopbackImportEvidence,
+        imported_dmabuf: &Dmabuf,
+        buffer: &super::utils::Buffer,
+    ) -> Result<(), VulkanError> {
+        if self.producer_dmabuf.upgrade().as_ref() != Some(producer_dmabuf)
+            || self.imported_dmabuf.upgrade().as_ref() != Some(imported_dmabuf)
+            || !std::ptr::eq(self.producer_evidence, producer_evidence)
+            || !producer_evidence.is_for_dmabuf(producer_dmabuf)
+        {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer acquire ordering identity",
+            ));
+        }
+        if buffer.acquire_point().is_none() {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf producer acquire point",
+            ));
+        }
+        let Some(stored_token) = self.commit_token.upgrade() else {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer acquire ordering commit token",
+            ));
+        };
+        let Some(current_slot) = buffer.user_data().get::<SampledDmabufWaylandCommitTokenSlot>() else {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer acquire ordering commit token",
+            ));
+        };
+        if !Arc::ptr_eq(&stored_token, &current_slot.token) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer acquire ordering commit token",
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -1501,7 +1605,7 @@ impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
             producer_evidence,
             imported_syncable: None,
             imported_view: None,
-            acquire_sync_orders_producer_release: false,
+            acquire_ordering: None,
             renderer_utils_lifecycle_declared: false,
         }
     }
@@ -1524,9 +1628,12 @@ impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
         self
     }
 
-    /// Declare that the Wayland acquire synchronization orders `producer_evidence.acquire_sync()`.
-    pub(crate) fn with_acquire_sync_orders_producer_release(mut self) -> Self {
-        self.acquire_sync_orders_producer_release = true;
+    /// Attach proof that Wayland acquire synchronization orders `producer_evidence.acquire_sync()`.
+    pub(crate) fn with_acquire_ordering(
+        mut self,
+        acquire_ordering: VulkanWaylandDmabufSampledImportAcquireOrderingProof<'a>,
+    ) -> Self {
+        self.acquire_ordering = Some(acquire_ordering);
         self
     }
 
@@ -1579,11 +1686,12 @@ impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
                 "sampled dmabuf producer imported view identity",
             ));
         }
-        if !self.acquire_sync_orders_producer_release {
-            return Err(VulkanError::MissingCapability(
+        let acquire_ordering = self
+            .acquire_ordering
+            .as_ref()
+            .ok_or(VulkanError::MissingCapability(
                 "sampled dmabuf producer acquire ordering",
-            ));
-        }
+            ))?;
         if !self.renderer_utils_lifecycle_declared {
             return Err(VulkanError::MissingCapability(
                 "sampled dmabuf producer lifecycle policy",
@@ -1601,11 +1709,12 @@ impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
                     "sampled dmabuf producer current buffer identity",
                 ));
             }
-            if buffer.acquire_point().is_none() {
-                return Err(VulkanError::MissingCapability(
-                    "sampled dmabuf producer acquire point",
-                ));
-            }
+            acquire_ordering.validate_for(
+                self.producer_dmabuf,
+                self.producer_evidence,
+                committed_dmabuf,
+                buffer,
+            )?;
             if buffer.release_point().is_none() {
                 return Err(VulkanError::MissingCapability(
                     "sampled dmabuf producer release point",

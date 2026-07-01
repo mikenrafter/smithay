@@ -5877,6 +5877,17 @@ fn runtime_import_dma_wl_protocol_dmabuf_commit_samples_and_releases() {
         .expect("protocol-created dmabuf should accept DMA_BUF_SYNC");
     let imported_view = VulkanWaylandDmabufSampledImportViewProof::new(&candidate.dmabuf, &committed_dmabuf)
         .expect("protocol-created dmabuf should preserve the producer import view");
+    let acquire_ordering = unsafe {
+        // SAFETY: The runtime harness waits for the controlled producer release represented by
+        // `evidence` before signaling the Wayland acquire point for this committed dmabuf.
+        VulkanWaylandDmabufSampledImportAcquireOrderingProof::assume_wayland_acquire_orders_loopback_release(
+            &candidate.dmabuf,
+            &evidence,
+            &committed_dmabuf,
+            harness.renderer_buffer(),
+        )
+        .unwrap()
+    };
     let release_point_probe = harness
         .renderer_buffer()
         .release_point()
@@ -5886,7 +5897,7 @@ fn runtime_import_dma_wl_protocol_dmabuf_commit_samples_and_releases() {
         VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&candidate.dmabuf, &evidence)
             .with_imported_syncable(imported_syncable)
             .with_imported_view(imported_view)
-            .with_acquire_sync_orders_producer_release()
+            .with_acquire_ordering(acquire_ordering)
             .with_renderer_utils_lifecycle_declared();
     unsafe {
         // SAFETY: The admission object owns the validation-stage assertion. It has checked the
@@ -10270,7 +10281,7 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         DmabufFlags::empty(),
         &[(0, 0, 4)],
     );
-    let Some((_display, _client_side, surface, _buffer)) =
+    let Some((_display, _client_side, surface, buffer)) =
         import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
             dmabuf.clone(),
             DrmSyncPoint::invalid_for_tests(93).unwrap(),
@@ -10287,6 +10298,11 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
     let unrelated_evidence = unsafe {
         // SAFETY: This negative fixture intentionally mismatches the producer evidence identity.
         VulkanDmabufLoopbackImportEvidence::new(unrelated_dmabuf.weak(), SyncPoint::signaled())
+    };
+    let second_evidence = unsafe {
+        // SAFETY: This negative fixture intentionally represents a distinct producer release token for
+        // the same dmabuf identity.
+        VulkanDmabufLoopbackImportEvidence::new(dmabuf.weak(), SyncPoint::signaled())
     };
     let imported_view = VulkanWaylandDmabufSampledImportViewProof::new(&dmabuf, &dmabuf).unwrap();
     let same_view_other_wrapper_proof =
@@ -10308,12 +10324,51 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         // SAFETY: This negative fixture intentionally binds syncability proof to another dmabuf.
         VulkanWaylandDmabufSampledImportSyncableProof::assume_for_imported_dmabuf(&unrelated_dmabuf)
     };
+    let acquire_ordering = unsafe {
+        // SAFETY: This non-runtime admission test validates only that the proof is required and bound
+        // to the expected Smithay wrappers; it does not exercise real drm-syncobj ordering.
+        VulkanWaylandDmabufSampledImportAcquireOrderingProof::assume_wayland_acquire_orders_loopback_release(
+            &dmabuf, &evidence, &dmabuf, &buffer,
+        )
+        .unwrap()
+    };
+    let second_evidence_acquire_ordering = unsafe {
+        // SAFETY: This negative fixture intentionally binds acquire-ordering proof to a distinct
+        // producer evidence token for the same dmabuf/current buffer.
+        VulkanWaylandDmabufSampledImportAcquireOrderingProof::assume_wayland_acquire_orders_loopback_release(
+            &dmabuf,
+            &second_evidence,
+            &dmabuf,
+            &buffer,
+        )
+        .unwrap()
+    };
+    let Some((_other_display, _other_client_side, _other_surface_data, other_buffer)) =
+        import_surface_dmabuf_buffer_with_sync_points_for_tests(
+            dmabuf.clone(),
+            DrmSyncPoint::invalid_for_tests(95).unwrap(),
+            DrmSyncPoint::invalid_for_tests(96).unwrap(),
+        )
+    else {
+        return;
+    };
+    let stale_buffer_acquire_ordering = unsafe {
+        // SAFETY: This negative fixture intentionally binds acquire-ordering proof to another
+        // renderer-managed buffer wrapper for the same dmabuf.
+        VulkanWaylandDmabufSampledImportAcquireOrderingProof::assume_wayland_acquire_orders_loopback_release(
+            &dmabuf,
+            &evidence,
+            &dmabuf,
+            &other_buffer,
+        )
+        .unwrap()
+    };
 
     let mismatched_admission =
         VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &unrelated_evidence)
             .with_imported_syncable(imported_syncable.clone())
             .with_imported_view(imported_view.clone())
-            .with_acquire_sync_orders_producer_release()
+            .with_acquire_ordering(acquire_ordering.clone())
             .with_renderer_utils_lifecycle_declared();
     assert!(matches!(
         unsafe {
@@ -10342,7 +10397,7 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
             .with_imported_syncable(unrelated_syncable)
             .with_imported_view(imported_view.clone())
-            .with_acquire_sync_orders_producer_release()
+            .with_acquire_ordering(acquire_ordering.clone())
             .with_renderer_utils_lifecycle_declared();
     assert!(matches!(
         unsafe {
@@ -10370,7 +10425,7 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
             .with_imported_syncable(imported_syncable.clone())
             .with_imported_view(unrelated_view)
-            .with_acquire_sync_orders_producer_release()
+            .with_acquire_ordering(acquire_ordering.clone())
             .with_renderer_utils_lifecycle_declared();
     assert!(matches!(
         unsafe {
@@ -10386,7 +10441,7 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
             .with_imported_syncable(imported_syncable.clone())
             .with_imported_view(same_view_other_wrapper_proof)
-            .with_acquire_sync_orders_producer_release()
+            .with_acquire_ordering(acquire_ordering.clone())
             .with_renderer_utils_lifecycle_declared();
     assert!(matches!(
         unsafe {
@@ -10413,11 +10468,45 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         ))
     ));
 
+    let mismatched_ordering =
+        VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
+            .with_imported_syncable(imported_syncable.clone())
+            .with_imported_view(imported_view.clone())
+            .with_acquire_ordering(second_evidence_acquire_ordering)
+            .with_renderer_utils_lifecycle_declared();
+    assert!(matches!(
+        unsafe {
+            // SAFETY: This negative test supplies acquire-ordering proof for another producer evidence
+            // token.
+            mismatched_ordering.admit_current_surface_commit(&renderer, &surface, &dmabuf)
+        },
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf producer acquire ordering identity"
+        ))
+    ));
+
+    let stale_buffer_ordering =
+        VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
+            .with_imported_syncable(imported_syncable.clone())
+            .with_imported_view(imported_view.clone())
+            .with_acquire_ordering(stale_buffer_acquire_ordering)
+            .with_renderer_utils_lifecycle_declared();
+    assert!(matches!(
+        unsafe {
+            // SAFETY: This negative test supplies acquire-ordering proof from another current-buffer
+            // token and must reject before recording current-commit evidence.
+            stale_buffer_ordering.admit_current_surface_commit(&renderer, &surface, &dmabuf)
+        },
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf producer acquire ordering commit token"
+        ))
+    ));
+
     let missing_lifecycle =
         VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
             .with_imported_syncable(imported_syncable.clone())
             .with_imported_view(imported_view.clone())
-            .with_acquire_sync_orders_producer_release();
+            .with_acquire_ordering(acquire_ordering.clone());
     assert!(matches!(
         unsafe {
             // SAFETY: This negative test omits the renderer-utils lifecycle declaration.
@@ -10432,7 +10521,7 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
             .with_imported_syncable(imported_syncable)
             .with_imported_view(imported_view)
-            .with_acquire_sync_orders_producer_release()
+            .with_acquire_ordering(acquire_ordering)
             .with_renderer_utils_lifecycle_declared();
     unsafe {
         // SAFETY: This positive fixture provides every policy claim needed to mark the current surface
