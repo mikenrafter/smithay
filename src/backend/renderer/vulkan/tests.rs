@@ -9914,6 +9914,178 @@ fn import_dma_wl_real_buffer_requires_import_surface_reachability() {
     );
 }
 
+#[test]
+fn sampled_acquire_release_token_pairing_rejects_mismatched_or_expired_tokens() {
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let token = Arc::new(());
+    let other_token = Arc::new(());
+    let acquire = SampledDmabufAcquireSyncEvidence::new_with_commit_token(
+        &dmabuf,
+        SyncPoint::signaled(),
+        Arc::downgrade(&token),
+    );
+    let release = SampledDmabufReleaseEvidence {
+        dmabuf: dmabuf.weak(),
+        commit_token: Some(Arc::downgrade(&token)),
+    };
+    assert!(acquire.same_commit_token_as(&release).is_ok());
+
+    let mismatched_release = SampledDmabufReleaseEvidence {
+        dmabuf: dmabuf.weak(),
+        commit_token: Some(Arc::downgrade(&other_token)),
+    };
+    assert!(matches!(
+        acquire.same_commit_token_as(&mismatched_release),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland acquire/release sync commit token"
+        ))
+    ));
+
+    let unbound_acquire = SampledDmabufAcquireSyncEvidence::new(&dmabuf, SyncPoint::signaled());
+    assert!(matches!(
+        unbound_acquire.same_commit_token_as(&release),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland acquire/release sync commit token"
+        ))
+    ));
+
+    let expired_release = {
+        let expired_token = Arc::new(());
+        SampledDmabufReleaseEvidence {
+            dmabuf: dmabuf.weak(),
+            commit_token: Some(Arc::downgrade(&expired_token)),
+        }
+    };
+    assert!(matches!(
+        acquire.same_commit_token_as(&expired_release),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland acquire/release sync commit token"
+        ))
+    ));
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+#[ignore = "requires a Wayland test display for renderer-managed buffer commit tokens"]
+fn sampled_acquire_release_evidence_requires_same_buffer_token() {
+    let renderer = VulkanRenderer::new_scaffold_for_tests();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let import = VulkanDmabufImportState::from_dmabuf(&dmabuf).unwrap();
+    let unrelated_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let unbound_acquire =
+        SampledDmabufAcquireSyncEvidence::new(&dmabuf, SyncPoint::from(SignaledExportableFence));
+    let unbound_release = renderer
+        .validate_sampled_dmabuf_wayland_release_point_contract(&dmabuf, true)
+        .unwrap();
+    let (_display_a, _client_a, _surface_a, buffer_a) =
+        import_surface_dmabuf_buffer_with_sync_points_for_tests(
+            dmabuf.clone(),
+            DrmSyncPoint::invalid_for_tests(125).unwrap(),
+            DrmSyncPoint::invalid_for_tests(126).unwrap(),
+        )
+        .expect("Wayland test display is required for acquire/release token fixture");
+    let (_display_b, _client_b, _surface_b, buffer_b) =
+        import_surface_dmabuf_buffer_with_sync_points_for_tests(
+            dmabuf.clone(),
+            DrmSyncPoint::invalid_for_tests(127).unwrap(),
+            DrmSyncPoint::invalid_for_tests(128).unwrap(),
+        )
+        .expect("Wayland test display is required for acquire/release token fixture");
+
+    let tokened_acquire = renderer
+        .sampled_dmabuf_wayland_acquire_sync_evidence(&dmabuf, &buffer_a)
+        .unwrap();
+    let tokened_release = renderer
+        .sampled_dmabuf_wayland_release_evidence(&dmabuf, &buffer_a)
+        .unwrap();
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_acquire_sync_evidence(&unrelated_dmabuf, &buffer_a),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf acquire sync buffer identity"
+        ))
+    ));
+
+    let mut context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &dmabuf,
+        &import,
+        &tokened_acquire,
+        &tokened_release,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    assert!(
+        renderer
+            .validate_sampled_dmabuf_wayland_acquire_sync_policy(&context)
+            .is_ok()
+    );
+
+    let mismatched_tokened_release = renderer
+        .sampled_dmabuf_wayland_release_evidence(&dmabuf, &buffer_b)
+        .unwrap();
+    context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &dmabuf,
+        &import,
+        &tokened_acquire,
+        &mismatched_tokened_release,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_acquire_sync_policy(&context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland acquire/release sync commit token"
+        ))
+    ));
+
+    let tokened_release_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &dmabuf,
+        &import,
+        &unbound_acquire,
+        &tokened_release,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_acquire_sync_policy(&tokened_release_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland acquire/release sync commit token"
+        ))
+    ));
+
+    let tokened_acquire_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &dmabuf,
+        &import,
+        &tokened_acquire,
+        &unbound_release,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_acquire_sync_policy(&tokened_acquire_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland acquire/release sync commit token"
+        ))
+    ));
+}
+
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
 #[ignore = "requires a Wayland test display for renderer-managed buffer commit tokens"]

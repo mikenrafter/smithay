@@ -726,11 +726,16 @@ impl SampledDmabufWaylandAcquireSyncPolicy {
 }
 
 /// Evidence that a Wayland acquire sync point is tied to a sampled dmabuf identity.
+///
+/// Normal renderer-managed Wayland buffer evidence is also bound to the buffer wrapper commit token
+/// so acquire/release sync evidence cannot be mixed across same-dmabuf commits. Unbound evidence is
+/// kept for scaffold-only policy tests.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct SampledDmabufAcquireSyncEvidence {
     dmabuf: WeakDmabuf,
     sync: SyncPoint,
+    commit_token: Option<Weak<()>>,
 }
 
 #[allow(dead_code)]
@@ -739,6 +744,15 @@ impl SampledDmabufAcquireSyncEvidence {
         Self {
             dmabuf: dmabuf.weak(),
             sync,
+            commit_token: None,
+        }
+    }
+
+    fn new_with_commit_token(dmabuf: &Dmabuf, sync: SyncPoint, commit_token: Weak<()>) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+            sync,
+            commit_token: Some(commit_token),
         }
     }
 
@@ -748,6 +762,37 @@ impl SampledDmabufAcquireSyncEvidence {
 
     fn sync(&self) -> &SyncPoint {
         &self.sync
+    }
+
+    fn same_commit_token_as(
+        &self,
+        release_evidence: &SampledDmabufReleaseEvidence,
+    ) -> Result<(), VulkanError> {
+        match (&self.commit_token, &release_evidence.commit_token) {
+            (None, None) => Ok(()),
+            (Some(acquire_token), Some(release_token)) => {
+                let Some(acquire_token) = acquire_token.upgrade() else {
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf Wayland acquire/release sync commit token",
+                    ));
+                };
+                let Some(release_token) = release_token.upgrade() else {
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf Wayland acquire/release sync commit token",
+                    ));
+                };
+                if Arc::ptr_eq(&acquire_token, &release_token) {
+                    Ok(())
+                } else {
+                    Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf Wayland acquire/release sync commit token",
+                    ))
+                }
+            }
+            _ => Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland acquire/release sync commit token",
+            )),
+        }
     }
 }
 
@@ -3279,10 +3324,26 @@ impl VulkanRenderer {
     ) -> Result<SampledDmabufAcquireSyncEvidence, VulkanError> {
         #[cfg(feature = "backend_drm")]
         {
+            let current_dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
+                .map_err(|_| VulkanError::UnsupportedOperation("sampled dmabuf acquire sync buffer"))?;
+            if current_dmabuf != dmabuf {
+                return Err(VulkanError::UnsupportedOperation(
+                    "sampled dmabuf acquire sync buffer identity",
+                ));
+            }
             let acquire_sync = buffer.acquire_point().cloned().map(SyncPoint::from);
             self.validate_sampled_dmabuf_wayland_acquire_sync_contract(acquire_sync.as_ref())?;
+            let commit_token_slot = buffer
+                .user_data()
+                .get_or_insert_threadsafe(SampledDmabufWaylandCommitTokenSlot::default);
             acquire_sync
-                .map(|sync| SampledDmabufAcquireSyncEvidence::new(dmabuf, sync))
+                .map(|sync| {
+                    SampledDmabufAcquireSyncEvidence::new_with_commit_token(
+                        dmabuf,
+                        sync,
+                        Arc::downgrade(&commit_token_slot.token),
+                    )
+                })
                 .ok_or(VulkanError::NotPublicAdvertised("sampled dmabuf implicit sync"))
         }
 
@@ -3945,6 +4006,9 @@ impl VulkanRenderer {
                 "sampled dmabuf acquire sync identity",
             ));
         }
+        context
+            .acquire_sync
+            .same_commit_token_as(context.release_evidence)?;
         self.validate_sampled_dmabuf_wayland_acquire_sync_contract(Some(context.acquire_sync.sync()))?;
         Ok(SampledDmabufWaylandAcquireSyncPolicy {
             dmabuf: context.dmabuf.weak(),
