@@ -57,7 +57,7 @@
 use std::{
     collections::HashMap,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
-    sync::Mutex,
+    sync::{Arc, Mutex, Weak},
 };
 
 #[cfg(all(
@@ -253,6 +253,18 @@ struct SampledDmabufWaylandForeignGeneralEvidenceSlot {
     evidence: Mutex<Option<SampledDmabufWaylandForeignGeneralEvidence>>,
 }
 
+#[derive(Debug)]
+#[allow(dead_code)]
+struct SampledDmabufWaylandCommitTokenSlot {
+    token: Arc<()>,
+}
+
+impl Default for SampledDmabufWaylandCommitTokenSlot {
+    fn default() -> Self {
+        Self { token: Arc::new(()) }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum SampledDmabufWaylandExternalStateUse {
@@ -266,21 +278,27 @@ enum SampledDmabufWaylandExternalStateUse {
 /// separate from linux-dmabuf metadata and explicit-sync points: those describe buffer layout data and
 /// ordering, but not the Vulkan image layout or queue-family ownership needed by the sampled import
 /// acquire barrier.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct SampledDmabufWaylandForeignGeneralEvidence {
     dmabuf: WeakDmabuf,
     use_case: SampledDmabufWaylandExternalStateUse,
     external_state: SampledDmabufExternalImageState,
+    commit_token: Option<Weak<()>>,
 }
 
 #[allow(dead_code)]
 impl SampledDmabufWaylandForeignGeneralEvidence {
-    unsafe fn new(dmabuf: WeakDmabuf, use_case: SampledDmabufWaylandExternalStateUse) -> Self {
+    unsafe fn new(
+        dmabuf: WeakDmabuf,
+        use_case: SampledDmabufWaylandExternalStateUse,
+        commit_token: Weak<()>,
+    ) -> Self {
         Self {
             dmabuf,
             use_case,
             external_state: SampledDmabufExternalImageState::foreign_general(),
+            commit_token: Some(commit_token),
         }
     }
 
@@ -290,6 +308,7 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
             dmabuf: dmabuf.weak(),
             use_case: SampledDmabufWaylandExternalStateUse::FirstImport,
             external_state: SampledDmabufExternalImageState::foreign_general(),
+            commit_token: None,
         }
     }
 
@@ -299,6 +318,7 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
             dmabuf: dmabuf.weak(),
             use_case: SampledDmabufWaylandExternalStateUse::CurrentReacquire,
             external_state: SampledDmabufExternalImageState::foreign_general(),
+            commit_token: None,
         }
     }
 
@@ -311,11 +331,36 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
             dmabuf: dmabuf.weak(),
             use_case: SampledDmabufWaylandExternalStateUse::FirstImport,
             external_state,
+            commit_token: None,
         }
     }
 
     fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
         self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    fn validate_commit_token(&self, user_data: &UserDataMap) -> Result<(), VulkanError> {
+        let Some(commit_token) = self.commit_token.as_ref() else {
+            return Ok(());
+        };
+        let Some(stored_token) = commit_token.upgrade() else {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland external-state commit token",
+            ));
+        };
+        let Some(current_slot) = user_data.get::<SampledDmabufWaylandCommitTokenSlot>() else {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland external-state commit token",
+            ));
+        };
+        if !Arc::ptr_eq(&stored_token, &current_slot.token) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland external-state commit token",
+            ));
+        }
+
+        Ok(())
     }
 
     fn layout_history_for_policy(&self) -> SampledDmabufWaylandLayoutHistory {
@@ -1859,12 +1904,18 @@ impl VulkanRenderer {
     ) -> Result<(), VulkanError> {
         let slot =
             user_data.get_or_insert_threadsafe(SampledDmabufWaylandForeignGeneralEvidenceSlot::default);
+        let commit_token_slot =
+            user_data.get_or_insert_threadsafe(SampledDmabufWaylandCommitTokenSlot::default);
         let mut evidence = slot.evidence.lock().map_err(|_| {
             VulkanError::UnsupportedOperation("sampled dmabuf Wayland external-state evidence")
         })?;
         *evidence = Some(unsafe {
             // SAFETY: Forwarded from this unsafe evidence-marking helper's caller.
-            SampledDmabufWaylandForeignGeneralEvidence::new(dmabuf.weak(), use_case)
+            SampledDmabufWaylandForeignGeneralEvidence::new(
+                dmabuf.weak(),
+                use_case,
+                Arc::downgrade(&commit_token_slot.token),
+            )
         });
         Ok(())
     }
@@ -2722,6 +2773,7 @@ impl VulkanRenderer {
                 "sampled dmabuf Wayland external-state identity",
             ));
         }
+        evidence.validate_commit_token(user_data)?;
         Ok(Some(evidence.clone()))
     }
 

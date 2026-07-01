@@ -8343,6 +8343,68 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         .unwrap();
     assert!(stored_external_state.is_for_dmabuf(&policy_dmabuf));
     assert!(!stored_external_state.is_for_dmabuf(&unrelated_dmabuf));
+    let stale_user_data_external_state = UserDataMap::new();
+    let stale_slot = stale_user_data_external_state
+        .get_or_insert_threadsafe(SampledDmabufWaylandForeignGeneralEvidenceSlot::default);
+    stale_user_data_external_state.get_or_insert_threadsafe(SampledDmabufWaylandCommitTokenSlot::default);
+    *stale_slot.evidence.lock().unwrap() = Some(stored_external_state.clone());
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_user_data_foreign_general_evidence(
+            &stale_user_data_external_state,
+            &policy_dmabuf,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland external-state commit token"
+        ))
+    ));
+    let missing_token_user_data_external_state = UserDataMap::new();
+    let missing_token_slot = missing_token_user_data_external_state
+        .get_or_insert_threadsafe(SampledDmabufWaylandForeignGeneralEvidenceSlot::default);
+    *missing_token_slot.evidence.lock().unwrap() = Some(stored_external_state.clone());
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_user_data_foreign_general_evidence(
+            &missing_token_user_data_external_state,
+            &policy_dmabuf,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland external-state commit token"
+        ))
+    ));
+    let orphaned_external_state = {
+        let orphaned_user_data_external_state = UserDataMap::new();
+        unsafe {
+            // SAFETY: This unit test only validates wrapper-local commit-token lifetime. It performs
+            // no Vulkan import, acquire, sampling, or release operation with the constructed evidence.
+            VulkanRenderer::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+                &orphaned_user_data_external_state,
+                &policy_dmabuf,
+                SampledDmabufWaylandExternalStateUse::FirstImport,
+            )
+            .unwrap();
+        }
+        renderer
+            .sampled_dmabuf_wayland_user_data_foreign_general_evidence(
+                &orphaned_user_data_external_state,
+                &policy_dmabuf,
+            )
+            .unwrap()
+            .unwrap()
+    };
+    let orphaned_read_user_data_external_state = UserDataMap::new();
+    let orphaned_read_slot = orphaned_read_user_data_external_state
+        .get_or_insert_threadsafe(SampledDmabufWaylandForeignGeneralEvidenceSlot::default);
+    orphaned_read_user_data_external_state
+        .get_or_insert_threadsafe(SampledDmabufWaylandCommitTokenSlot::default);
+    *orphaned_read_slot.evidence.lock().unwrap() = Some(orphaned_external_state);
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_user_data_foreign_general_evidence(
+            &orphaned_read_user_data_external_state,
+            &policy_dmabuf,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland external-state commit token"
+        ))
+    ));
     assert!(matches!(
         renderer.sampled_dmabuf_wayland_user_data_foreign_general_evidence(
             &user_data_external_state,
