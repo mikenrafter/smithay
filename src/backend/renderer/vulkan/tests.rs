@@ -7137,6 +7137,251 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
     drop(surface);
 }
 
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format and DRM syncobj"]
+fn runtime_import_dma_wl_replacement_failure_releases_cached_dmabuf() {
+    let test_name = "Vulkan ImportDmaWl replacement failure release test";
+    let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
+        return;
+    };
+    let Some(drm_device) = candidate.drm_syncobj_device.clone() else {
+        eprintln!("skipping {test_name}: no DRM device for syncobj timeline");
+        return;
+    };
+    let usage = ImageUsageFlags::COLOR_ATTACHMENT
+        | ImageUsageFlags::SAMPLED
+        | ImageUsageFlags::TRANSFER_SRC
+        | ImageUsageFlags::TRANSFER_DST;
+
+    let first_allocator_release = unsafe {
+        // SAFETY: The first dmabuf was just exported from `candidate.image`, and this ignored runtime
+        // test does not hand it to any other API before asking the allocator to release the fresh image
+        // to FOREIGN/GENERAL for the renderer acquire below.
+        candidate
+            .allocator
+            .release_dmabuf_to_foreign_general(&candidate.image, &candidate.dmabuf)
+    }
+    .expect("release first allocator dmabuf to foreign GENERAL");
+
+    let mut first_target = unsafe {
+        // SAFETY: `first_allocator_release` proves that the allocator-owned image backing this
+        // exported dmabuf was released to VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL layout. There is no
+        // intervening access before this renderer acquire.
+        candidate
+            .renderer
+            .bind_allocator_released_dmabuf_render_target(&mut candidate.dmabuf, first_allocator_release)
+    }
+    .expect("bind first allocator-released dmabuf as Vulkan render target")
+    .expect("renderer should advertise the selected first dmabuf render-target modifier");
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = candidate
+            .renderer
+            .render(&mut first_target, (4, 4).into(), Transform::Normal)
+            .expect("render first loopback dmabuf target before failed replacement");
+        frame
+            .clear(Color32F::new(0.625, 0.25, 0.875, 1.0), &full_damage)
+            .expect("clear first loopback dmabuf render target before failed replacement");
+    }
+
+    let first_evidence = match candidate
+        .renderer
+        .release_dmabuf_render_target_for_sampled_loopback(&mut first_target, true)
+    {
+        Ok(Some(evidence)) => evidence,
+        Ok(None) => panic!("first loopback release should produce sampled import evidence"),
+        Err(VulkanError::UnsupportedOperation("sync-file semaphore export")) => {
+            eprintln!("skipping {test_name}: sync-file export unsupported");
+            candidate
+                .renderer
+                .release_dmabuf_render_target_for_sampled_loopback(&mut first_target, false)
+                .expect("release first loopback render target without exported sync after export skip");
+            return;
+        }
+        Err(err) => {
+            panic!("release first loopback render target to foreign GENERAL with exported sync: {err:?}")
+        }
+    };
+    drop(first_target);
+    assert!(first_evidence.is_for_dmabuf(&candidate.dmabuf));
+
+    let (first_acquire_point, first_release_point) =
+        DrmSyncPoint::timeline_pair_for_tests(&drm_device, 51, 52)
+            .expect("create first DRM syncobj acquire/release timeline points");
+    if !import_or_signal_wayland_acquire_point_for_tests(
+        test_name,
+        first_evidence.acquire_sync(),
+        &first_acquire_point,
+    ) {
+        return;
+    }
+    let first_release_point_probe = first_release_point.clone();
+
+    let Some((first_display, _first_client_side, surface, first_buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+            candidate.dmabuf.clone(),
+            first_acquire_point,
+            first_release_point,
+        )
+    else {
+        return;
+    };
+    unsafe {
+        // SAFETY: `first_evidence` proves this exact Smithay-controlled loopback dmabuf was released
+        // to FOREIGN ownership in GENERAL layout, and its release sync was attached to or waited before
+        // the first Wayland acquire point. The replacement commit below intentionally omits admission
+        // evidence for a different dmabuf, so the only expected Vulkan side effect is release of this
+        // already-cached first texture before the replacement import fails.
+        candidate
+            .renderer
+            .mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
+                &surface,
+                &candidate.dmabuf,
+                &first_evidence,
+            )
+            .unwrap();
+        candidate
+            .renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
+                &first_buffer,
+                &candidate.dmabuf,
+            )
+            .unwrap();
+    }
+
+    crate::wayland::compositor::with_states(&surface, |states| {
+        crate::backend::renderer::utils::import_surface(&mut candidate.renderer, states)
+    })
+    .expect("normal ImportDmaWl import_surface should import first sampled loopback dmabuf");
+    assert!(
+        first_buffer.release_point().is_none(),
+        "first ImportDmaWl texture construction must take the first Wayland release ownership"
+    );
+    assert_eq!(
+        candidate
+            .renderer
+            .sampled_dmabuf_layout_history(&candidate.dmabuf),
+        SampledDmabufWaylandLayoutHistory::LocallyAcquired
+    );
+    crate::wayland::compositor::with_states(&surface, |states| {
+        let data = states
+            .data_map
+            .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
+            .expect("first import should preserve renderer surface state before failed replacement");
+        let data = data.lock().unwrap();
+        assert!(
+            data.texture(candidate.renderer.context_id()).is_some(),
+            "first import should cache a Vulkan texture before failed replacement"
+        );
+    });
+
+    let mut first_release_satisfied_for_cleanup = false;
+    let replacement_failure_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(first_buffer);
+
+        let second_image = candidate
+            .allocator
+            .create_buffer_with_usage(4, 4, candidate.format.code, &[candidate.format.modifier], usage)
+            .expect("allocate replacement dmabuf image");
+        let second_dmabuf = second_image.export().expect("export replacement dmabuf");
+        assert_eq!(second_dmabuf.format(), candidate.format);
+
+        let (second_acquire_point, second_release_point) =
+            DrmSyncPoint::timeline_pair_for_tests(&drm_device, 53, 54)
+                .expect("create replacement DRM syncobj acquire/release timeline points");
+        second_acquire_point
+            .signal()
+            .expect("signal replacement acquire point before expected admission failure");
+        let second_release_point_probe = second_release_point.clone();
+
+        let display_handle = first_display.handle();
+        let second_buffer = update_import_wl_surface_dmabuf_buffer_with_sync_points_for_tests(
+            &display_handle,
+            &surface,
+            second_dmabuf.clone(),
+            second_acquire_point,
+            second_release_point,
+        );
+        assert!(
+            second_buffer.release_point().is_some(),
+            "replacement buffer should keep release point before failed import"
+        );
+        assert_buffer_release_point_matches_for_tests(
+            &second_buffer,
+            &second_release_point_probe,
+            "replacement buffer should keep exact release point before failed import",
+        );
+
+        let replacement_error = crate::wayland::compositor::with_states(&surface, |states| {
+            crate::backend::renderer::utils::import_surface(&mut candidate.renderer, states)
+        })
+        .expect_err("replacement without external-state evidence should fail admission");
+        assert!(matches!(
+            replacement_error,
+            VulkanError::MissingCapability("sampled dmabuf Wayland Vulkan first-import layout policy")
+        ));
+
+        first_release_point_probe
+            .wait(1_000_000_000)
+            .expect("failed replacement import should still signal first Wayland release point");
+        first_release_satisfied_for_cleanup = true;
+        assert!(
+            second_buffer.release_point().is_some(),
+            "failed replacement import must not consume the replacement Wayland release ownership"
+        );
+        assert!(
+            second_release_point_probe.wait(0).is_err(),
+            "failed replacement import must not signal the replacement release point"
+        );
+
+        crate::wayland::compositor::with_states(&surface, |states| {
+            let data = states
+                .data_map
+                .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
+                .expect("failed replacement should preserve renderer surface state");
+            let data = data.lock().unwrap();
+            assert!(
+                data.texture(candidate.renderer.context_id()).is_none(),
+                "failed replacement should leave no active cached Vulkan texture"
+            );
+        });
+        assert_eq!(
+            candidate
+                .renderer
+                .sampled_dmabuf_layout_history(&candidate.dmabuf),
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+        );
+        assert_eq!(
+            candidate.renderer.sampled_dmabuf_layout_history(&second_dmabuf),
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory
+        );
+        assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
+        assert!(matches!(
+            candidate
+                .renderer
+                .validate_sampled_dmabuf_public_advertisement_contract(),
+            Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        ));
+
+        drop(second_buffer);
+    }));
+
+    if let Err(payload) = replacement_failure_result {
+        if !first_release_satisfied_for_cleanup {
+            retire_import_wl_surface_textures_and_wait_for_tests(
+                &mut candidate.renderer,
+                &surface,
+                &first_release_point_probe,
+                "panic cleanup should signal first Wayland release point after failed replacement",
+            );
+        }
+        std::panic::resume_unwind(payload);
+    }
+    drop(surface);
+}
+
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format and sync-file export"]
 fn runtime_dmabuf_loopback_reimports_after_sampled_release_with_exported_sync() {
