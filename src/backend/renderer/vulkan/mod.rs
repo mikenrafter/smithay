@@ -1366,6 +1366,168 @@ impl VulkanDmabufLoopbackImportEvidence {
     }
 }
 
+/// Validation-stage admission for importing a current Wayland dmabuf commit as a sampled Vulkan image.
+///
+/// This keeps producer/compositor policy separate from raw linux-dmabuf metadata. The producer evidence
+/// proves a controlled Smithay Vulkan producer released the source dmabuf to `FOREIGN + GENERAL`; the
+/// remaining flags are explicit compositor assertions about the committed Wayland buffer and its normal
+/// renderer-utils lifecycle. The admission helper validates those assertions against the current
+/// renderer-managed surface buffer before recording the wrapper-local evidence consumed by [`ImportDmaWl`].
+///
+/// This crate-internal type does not public-advertise generic sampled [`ImportDma`] support and must
+/// not be used as proof for arbitrary client dmabufs unless a real producer contract establishes the
+/// same Vulkan external-state and synchronization guarantees.
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct VulkanWaylandDmabufSampledImportAdmission<'a> {
+    producer_dmabuf: &'a Dmabuf,
+    producer_evidence: &'a VulkanDmabufLoopbackImportEvidence,
+    imported_dmabuf_syncable: bool,
+    imported_dmabuf_matches_expected: bool,
+    acquire_sync_orders_producer_release: bool,
+    renderer_utils_lifecycle_declared: bool,
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[allow(dead_code)]
+impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
+    /// Create an admission policy tied to controlled Smithay Vulkan producer evidence.
+    pub(crate) fn from_loopback_evidence(
+        producer_dmabuf: &'a Dmabuf,
+        producer_evidence: &'a VulkanDmabufLoopbackImportEvidence,
+    ) -> Self {
+        Self {
+            producer_dmabuf,
+            producer_evidence,
+            imported_dmabuf_syncable: false,
+            imported_dmabuf_matches_expected: false,
+            acquire_sync_orders_producer_release: false,
+            renderer_utils_lifecycle_declared: false,
+        }
+    }
+
+    /// Declare whether the imported Wayland dmabuf is backed by a kernel-syncable dma-buf fd.
+    pub(crate) fn with_imported_dmabuf_syncable(mut self, imported_dmabuf_syncable: bool) -> Self {
+        self.imported_dmabuf_syncable = imported_dmabuf_syncable;
+        self
+    }
+
+    /// Declare whether protocol import preserved the producer dmabuf metadata expected by the caller.
+    ///
+    /// For validation-stage loopback this must cover the size, FourCC, modifier, flags, plane count,
+    /// plane offsets, strides, and fd-backed dma-buf identity expected by the controlled producer.
+    pub(crate) fn with_imported_dmabuf_matches_expected(
+        mut self,
+        imported_dmabuf_matches_expected: bool,
+    ) -> Self {
+        self.imported_dmabuf_matches_expected = imported_dmabuf_matches_expected;
+        self
+    }
+
+    /// Declare that the Wayland acquire synchronization orders `producer_evidence.acquire_sync()`.
+    pub(crate) fn with_acquire_sync_orders_producer_release(mut self) -> Self {
+        self.acquire_sync_orders_producer_release = true;
+        self
+    }
+
+    /// Declare that the compositor will use normal renderer-utils release hooks for this surface cache.
+    pub(crate) fn with_renderer_utils_lifecycle_declared(mut self) -> Self {
+        self.renderer_utils_lifecycle_declared = true;
+        self
+    }
+
+    /// Admit the current renderer-managed dmabuf commit for validation-stage sampled import.
+    ///
+    /// The helper verifies producer evidence identity, caller-supplied protocol/sync/lifecycle
+    /// declarations, current surface state, current dmabuf identity, and explicit acquire/release
+    /// points before recording external-state and lifecycle evidence on the current buffer wrapper.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prove that `producer_evidence` describes the image state of this exact current
+    /// Wayland commit, that no intervening access changed the image's external state, and that the
+    /// acquire point on `surface` orders the producer release to `VK_QUEUE_FAMILY_FOREIGN_EXT` in
+    /// `VK_IMAGE_LAYOUT_GENERAL`. The renderer-utils lifecycle declaration must cover replacement,
+    /// no-next-import, surface reset/drop, and renderer teardown release paths for this renderer.
+    pub(crate) unsafe fn admit_current_surface_commit(
+        &self,
+        renderer: &VulkanRenderer,
+        surface: &WlSurface,
+        committed_dmabuf: &Dmabuf,
+    ) -> Result<(), VulkanError> {
+        if !self.producer_evidence.is_for_dmabuf(self.producer_dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer evidence",
+            ));
+        }
+        if !self.imported_dmabuf_syncable {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf producer syncable dmabuf",
+            ));
+        }
+        if !self.imported_dmabuf_matches_expected {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer metadata",
+            ));
+        }
+        if !self.acquire_sync_orders_producer_release {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf producer acquire ordering",
+            ));
+        }
+        if !self.renderer_utils_lifecycle_declared {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf producer lifecycle policy",
+            ));
+        }
+
+        super::utils::with_renderer_surface_state(surface, |state| {
+            let buffer = state.buffer().ok_or(VulkanError::MissingCapability(
+                "sampled dmabuf producer current buffer",
+            ))?;
+            let current_dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
+                .map_err(|_| VulkanError::UnsupportedOperation("sampled dmabuf producer current buffer"))?;
+            if current_dmabuf != committed_dmabuf {
+                return Err(VulkanError::UnsupportedOperation(
+                    "sampled dmabuf producer current buffer identity",
+                ));
+            }
+            if buffer.acquire_point().is_none() {
+                return Err(VulkanError::MissingCapability(
+                    "sampled dmabuf producer acquire point",
+                ));
+            }
+            if buffer.release_point().is_none() {
+                return Err(VulkanError::MissingCapability(
+                    "sampled dmabuf producer release point",
+                ));
+            }
+
+            Ok(())
+        })
+        .unwrap_or(Err(VulkanError::MissingCapability(
+            "sampled dmabuf producer renderer surface state",
+        )))?;
+
+        unsafe {
+            // SAFETY: Forwarded from this admission method's caller. The checks above only validate
+            // the current Smithay object identities and required declarations before recording the
+            // explicit validation-stage evidence.
+            renderer.assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import(
+                surface,
+                committed_dmabuf,
+            )?;
+            renderer.mark_wayland_surface_current_dmabuf_commit_texture_cache_release_lifecycle_for_sampled_import(
+                surface,
+                committed_dmabuf,
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
 use self::{
     device::{
         VulkanDeviceState, VulkanSampledDmabufForeignReleaseError, VulkanSyncFileSemaphore,

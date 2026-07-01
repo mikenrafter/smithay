@@ -4016,127 +4016,6 @@ struct RuntimeDmabufLoopbackCandidate {
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
-struct RuntimeImportDmaWlProtocolProducerPolicy<'a> {
-    producer_dmabuf: &'a Dmabuf,
-    producer_evidence: &'a VulkanDmabufLoopbackImportEvidence,
-    imported_dmabuf_syncable: bool,
-    imported_dmabuf_matches_expected: bool,
-    acquire_sync_orders_producer_release: bool,
-    renderer_utils_lifecycle_declared: bool,
-}
-
-#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
-impl<'a> RuntimeImportDmaWlProtocolProducerPolicy<'a> {
-    fn new(producer_dmabuf: &'a Dmabuf, producer_evidence: &'a VulkanDmabufLoopbackImportEvidence) -> Self {
-        Self {
-            producer_dmabuf,
-            producer_evidence,
-            imported_dmabuf_syncable: false,
-            imported_dmabuf_matches_expected: false,
-            acquire_sync_orders_producer_release: false,
-            renderer_utils_lifecycle_declared: false,
-        }
-    }
-
-    fn with_imported_dmabuf_syncable(mut self, imported_dmabuf_syncable: bool) -> Self {
-        self.imported_dmabuf_syncable = imported_dmabuf_syncable;
-        self
-    }
-
-    fn with_imported_dmabuf_matches_expected(mut self, imported_dmabuf_matches_expected: bool) -> Self {
-        self.imported_dmabuf_matches_expected = imported_dmabuf_matches_expected;
-        self
-    }
-
-    fn with_acquire_sync_orders_producer_release(mut self) -> Self {
-        self.acquire_sync_orders_producer_release = true;
-        self
-    }
-
-    fn with_renderer_utils_lifecycle_declared(mut self) -> Self {
-        self.renderer_utils_lifecycle_declared = true;
-        self
-    }
-
-    unsafe fn admit_current_surface_commit(
-        &self,
-        renderer: &VulkanRenderer,
-        surface: &WlSurface,
-        committed_dmabuf: &Dmabuf,
-    ) -> Result<(), VulkanError> {
-        if !self.producer_evidence.is_for_dmabuf(self.producer_dmabuf) {
-            return Err(VulkanError::UnsupportedOperation(
-                "sampled dmabuf producer evidence",
-            ));
-        }
-        if !self.imported_dmabuf_syncable {
-            return Err(VulkanError::MissingCapability(
-                "sampled dmabuf producer syncable dmabuf",
-            ));
-        }
-        if !self.imported_dmabuf_matches_expected {
-            return Err(VulkanError::UnsupportedOperation(
-                "sampled dmabuf producer metadata",
-            ));
-        }
-        if !self.acquire_sync_orders_producer_release {
-            return Err(VulkanError::MissingCapability(
-                "sampled dmabuf producer acquire ordering",
-            ));
-        }
-        if !self.renderer_utils_lifecycle_declared {
-            return Err(VulkanError::MissingCapability(
-                "sampled dmabuf producer lifecycle policy",
-            ));
-        }
-
-        crate::backend::renderer::utils::with_renderer_surface_state(surface, |state| {
-            let buffer = state.buffer().ok_or(VulkanError::MissingCapability(
-                "sampled dmabuf producer current buffer",
-            ))?;
-            let current_dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
-                .map_err(|_| VulkanError::UnsupportedOperation("sampled dmabuf producer current buffer"))?;
-            if current_dmabuf != committed_dmabuf {
-                return Err(VulkanError::UnsupportedOperation(
-                    "sampled dmabuf producer current buffer identity",
-                ));
-            }
-            if buffer.acquire_point().is_none() {
-                return Err(VulkanError::MissingCapability(
-                    "sampled dmabuf producer acquire point",
-                ));
-            }
-            if buffer.release_point().is_none() {
-                return Err(VulkanError::MissingCapability(
-                    "sampled dmabuf producer release point",
-                ));
-            }
-
-            Ok(())
-        })
-        .unwrap_or(Err(VulkanError::MissingCapability(
-            "sampled dmabuf producer renderer surface state",
-        )))?;
-
-        unsafe {
-            // SAFETY: The policy checks above establish the test producer evidence, protocol metadata
-            // preservation, explicit commit sync, and renderer-utils lifecycle declaration before
-            // delegating to the surface-scoped validation-stage Vulkan admission helpers.
-            renderer.assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import(
-                surface,
-                committed_dmabuf,
-            )?;
-            renderer.mark_wayland_surface_current_dmabuf_commit_texture_cache_release_lifecycle_for_sampled_import(
-                surface,
-                committed_dmabuf,
-            )?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 fn runtime_drm_syncobj_device_for_tests(
     physical_device: &PhysicalDevice,
     test_name: &str,
@@ -5999,16 +5878,17 @@ fn runtime_import_dma_wl_protocol_dmabuf_commit_samples_and_releases() {
         .release_point()
         .expect("protocol renderer-managed buffer should carry a release point");
 
-    let policy = RuntimeImportDmaWlProtocolProducerPolicy::new(&candidate.dmabuf, &evidence)
-        .with_imported_dmabuf_syncable(harness.evidence().imported_dmabuf_syncable)
-        .with_imported_dmabuf_matches_expected(harness.evidence().imported_dmabuf_matches_expected)
-        .with_acquire_sync_orders_producer_release()
-        .with_renderer_utils_lifecycle_declared();
+    let admission =
+        VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&candidate.dmabuf, &evidence)
+            .with_imported_dmabuf_syncable(harness.evidence().imported_dmabuf_syncable)
+            .with_imported_dmabuf_matches_expected(harness.evidence().imported_dmabuf_matches_expected)
+            .with_acquire_sync_orders_producer_release()
+            .with_renderer_utils_lifecycle_declared();
     unsafe {
-        // SAFETY: The test policy owns the validation-stage assertion. It has checked the controlled
-        // Vulkan producer evidence, protocol dmabuf metadata preservation, explicit commit sync, and
-        // renderer-utils lifecycle declaration before marking the current surface commit.
-        policy
+        // SAFETY: The admission object owns the validation-stage assertion. It has checked the
+        // controlled Vulkan producer evidence, protocol dmabuf metadata preservation, explicit commit
+        // sync, and renderer-utils lifecycle declaration before marking the current surface commit.
+        admission
             .admit_current_surface_commit(&candidate.renderer, harness.surface(), &committed_dmabuf)
             .unwrap();
     }
@@ -10398,23 +10278,25 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         VulkanDmabufLoopbackImportEvidence::new(unrelated_dmabuf.weak(), SyncPoint::signaled())
     };
 
-    let mismatched_policy = RuntimeImportDmaWlProtocolProducerPolicy::new(&dmabuf, &unrelated_evidence)
-        .with_imported_dmabuf_syncable(true)
-        .with_imported_dmabuf_matches_expected(true)
-        .with_acquire_sync_orders_producer_release()
-        .with_renderer_utils_lifecycle_declared();
+    let mismatched_admission =
+        VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &unrelated_evidence)
+            .with_imported_dmabuf_syncable(true)
+            .with_imported_dmabuf_matches_expected(true)
+            .with_acquire_sync_orders_producer_release()
+            .with_renderer_utils_lifecycle_declared();
     assert!(matches!(
         unsafe {
-            // SAFETY: This negative test supplies mismatched producer evidence, so the policy must
+            // SAFETY: This negative test supplies mismatched producer evidence, so admission must
             // reject before recording any current-commit evidence.
-            mismatched_policy.admit_current_surface_commit(&renderer, &surface, &dmabuf)
+            mismatched_admission.admit_current_surface_commit(&renderer, &surface, &dmabuf)
         },
         Err(VulkanError::UnsupportedOperation(
             "sampled dmabuf producer evidence"
         ))
     ));
 
-    let missing_syncable = RuntimeImportDmaWlProtocolProducerPolicy::new(&dmabuf, &evidence);
+    let missing_syncable =
+        VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence);
     assert!(matches!(
         unsafe {
             // SAFETY: This negative test omits the policy's syncable-dmabuf claim.
@@ -10426,7 +10308,8 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
     ));
 
     let missing_metadata =
-        RuntimeImportDmaWlProtocolProducerPolicy::new(&dmabuf, &evidence).with_imported_dmabuf_syncable(true);
+        VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
+            .with_imported_dmabuf_syncable(true);
     assert!(matches!(
         unsafe {
             // SAFETY: This negative test omits the policy's protocol metadata preservation claim.
@@ -10437,9 +10320,10 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         ))
     ));
 
-    let missing_ordering = RuntimeImportDmaWlProtocolProducerPolicy::new(&dmabuf, &evidence)
-        .with_imported_dmabuf_syncable(true)
-        .with_imported_dmabuf_matches_expected(true);
+    let missing_ordering =
+        VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
+            .with_imported_dmabuf_syncable(true)
+            .with_imported_dmabuf_matches_expected(true);
     assert!(matches!(
         unsafe {
             // SAFETY: This negative test omits the acquire-sync ordering claim.
@@ -10450,10 +10334,11 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         ))
     ));
 
-    let missing_lifecycle = RuntimeImportDmaWlProtocolProducerPolicy::new(&dmabuf, &evidence)
-        .with_imported_dmabuf_syncable(true)
-        .with_imported_dmabuf_matches_expected(true)
-        .with_acquire_sync_orders_producer_release();
+    let missing_lifecycle =
+        VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
+            .with_imported_dmabuf_syncable(true)
+            .with_imported_dmabuf_matches_expected(true)
+            .with_acquire_sync_orders_producer_release();
     assert!(matches!(
         unsafe {
             // SAFETY: This negative test omits the renderer-utils lifecycle declaration.
@@ -10464,18 +10349,26 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         ))
     ));
 
-    let complete_policy = RuntimeImportDmaWlProtocolProducerPolicy::new(&dmabuf, &evidence)
-        .with_imported_dmabuf_syncable(true)
-        .with_imported_dmabuf_matches_expected(true)
-        .with_acquire_sync_orders_producer_release()
-        .with_renderer_utils_lifecycle_declared();
+    let complete_admission =
+        VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
+            .with_imported_dmabuf_syncable(true)
+            .with_imported_dmabuf_matches_expected(true)
+            .with_acquire_sync_orders_producer_release()
+            .with_renderer_utils_lifecycle_declared();
     unsafe {
         // SAFETY: This positive fixture provides every policy claim needed to mark the current surface
         // commit; no Vulkan device import is attempted by this unit test.
-        complete_policy
+        complete_admission
             .admit_current_surface_commit(&renderer, &surface, &dmabuf)
             .unwrap();
     }
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+    assert!(matches!(
+        ImportDma::import_dmabuf(&mut VulkanRenderer::new_scaffold_for_tests(), &dmabuf, None),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf generic ImportDma external-state contract"
+        ))
+    ));
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
