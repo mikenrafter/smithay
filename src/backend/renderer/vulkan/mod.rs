@@ -322,12 +322,25 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
 
     #[cfg(test)]
     fn current_reacquire_for_tests(dmabuf: &Dmabuf) -> Self {
+        Self::current_reacquire_with_optional_release_generation_for_tests(dmabuf, None)
+    }
+
+    #[cfg(test)]
+    fn current_reacquire_with_release_generation_for_tests(dmabuf: &Dmabuf, release_generation: u64) -> Self {
+        Self::current_reacquire_with_optional_release_generation_for_tests(dmabuf, Some(release_generation))
+    }
+
+    #[cfg(test)]
+    fn current_reacquire_with_optional_release_generation_for_tests(
+        dmabuf: &Dmabuf,
+        release_generation: Option<u64>,
+    ) -> Self {
         Self {
             dmabuf: dmabuf.weak(),
             use_case: SampledDmabufWaylandExternalStateUse::CurrentReacquire,
             external_state: SampledDmabufExternalImageState::foreign_general(),
             commit_token: None,
-            release_generation: None,
+            release_generation,
         }
     }
 
@@ -449,6 +462,7 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
         self.validate_for_use(dmabuf, SampledDmabufWaylandExternalStateUse::CurrentReacquire)?;
         Ok(SampledDmabufWaylandCurrentReacquireLayoutEvidence {
             dmabuf: self.dmabuf.clone(),
+            release_generation: self.release_generation,
         })
     }
 
@@ -576,6 +590,7 @@ impl SampledDmabufWaylandReacquireLayoutPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SampledDmabufWaylandCurrentReacquireLayoutEvidence {
     dmabuf: WeakDmabuf,
+    release_generation: Option<u64>,
 }
 
 #[allow(dead_code)]
@@ -584,11 +599,29 @@ impl SampledDmabufWaylandCurrentReacquireLayoutEvidence {
     fn new_for_tests(dmabuf: &Dmabuf) -> Self {
         Self {
             dmabuf: dmabuf.weak(),
+            release_generation: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_release_generation_for_tests(dmabuf: &Dmabuf, release_generation: u64) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+            release_generation: Some(release_generation),
         }
     }
 
     fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
         self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+
+    fn validate_release_generation(&self, release_generation: Option<u64>) -> Result<(), VulkanError> {
+        match (self.release_generation, release_generation) {
+            (Some(stored), Some(current)) if stored == current => Ok(()),
+            _ => Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland current reacquire generation",
+            )),
+        }
     }
 }
 
@@ -3557,6 +3590,8 @@ impl VulkanRenderer {
                 "sampled dmabuf Wayland current reacquire identity",
             ));
         }
+        evidence
+            .validate_release_generation(self.sampled_dmabuf_release_generation_snapshot(context.dmabuf))?;
 
         Ok(evidence.clone())
     }
@@ -3580,7 +3615,12 @@ impl VulkanRenderer {
                 "sampled dmabuf Wayland Vulkan unreleased local acquire",
             )),
             SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => external_state
-                .map(|evidence| evidence.current_reacquire_layout(dmabuf))
+                .map(|evidence| {
+                    evidence.validate_release_generation(
+                        self.sampled_dmabuf_release_generation_snapshot(dmabuf),
+                    )?;
+                    evidence.current_reacquire_layout(dmabuf)
+                })
                 .transpose()?
                 .ok_or(VulkanError::MissingCapability(
                     "sampled dmabuf Wayland Vulkan current reacquire layout policy",
@@ -3617,6 +3657,8 @@ impl VulkanRenderer {
                         "sampled dmabuf Wayland current reacquire identity",
                     ));
                 }
+                evidence
+                    .validate_release_generation(self.sampled_dmabuf_release_generation_snapshot(dmabuf))?;
 
                 Ok(Some(unsafe {
                     // SAFETY: The same-dmabuf current-reacquire layout evidence is the
@@ -3746,6 +3788,7 @@ impl VulkanRenderer {
     #[cfg(feature = "wayland_frontend")]
     fn sampled_dmabuf_wayland_policy_layout_history(
         &self,
+        dmabuf: &Dmabuf,
         renderer_history: SampledDmabufWaylandLayoutHistory,
         external_state: Option<&SampledDmabufWaylandForeignGeneralEvidence>,
     ) -> Result<SampledDmabufWaylandLayoutHistory, VulkanError> {
@@ -3755,9 +3798,12 @@ impl VulkanRenderer {
             ));
         }
 
-        Ok(external_state
-            .map(SampledDmabufWaylandForeignGeneralEvidence::layout_history_for_policy)
-            .unwrap_or(renderer_history))
+        if let Some(evidence) = external_state {
+            evidence.validate_release_generation(self.sampled_dmabuf_release_generation_snapshot(dmabuf))?;
+            Ok(evidence.layout_history_for_policy())
+        } else {
+            Ok(renderer_history)
+        }
     }
 
     /// Validate the reacquire external image layout policy for a normal Wayland dmabuf.
@@ -4940,6 +4986,7 @@ impl VulkanRenderer {
         let wayland_external_state =
             self.sampled_dmabuf_wayland_buffer_foreign_general_evidence(buffer, dmabuf)?;
         let layout_history = self.sampled_dmabuf_wayland_policy_layout_history(
+            dmabuf,
             renderer_layout_history,
             wayland_external_state.as_ref(),
         )?;

@@ -8273,6 +8273,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     assert_eq!(
         renderer
             .sampled_dmabuf_wayland_policy_layout_history(
+                &policy_dmabuf,
                 SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
                 Some(&wayland_external_state),
             )
@@ -8731,11 +8732,84 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland Vulkan current reacquire layout policy"
         ))
     ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_external_state_evidence_sources(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            Some(&SampledDmabufWaylandForeignGeneralEvidence::current_reacquire_for_tests(&policy_dmabuf)),
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland external-state release generation"
+        ))
+    ));
+    renderer.record_sampled_dmabuf_released_to_foreign_general(&policy_dmabuf);
+    let stale_direct_reacquire_external_state =
+        SampledDmabufWaylandForeignGeneralEvidence::current_reacquire_with_release_generation_for_tests(
+            &policy_dmabuf,
+            renderer
+                .sampled_dmabuf_release_generation_snapshot(&policy_dmabuf)
+                .unwrap(),
+        );
+    renderer.record_sampled_dmabuf_locally_acquired(&policy_dmabuf);
+    renderer.record_sampled_dmabuf_released_to_foreign_general(&policy_dmabuf);
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_policy_layout_history(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            Some(&stale_direct_reacquire_external_state),
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland external-state release generation"
+        ))
+    ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_external_state_evidence_sources(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            Some(&stale_direct_reacquire_external_state),
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland external-state release generation"
+        ))
+    ));
     let current_reacquire_external_state =
-        SampledDmabufWaylandForeignGeneralEvidence::current_reacquire_for_tests(&policy_dmabuf);
+        SampledDmabufWaylandForeignGeneralEvidence::current_reacquire_with_release_generation_for_tests(
+            &policy_dmabuf,
+            renderer
+                .sampled_dmabuf_release_generation_snapshot(&policy_dmabuf)
+                .unwrap(),
+        );
+    let stale_derived_reacquire_layout = renderer
+        .sampled_dmabuf_wayland_current_reacquire_layout_evidence(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            Some(&current_reacquire_external_state),
+        )
+        .unwrap()
+        .unwrap();
+    renderer.record_sampled_dmabuf_locally_acquired(&policy_dmabuf);
+    renderer.record_sampled_dmabuf_released_to_foreign_general(&policy_dmabuf);
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_current_reacquire_foreign_general_evidence(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            Some(&stale_derived_reacquire_layout),
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland current reacquire generation"
+        ))
+    ));
+    let current_reacquire_external_state =
+        SampledDmabufWaylandForeignGeneralEvidence::current_reacquire_with_release_generation_for_tests(
+            &policy_dmabuf,
+            renderer
+                .sampled_dmabuf_release_generation_snapshot(&policy_dmabuf)
+                .unwrap(),
+        );
     assert_eq!(
         renderer
             .sampled_dmabuf_wayland_policy_layout_history(
+                &policy_dmabuf,
                 SampledDmabufWaylandLayoutHistory::NoRendererHistory,
                 Some(&current_reacquire_external_state),
             )
@@ -8744,6 +8818,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     );
     assert!(matches!(
         renderer.sampled_dmabuf_wayland_policy_layout_history(
+            &policy_dmabuf,
             SampledDmabufWaylandLayoutHistory::LocallyAcquired,
             Some(&current_reacquire_external_state),
         ),
@@ -8917,6 +8992,30 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     ));
     current_reacquire_context.current_reacquire_layout = Some(
         SampledDmabufWaylandCurrentReacquireLayoutEvidence::new_for_tests(&policy_dmabuf),
+    );
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_current_reacquire_layout_policy(&current_reacquire_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland current reacquire generation"
+        ))
+    ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_current_reacquire_foreign_general_evidence(
+            &policy_dmabuf,
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral,
+            current_reacquire_context.current_reacquire_layout.as_ref(),
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland current reacquire generation"
+        ))
+    ));
+    current_reacquire_context.current_reacquire_layout = Some(
+        SampledDmabufWaylandCurrentReacquireLayoutEvidence::new_with_release_generation_for_tests(
+            &policy_dmabuf,
+            renderer
+                .sampled_dmabuf_release_generation_snapshot(&policy_dmabuf)
+                .unwrap(),
+        ),
     );
     current_reacquire_context.current_reacquire_foreign_general = renderer
         .sampled_dmabuf_wayland_current_reacquire_foreign_general_evidence(
