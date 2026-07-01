@@ -857,12 +857,14 @@ struct SampledDmabufWaylandTextureCacheReleaseLifecycleSlot {
 ///
 /// This is a validation-stage marker for compositor-owned lifecycle coverage. It is tied to the
 /// Vulkan renderer context because the release call sites must use the same renderer/context that
-/// imported the sampled dmabuf texture from the Wayland surface cache.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// imported the sampled dmabuf texture from the Wayland surface cache, and to the renderer-managed
+/// buffer wrapper's commit token so copied lifecycle evidence cannot satisfy another current commit.
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct SampledDmabufWaylandTextureCacheReleaseLifecycleEvidence {
     dmabuf: WeakDmabuf,
     renderer_context: ContextId<VulkanTexture>,
+    commit_token: Weak<()>,
 }
 
 #[allow(dead_code)]
@@ -881,10 +883,15 @@ impl SampledDmabufWaylandTextureCacheReleaseLifecycle {
 
 #[allow(dead_code)]
 impl SampledDmabufWaylandTextureCacheReleaseLifecycleEvidence {
-    unsafe fn new(dmabuf: WeakDmabuf, renderer_context: ContextId<VulkanTexture>) -> Self {
+    unsafe fn new(
+        dmabuf: WeakDmabuf,
+        renderer_context: ContextId<VulkanTexture>,
+        commit_token: Weak<()>,
+    ) -> Self {
         Self {
             dmabuf,
             renderer_context,
+            commit_token,
         }
     }
 
@@ -894,6 +901,27 @@ impl SampledDmabufWaylandTextureCacheReleaseLifecycleEvidence {
 
     fn is_for_renderer_context(&self, renderer_context: &ContextId<VulkanTexture>) -> bool {
         &self.renderer_context == renderer_context
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    fn validate_commit_token(&self, user_data: &UserDataMap) -> Result<(), VulkanError> {
+        let Some(stored_token) = self.commit_token.upgrade() else {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland texture-cache release lifecycle commit token",
+            ));
+        };
+        let Some(current_slot) = user_data.get::<SampledDmabufWaylandCommitTokenSlot>() else {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland texture-cache release lifecycle commit token",
+            ));
+        };
+        if !Arc::ptr_eq(&stored_token, &current_slot.token) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland texture-cache release lifecycle commit token",
+            ));
+        }
+
+        Ok(())
     }
 
     fn release_lifecycle(
@@ -2825,6 +2853,8 @@ impl VulkanRenderer {
     ) -> Result<(), VulkanError> {
         let slot =
             user_data.get_or_insert_threadsafe(SampledDmabufWaylandTextureCacheReleaseLifecycleSlot::default);
+        let commit_token_slot =
+            user_data.get_or_insert_threadsafe(SampledDmabufWaylandCommitTokenSlot::default);
         let mut evidence = slot.evidence.lock().map_err(|_| {
             VulkanError::UnsupportedOperation("sampled dmabuf Wayland texture-cache release lifecycle")
         })?;
@@ -2833,6 +2863,7 @@ impl VulkanRenderer {
             SampledDmabufWaylandTextureCacheReleaseLifecycleEvidence::new(
                 dmabuf.weak(),
                 self.context_id.clone(),
+                Arc::downgrade(&commit_token_slot.token),
             )
         });
         Ok(())
@@ -3740,6 +3771,7 @@ impl VulkanRenderer {
             return Ok(None);
         };
 
+        evidence.validate_commit_token(user_data)?;
         evidence.release_lifecycle(dmabuf, &self.context_id).map(Some)
     }
 

@@ -8497,6 +8497,78 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         .unwrap();
     assert!(stored_lifecycle.is_for_dmabuf(&policy_dmabuf));
     assert!(!stored_lifecycle.is_for_dmabuf(&unrelated_dmabuf));
+    let stored_lifecycle_evidence = user_data_lifecycle
+        .get::<SampledDmabufWaylandTextureCacheReleaseLifecycleSlot>()
+        .unwrap()
+        .evidence
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+    let stale_lifecycle_user_data = UserDataMap::new();
+    let stale_lifecycle_slot = stale_lifecycle_user_data
+        .get_or_insert_threadsafe(SampledDmabufWaylandTextureCacheReleaseLifecycleSlot::default);
+    stale_lifecycle_user_data.get_or_insert_threadsafe(SampledDmabufWaylandCommitTokenSlot::default);
+    *stale_lifecycle_slot.evidence.lock().unwrap() = Some(stored_lifecycle_evidence.clone());
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_user_data_texture_cache_release_lifecycle(
+            &stale_lifecycle_user_data,
+            &policy_dmabuf,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland texture-cache release lifecycle commit token"
+        ))
+    ));
+    let missing_lifecycle_token_user_data = UserDataMap::new();
+    let missing_lifecycle_token_slot = missing_lifecycle_token_user_data
+        .get_or_insert_threadsafe(SampledDmabufWaylandTextureCacheReleaseLifecycleSlot::default);
+    *missing_lifecycle_token_slot.evidence.lock().unwrap() = Some(stored_lifecycle_evidence.clone());
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_user_data_texture_cache_release_lifecycle(
+            &missing_lifecycle_token_user_data,
+            &policy_dmabuf,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland texture-cache release lifecycle commit token"
+        ))
+    ));
+    let orphaned_lifecycle_evidence = {
+        let orphaned_lifecycle_user_data = UserDataMap::new();
+        unsafe {
+            // SAFETY: This unit test validates only wrapper-local lifecycle-token lifetime. It does
+            // not import, sample, release, reset, destroy, or otherwise use a real Wayland surface cache.
+            renderer
+                .mark_wayland_dmabuf_user_data_texture_cache_release_lifecycle_for_sampled_import(
+                    &orphaned_lifecycle_user_data,
+                    &policy_dmabuf,
+                )
+                .unwrap();
+        }
+        orphaned_lifecycle_user_data
+            .get::<SampledDmabufWaylandTextureCacheReleaseLifecycleSlot>()
+            .unwrap()
+            .evidence
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone()
+    };
+    let orphaned_lifecycle_destination = UserDataMap::new();
+    let orphaned_lifecycle_slot = orphaned_lifecycle_destination
+        .get_or_insert_threadsafe(SampledDmabufWaylandTextureCacheReleaseLifecycleSlot::default);
+    orphaned_lifecycle_destination.get_or_insert_threadsafe(SampledDmabufWaylandCommitTokenSlot::default);
+    *orphaned_lifecycle_slot.evidence.lock().unwrap() = Some(orphaned_lifecycle_evidence);
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_user_data_texture_cache_release_lifecycle(
+            &orphaned_lifecycle_destination,
+            &policy_dmabuf,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland texture-cache release lifecycle commit token"
+        ))
+    ));
     assert!(matches!(
         renderer.sampled_dmabuf_wayland_user_data_texture_cache_release_lifecycle(
             &user_data_lifecycle,
