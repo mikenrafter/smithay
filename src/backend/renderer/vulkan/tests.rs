@@ -9378,6 +9378,25 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             "sampled dmabuf Wayland texture-cache release hook identity"
         ))
     ));
+    let other_renderer_cache_hook = VulkanRenderer::new_scaffold_for_tests();
+    let mut foreign_renderer_cache_hook_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &policy_dmabuf,
+        &policy_import,
+        &policy_acquire_evidence,
+        &policy_release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    foreign_renderer_cache_hook_context.texture_cache_replacement_release_reachability =
+        Some(replacement_release_reachability.clone());
+    foreign_renderer_cache_hook_context.texture_cache_release_hook =
+        Some(other_renderer_cache_hook.sampled_dmabuf_wayland_texture_cache_release_hook(&policy_dmabuf));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_texture_cache_policy(&foreign_renderer_cache_hook_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland texture-cache release hook renderer identity"
+        ))
+    ));
     let mut missing_cache_lifecycle_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
         &policy_dmabuf,
         &policy_import,
@@ -9429,9 +9448,8 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     );
     cache_lifecycle_context.texture_cache_replacement_release_reachability =
         Some(replacement_release_reachability);
-    cache_lifecycle_context.texture_cache_release_hook = Some(
-        SampledDmabufWaylandTextureCacheReleaseHook::new_for_tests(&policy_dmabuf),
-    );
+    cache_lifecycle_context.texture_cache_release_hook =
+        Some(renderer.sampled_dmabuf_wayland_texture_cache_release_hook(&policy_dmabuf));
     cache_lifecycle_context.texture_cache_release_lifecycle = Some(
         SampledDmabufWaylandTextureCacheReleaseLifecycle::new_for_tests(&policy_dmabuf),
     );
