@@ -211,6 +211,20 @@ impl Backend for UdevData {
         }
     }
 
+    fn retire_surface_tree_textures(&mut self, surface: &wl_surface::WlSurface) {
+        match self.gpus.single_renderer(&self.primary_gpu) {
+            Ok(mut renderer) => {
+                if let Err(err) = smithay::backend::renderer::utils::retire_and_release_surface_tree_textures(
+                    &mut renderer,
+                    surface,
+                ) {
+                    warn!("Failed to release retired surface textures: {}", err);
+                }
+            }
+            Err(err) => warn!("Failed to get udev renderer for surface texture release: {}", err),
+        }
+    }
+
     fn update_led_state(&mut self, led_state: LedState) {
         for keyboard in self.keyboards.iter_mut() {
             keyboard.led_update(led_state.into());
