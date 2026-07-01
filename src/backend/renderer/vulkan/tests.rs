@@ -6174,6 +6174,41 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
             second_acquire_point,
             second_release_point,
         );
+        let second_imported_syncable = VulkanWaylandDmabufSampledImportSyncableProof::new(&candidate.dmabuf)
+            .expect("same-dmabuf reacquire dmabuf should accept DMA_BUF_SYNC");
+        let second_imported_view =
+            VulkanWaylandDmabufSampledImportViewProof::new(&candidate.dmabuf, &candidate.dmabuf)
+                .expect("same-dmabuf reacquire should preserve the import view");
+        let second_acquire_ordering = unsafe {
+            // SAFETY: The first renderer-utils cache release returned this dmabuf to FOREIGN/GENERAL,
+            // the test waited/signaled the second Wayland acquire point after that release, and no
+            // intervening producer use occurs before the same-dmabuf reacquire commit.
+            VulkanWaylandDmabufSampledReacquireAcquireOrderingProof::assume_wayland_acquire_orders_renderer_release(
+                &candidate.renderer,
+                &renderer_release_evidence,
+                &candidate.dmabuf,
+                &second_buffer,
+            )
+            .unwrap()
+        };
+        let second_renderer_utils_lifecycle = unsafe {
+            // SAFETY: The reacquire continues through the same live WlSurface's normal renderer-utils
+            // cache and the test releases through renderer-utils before dropping current state.
+            VulkanWaylandDmabufSampledImportRendererUtilsLifecycleProof::assume_renderer_utils_lifecycle(
+                &candidate.renderer,
+                &second_buffer,
+                &candidate.dmabuf,
+            )
+            .unwrap()
+        };
+        let reacquire_admission =
+            VulkanWaylandDmabufSampledReacquireAdmission::from_renderer_release_evidence(
+                &renderer_release_evidence,
+            )
+            .with_imported_syncable(second_imported_syncable)
+            .with_imported_view(second_imported_view)
+            .with_acquire_ordering(second_acquire_ordering)
+            .with_renderer_utils_lifecycle(second_renderer_utils_lifecycle);
         unsafe {
             // SAFETY: the immediately preceding renderer-utils cache release returned this exact
             // dmabuf to FOREIGN ownership in GENERAL layout, and `renderer_release_evidence` records the
@@ -6181,20 +6216,8 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
             // or signaled a current Wayland acquire point before the same dmabuf is reacquired through
             // the normal ImportDmaWl path on the same WlSurface, with no intervening producer use in
             // this loopback probe.
-            candidate
-                .renderer
-                .mark_wayland_surface_current_dmabuf_commit_from_renderer_release_evidence_for_sampled_import(
-                    &surface,
-                    &candidate.dmabuf,
-                    &renderer_release_evidence,
-                )
-                .unwrap();
-            candidate
-                .renderer
-                .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                    &second_buffer,
-                    &candidate.dmabuf,
-                )
+            reacquire_admission
+                .admit_current_surface_commit(&candidate.renderer, &surface, &candidate.dmabuf)
                 .unwrap();
         }
         assert_eq!(
@@ -10608,6 +10631,95 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
             "sampled dmabuf generic ImportDma external-state contract"
         ))
     ));
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_surface_reacquire_admission_rejects_stale_current_buffer_token() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    renderer.record_sampled_dmabuf_released_to_foreign_general(&dmabuf);
+    let renderer_release_evidence = renderer
+        .sampled_dmabuf_wayland_renderer_foreign_general_release_evidence_for_tests(&dmabuf)
+        .unwrap();
+    let Some((_display, _client_side, surface, current_buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+            dmabuf.clone(),
+            DrmSyncPoint::invalid_for_tests(101).unwrap(),
+            DrmSyncPoint::invalid_for_tests(102).unwrap(),
+        )
+    else {
+        return;
+    };
+    let Some((_stale_display, _stale_client_side, _stale_surface, stale_buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+            dmabuf.clone(),
+            DrmSyncPoint::invalid_for_tests(103).unwrap(),
+            DrmSyncPoint::invalid_for_tests(104).unwrap(),
+        )
+    else {
+        return;
+    };
+    let imported_syncable = unsafe {
+        // SAFETY: This non-runtime admission test uses a synthetic `/dev/null` dmabuf and validates
+        // only same-dmabuf reacquire token binding, not kernel DMA_BUF_SYNC support.
+        VulkanWaylandDmabufSampledImportSyncableProof::assume_for_imported_dmabuf(&dmabuf)
+    };
+    let imported_view = VulkanWaylandDmabufSampledImportViewProof::new(&dmabuf, &dmabuf).unwrap();
+    let stale_acquire_ordering = unsafe {
+        // SAFETY: This negative fixture intentionally binds acquire-ordering proof to another
+        // renderer-managed buffer token for the same dmabuf.
+        VulkanWaylandDmabufSampledReacquireAcquireOrderingProof::assume_wayland_acquire_orders_renderer_release(
+            &renderer,
+            &renderer_release_evidence,
+            &dmabuf,
+            &stale_buffer,
+        )
+        .unwrap()
+    };
+    let current_lifecycle = unsafe {
+        // SAFETY: This non-runtime admission test validates that the stale acquire-ordering proof is
+        // rejected before any current-buffer marker is stored.
+        VulkanWaylandDmabufSampledImportRendererUtilsLifecycleProof::assume_renderer_utils_lifecycle(
+            &renderer,
+            &current_buffer,
+            &dmabuf,
+        )
+        .unwrap()
+    };
+    let stale_token_admission = VulkanWaylandDmabufSampledReacquireAdmission::from_renderer_release_evidence(
+        &renderer_release_evidence,
+    )
+    .with_imported_syncable(imported_syncable)
+    .with_imported_view(imported_view)
+    .with_acquire_ordering(stale_acquire_ordering)
+    .with_renderer_utils_lifecycle(current_lifecycle);
+
+    assert!(matches!(
+        unsafe {
+            // SAFETY: This negative test supplies a reacquire acquire-ordering proof from a different
+            // current-buffer token, so admission must reject before recording evidence.
+            stale_token_admission.admit_current_surface_commit(&renderer, &surface, &dmabuf)
+        },
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf renderer-release reacquire commit token"
+        ))
+    ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_buffer_foreign_general_evidence(&current_buffer, &dmabuf),
+        Ok(None)
+    ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_buffer_texture_cache_release_lifecycle(&current_buffer, &dmabuf),
+        Ok(None)
+    ));
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]

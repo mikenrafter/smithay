@@ -1834,6 +1834,269 @@ impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
     }
 }
 
+#[cfg(all(test, feature = "wayland_frontend", feature = "backend_drm"))]
+#[derive(Debug, Clone)]
+struct VulkanWaylandDmabufSampledReacquireAcquireOrderingProof<'a> {
+    renderer_context: ContextId<VulkanTexture>,
+    renderer_release_evidence: &'a SampledDmabufWaylandRendererForeignGeneralReleaseEvidence,
+    imported_dmabuf: WeakDmabuf,
+    commit_token: Weak<()>,
+}
+
+#[cfg(all(test, feature = "wayland_frontend", feature = "backend_drm"))]
+impl<'a> VulkanWaylandDmabufSampledReacquireAcquireOrderingProof<'a> {
+    /// Assert that `buffer`'s Wayland acquire point orders this renderer's previous sampled release.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prove that `buffer` belongs to the same current Wayland commit as
+    /// `imported_dmabuf`, that waiting for its acquire point orders the renderer release represented by
+    /// `renderer_release_evidence`, and that no foreign producer changed the dmabuf's Vulkan external
+    /// state after that release and before this reacquire commit.
+    unsafe fn assume_wayland_acquire_orders_renderer_release(
+        renderer: &VulkanRenderer,
+        renderer_release_evidence: &'a SampledDmabufWaylandRendererForeignGeneralReleaseEvidence,
+        imported_dmabuf: &Dmabuf,
+        buffer: &super::utils::Buffer,
+    ) -> Result<Self, VulkanError> {
+        if !renderer_release_evidence.is_for_renderer_context(&renderer.context_id) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf renderer-release reacquire evidence renderer identity",
+            ));
+        }
+        if !renderer_release_evidence.is_for_dmabuf(imported_dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf renderer-release reacquire evidence identity",
+            ));
+        }
+        let current_dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer).map_err(|_| {
+            VulkanError::UnsupportedOperation("sampled dmabuf renderer-release reacquire buffer")
+        })?;
+        if current_dmabuf != imported_dmabuf {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf renderer-release reacquire buffer identity",
+            ));
+        }
+        if buffer.acquire_point().is_none() {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf renderer-release reacquire acquire point",
+            ));
+        }
+        let commit_token_slot = buffer
+            .user_data()
+            .get_or_insert_threadsafe(SampledDmabufWaylandCommitTokenSlot::default);
+
+        Ok(Self {
+            renderer_context: renderer.context_id.clone(),
+            renderer_release_evidence,
+            imported_dmabuf: imported_dmabuf.weak(),
+            commit_token: Arc::downgrade(&commit_token_slot.token),
+        })
+    }
+
+    fn validate_for(
+        &self,
+        renderer: &VulkanRenderer,
+        renderer_release_evidence: &SampledDmabufWaylandRendererForeignGeneralReleaseEvidence,
+        imported_dmabuf: &Dmabuf,
+        buffer: &super::utils::Buffer,
+    ) -> Result<(), VulkanError> {
+        if self.renderer_context != renderer.context_id
+            || !std::ptr::eq(self.renderer_release_evidence, renderer_release_evidence)
+            || !renderer_release_evidence.is_for_renderer_context(&renderer.context_id)
+            || !renderer_release_evidence.is_for_dmabuf(imported_dmabuf)
+            || self.imported_dmabuf.upgrade().as_ref() != Some(imported_dmabuf)
+        {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf renderer-release reacquire ordering identity",
+            ));
+        }
+        if buffer.acquire_point().is_none() {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf renderer-release reacquire acquire point",
+            ));
+        }
+        let Some(stored_token) = self.commit_token.upgrade() else {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf renderer-release reacquire commit token",
+            ));
+        };
+        let Some(current_slot) = buffer.user_data().get::<SampledDmabufWaylandCommitTokenSlot>() else {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf renderer-release reacquire commit token",
+            ));
+        };
+        if !Arc::ptr_eq(&stored_token, &current_slot.token) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf renderer-release reacquire commit token",
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "wayland_frontend", feature = "backend_drm"))]
+#[derive(Debug)]
+struct VulkanWaylandDmabufSampledReacquireAdmission<'a> {
+    renderer_release_evidence: &'a SampledDmabufWaylandRendererForeignGeneralReleaseEvidence,
+    imported_syncable: Option<VulkanWaylandDmabufSampledImportSyncableProof>,
+    imported_view: Option<VulkanWaylandDmabufSampledImportViewProof>,
+    acquire_ordering: Option<VulkanWaylandDmabufSampledReacquireAcquireOrderingProof<'a>>,
+    renderer_utils_lifecycle: Option<VulkanWaylandDmabufSampledImportRendererUtilsLifecycleProof>,
+}
+
+#[cfg(all(test, feature = "wayland_frontend", feature = "backend_drm"))]
+impl<'a> VulkanWaylandDmabufSampledReacquireAdmission<'a> {
+    fn from_renderer_release_evidence(
+        renderer_release_evidence: &'a SampledDmabufWaylandRendererForeignGeneralReleaseEvidence,
+    ) -> Self {
+        Self {
+            renderer_release_evidence,
+            imported_syncable: None,
+            imported_view: None,
+            acquire_ordering: None,
+            renderer_utils_lifecycle: None,
+        }
+    }
+
+    fn with_imported_syncable(
+        mut self,
+        imported_syncable: VulkanWaylandDmabufSampledImportSyncableProof,
+    ) -> Self {
+        self.imported_syncable = Some(imported_syncable);
+        self
+    }
+
+    fn with_imported_view(mut self, imported_view: VulkanWaylandDmabufSampledImportViewProof) -> Self {
+        self.imported_view = Some(imported_view);
+        self
+    }
+
+    fn with_acquire_ordering(
+        mut self,
+        acquire_ordering: VulkanWaylandDmabufSampledReacquireAcquireOrderingProof<'a>,
+    ) -> Self {
+        self.acquire_ordering = Some(acquire_ordering);
+        self
+    }
+
+    fn with_renderer_utils_lifecycle(
+        mut self,
+        renderer_utils_lifecycle: VulkanWaylandDmabufSampledImportRendererUtilsLifecycleProof,
+    ) -> Self {
+        self.renderer_utils_lifecycle = Some(renderer_utils_lifecycle);
+        self
+    }
+
+    /// Admit a same-dmabuf current commit using this renderer's previous sampled release evidence.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prove that `renderer_release_evidence` is the release event ordered by this
+    /// commit's Wayland acquire point, that no foreign producer changed the dmabuf's queue-family
+    /// ownership or image layout after that release, and that the renderer-utils lifecycle proof covers
+    /// all no-next-import/reset/drop/teardown paths for this current buffer commit. This helper records
+    /// validation-stage evidence only; the actual acquire wait and release-point transfer still happen
+    /// through the following normal `ImportDmaWl` import.
+    unsafe fn admit_current_surface_commit(
+        &self,
+        renderer: &VulkanRenderer,
+        surface: &WlSurface,
+        committed_dmabuf: &Dmabuf,
+    ) -> Result<(), VulkanError> {
+        if !self
+            .renderer_release_evidence
+            .is_for_renderer_context(&renderer.context_id)
+            || !self.renderer_release_evidence.is_for_dmabuf(committed_dmabuf)
+        {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf renderer-release reacquire evidence identity",
+            ));
+        }
+        let imported_syncable = self
+            .imported_syncable
+            .as_ref()
+            .ok_or(VulkanError::MissingCapability(
+                "sampled dmabuf imported syncable dmabuf",
+            ))?;
+        if !imported_syncable.is_for(committed_dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf imported syncable dmabuf identity",
+            ));
+        }
+        let imported_view = self.imported_view.as_ref().ok_or(VulkanError::MissingCapability(
+            "sampled dmabuf producer imported view",
+        ))?;
+        if !imported_view.is_for(committed_dmabuf, committed_dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer imported view identity",
+            ));
+        }
+        let acquire_ordering = self
+            .acquire_ordering
+            .as_ref()
+            .ok_or(VulkanError::MissingCapability(
+                "sampled dmabuf renderer-release reacquire acquire ordering",
+            ))?;
+        let renderer_utils_lifecycle =
+            self.renderer_utils_lifecycle
+                .as_ref()
+                .ok_or(VulkanError::MissingCapability(
+                    "sampled dmabuf producer lifecycle policy",
+                ))?;
+
+        super::utils::with_renderer_surface_state(surface, |state| {
+            let buffer = state.buffer().ok_or(VulkanError::MissingCapability(
+                "sampled dmabuf renderer-release reacquire current buffer",
+            ))?;
+            let current_dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer).map_err(|_| {
+                VulkanError::UnsupportedOperation("sampled dmabuf renderer-release reacquire current buffer")
+            })?;
+            if current_dmabuf != committed_dmabuf {
+                return Err(VulkanError::UnsupportedOperation(
+                    "sampled dmabuf renderer-release reacquire current buffer identity",
+                ));
+            }
+            acquire_ordering.validate_for(
+                renderer,
+                self.renderer_release_evidence,
+                committed_dmabuf,
+                buffer,
+            )?;
+            renderer_utils_lifecycle.validate_for(renderer, committed_dmabuf, buffer)?;
+            if buffer.release_point().is_none() {
+                return Err(VulkanError::MissingCapability(
+                    "sampled dmabuf renderer-release reacquire release point",
+                ));
+            }
+
+            unsafe {
+                // SAFETY: Forwarded from this admission method's caller after validation of this exact
+                // renderer-managed buffer, renderer release evidence, sync, and lifecycle proof tokens.
+                // Recording on `buffer.user_data()` avoids re-looking up a different same-dmabuf commit
+                // after token validation.
+                VulkanRenderer::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+                    buffer.user_data(),
+                    committed_dmabuf,
+                    SampledDmabufWaylandExternalStateUse::CurrentReacquire,
+                )?;
+                renderer.mark_wayland_dmabuf_user_data_texture_cache_release_lifecycle_for_sampled_import(
+                    buffer.user_data(),
+                    committed_dmabuf,
+                )?;
+            }
+
+            Ok(())
+        })
+        .unwrap_or(Err(VulkanError::MissingCapability(
+            "sampled dmabuf renderer-release reacquire renderer surface state",
+        )))?;
+
+        Ok(())
+    }
+}
+
 use self::{
     device::{
         VulkanDeviceState, VulkanSampledDmabufForeignReleaseError, VulkanSyncFileSemaphore,
