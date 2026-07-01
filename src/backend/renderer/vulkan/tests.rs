@@ -5015,6 +5015,51 @@ fn runtime_sample_texture_to_offscreen_and_assert_non_black(
     readback
 }
 
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+fn runtime_draw_wayland_surface_elements_to_offscreen_and_assert_non_black(
+    renderer: &mut VulkanRenderer,
+    elements: &[crate::backend::renderer::element::surface::WaylandSurfaceRenderElement<VulkanRenderer>],
+    render_format: Fourcc,
+    test_name: &str,
+) -> Vec<u8> {
+    let mut sample_target = renderer
+        .create_offscreen_render_target(render_format, (4, 4).into())
+        .expect("create offscreen Wayland surface element target");
+    renderer
+        .clear_offscreen_render_target(&mut sample_target, Color32F::BLACK)
+        .expect("clear Wayland surface element target before render");
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = renderer
+            .render(&mut sample_target, (4, 4).into(), Transform::Normal)
+            .expect("render into offscreen Wayland surface element target");
+        assert!(
+            crate::backend::renderer::utils::draw_render_elements::<VulkanRenderer, _, _>(
+                &mut frame,
+                1.0,
+                elements,
+                &full_damage,
+            )
+            .expect("draw Wayland surface render element")
+            .is_some(),
+            "Wayland surface render element should produce render damage"
+        );
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    let readback = renderer
+        .read_offscreen_render_target(&mut sample_target)
+        .expect("read back Wayland surface element target");
+    assert!(
+        readback
+            .chunks_exact(4)
+            .any(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0),
+        "{test_name}: Wayland surface render element should write non-black color data"
+    );
+    readback
+}
+
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
 fn runtime_dmabuf_loopback_prerequisites_find_common_exportable_modifier() {
@@ -5918,36 +5963,35 @@ fn runtime_import_dma_wl_protocol_dmabuf_commit_samples_and_releases() {
             .unwrap();
     }
 
-    crate::wayland::compositor::with_states(harness.surface(), |states| {
-        crate::backend::renderer::utils::import_surface(&mut candidate.renderer, states)
-    })
-    .expect("protocol-driven ImportDmaWl import_surface should import sampled loopback dmabuf");
+    let render_elements: Vec<
+        crate::backend::renderer::element::surface::WaylandSurfaceRenderElement<VulkanRenderer>,
+    > = crate::backend::renderer::element::surface::render_elements_from_surface_tree(
+        &mut candidate.renderer,
+        harness.surface(),
+        crate::utils::Point::from((0, 0)),
+        1.0,
+        1.0,
+        crate::backend::renderer::element::Kind::Unspecified,
+    );
+    assert_eq!(
+        render_elements.len(),
+        1,
+        "protocol-driven render element construction should import one sampled dmabuf surface"
+    );
     assert!(
         harness.renderer_buffer().release_point().is_none(),
-        "successful protocol-driven ImportDmaWl texture construction must take Wayland release ownership"
+        "successful protocol-driven WaylandSurfaceRenderElement construction must take Wayland release ownership"
     );
 
     let mut release_satisfied = false;
     let sample_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let cached_texture = {
-            crate::wayland::compositor::with_states(harness.surface(), |states| {
-                let data = states
-                    .data_map
-                    .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
-                    .expect("protocol import_surface should preserve renderer surface state");
-                let data = data.lock().unwrap();
-                data.texture(candidate.renderer.context_id())
-                    .expect("protocol ImportDmaWl import_surface should cache a Vulkan texture")
-                    .clone()
-            })
-        };
-        runtime_sample_texture_to_offscreen_and_assert_non_black(
+        runtime_draw_wayland_surface_elements_to_offscreen_and_assert_non_black(
             &mut candidate.renderer,
-            &cached_texture,
+            &render_elements,
             render_format,
             test_name,
         );
-        drop(cached_texture);
+        drop(render_elements);
         assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
         assert!(matches!(
             candidate
