@@ -134,6 +134,8 @@ pub struct UdevData {
     dh: DisplayHandle,
     dmabuf_state: Option<(DmabufState, DmabufGlobal)>,
     syncobj_state: Option<DrmSyncobjState>,
+    syncobj_acquire_source_tokens: HashMap<u64, RegistrationToken>,
+    next_syncobj_acquire_source_id: u64,
     primary_gpu: DrmNode,
     gpus: GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>,
     backends: HashMap<DrmNode, BackendData>,
@@ -161,6 +163,15 @@ impl UdevData {
 
     pub fn debug_flags(&self) -> DebugFlags {
         self.debug_flags
+    }
+
+    fn next_syncobj_acquire_source_id(&mut self) -> u64 {
+        let id = self.next_syncobj_acquire_source_id;
+        self.next_syncobj_acquire_source_id = self
+            .next_syncobj_acquire_source_id
+            .checked_add(1)
+            .expect("Anvil syncobj acquire source id space exhausted");
+        id
     }
 }
 
@@ -281,6 +292,8 @@ pub fn run_udev() {
         dh: display_handle.clone(),
         dmabuf_state: None,
         syncobj_state: None,
+        syncobj_acquire_source_tokens: HashMap::new(),
+        next_syncobj_acquire_source_id: 0,
         session,
         primary_gpu,
         gpus,
@@ -506,9 +519,9 @@ pub fn run_udev() {
         if let Some(backend) = state.backend_data.backends.get(&primary_node) {
             let import_device = backend.drm_output_manager.device().device_fd().clone();
             if supports_syncobj_eventfd(&import_device) {
-                // Development-gated: Anvil can install acquire sources through the Smithay hook,
-                // but still needs token ownership/removal for never-signalled sources and device
-                // hot-unplug before advertising linux-drm-syncobj-v1 to general clients.
+                // Development-gated: Anvil owns inserted acquire-source tokens, but still needs
+                // surface/client teardown policy for never-signalled acquire sources before
+                // advertising linux-drm-syncobj-v1 to general clients.
                 debug!(
                     "not advertising linux-drm-syncobj-v1: acquire source token lifecycle is development-gated"
                 );
@@ -650,12 +663,24 @@ impl DrmSyncobjHandler for AnvilState<UdevData> {
         let Some(client) = surface.client() else {
             return false;
         };
+        let acquire_source_id = self.backend_data.next_syncobj_acquire_source_id();
         let res = self.handle.insert_source(source, move |_, _, data| {
+            data.backend_data
+                .syncobj_acquire_source_tokens
+                .remove(&acquire_source_id);
             let dh = data.display_handle.clone();
             data.client_compositor_state(&client).blocker_cleared(data, &dh);
             Ok(())
         });
-        res.is_ok()
+        match res {
+            Ok(token) => {
+                self.backend_data
+                    .syncobj_acquire_source_tokens
+                    .insert(acquire_source_id, token);
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -808,6 +833,12 @@ fn get_surface_dmabuf_feedback(
 }
 
 impl AnvilState<UdevData> {
+    fn clear_syncobj_acquire_sources(&mut self) {
+        for (_, token) in self.backend_data.syncobj_acquire_source_tokens.drain() {
+            self.handle.remove(token);
+        }
+    }
+
     fn device_added(&mut self, node: DrmNode, path: &Path) -> Result<(), DeviceAddError> {
         // Try to open the device
         let fd = self
@@ -1219,6 +1250,18 @@ impl AnvilState<UdevData> {
 
         // drop the backends on this side
         if let Some(mut backend_data) = self.backend_data.backends.remove(&node) {
+            let removes_primary_render_node = node == self.backend_data.primary_gpu
+                || backend_data.render_node == Some(self.backend_data.primary_gpu)
+                || self
+                    .backend_data
+                    .primary_gpu
+                    .node_with_type(NodeType::Primary)
+                    .and_then(|node_with_type| node_with_type.ok())
+                    == Some(node);
+            if removes_primary_render_node {
+                self.clear_syncobj_acquire_sources();
+            }
+
             if let Some(mut leasing_global) = backend_data.leasing_global.take() {
                 leasing_global.disable_global::<AnvilState<UdevData>>();
             }
