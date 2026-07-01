@@ -1147,18 +1147,51 @@ struct SampledDmabufWaylandVulkanInteropPolicyContracts {
 
 /// Evidence that a Wayland release point exists for a sampled dmabuf.
 ///
-/// This is only protocol-handle evidence. It does not prove Vulkan has finished sampling, released
-/// the image back to foreign ownership, or signaled/satisfied the Wayland release point.
+/// This is only protocol-handle evidence, optionally bound to the renderer-managed buffer wrapper's
+/// commit token. It does not prove Vulkan has finished sampling, released the image back to foreign
+/// ownership, or signaled/satisfied the Wayland release point.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct SampledDmabufReleaseEvidence {
     dmabuf: WeakDmabuf,
+    commit_token: Option<Weak<()>>,
 }
 
 #[allow(dead_code)]
 impl SampledDmabufReleaseEvidence {
     fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
         self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+
+    fn same_commit_token_as(
+        &self,
+        release_ownership: &SampledDmabufReleaseOwnershipEvidence,
+    ) -> Result<(), VulkanError> {
+        match (&self.commit_token, &release_ownership.commit_token) {
+            (None, None) => Ok(()),
+            (Some(release_token), Some(ownership_token)) => {
+                let Some(release_token) = release_token.upgrade() else {
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf Wayland release ownership commit token",
+                    ));
+                };
+                let Some(ownership_token) = ownership_token.upgrade() else {
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf Wayland release ownership commit token",
+                    ));
+                };
+                if Arc::ptr_eq(&release_token, &ownership_token) {
+                    Ok(())
+                } else {
+                    Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf Wayland release ownership commit token",
+                    ))
+                }
+            }
+            _ => Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf Wayland release ownership commit token",
+            )),
+        }
     }
 }
 
@@ -1172,6 +1205,7 @@ impl SampledDmabufReleaseEvidence {
 #[derive(Debug, Clone)]
 struct SampledDmabufReleaseOwnershipEvidence {
     dmabuf: WeakDmabuf,
+    commit_token: Option<Weak<()>>,
 }
 
 #[allow(dead_code)]
@@ -1180,6 +1214,7 @@ impl SampledDmabufReleaseOwnershipEvidence {
     fn new_for_tests(dmabuf: &Dmabuf) -> Self {
         Self {
             dmabuf: dmabuf.weak(),
+            commit_token: None,
         }
     }
 
@@ -3270,14 +3305,25 @@ impl VulkanRenderer {
     ) -> Result<SampledDmabufReleaseEvidence, VulkanError> {
         #[cfg(feature = "backend_drm")]
         {
+            let current_dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
+                .map_err(|_| VulkanError::UnsupportedOperation("sampled dmabuf release point buffer"))?;
+            if current_dmabuf != dmabuf {
+                return Err(VulkanError::UnsupportedOperation(
+                    "sampled dmabuf release point buffer identity",
+                ));
+            }
             if buffer.release_point().is_none() {
                 return Err(VulkanError::MissingCapability(
                     "sampled dmabuf release point contract",
                 ));
             }
+            let commit_token_slot = buffer
+                .user_data()
+                .get_or_insert_threadsafe(SampledDmabufWaylandCommitTokenSlot::default);
 
             Ok(SampledDmabufReleaseEvidence {
                 dmabuf: dmabuf.weak(),
+                commit_token: Some(Arc::downgrade(&commit_token_slot.token)),
             })
         }
 
@@ -3356,6 +3402,7 @@ impl VulkanRenderer {
         if has_release_point {
             Ok(SampledDmabufReleaseEvidence {
                 dmabuf: dmabuf.weak(),
+                commit_token: None,
             })
         } else {
             Err(VulkanError::MissingCapability(
@@ -3974,6 +4021,7 @@ impl VulkanRenderer {
                 "sampled dmabuf Wayland release ownership identity",
             ));
         }
+        context.release_evidence.same_commit_token_as(release_ownership)?;
         Ok(release_ownership.clone())
     }
 
@@ -3992,6 +4040,7 @@ impl VulkanRenderer {
         if has_release_point {
             Ok(SampledDmabufReleaseOwnershipEvidence {
                 dmabuf: dmabuf.weak(),
+                commit_token: None,
             })
         } else {
             Err(VulkanError::MissingCapability(
@@ -4010,10 +4059,26 @@ impl VulkanRenderer {
     ) -> Result<SampledDmabufReleaseOwnershipEvidence, VulkanError> {
         #[cfg(feature = "backend_drm")]
         {
-            self.validate_sampled_dmabuf_wayland_release_ownership_availability_contract(
-                dmabuf,
-                buffer.release_point().is_some(),
-            )
+            let current_dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer).map_err(|_| {
+                VulkanError::UnsupportedOperation("sampled dmabuf Wayland release ownership buffer")
+            })?;
+            if current_dmabuf != dmabuf {
+                return Err(VulkanError::UnsupportedOperation(
+                    "sampled dmabuf Wayland release ownership buffer identity",
+                ));
+            }
+            if buffer.release_point().is_none() {
+                return Err(VulkanError::MissingCapability(
+                    "sampled dmabuf Wayland release ownership transfer",
+                ));
+            }
+            let commit_token_slot = buffer
+                .user_data()
+                .get_or_insert_threadsafe(SampledDmabufWaylandCommitTokenSlot::default);
+            Ok(SampledDmabufReleaseOwnershipEvidence {
+                dmabuf: dmabuf.weak(),
+                commit_token: Some(Arc::downgrade(&commit_token_slot.token)),
+            })
         }
 
         #[cfg(not(feature = "backend_drm"))]

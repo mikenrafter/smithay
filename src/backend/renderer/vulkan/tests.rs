@@ -9916,6 +9916,113 @@ fn import_dma_wl_real_buffer_requires_import_surface_reachability() {
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
+#[ignore = "requires a Wayland test display for renderer-managed buffer commit tokens"]
+fn sampled_release_ownership_evidence_requires_same_buffer_token() {
+    let renderer = VulkanRenderer::new_scaffold_for_tests();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let explicit_acquire = SyncPoint::from(SignaledExportableFence);
+    let acquire_evidence = SampledDmabufAcquireSyncEvidence::new(&dmabuf, explicit_acquire);
+    let import = VulkanDmabufImportState::from_dmabuf(&dmabuf).unwrap();
+    let unrelated_dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let unbound_release_evidence = renderer
+        .validate_sampled_dmabuf_wayland_release_point_contract(&dmabuf, true)
+        .unwrap();
+    let (_display_a, _client_a, _surface_a, buffer_a) =
+        import_surface_dmabuf_buffer_with_sync_points_for_tests(
+            dmabuf.clone(),
+            DrmSyncPoint::invalid_for_tests(121).unwrap(),
+            DrmSyncPoint::invalid_for_tests(122).unwrap(),
+        )
+        .expect("Wayland test display is required for release ownership token fixture");
+    let (_display_b, _client_b, _surface_b, buffer_b) =
+        import_surface_dmabuf_buffer_with_sync_points_for_tests(
+            dmabuf.clone(),
+            DrmSyncPoint::invalid_for_tests(123).unwrap(),
+            DrmSyncPoint::invalid_for_tests(124).unwrap(),
+        )
+        .expect("Wayland test display is required for release ownership token fixture");
+    let tokened_release_evidence = renderer
+        .sampled_dmabuf_wayland_release_evidence(&dmabuf, &buffer_a)
+        .unwrap();
+    let tokened_release_ownership = renderer
+        .sampled_dmabuf_wayland_release_ownership_evidence(&dmabuf, &buffer_a)
+        .unwrap();
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_release_evidence(&unrelated_dmabuf, &buffer_a),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf release point buffer identity"
+        ))
+    ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_release_ownership_evidence(&unrelated_dmabuf, &buffer_a),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland release ownership buffer identity"
+        ))
+    ));
+    let mismatched_tokened_release_ownership = renderer
+        .sampled_dmabuf_wayland_release_ownership_evidence(&dmabuf, &buffer_b)
+        .unwrap();
+
+    let mut context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &dmabuf,
+        &import,
+        &acquire_evidence,
+        &tokened_release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    context.release_ownership = Some(tokened_release_ownership.clone());
+    assert!(
+        renderer
+            .validate_sampled_dmabuf_wayland_release_ownership_policy(&context)
+            .is_ok()
+    );
+    context.release_ownership = Some(mismatched_tokened_release_ownership);
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_release_ownership_policy(&context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland release ownership commit token"
+        ))
+    ));
+    context.release_ownership = Some(SampledDmabufReleaseOwnershipEvidence::new_for_tests(&dmabuf));
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_release_ownership_policy(&context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland release ownership commit token"
+        ))
+    ));
+
+    let mut unbound_context = SampledDmabufWaylandVulkanInteropPolicyContext::new(
+        &dmabuf,
+        &import,
+        &acquire_evidence,
+        &unbound_release_evidence,
+        true,
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory,
+    );
+    unbound_context.release_ownership = Some(tokened_release_ownership);
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_wayland_release_ownership_policy(&unbound_context),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland release ownership commit token"
+        ))
+    ));
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
 fn import_surface_real_buffer_reaches_device_import_boundary() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
