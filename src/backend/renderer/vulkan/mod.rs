@@ -60,6 +60,10 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+use crate::backend::allocator::Buffer as _;
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+use crate::backend::allocator::dmabuf::DmabufSyncFlags;
 #[cfg(all(
     feature = "wayland_frontend",
     feature = "backend_egl",
@@ -76,7 +80,7 @@ use crate::{
     backend::vulkan::PhysicalDevice,
     backend::{
         allocator::{
-            Buffer as _, Format, Fourcc, Modifier,
+            Format, Fourcc, Modifier,
             dmabuf::{Dmabuf, WeakDmabuf},
             format::FormatSet,
             vulkan::VulkanAllocatorDmabufForeignReleaseEvidence,
@@ -1383,10 +1387,60 @@ impl VulkanDmabufLoopbackImportEvidence {
 pub(crate) struct VulkanWaylandDmabufSampledImportAdmission<'a> {
     producer_dmabuf: &'a Dmabuf,
     producer_evidence: &'a VulkanDmabufLoopbackImportEvidence,
-    imported_dmabuf_syncable: bool,
+    imported_syncable: Option<VulkanWaylandDmabufSampledImportSyncableProof>,
     imported_view: Option<VulkanWaylandDmabufSampledImportViewProof>,
     acquire_sync_orders_producer_release: bool,
     renderer_utils_lifecycle_declared: bool,
+}
+
+/// Validation-stage proof that an imported Wayland dmabuf supports dma-buf synchronization ioctls.
+///
+/// This proves only that the current imported Smithay dmabuf wrapper is backed by fds accepting
+/// `DMA_BUF_SYNC` for every plane. It does not prove the dmabuf is the same kernel object as a producer
+/// dmabuf, and it does not prove Vulkan image layout, queue-family ownership, or acquire ordering.
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[derive(Debug, Clone)]
+pub(crate) struct VulkanWaylandDmabufSampledImportSyncableProof {
+    imported_dmabuf: WeakDmabuf,
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[allow(dead_code)]
+impl VulkanWaylandDmabufSampledImportSyncableProof {
+    pub(crate) fn new(imported_dmabuf: &Dmabuf) -> Result<Self, VulkanError> {
+        if !Self::dmabuf_is_syncable(imported_dmabuf) {
+            return Err(VulkanError::MissingCapability(
+                "sampled dmabuf imported syncable dmabuf",
+            ));
+        }
+
+        Ok(Self {
+            imported_dmabuf: imported_dmabuf.weak(),
+        })
+    }
+
+    #[cfg(test)]
+    unsafe fn assume_for_imported_dmabuf(imported_dmabuf: &Dmabuf) -> Self {
+        Self {
+            imported_dmabuf: imported_dmabuf.weak(),
+        }
+    }
+
+    fn is_for(&self, imported_dmabuf: &Dmabuf) -> bool {
+        self.imported_dmabuf.upgrade().as_ref() == Some(imported_dmabuf)
+    }
+
+    fn dmabuf_is_syncable(imported_dmabuf: &Dmabuf) -> bool {
+        imported_dmabuf.num_planes() > 0
+            && (0..imported_dmabuf.num_planes()).all(|idx| {
+                imported_dmabuf
+                    .sync_plane(idx, DmabufSyncFlags::READ | DmabufSyncFlags::START)
+                    .is_ok()
+                    && imported_dmabuf
+                        .sync_plane(idx, DmabufSyncFlags::READ | DmabufSyncFlags::END)
+                        .is_ok()
+            })
+    }
 }
 
 /// Validation-stage proof that a protocol-created dmabuf preserves the producer's import view.
@@ -1445,16 +1499,19 @@ impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
         Self {
             producer_dmabuf,
             producer_evidence,
-            imported_dmabuf_syncable: false,
+            imported_syncable: None,
             imported_view: None,
             acquire_sync_orders_producer_release: false,
             renderer_utils_lifecycle_declared: false,
         }
     }
 
-    /// Declare whether the imported Wayland dmabuf is backed by a kernel-syncable dma-buf fd.
-    pub(crate) fn with_imported_dmabuf_syncable(mut self, imported_dmabuf_syncable: bool) -> Self {
-        self.imported_dmabuf_syncable = imported_dmabuf_syncable;
+    /// Attach proof that the imported Wayland dmabuf is backed by kernel-syncable dma-buf fds.
+    pub(crate) fn with_imported_syncable(
+        mut self,
+        imported_syncable: VulkanWaylandDmabufSampledImportSyncableProof,
+    ) -> Self {
+        self.imported_syncable = Some(imported_syncable);
         self
     }
 
@@ -1503,9 +1560,15 @@ impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
                 "sampled dmabuf producer evidence",
             ));
         }
-        if !self.imported_dmabuf_syncable {
-            return Err(VulkanError::MissingCapability(
-                "sampled dmabuf producer syncable dmabuf",
+        let imported_syncable = self
+            .imported_syncable
+            .as_ref()
+            .ok_or(VulkanError::MissingCapability(
+                "sampled dmabuf imported syncable dmabuf",
+            ))?;
+        if !imported_syncable.is_for(committed_dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf imported syncable dmabuf identity",
             ));
         }
         let imported_view = self.imported_view.as_ref().ok_or(VulkanError::MissingCapability(
