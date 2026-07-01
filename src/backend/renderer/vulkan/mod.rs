@@ -76,7 +76,7 @@ use crate::{
     backend::vulkan::PhysicalDevice,
     backend::{
         allocator::{
-            Format, Fourcc, Modifier,
+            Buffer as _, Format, Fourcc, Modifier,
             dmabuf::{Dmabuf, WeakDmabuf},
             format::FormatSet,
             vulkan::VulkanAllocatorDmabufForeignReleaseEvidence,
@@ -1384,9 +1384,54 @@ pub(crate) struct VulkanWaylandDmabufSampledImportAdmission<'a> {
     producer_dmabuf: &'a Dmabuf,
     producer_evidence: &'a VulkanDmabufLoopbackImportEvidence,
     imported_dmabuf_syncable: bool,
-    imported_dmabuf_matches_expected: bool,
+    imported_view: Option<VulkanWaylandDmabufSampledImportViewProof>,
     acquire_sync_orders_producer_release: bool,
     renderer_utils_lifecycle_declared: bool,
+}
+
+/// Validation-stage proof that a protocol-created dmabuf preserves the producer's import view.
+///
+/// This is intentionally a *view* proof, not a Vulkan external-state or portable kernel storage proof.
+/// It binds the producer and imported Smithay dmabuf wrappers and verifies that the protocol-created
+/// dmabuf has the same size, FourCC/modifier, flags, plane count, offsets, and strides expected by the
+/// controlled producer. It does not prove `VK_QUEUE_FAMILY_FOREIGN_EXT`, `VK_IMAGE_LAYOUT_GENERAL`, or
+/// acquire ordering; those remain separate admission requirements.
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[derive(Debug, Clone)]
+pub(crate) struct VulkanWaylandDmabufSampledImportViewProof {
+    producer_dmabuf: WeakDmabuf,
+    imported_dmabuf: WeakDmabuf,
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[allow(dead_code)]
+impl VulkanWaylandDmabufSampledImportViewProof {
+    pub(crate) fn new(producer_dmabuf: &Dmabuf, imported_dmabuf: &Dmabuf) -> Result<Self, VulkanError> {
+        if !Self::same_import_view(producer_dmabuf, imported_dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf producer imported view",
+            ));
+        }
+
+        Ok(Self {
+            producer_dmabuf: producer_dmabuf.weak(),
+            imported_dmabuf: imported_dmabuf.weak(),
+        })
+    }
+
+    fn is_for(&self, producer_dmabuf: &Dmabuf, imported_dmabuf: &Dmabuf) -> bool {
+        self.producer_dmabuf.upgrade().as_ref() == Some(producer_dmabuf)
+            && self.imported_dmabuf.upgrade().as_ref() == Some(imported_dmabuf)
+    }
+
+    fn same_import_view(producer_dmabuf: &Dmabuf, imported_dmabuf: &Dmabuf) -> bool {
+        producer_dmabuf.size() == imported_dmabuf.size()
+            && producer_dmabuf.format() == imported_dmabuf.format()
+            && producer_dmabuf.0.flags == imported_dmabuf.0.flags
+            && producer_dmabuf.num_planes() == imported_dmabuf.num_planes()
+            && producer_dmabuf.offsets().eq(imported_dmabuf.offsets())
+            && producer_dmabuf.strides().eq(imported_dmabuf.strides())
+    }
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
@@ -1401,7 +1446,7 @@ impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
             producer_dmabuf,
             producer_evidence,
             imported_dmabuf_syncable: false,
-            imported_dmabuf_matches_expected: false,
+            imported_view: None,
             acquire_sync_orders_producer_release: false,
             renderer_utils_lifecycle_declared: false,
         }
@@ -1413,15 +1458,12 @@ impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
         self
     }
 
-    /// Declare whether protocol import preserved the producer dmabuf metadata expected by the caller.
-    ///
-    /// For validation-stage loopback this must cover the size, FourCC, modifier, flags, plane count,
-    /// plane offsets, strides, and fd-backed dma-buf identity expected by the controlled producer.
-    pub(crate) fn with_imported_dmabuf_matches_expected(
+    /// Attach proof that protocol import preserved the producer dmabuf view expected by the caller.
+    pub(crate) fn with_imported_view(
         mut self,
-        imported_dmabuf_matches_expected: bool,
+        imported_view: VulkanWaylandDmabufSampledImportViewProof,
     ) -> Self {
-        self.imported_dmabuf_matches_expected = imported_dmabuf_matches_expected;
+        self.imported_view = Some(imported_view);
         self
     }
 
@@ -1466,9 +1508,12 @@ impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
                 "sampled dmabuf producer syncable dmabuf",
             ));
         }
-        if !self.imported_dmabuf_matches_expected {
+        let imported_view = self.imported_view.as_ref().ok_or(VulkanError::MissingCapability(
+            "sampled dmabuf producer imported view",
+        ))?;
+        if !imported_view.is_for(self.producer_dmabuf, committed_dmabuf) {
             return Err(VulkanError::UnsupportedOperation(
-                "sampled dmabuf producer metadata",
+                "sampled dmabuf producer imported view identity",
             ));
         }
         if !self.acquire_sync_orders_producer_release {

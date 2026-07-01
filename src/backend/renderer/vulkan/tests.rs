@@ -5873,6 +5873,8 @@ fn runtime_import_dma_wl_protocol_dmabuf_commit_samples_and_releases() {
     let committed_dmabuf = crate::wayland::dmabuf::get_dmabuf(harness.renderer_buffer())
         .expect("protocol renderer-managed buffer should contain a dmabuf")
         .clone();
+    let imported_view = VulkanWaylandDmabufSampledImportViewProof::new(&candidate.dmabuf, &committed_dmabuf)
+        .expect("protocol-created dmabuf should preserve the producer import view");
     let release_point_probe = harness
         .renderer_buffer()
         .release_point()
@@ -5881,7 +5883,7 @@ fn runtime_import_dma_wl_protocol_dmabuf_commit_samples_and_releases() {
     let admission =
         VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&candidate.dmabuf, &evidence)
             .with_imported_dmabuf_syncable(harness.evidence().imported_dmabuf_syncable)
-            .with_imported_dmabuf_matches_expected(harness.evidence().imported_dmabuf_matches_expected)
+            .with_imported_view(imported_view)
             .with_acquire_sync_orders_producer_release()
             .with_renderer_utils_lifecycle_declared();
     unsafe {
@@ -10252,6 +10254,13 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         DmabufFlags::empty(),
         &[(0, 0, 4)],
     );
+    let same_view_other_wrapper = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
     let unrelated_dmabuf = dmabuf_with_planes_for_tests(
         (1, 1).into(),
         Fourcc::Xrgb8888,
@@ -10277,11 +10286,22 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         // SAFETY: This negative fixture intentionally mismatches the producer evidence identity.
         VulkanDmabufLoopbackImportEvidence::new(unrelated_dmabuf.weak(), SyncPoint::signaled())
     };
+    let imported_view = VulkanWaylandDmabufSampledImportViewProof::new(&dmabuf, &dmabuf).unwrap();
+    let same_view_other_wrapper_proof =
+        VulkanWaylandDmabufSampledImportViewProof::new(&dmabuf, &same_view_other_wrapper).unwrap();
+    let unrelated_view =
+        VulkanWaylandDmabufSampledImportViewProof::new(&unrelated_dmabuf, &unrelated_dmabuf).unwrap();
+    assert!(matches!(
+        VulkanWaylandDmabufSampledImportViewProof::new(&dmabuf, &unrelated_dmabuf),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf producer imported view"
+        ))
+    ));
 
     let mismatched_admission =
         VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &unrelated_evidence)
             .with_imported_dmabuf_syncable(true)
-            .with_imported_dmabuf_matches_expected(true)
+            .with_imported_view(imported_view.clone())
             .with_acquire_sync_orders_producer_release()
             .with_renderer_utils_lifecycle_declared();
     assert!(matches!(
@@ -10307,23 +10327,55 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         ))
     ));
 
-    let missing_metadata =
-        VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
-            .with_imported_dmabuf_syncable(true);
+    let missing_view = VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
+        .with_imported_dmabuf_syncable(true);
     assert!(matches!(
         unsafe {
-            // SAFETY: This negative test omits the policy's protocol metadata preservation claim.
-            missing_metadata.admit_current_surface_commit(&renderer, &surface, &dmabuf)
+            // SAFETY: This negative test omits the protocol imported-view proof.
+            missing_view.admit_current_surface_commit(&renderer, &surface, &dmabuf)
+        },
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf producer imported view"
+        ))
+    ));
+
+    let mismatched_view =
+        VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
+            .with_imported_dmabuf_syncable(true)
+            .with_imported_view(unrelated_view)
+            .with_acquire_sync_orders_producer_release()
+            .with_renderer_utils_lifecycle_declared();
+    assert!(matches!(
+        unsafe {
+            // SAFETY: This negative test supplies an imported-view proof for another dmabuf pair.
+            mismatched_view.admit_current_surface_commit(&renderer, &surface, &dmabuf)
         },
         Err(VulkanError::UnsupportedOperation(
-            "sampled dmabuf producer metadata"
+            "sampled dmabuf producer imported view identity"
+        ))
+    ));
+
+    let same_view_wrong_wrapper =
+        VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
+            .with_imported_dmabuf_syncable(true)
+            .with_imported_view(same_view_other_wrapper_proof)
+            .with_acquire_sync_orders_producer_release()
+            .with_renderer_utils_lifecycle_declared();
+    assert!(matches!(
+        unsafe {
+            // SAFETY: This negative test proves matching metadata is not enough if the proof is not
+            // bound to the current committed dmabuf wrapper.
+            same_view_wrong_wrapper.admit_current_surface_commit(&renderer, &surface, &dmabuf)
+        },
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf producer imported view identity"
         ))
     ));
 
     let missing_ordering =
         VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
             .with_imported_dmabuf_syncable(true)
-            .with_imported_dmabuf_matches_expected(true);
+            .with_imported_view(imported_view.clone());
     assert!(matches!(
         unsafe {
             // SAFETY: This negative test omits the acquire-sync ordering claim.
@@ -10337,7 +10389,7 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
     let missing_lifecycle =
         VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
             .with_imported_dmabuf_syncable(true)
-            .with_imported_dmabuf_matches_expected(true)
+            .with_imported_view(imported_view.clone())
             .with_acquire_sync_orders_producer_release();
     assert!(matches!(
         unsafe {
@@ -10352,7 +10404,7 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
     let complete_admission =
         VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
             .with_imported_dmabuf_syncable(true)
-            .with_imported_dmabuf_matches_expected(true)
+            .with_imported_view(imported_view)
             .with_acquire_sync_orders_producer_release()
             .with_renderer_utils_lifecycle_declared();
     unsafe {
