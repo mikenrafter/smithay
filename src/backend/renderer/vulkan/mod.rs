@@ -1702,6 +1702,28 @@ impl VulkanRenderer {
         dmabuf: &Dmabuf,
         use_case: SampledDmabufWaylandExternalStateUse,
     ) -> Result<(), VulkanError> {
+        Self::with_wayland_surface_current_dmabuf_buffer(surface, dmabuf, |buffer| {
+            unsafe {
+                // SAFETY: Forwarded from this helper's caller after verifying that the current
+                // renderer-managed buffer is the requested dmabuf.
+                Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+                    buffer.user_data(),
+                    dmabuf,
+                    use_case,
+                )
+            }
+        })
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    fn with_wayland_surface_current_dmabuf_buffer<F, T>(
+        surface: &WlSurface,
+        dmabuf: &Dmabuf,
+        f: F,
+    ) -> Result<T, VulkanError>
+    where
+        F: FnOnce(&super::utils::Buffer) -> Result<T, VulkanError>,
+    {
         super::utils::with_renderer_surface_state(surface, |state| {
             let buffer = state.buffer().ok_or(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland current buffer",
@@ -1715,15 +1737,7 @@ impl VulkanRenderer {
                 ));
             }
 
-            unsafe {
-                // SAFETY: Forwarded from this helper's caller after verifying that the current
-                // renderer-managed buffer is the requested dmabuf.
-                Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
-                    buffer.user_data(),
-                    dmabuf,
-                    use_case,
-                )
-            }
+            f(buffer)
         })
         .unwrap_or(Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland renderer surface state",
@@ -1894,6 +1908,36 @@ impl VulkanRenderer {
                 dmabuf,
             )
         }
+    }
+
+    /// Mark the current renderer-managed dmabuf commit on a [`WlSurface`] as covered by texture-cache
+    /// release call sites.
+    ///
+    /// This is the surface-scoped companion to
+    /// [`mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import`](Self::mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import)
+    /// for compositors using Smithay's normal [`super::utils::on_commit_buffer_handler`] path. It
+    /// looks up the surface's current renderer-managed buffer, verifies that it is the same dmabuf
+    /// identity as `dmabuf`, and records lifecycle evidence on that current buffer wrapper.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy the same lifecycle contract as
+    /// [`mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import`](Self::mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import)
+    /// for the surface's current renderer-managed buffer.
+    #[cfg(feature = "wayland_frontend")]
+    pub unsafe fn mark_wayland_surface_current_dmabuf_commit_texture_cache_release_lifecycle_for_sampled_import(
+        &self,
+        surface: &WlSurface,
+        dmabuf: &Dmabuf,
+    ) -> Result<(), VulkanError> {
+        Self::with_wayland_surface_current_dmabuf_buffer(surface, dmabuf, |buffer| unsafe {
+            // SAFETY: Forwarded from this surface-scoped lifecycle helper's caller after verifying the
+            // current renderer-managed buffer is the requested dmabuf.
+            self.mark_wayland_dmabuf_user_data_texture_cache_release_lifecycle_for_sampled_import(
+                buffer.user_data(),
+                dmabuf,
+            )
+        })
     }
 
     #[cfg(feature = "wayland_frontend")]

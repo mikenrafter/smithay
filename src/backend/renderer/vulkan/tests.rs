@@ -5896,8 +5896,8 @@ fn runtime_import_dma_wl_protocol_dmabuf_commit_samples_and_releases() {
             .unwrap();
         candidate
             .renderer
-            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                harness.renderer_buffer(),
+            .mark_wayland_surface_current_dmabuf_commit_texture_cache_release_lifecycle_for_sampled_import(
+                harness.surface(),
                 &committed_dmabuf,
             )
             .unwrap();
@@ -10070,7 +10070,9 @@ fn import_surface_current_surface_marker_reaches_device_import_boundary() {
             )
             .unwrap();
         renderer
-            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
+            .mark_wayland_surface_current_dmabuf_commit_texture_cache_release_lifecycle_for_sampled_import(
+                &surface, &dmabuf,
+            )
             .unwrap();
     }
     assert_buffer_release_point_matches_for_tests(
@@ -10120,6 +10122,20 @@ fn import_surface_current_surface_marker_rejects_missing_current_buffer() {
             "sampled dmabuf Wayland current buffer"
         ))
     ));
+    let lifecycle_result = unsafe {
+        // SAFETY: This negative test supplies no current buffer, so the helper must reject the surface
+        // state before recording lifecycle evidence.
+        renderer
+            .mark_wayland_surface_current_dmabuf_commit_texture_cache_release_lifecycle_for_sampled_import(
+                &surface, &dmabuf,
+            )
+    };
+    assert!(matches!(
+        lifecycle_result,
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland current buffer"
+        ))
+    ));
     assert!(renderer.dmabuf_formats().iter().next().is_none());
 }
 
@@ -10147,6 +10163,20 @@ fn import_surface_current_surface_marker_rejects_missing_renderer_surface_state(
     };
     assert!(matches!(
         result,
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland renderer surface state"
+        ))
+    ));
+    let lifecycle_result = unsafe {
+        // SAFETY: This negative test deliberately skips on_commit_buffer_handler, so the helper must
+        // reject the unprocessed surface before recording lifecycle evidence.
+        renderer
+            .mark_wayland_surface_current_dmabuf_commit_texture_cache_release_lifecycle_for_sampled_import(
+                &surface, &dmabuf,
+            )
+    };
+    assert!(matches!(
+        lifecycle_result,
         Err(VulkanError::MissingCapability(
             "sampled dmabuf Wayland renderer surface state"
         ))
@@ -10195,6 +10225,27 @@ fn import_surface_current_surface_marker_rejects_mismatched_dmabuf() {
         Err(VulkanError::UnsupportedOperation(
             "sampled dmabuf Wayland current buffer identity"
         ))
+    ));
+    let lifecycle_result = unsafe {
+        // SAFETY: This negative test asks the helper to mark lifecycle evidence for a different dmabuf
+        // than the surface's current renderer-managed buffer, which must be rejected before storage.
+        renderer
+            .mark_wayland_surface_current_dmabuf_commit_texture_cache_release_lifecycle_for_sampled_import(
+                &surface,
+                &mismatched_dmabuf,
+            )
+    };
+    assert!(matches!(
+        lifecycle_result,
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland current buffer identity"
+        ))
+    ));
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_buffer_texture_cache_release_lifecycle(&buffer, &mismatched_dmabuf,),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf Wayland texture-cache release lifecycle identity"
+        )) | Ok(None)
     ));
     assert!(buffer.release_point().is_some());
     assert!(renderer.dmabuf_formats().iter().next().is_none());
