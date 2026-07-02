@@ -6220,7 +6220,8 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
     unsafe {
         // SAFETY: `evidence` proves this exact Smithay-controlled loopback dmabuf was released to
         // FOREIGN ownership in GENERAL layout, and its release sync was attached to or waited before
-        // the first Wayland acquire point. There is no intervening use before import_surface.
+        // the first Wayland acquire point. There is no intervening use before from_surface's internal
+        // import_surface call.
         // The probe drives the buffer through a live WlSurface's normal renderer-utils surface cache
         // and records typed admission evidence for that current commit, then calls
         // retire_and_release_surface_textures before reacquiring the same dmabuf through a later
@@ -6236,39 +6237,39 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
         .unwrap();
     }
 
-    crate::wayland::compositor::with_states(&surface, |states| {
-        crate::backend::renderer::utils::import_surface(&mut candidate.renderer, states)
-    })
-    .expect("normal ImportDmaWl import_surface should import first sampled loopback dmabuf");
-    assert!(
-        first_buffer.release_point().is_none(),
-        "first ImportDmaWl texture construction must take Wayland release ownership"
-    );
-
+    let mut first_buffer = Some(first_buffer);
     let mut first_release_satisfied = false;
     let mut second_release_point_for_cleanup = None;
     let mut second_cache_needs_release_for_cleanup = false;
     let reacquire_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> bool {
-        let first_cached_texture = {
-            crate::wayland::compositor::with_states(&surface, |states| {
-                let data = states
-                    .data_map
-                    .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
-                    .expect("first import_surface should preserve renderer surface state");
-                let data = data.lock().unwrap();
-                data.texture(candidate.renderer.context_id())
-                    .expect("first ImportDmaWl import_surface should cache a Vulkan texture")
-                    .clone()
-            })
-        };
-        runtime_sample_texture_to_offscreen_and_assert_non_black(
+        let first_render_element = crate::wayland::compositor::with_states(&surface, |states| {
+            crate::backend::renderer::element::surface::WaylandSurfaceRenderElement::from_surface(
+                &mut candidate.renderer,
+                &surface,
+                states,
+                crate::utils::Point::from((0.0, 0.0)),
+                1.0,
+                crate::backend::renderer::element::Kind::Unspecified,
+            )
+        })
+        .expect("normal WaylandSurfaceRenderElement construction should import first sampled loopback dmabuf")
+        .expect("normal WaylandSurfaceRenderElement construction should create one first sampled element");
+        let first_buffer_ref = first_buffer
+            .as_ref()
+            .expect("test should retain first buffer until after initial sampled draw");
+        assert!(
+            first_buffer_ref.release_point().is_none(),
+            "first WaylandSurfaceRenderElement construction must take Wayland release ownership"
+        );
+        let first_render_elements = [first_render_element];
+        runtime_draw_wayland_surface_elements_to_offscreen_and_assert_non_black(
             &mut candidate.renderer,
-            &first_cached_texture,
+            &first_render_elements,
             render_format,
             test_name,
         );
-        drop(first_cached_texture);
-        drop(first_buffer);
+        drop(first_render_elements);
+        drop(first_buffer.take());
 
         crate::wayland::compositor::with_states(&surface, |states| {
             crate::backend::renderer::utils::retire_and_release_surface_textures(
@@ -6364,15 +6365,25 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
             SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
         );
 
-        crate::wayland::compositor::with_states(&surface, |states| {
-            crate::backend::renderer::utils::import_surface(&mut candidate.renderer, states)
+        let second_render_element = crate::wayland::compositor::with_states(&surface, |states| {
+            crate::backend::renderer::element::surface::WaylandSurfaceRenderElement::from_surface(
+                &mut candidate.renderer,
+                &surface,
+                states,
+                crate::utils::Point::from((0.0, 0.0)),
+                1.0,
+                crate::backend::renderer::element::Kind::Unspecified,
+            )
         })
-        .expect("normal ImportDmaWl import_surface should reacquire same sampled dmabuf");
-        second_cache_needs_release_for_cleanup = true;
+        .expect("normal WaylandSurfaceRenderElement construction should reacquire same sampled dmabuf")
+        .expect(
+            "normal WaylandSurfaceRenderElement construction should create one reacquired sampled element",
+        );
         assert!(
             second_buffer.release_point().is_none(),
-            "same-dmabuf reacquire must take the second Wayland release ownership"
+            "same-dmabuf WaylandSurfaceRenderElement construction must take the second Wayland release ownership"
         );
+        second_cache_needs_release_for_cleanup = true;
         assert_eq!(
             candidate
                 .renderer
@@ -6380,25 +6391,14 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
             SampledDmabufWaylandLayoutHistory::LocallyAcquired
         );
 
-        let second_cached_texture = {
-            crate::wayland::compositor::with_states(&surface, |states| {
-                let data = states
-                    .data_map
-                    .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
-                    .expect("same-dmabuf reacquire should preserve renderer surface state");
-                let data = data.lock().unwrap();
-                data.texture(candidate.renderer.context_id())
-                    .expect("same-dmabuf reacquire should cache a Vulkan texture")
-                    .clone()
-            })
-        };
-        runtime_sample_texture_to_offscreen_and_assert_non_black(
+        let second_render_elements = [second_render_element];
+        runtime_draw_wayland_surface_elements_to_offscreen_and_assert_non_black(
             &mut candidate.renderer,
-            &second_cached_texture,
+            &second_render_elements,
             render_format,
             test_name,
         );
-        drop(second_cached_texture);
+        drop(second_render_elements);
         assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
         assert!(matches!(
             candidate
@@ -6430,20 +6430,30 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
         Err(payload) => {
             if second_cache_needs_release_for_cleanup {
                 if let Some(second_release_point) = second_release_point_for_cleanup.as_ref() {
-                    retire_import_wl_surface_textures_and_wait_for_tests(
-                        &mut candidate.renderer,
-                        &surface,
-                        second_release_point,
-                        "panic cleanup should signal same-dmabuf reacquire Wayland release point",
-                    );
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        retire_import_wl_surface_textures_and_wait_for_tests(
+                            &mut candidate.renderer,
+                            &surface,
+                            second_release_point,
+                            "panic cleanup should signal same-dmabuf reacquire Wayland release point",
+                        );
+                    }));
                 }
-            } else if !first_release_satisfied {
-                retire_import_wl_surface_textures_and_wait_for_tests(
-                    &mut candidate.renderer,
-                    &surface,
-                    &first_release_point_probe,
-                    "panic cleanup should signal first same-dmabuf Wayland release point",
-                );
+            } else {
+                let first_release_ownership_taken = first_buffer
+                    .as_ref()
+                    .map(|buffer| buffer.release_point().is_none())
+                    .unwrap_or(true);
+                if !first_release_satisfied && first_release_ownership_taken {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        retire_import_wl_surface_textures_and_wait_for_tests(
+                            &mut candidate.renderer,
+                            &surface,
+                            &first_release_point_probe,
+                            "panic cleanup should signal first same-dmabuf Wayland release point",
+                        );
+                    }));
+                }
             }
             std::panic::resume_unwind(payload);
         }
