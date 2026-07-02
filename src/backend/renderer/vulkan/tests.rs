@@ -653,6 +653,47 @@ fn import_or_signal_wayland_acquire_point_for_tests(
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+unsafe fn admit_loopback_current_surface_commit_for_tests(
+    renderer: &VulkanRenderer,
+    surface: &WlSurface,
+    buffer: &crate::backend::renderer::utils::Buffer,
+    producer_dmabuf: &Dmabuf,
+    evidence: &VulkanDmabufLoopbackImportEvidence,
+    committed_dmabuf: &Dmabuf,
+) -> Result<(), VulkanError> {
+    let imported_syncable = VulkanWaylandDmabufSampledImportSyncableProof::new(committed_dmabuf)?;
+    let imported_view = VulkanWaylandDmabufSampledImportViewProof::new(producer_dmabuf, committed_dmabuf)?;
+    let acquire_ordering = unsafe {
+        // SAFETY: Forwarded from this helper's caller.
+        VulkanWaylandDmabufSampledImportAcquireOrderingProof::assume_wayland_acquire_orders_loopback_release(
+            producer_dmabuf,
+            evidence,
+            committed_dmabuf,
+            buffer,
+        )?
+    };
+    let renderer_utils_lifecycle = unsafe {
+        // SAFETY: Forwarded from this helper's caller.
+        VulkanWaylandDmabufSampledImportRendererUtilsLifecycleProof::assume_renderer_utils_lifecycle(
+            renderer,
+            buffer,
+            committed_dmabuf,
+        )?
+    };
+    let admission =
+        VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(producer_dmabuf, evidence)
+            .with_imported_syncable(imported_syncable)
+            .with_imported_view(imported_view)
+            .with_acquire_ordering(acquire_ordering)
+            .with_renderer_utils_lifecycle(renderer_utils_lifecycle);
+
+    unsafe {
+        // SAFETY: Forwarded from this helper's caller.
+        admission.admit_current_surface_commit(renderer, surface, committed_dmabuf)
+    }
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 fn import_or_signal_reacquire_point_from_release_for_tests(
     test_name: &str,
     release_point: &DrmSyncPoint,
@@ -5788,23 +5829,18 @@ fn runtime_import_dma_wl_loopback_samples_and_releases_with_drm_syncobj() {
         // Wayland acquire point or waits it on the CPU before explicitly signaling the acquire point.
         // There is no intervening use before import_surface.
         // It then drives the buffer through a live WlSurface's normal renderer-utils surface cache,
-        // records evidence through the surface-level helper, and calls retire_and_release_surface_textures
-        // while the renderer is still available before dropping the surface state.
-        candidate
-            .renderer
-            .mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
-                &surface,
-                &candidate.dmabuf,
-                &evidence,
-            )
-            .unwrap();
-        candidate
-            .renderer
-            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                &buffer,
-                &candidate.dmabuf,
-            )
-            .unwrap();
+        // records typed admission evidence for that current commit, and calls
+        // retire_and_release_surface_textures while the renderer is still available before dropping
+        // the surface state.
+        admit_loopback_current_surface_commit_for_tests(
+            &candidate.renderer,
+            &surface,
+            &buffer,
+            &candidate.dmabuf,
+            &evidence,
+            &candidate.dmabuf,
+        )
+        .unwrap();
     }
     assert!(buffer.release_point().is_some());
 
@@ -6188,24 +6224,18 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
         // FOREIGN ownership in GENERAL layout, and its release sync was attached to or waited before
         // the first Wayland acquire point. There is no intervening use before import_surface.
         // The probe drives the buffer through a live WlSurface's normal renderer-utils surface cache
-        // and records evidence through the surface-level helper, then calls
+        // and records typed admission evidence for that current commit, then calls
         // retire_and_release_surface_textures before reacquiring the same dmabuf through a later
         // normal ImportDmaWl commit on that same WlSurface.
-        candidate
-            .renderer
-            .mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
-                &surface,
-                &candidate.dmabuf,
-                &evidence,
-            )
-            .unwrap();
-        candidate
-            .renderer
-            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                &first_buffer,
-                &candidate.dmabuf,
-            )
-            .unwrap();
+        admit_loopback_current_surface_commit_for_tests(
+            &candidate.renderer,
+            &surface,
+            &first_buffer,
+            &candidate.dmabuf,
+            &evidence,
+            &candidate.dmabuf,
+        )
+        .unwrap();
     }
 
     crate::wayland::compositor::with_states(&surface, |states| {
@@ -6512,25 +6542,19 @@ fn runtime_import_dma_wl_loopback_removed_buffer_releases_cached_dmabuf() {
         // FOREIGN ownership in GENERAL layout, and its release sync was attached to or waited before
         // the Wayland acquire point. There is no intervening use before import_surface.
         // The probe drives the buffer through a live WlSurface's normal renderer-utils surface cache
-        // and records evidence through the surface-level helper. After the removed-buffer commit
+        // and records typed admission evidence for that current commit. After the removed-buffer commit
         // retires the cached texture, the test calls release_retired_surface_textures while the
         // renderer is still available before dropping the surface state, and panic cleanup falls back
         // to retire_and_release_surface_textures.
-        candidate
-            .renderer
-            .mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
-                &surface,
-                &candidate.dmabuf,
-                &evidence,
-            )
-            .unwrap();
-        candidate
-            .renderer
-            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                &buffer,
-                &candidate.dmabuf,
-            )
-            .unwrap();
+        admit_loopback_current_surface_commit_for_tests(
+            &candidate.renderer,
+            &surface,
+            &buffer,
+            &candidate.dmabuf,
+            &evidence,
+            &candidate.dmabuf,
+        )
+        .unwrap();
     }
 
     crate::wayland::compositor::with_states(&surface, |states| {
@@ -6710,24 +6734,18 @@ fn runtime_import_dma_wl_loopback_surface_tree_teardown_releases_cached_dmabuf()
         // FOREIGN ownership in GENERAL layout, and its release sync was attached to or waited before
         // the Wayland acquire point. There is no intervening use before import_surface.
         // The probe drives the buffer through a live WlSurface's normal renderer-utils surface cache
-        // and records the evidence through the surface-level helper, then calls
+        // and records typed admission evidence for that current commit, then calls
         // retire_and_release_surface_tree_textures while the renderer is still available before
         // dropping the surface tree state.
-        candidate
-            .renderer
-            .mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
-                &surface,
-                &candidate.dmabuf,
-                &evidence,
-            )
-            .unwrap();
-        candidate
-            .renderer
-            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                &buffer,
-                &candidate.dmabuf,
-            )
-            .unwrap();
+        admit_loopback_current_surface_commit_for_tests(
+            &candidate.renderer,
+            &surface,
+            &buffer,
+            &candidate.dmabuf,
+            &evidence,
+            &candidate.dmabuf,
+        )
+        .unwrap();
     }
 
     crate::wayland::compositor::with_states(&surface, |states| {
@@ -6902,23 +6920,17 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
         // SAFETY: `first_evidence` proves this exact Smithay-controlled loopback dmabuf was released
         // to FOREIGN ownership in GENERAL layout, and its release sync was attached to or waited before
         // the first Wayland acquire point. There is no intervening use before the first import_surface.
-        // The probe drives the first buffer through a live WlSurface and records evidence through the
-        // surface-level helper before replacing it with a second dmabuf commit on the same WlSurface.
-        candidate
-            .renderer
-            .mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
-                &surface,
-                &candidate.dmabuf,
-                &first_evidence,
-            )
-            .unwrap();
-        candidate
-            .renderer
-            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                &first_buffer,
-                &candidate.dmabuf,
-            )
-            .unwrap();
+        // The probe drives the first buffer through a live WlSurface and records typed admission
+        // evidence before replacing it with a second dmabuf commit on the same WlSurface.
+        admit_loopback_current_surface_commit_for_tests(
+            &candidate.renderer,
+            &surface,
+            &first_buffer,
+            &candidate.dmabuf,
+            &first_evidence,
+            &candidate.dmabuf,
+        )
+        .unwrap();
     }
 
     crate::wayland::compositor::with_states(&surface, |states| {
@@ -7070,21 +7082,15 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
             // waited before the second Wayland acquire point. on_commit_buffer_handler retired the
             // first cached texture on the same WlSurface; import_surface must release it before
             // importing this second buffer.
-            candidate
-                .renderer
-                .mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
-                    &surface,
-                    &second_dmabuf,
-                    &second_evidence,
-                )
-                .unwrap();
-            candidate
-                .renderer
-                .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                    &second_buffer,
-                    &second_dmabuf,
-                )
-                .unwrap();
+            admit_loopback_current_surface_commit_for_tests(
+                &candidate.renderer,
+                &surface,
+                &second_buffer,
+                &second_dmabuf,
+                &second_evidence,
+                &second_dmabuf,
+            )
+            .unwrap();
         }
         assert!(second_buffer.release_point().is_some());
 
@@ -7299,21 +7305,15 @@ fn runtime_import_dma_wl_replacement_failure_releases_cached_dmabuf() {
         // the first Wayland acquire point. The replacement commit below intentionally omits admission
         // evidence for a different dmabuf, so the only expected Vulkan side effect is release of this
         // already-cached first texture before the replacement import fails.
-        candidate
-            .renderer
-            .mark_wayland_surface_current_dmabuf_commit_from_loopback_evidence_for_sampled_import(
-                &surface,
-                &candidate.dmabuf,
-                &first_evidence,
-            )
-            .unwrap();
-        candidate
-            .renderer
-            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(
-                &first_buffer,
-                &candidate.dmabuf,
-            )
-            .unwrap();
+        admit_loopback_current_surface_commit_for_tests(
+            &candidate.renderer,
+            &surface,
+            &first_buffer,
+            &candidate.dmabuf,
+            &first_evidence,
+            &candidate.dmabuf,
+        )
+        .unwrap();
     }
 
     crate::wayland::compositor::with_states(&surface, |states| {
