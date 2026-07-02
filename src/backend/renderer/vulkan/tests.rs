@@ -62,10 +62,12 @@ use super::capabilities::{
     should_query_modifier_properties,
 };
 use super::device::{
-    VulkanDeviceState, VulkanDmabufExternalImageFormatProperties, VulkanSampledDmabufForeignAcquireError,
+    VulkanDeviceState, VulkanDmabufExternalImageFormatProperties,
+    VulkanDmabufRenderTargetForeignReleaseError, VulkanSampledDmabufForeignAcquireError,
     VulkanSampledDmabufForeignReleaseError, VulkanSampledTexturePipelineShaders, VulkanShaderSpirv,
     VulkanSharedImageSyncState, VulkanSubmitSynchronization, VulkanSyncFileImport,
-    VulkanSyncFileSemaphorePayloadState, classify_sampled_dmabuf_acquire_submit_error_for_tests,
+    VulkanSyncFileSemaphorePayloadState, classify_dmabuf_render_target_release_submit_error_for_tests,
+    classify_sampled_dmabuf_acquire_submit_error_for_tests,
     classify_sampled_dmabuf_release_submit_error_for_tests, dmabuf_import_memory_type_bits,
     dmabuf_plane_layouts, dmabuf_render_target_foreign_acquire_barrier,
     dmabuf_render_target_foreign_release_barrier, find_memory_type_index, image_copy_buffer_offset,
@@ -5488,25 +5490,16 @@ fn runtime_dmabuf_discard_acquire_renders_then_samples_fresh_contents() {
             .expect("clear discard-acquired dmabuf target with fresh contents");
     }
 
-    let evidence = candidate
+    let mut target = Some(target);
+    let texture = candidate
         .renderer
-        .release_dmabuf_render_target_for_sampled_loopback(&mut target, false)
-        .expect("release discard-acquired render target to foreign GENERAL")
-        .expect("discard-acquired render target release should produce sampled import evidence");
-    assert_eq!(target.image.layout, VulkanImageLayoutState::Undefined);
-    drop(target);
-    assert!(evidence.is_for_dmabuf(&candidate.dmabuf));
-    assert!(evidence.acquire_sync().is_reached());
-
-    let texture = unsafe {
-        // SAFETY: `evidence` was produced by releasing the freshly-rendered dmabuf render target
-        // immediately above, and there is no intervening access before this sampled import.
-        candidate
-            .renderer
-            .import_dmabuf_texture_from_loopback(&candidate.dmabuf, evidence)
-    }
-    .expect("import freshly rendered discard-acquired dmabuf as sampled texture")
-    .expect("selected modifier should support sampled dmabuf import after discard acquire");
+        .release_dmabuf_render_target_and_import_sampled_loopback(&mut target, false)
+        .expect("release discard-acquired render target and import sampled loopback texture")
+        .expect("discard-acquired target should produce sampled loopback texture");
+    assert!(
+        target.is_none(),
+        "one-shot sampled loopback import should consume the released render target"
+    );
     assert_eq!(texture.width(), 4);
     assert_eq!(texture.height(), 4);
     assert_eq!(texture.format(), Some(candidate.format.code));
@@ -5575,42 +5568,26 @@ fn runtime_dmabuf_loopback_samples_with_exported_release_sync() {
             .expect("clear loopback dmabuf render target");
     }
 
-    let evidence = match candidate
+    let mut target = Some(target);
+    let texture = match candidate
         .renderer
-        .release_dmabuf_render_target_for_sampled_loopback(&mut target, true)
+        .release_dmabuf_render_target_and_import_sampled_loopback(&mut target, true)
     {
-        Ok(Some(evidence)) => evidence,
-        Ok(None) => panic!("released loopback render target should produce sampled import evidence"),
+        Ok(Some(texture)) => texture,
+        Ok(None) => panic!("released loopback render target should import sampled texture"),
         Err(VulkanError::UnsupportedOperation("sync-file semaphore export")) => {
             eprintln!(
                 "skipping Vulkan dmabuf loopback exported-sync sampling test: sync-file export unsupported"
             );
-            candidate
+            let _ = candidate
                 .renderer
-                .release_dmabuf_render_target_for_sampled_loopback(&mut target, false)
-                .expect("release loopback render target without exported sync after export skip");
+                .release_dmabuf_render_target_and_import_sampled_loopback(&mut target, false)
+                .expect("release/import loopback render target without exported sync after export skip");
             return;
         }
-        Err(err) => panic!("release loopback render target to foreign GENERAL with exported sync: {err:?}"),
+        Err(err) => panic!("release/import loopback render target with exported sync: {err:?}"),
     };
-    drop(target);
-    assert!(evidence.is_for_dmabuf(&candidate.dmabuf));
-    assert!(
-        evidence.acquire_sync().contains_fence(),
-        "exported loopback release should carry a fence-backed acquire SyncPoint"
-    );
-
-    let texture = unsafe {
-        // SAFETY: `evidence` was produced by releasing the same Smithay dmabuf identity immediately
-        // above, and there is no intervening access, acquire, release, or layout/ownership transition
-        // before this sampled loopback import. Unlike the safe generic ImportDma trait, this path
-        // passes the exported release sync point into the Vulkan acquire helper.
-        candidate
-            .renderer
-            .import_dmabuf_texture_from_loopback(&candidate.dmabuf, evidence)
-    }
-    .expect("import exported-sync loopback dmabuf as sampled texture")
-    .expect("selected modifier should support sampled dmabuf import");
+    assert!(target.is_none());
 
     runtime_sample_texture_to_offscreen_and_assert_non_black(
         &mut candidate.renderer,
@@ -7984,6 +7961,29 @@ fn internal_dmabuf_render_target_release_rejects_preconditions_before_device_loo
         ),
         Err(VulkanError::UnsupportedOperation("dmabuf render target image"))
     ));
+}
+
+#[test]
+fn one_shot_loopback_import_retains_target_on_retry_safe_pre_release_failure() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let dmabuf = dmabuf_for_tests();
+    let mut target = render_target_for_tests(
+        renderer.context_id(),
+        VulkanImageSource::RenderTarget,
+        (1, 1).into(),
+        Some(Fourcc::Abgr8888),
+    );
+    target.dmabuf = Some(dmabuf.weak());
+
+    let mut target = Some(target);
+    assert!(matches!(
+        renderer.release_dmabuf_render_target_and_import_sampled_loopback(&mut target, false),
+        Err(VulkanError::MissingCapability("sampled dmabuf explicit modifier"))
+    ));
+    assert!(
+        target.is_some(),
+        "retry-safe pre-release failure should leave the acquired target available for cleanup"
+    );
 }
 
 #[test]
@@ -12118,6 +12118,38 @@ fn sampled_release_submit_errors_are_classified_by_queue_acceptance() {
             VulkanError::UnsupportedOperation("submit")
         ),
         VulkanSampledDmabufForeignReleaseError::ReleaseSubmitted(VulkanError::UnsupportedOperation("submit"))
+    ));
+}
+
+#[test]
+fn dmabuf_render_target_release_submit_errors_are_classified_by_queue_acceptance() {
+    assert!(matches!(
+        classify_dmabuf_render_target_release_submit_error_for_tests(
+            false,
+            false,
+            VulkanError::UnsupportedOperation("submit")
+        ),
+        VulkanDmabufRenderTargetForeignReleaseError::RetrySafe(VulkanError::UnsupportedOperation("submit"))
+    ));
+    assert!(matches!(
+        classify_dmabuf_render_target_release_submit_error_for_tests(
+            true,
+            false,
+            VulkanError::UnsupportedOperation("submit")
+        ),
+        VulkanDmabufRenderTargetForeignReleaseError::ReleaseSubmitted(VulkanError::UnsupportedOperation(
+            "submit"
+        ))
+    ));
+    assert!(matches!(
+        classify_dmabuf_render_target_release_submit_error_for_tests(
+            false,
+            true,
+            VulkanError::UnsupportedOperation("submit")
+        ),
+        VulkanDmabufRenderTargetForeignReleaseError::ReleaseSubmitted(VulkanError::UnsupportedOperation(
+            "submit"
+        ))
     ));
 }
 

@@ -25,8 +25,8 @@ use crate::{
 use super::{
     VulkanError, VulkanRenderer, clear_color_value_for_format,
     device::{
-        VulkanDeviceState, VulkanOwnedImage, VulkanSampledImage, VulkanSampledTextureDrawConstants,
-        VulkanSolidColorDrawConstants,
+        VulkanDeviceState, VulkanDmabufRenderTargetForeignReleaseError, VulkanOwnedImage, VulkanSampledImage,
+        VulkanSampledTextureDrawConstants, VulkanSolidColorDrawConstants,
     },
     format::{get_format_info, get_render_vk_format},
     sync_point_from_sync_file,
@@ -1481,8 +1481,18 @@ impl Frame for VulkanFrame<'_, '_> {
         let device = self
             .device
             .ok_or(VulkanError::UnsupportedOperation("dmabuf render target device"))?;
-        let (released, sync_file) = device
-            .release_dmabuf_render_target_to_foreign_general(color_image, device.can_export_sync_file())?;
+        let (released, sync_file) = match device.release_dmabuf_render_target_to_foreign_general_classified(
+            color_image,
+            device.can_export_sync_file(),
+        ) {
+            Ok(release) => release,
+            Err(VulkanDmabufRenderTargetForeignReleaseError::ReleaseSubmitted(err)) => {
+                target.image.layout = VulkanImageLayoutState::Undefined;
+                target.image.sync = dmabuf_import_sync_state();
+                return Err(err);
+            }
+            Err(VulkanDmabufRenderTargetForeignReleaseError::RetrySafe(err)) => return Err(err),
+        };
         if released {
             target.image.layout = VulkanImageLayoutState::Undefined;
             target.image.sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
