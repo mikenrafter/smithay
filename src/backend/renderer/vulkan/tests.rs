@@ -5440,6 +5440,94 @@ fn runtime_import_dma_known_layout_helper_samples_released_loopback_dmabuf() {
 }
 
 #[test]
+#[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
+fn runtime_dmabuf_discard_acquire_renders_then_samples_fresh_contents() {
+    let test_name = "Vulkan dmabuf discard-acquire render then sample test";
+    let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
+        return;
+    };
+    let Some(render_format) =
+        runtime_offscreen_sample_render_format(&candidate.renderer, candidate.format.code, test_name)
+    else {
+        return;
+    };
+
+    let allocator_release = unsafe {
+        // SAFETY: The dmabuf was just exported from `candidate.image`, and this ignored runtime test
+        // does not hand it to any other API before asking the allocator to release the fresh image to
+        // the foreign queue family. The discard acquire below intentionally does not preserve or read
+        // allocator-produced contents; it uses the release only as ownership-transfer evidence.
+        candidate
+            .allocator
+            .release_dmabuf_to_foreign_general(&candidate.image, &candidate.dmabuf)
+    }
+    .expect("release allocator dmabuf before discard acquire");
+    assert!(allocator_release.is_for_dmabuf(&candidate.dmabuf));
+    drop(allocator_release);
+
+    let mut target = unsafe {
+        // SAFETY: The allocator release above transferred ownership to the foreign queue family and
+        // completed before this acquire. This experiment deliberately uses the discard acquire path,
+        // so it does not rely on the producer's previous image layout or contents being preserved.
+        candidate
+            .renderer
+            .bind_dmabuf_render_target(&mut candidate.dmabuf, VulkanDmabufRenderTargetAcquire::discard())
+    }
+    .expect("discard-acquire dmabuf as Vulkan render target")
+    .expect("renderer should support the selected dmabuf render-target modifier");
+    assert_eq!(target.image.layout, VulkanImageLayoutState::ColorAttachment);
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = candidate
+            .renderer
+            .render(&mut target, (4, 4).into(), Transform::Normal)
+            .expect("render into discard-acquired dmabuf target");
+        frame
+            .clear(Color32F::new(0.125, 0.875, 0.5, 1.0), &full_damage)
+            .expect("clear discard-acquired dmabuf target with fresh contents");
+    }
+
+    let evidence = candidate
+        .renderer
+        .release_dmabuf_render_target_for_sampled_loopback(&mut target, false)
+        .expect("release discard-acquired render target to foreign GENERAL")
+        .expect("discard-acquired render target release should produce sampled import evidence");
+    assert_eq!(target.image.layout, VulkanImageLayoutState::Undefined);
+    drop(target);
+    assert!(evidence.is_for_dmabuf(&candidate.dmabuf));
+    assert!(evidence.acquire_sync().is_reached());
+
+    let texture = unsafe {
+        // SAFETY: `evidence` was produced by releasing the freshly-rendered dmabuf render target
+        // immediately above, and there is no intervening access before this sampled import.
+        candidate
+            .renderer
+            .import_dmabuf_texture_from_loopback(&candidate.dmabuf, evidence)
+    }
+    .expect("import freshly rendered discard-acquired dmabuf as sampled texture")
+    .expect("selected modifier should support sampled dmabuf import after discard acquire");
+    assert_eq!(texture.width(), 4);
+    assert_eq!(texture.height(), 4);
+    assert_eq!(texture.format(), Some(candidate.format.code));
+    assert!(texture.has_sampled_image_for_tests());
+
+    runtime_sample_texture_to_offscreen_and_assert_non_black(
+        &mut candidate.renderer,
+        &texture,
+        render_format,
+        test_name,
+    );
+
+    let (released, release_sync) = candidate
+        .renderer
+        .release_imported_dmabuf_texture_to_foreign_general_sync_point(&texture, false)
+        .expect("release sampled discard-acquire texture back to foreign GENERAL");
+    assert!(released);
+    assert!(release_sync.is_reached());
+}
+
+#[test]
 #[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format and sync-file export"]
 fn runtime_dmabuf_loopback_samples_with_exported_release_sync() {
     let Some(mut candidate) =
