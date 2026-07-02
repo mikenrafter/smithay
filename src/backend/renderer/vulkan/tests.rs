@@ -6555,37 +6555,37 @@ fn runtime_import_dma_wl_loopback_removed_buffer_releases_cached_dmabuf() {
         .unwrap();
     }
 
-    crate::wayland::compositor::with_states(&surface, |states| {
-        crate::backend::renderer::utils::import_surface(&mut candidate.renderer, states)
-    })
-    .expect("normal ImportDmaWl import_surface should import sampled loopback dmabuf before removal");
-    assert!(
-        buffer.release_point().is_none(),
-        "successful ImportDmaWl texture construction must take Wayland release ownership"
-    );
-
+    let mut buffer = Some(buffer);
     let mut release_satisfied = false;
     let removed_buffer_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let cached_texture = {
-            crate::wayland::compositor::with_states(&surface, |states| {
-                let data = states
-                    .data_map
-                    .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
-                    .expect("import_surface should preserve renderer surface state");
-                let data = data.lock().unwrap();
-                data.texture(candidate.renderer.context_id()).cloned()
-            })
-        };
-        let cached_texture =
-            cached_texture.expect("ImportDmaWl import_surface should cache a Vulkan texture");
-        runtime_sample_texture_to_offscreen_and_assert_non_black(
+        let render_element = crate::wayland::compositor::with_states(&surface, |states| {
+            crate::backend::renderer::element::surface::WaylandSurfaceRenderElement::from_surface(
+                &mut candidate.renderer,
+                &surface,
+                states,
+                crate::utils::Point::from((0.0, 0.0)),
+                1.0,
+                crate::backend::renderer::element::Kind::Unspecified,
+            )
+        })
+        .expect("normal WaylandSurfaceRenderElement construction should import sampled loopback dmabuf before removal")
+        .expect("normal WaylandSurfaceRenderElement construction should create one sampled element before removal");
+        let buffer_ref = buffer
+            .as_ref()
+            .expect("test should retain buffer until after initial sampled draw");
+        assert!(
+            buffer_ref.release_point().is_none(),
+            "successful WaylandSurfaceRenderElement construction must take Wayland release ownership before removal"
+        );
+        let render_elements = [render_element];
+        runtime_draw_wayland_surface_elements_to_offscreen_and_assert_non_black(
             &mut candidate.renderer,
-            &cached_texture,
+            &render_elements,
             render_format,
             test_name,
         );
-        drop(cached_texture);
-        drop(buffer);
+        drop(render_elements);
+        drop(buffer.take());
 
         let display_handle = display.handle();
         remove_import_wl_surface_buffer_for_tests(&display_handle, &surface);
@@ -6630,13 +6630,19 @@ fn runtime_import_dma_wl_loopback_removed_buffer_releases_cached_dmabuf() {
     }));
 
     if let Err(payload) = removed_buffer_result {
-        if !release_satisfied {
-            retire_import_wl_surface_textures_and_wait_for_tests(
-                &mut candidate.renderer,
-                &surface,
-                &release_point_probe,
-                "panic cleanup should signal removed-buffer Wayland release point",
-            );
+        let release_ownership_taken = buffer
+            .as_ref()
+            .map(|buffer| buffer.release_point().is_none())
+            .unwrap_or(true);
+        if !release_satisfied && release_ownership_taken {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                retire_import_wl_surface_textures_and_wait_for_tests(
+                    &mut candidate.renderer,
+                    &surface,
+                    &release_point_probe,
+                    "panic cleanup should signal removed-buffer Wayland release point",
+                );
+            }));
         }
         std::panic::resume_unwind(payload);
     }
