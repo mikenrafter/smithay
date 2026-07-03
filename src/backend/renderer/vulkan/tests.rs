@@ -12484,6 +12484,59 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         ))
     ));
 
+    let public_contract_unrelated_release = unsafe {
+        // SAFETY: This negative fixture intentionally mismatches the producer release token identity.
+        VulkanWaylandDmabufProducerRelease::new(unrelated_dmabuf.weak(), SyncPoint::signaled())
+    };
+    assert!(matches!(
+        VulkanWaylandDmabufSampledImportProducerContract::from_vulkan_producer_release(
+            &dmabuf,
+            public_contract_unrelated_release,
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "sampled dmabuf producer evidence"
+        ))
+    ));
+    let public_contract_release = unsafe {
+        // SAFETY: This public-wrapper fixture validates admission ordering and marker storage failure
+        // for synthetic dmabuf fds only. It does not import, sample, or release a Vulkan image.
+        VulkanWaylandDmabufProducerRelease::new(dmabuf.weak(), SyncPoint::signaled())
+    };
+    let public_contract = VulkanWaylandDmabufSampledImportProducerContract::from_vulkan_producer_release(
+        &dmabuf,
+        public_contract_release,
+    )
+    .unwrap();
+    assert!(matches!(
+        unsafe {
+            // SAFETY: This synthetic dmabuf is not DMA_BUF_SYNC-capable, so the public admission method
+            // must reject before recording external-state or lifecycle evidence.
+            renderer.admit_wayland_dmabuf_current_commit_from_vulkan_producer_release_for_sampled_import(
+                public_contract,
+                &surface,
+                &buffer,
+                &dmabuf,
+            )
+        },
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf imported syncable dmabuf"
+        ))
+    ));
+    assert!(
+        renderer
+            .sampled_dmabuf_wayland_buffer_foreign_general_evidence(&buffer, &dmabuf)
+            .unwrap()
+            .is_none(),
+        "public admission failure must not record current-commit external-state evidence"
+    );
+    assert!(
+        renderer
+            .sampled_dmabuf_wayland_buffer_texture_cache_release_lifecycle(&buffer, &dmabuf)
+            .unwrap()
+            .is_none(),
+        "public admission failure must not record lifecycle evidence"
+    );
+
     let complete_admission =
         VulkanWaylandDmabufSampledImportAdmission::from_loopback_evidence(&dmabuf, &evidence)
             .with_imported_syncable(imported_syncable)
