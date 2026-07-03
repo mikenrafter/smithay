@@ -808,6 +808,172 @@ pub(crate) mod test_utils {
         pub(crate) fn renderer_buffer_has_dmabuf(&self) -> bool {
             get_dmabuf(self.renderer_buffer()).is_ok()
         }
+
+        #[allow(dead_code)]
+        pub(crate) fn commit_replacement_dmabuf(
+            &mut self,
+            timeline_fd: OwnedFd,
+            source_dmabuf: Dmabuf,
+            acquire_point: u64,
+            release_point: u64,
+        ) -> renderer_utils::Buffer {
+            self.server_state.expected_dmabuf = Some(source_dmabuf.clone());
+            self.server_state.last_imported_dmabuf_syncable = false;
+            self.server_state.last_imported_dmabuf_matches_expected = false;
+
+            let qh = self.event_queue.handle();
+            let dmabuf_global = self
+                .client_state
+                .dmabuf
+                .as_ref()
+                .expect("test dmabuf global should remain bound");
+            let syncobj_surface = self
+                .client_state
+                .syncobj_surface
+                .as_ref()
+                .expect("test syncobj surface should remain live");
+            let syncobj_manager = self
+                .client_state
+                .syncobj_manager
+                .as_ref()
+                .expect("test syncobj manager should remain bound");
+            let surface = self
+                .client_state
+                .surface
+                .as_ref()
+                .expect("test surface should remain live");
+            let timeline = syncobj_manager.import_timeline(timeline_fd.as_fd(), &qh, ());
+
+            let dmabuf_format = source_dmabuf.format();
+            let dmabuf_size = source_dmabuf.size();
+            let params = dmabuf_global.create_params(&qh, ());
+            let modifier: u64 = dmabuf_format.modifier.into();
+            for plane in &source_dmabuf.0.planes {
+                params.add(
+                    plane.fd.as_fd(),
+                    plane.plane_idx,
+                    plane.offset,
+                    plane.stride,
+                    (modifier >> 32) as u32,
+                    modifier as u32,
+                );
+            }
+            let buffer = params.create_immed(
+                dmabuf_size.w,
+                dmabuf_size.h,
+                dmabuf_format.code as u32,
+                zwp_linux_buffer_params_v1::Flags::empty(),
+                &qh,
+                (),
+            );
+            let (acquire_hi, acquire_lo) = (((acquire_point >> 32) as u32), acquire_point as u32);
+            let (release_hi, release_lo) = (((release_point >> 32) as u32), release_point as u32);
+            syncobj_surface.set_acquire_point(&timeline, acquire_hi, acquire_lo);
+            syncobj_surface.set_release_point(&timeline, release_hi, release_lo);
+            self.client_connection
+                .flush()
+                .expect("flush replacement dmabuf setup and syncobj surface point requests");
+            pump_surface_point_protocol_server(&mut self.display, &mut self.server_state);
+            let pending_acquire = with_states(&self.server_surface, |states| {
+                let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+                cached
+                    .pending()
+                    .acquire_point
+                    .as_ref()
+                    .expect("replacement set_acquire_point should stage a pending acquire point")
+                    .clone()
+            });
+            pending_acquire
+                .signal()
+                .expect("signal replacement acquire point for non-blocking explicit-sync commit helper");
+
+            surface.attach(Some(&buffer), 0, 0);
+            surface.commit();
+            if let Some(previous_timeline) = self.client_state.timeline.take() {
+                self.client_state.retained_timelines.push(previous_timeline);
+            }
+            if let Some(previous_buffer) = self.client_state.buffer.take() {
+                self.client_state.retained_buffers.push(previous_buffer);
+            }
+            self.client_state.timeline = Some(timeline);
+            self.client_state.params = Some(params);
+            self.client_state.buffer = Some(buffer);
+            self.client_connection
+                .flush()
+                .expect("flush replacement dmabuf surface commit request");
+            pump_surface_point_protocol_server(&mut self.display, &mut self.server_state);
+
+            let (
+                current_has_dmabuf,
+                staged_acquire_point,
+                staged_release_point,
+                acquire_release_same_timeline,
+            ) = with_states(&self.server_surface, |states| {
+                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                let current_buffer =
+                    attributes
+                        .current()
+                        .buffer
+                        .as_ref()
+                        .and_then(|assignment| match assignment {
+                            BufferAssignment::NewBuffer(buffer) => Some(buffer),
+                            BufferAssignment::Removed => None,
+                        });
+                let current_has_dmabuf = current_buffer
+                    .map(|buffer| get_dmabuf(buffer).is_ok())
+                    .unwrap_or(false);
+
+                let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
+                let current = cached.current();
+                let acquire = current.acquire_point.as_ref();
+                let release = current.release_point.as_ref();
+                (
+                    current_has_dmabuf,
+                    acquire.map(|point| point.point),
+                    release.map(|point| point.point),
+                    acquire
+                        .zip(release)
+                        .map(|(acquire, release)| acquire.timeline == release.timeline)
+                        .unwrap_or(false),
+                )
+            });
+            let known_timeline_count = self
+                .server_state
+                .syncobj_state
+                .as_ref()
+                .expect("test syncobj state should remain installed")
+                .known_timelines
+                .iter()
+                .filter_map(Weak::upgrade)
+                .count();
+            self.evidence = ClientDmabufCommitEvidence {
+                known_timeline_count,
+                imported_dmabuf_syncable: self.server_state.last_imported_dmabuf_syncable,
+                imported_dmabuf_matches_expected: self.server_state.last_imported_dmabuf_matches_expected,
+                current_has_dmabuf,
+                acquire_point: staged_acquire_point,
+                release_point: staged_release_point,
+                acquire_release_same_timeline,
+                transaction_acquire_source_installed: None,
+                transaction_pending_before_acquire_signal: None,
+                transaction_released_after_acquire_signal: None,
+                removal_release_point_signaled_before_commit: None,
+                removal_release_point_signaled_after_commit: None,
+                removal_release_point_signaled_at_buffer_release_event: None,
+                removal_buffer_release_events: None,
+                current_has_dmabuf_after_removal: None,
+            };
+            self.renderer_buffer =
+                renderer_utils::with_renderer_surface_state(&self.server_surface, |state| {
+                    state.buffer().cloned()
+                })
+                .flatten()
+                .expect(
+                    "replacement renderer commit handler should install a renderer-managed dmabuf buffer",
+                );
+
+            self.renderer_buffer.clone()
+        }
     }
 
     struct ClientDmabufCommitArtifacts {
@@ -1044,6 +1210,8 @@ pub(crate) mod test_utils {
         params: Option<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1>,
         syncobj_surface: Option<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1>,
         timeline: Option<wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1>,
+        retained_timelines: Vec<wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1>,
+        retained_buffers: Vec<wl_buffer::WlBuffer>,
     }
 
     impl ClientDispatch<wl_registry::WlRegistry, ()> for SurfacePointProtocolClientState {

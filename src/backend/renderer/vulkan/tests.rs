@@ -6129,6 +6129,402 @@ fn runtime_import_dma_wl_protocol_dmabuf_commit_samples_and_releases() {
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
+#[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format, DRM syncobj and Wayland test display"]
+fn runtime_import_dma_wl_protocol_dmabuf_replaces_cached_dmabuf_with_fresh_contents() {
+    let test_name = "Vulkan ImportDmaWl client-protocol dmabuf replacement sampling test";
+    let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
+        return;
+    };
+    let Some(drm_device) = candidate.drm_syncobj_device.clone() else {
+        eprintln!("skipping {test_name}: no DRM device for syncobj timeline");
+        return;
+    };
+    let Some(render_format) =
+        runtime_offscreen_sample_render_format(&candidate.renderer, candidate.format.code, test_name)
+    else {
+        return;
+    };
+    let usage = ImageUsageFlags::COLOR_ATTACHMENT
+        | ImageUsageFlags::SAMPLED
+        | ImageUsageFlags::TRANSFER_SRC
+        | ImageUsageFlags::TRANSFER_DST;
+
+    let first_allocator_release = unsafe {
+        // SAFETY: The first dmabuf was just exported from `candidate.image`, and this ignored runtime
+        // test does not hand it to any other API before asking the allocator to release the fresh image
+        // to FOREIGN/GENERAL for the renderer acquire below.
+        candidate
+            .allocator
+            .release_dmabuf_to_foreign_general(&candidate.image, &candidate.dmabuf)
+    }
+    .expect("release first allocator dmabuf to foreign GENERAL");
+
+    let mut first_target = unsafe {
+        // SAFETY: `first_allocator_release` proves that the allocator-owned image backing this
+        // exported dmabuf was released to VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL layout. There is no
+        // intervening access before this renderer acquire.
+        candidate
+            .renderer
+            .bind_allocator_released_dmabuf_render_target(&mut candidate.dmabuf, first_allocator_release)
+    }
+    .expect("bind first allocator-released dmabuf as Vulkan render target")
+    .expect("renderer should advertise the selected first dmabuf render-target modifier");
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = candidate
+            .renderer
+            .render(&mut first_target, (4, 4).into(), Transform::Normal)
+            .expect("render first protocol loopback dmabuf target");
+        frame
+            .clear(Color32F::new(0.125, 0.75, 0.375, 1.0), &full_damage)
+            .expect("clear first protocol loopback dmabuf render target");
+    }
+
+    let first_evidence = match candidate
+        .renderer
+        .release_dmabuf_render_target_for_sampled_loopback(&mut first_target, true)
+    {
+        Ok(Some(evidence)) => evidence,
+        Ok(None) => panic!("first protocol loopback release should produce sampled import evidence"),
+        Err(VulkanError::UnsupportedOperation("sync-file semaphore export")) => {
+            eprintln!("skipping {test_name}: sync-file export unsupported");
+            candidate
+                .renderer
+                .release_dmabuf_render_target_for_sampled_loopback(&mut first_target, false)
+                .expect(
+                    "release first protocol loopback render target without exported sync after export skip",
+                );
+            return;
+        }
+        Err(err) => {
+            panic!(
+                "release first protocol loopback render target to foreign GENERAL with exported sync: {err:?}"
+            )
+        }
+    };
+    drop(first_target);
+    assert!(first_evidence.is_for_dmabuf(&candidate.dmabuf));
+    first_evidence
+        .acquire_sync()
+        .wait()
+        .expect("wait for first loopback release before protocol acquire signal");
+
+    let timeline_fd = match runtime_syncobj_timeline_fd_for_tests(&drm_device) {
+        Ok(fd) => fd,
+        Err(err) => {
+            eprintln!("skipping {test_name}: syncobj timeline fd: {err}");
+            return;
+        }
+    };
+    let Some(mut harness) =
+        crate::wayland::drm_syncobj::test_utils::commit_dmabuf_surface_with_renderer_buffer_through_client_for_tests(
+            drm_device.clone(),
+            timeline_fd,
+            candidate.dmabuf.clone(),
+            0x3_0000_0600,
+            0x3_0000_0601,
+        )
+    else {
+        eprintln!("skipping {test_name}: failed to create Wayland test display");
+        return;
+    };
+    assert!(harness.renderer_buffer_has_dmabuf());
+    assert!(harness.evidence().imported_dmabuf_syncable);
+    assert!(harness.evidence().imported_dmabuf_matches_expected);
+    let first_buffer = harness.renderer_buffer().clone();
+    let first_release_point_probe = first_buffer
+        .release_point()
+        .expect("first protocol renderer-managed buffer should carry a release point");
+    let first_committed_dmabuf = crate::wayland::dmabuf::get_dmabuf(&first_buffer)
+        .expect("first protocol renderer-managed buffer should contain a dmabuf")
+        .clone();
+    unsafe {
+        // SAFETY: `first_evidence` proves the controlled first loopback dmabuf was released to
+        // FOREIGN ownership in GENERAL layout, the runtime probe waited that release before allowing
+        // the protocol commit's acquire point to complete, and the live protocol-created buffer is
+        // imported through the normal renderer-utils surface path below.
+        admit_loopback_current_surface_commit_for_tests(
+            &candidate.renderer,
+            harness.surface(),
+            &first_buffer,
+            &candidate.dmabuf,
+            &first_evidence,
+            &first_committed_dmabuf,
+        )
+        .unwrap();
+    }
+
+    let mut first_release_satisfied_for_cleanup = false;
+    let mut second_release_point_for_cleanup = None;
+    let mut second_cache_needs_release_for_cleanup = false;
+    let mut second_buffer_for_cleanup = None;
+    let replacement_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> bool {
+        let first_render_elements: Vec<
+            crate::backend::renderer::element::surface::WaylandSurfaceRenderElement<VulkanRenderer>,
+        > = crate::backend::renderer::element::surface::render_elements_from_surface_tree(
+            &mut candidate.renderer,
+            harness.surface(),
+            crate::utils::Point::from((0, 0)),
+            1.0,
+            1.0,
+            crate::backend::renderer::element::Kind::Unspecified,
+        );
+        assert_eq!(
+            first_render_elements.len(),
+            1,
+            "first protocol render-element construction should import one sampled dmabuf surface"
+        );
+        assert!(
+            first_buffer.release_point().is_none(),
+            "first protocol render-element construction must take first Wayland release ownership"
+        );
+        let first_readback = runtime_draw_wayland_surface_elements_to_offscreen_and_assert_non_black(
+            &mut candidate.renderer,
+            &first_render_elements,
+            render_format,
+            test_name,
+        );
+        drop(first_render_elements);
+
+        let second_image = candidate
+            .allocator
+            .create_buffer_with_usage(4, 4, candidate.format.code, &[candidate.format.modifier], usage)
+            .expect("allocate second protocol loopback dmabuf image");
+        let mut second_dmabuf = second_image
+            .export()
+            .expect("export second protocol loopback dmabuf");
+        assert_eq!(second_dmabuf.format(), candidate.format);
+
+        let second_allocator_release = unsafe {
+            // SAFETY: The second dmabuf was just exported from `second_image`, and this ignored
+            // runtime test does not hand it to any other API before asking the allocator to release the
+            // fresh image to FOREIGN/GENERAL for the renderer acquire below.
+            candidate
+                .allocator
+                .release_dmabuf_to_foreign_general(&second_image, &second_dmabuf)
+        }
+        .expect("release second allocator dmabuf to foreign GENERAL");
+
+        let mut second_target = unsafe {
+            // SAFETY: `second_allocator_release` proves that the allocator-owned image backing this
+            // exported dmabuf was released to VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL layout. There is no
+            // intervening access before this renderer acquire.
+            candidate
+                .renderer
+                .bind_allocator_released_dmabuf_render_target(&mut second_dmabuf, second_allocator_release)
+        }
+        .expect("bind second allocator-released dmabuf as Vulkan render target")
+        .expect("renderer should advertise the selected second dmabuf render-target modifier");
+
+        {
+            let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+            let mut frame = candidate
+                .renderer
+                .render(&mut second_target, (4, 4).into(), Transform::Normal)
+                .expect("render second protocol loopback dmabuf target");
+            frame
+                .clear(Color32F::new(0.875, 0.25, 0.125, 1.0), &full_damage)
+                .expect("clear second protocol loopback dmabuf render target");
+        }
+
+        let second_evidence = match candidate
+            .renderer
+            .release_dmabuf_render_target_for_sampled_loopback(&mut second_target, true)
+        {
+            Ok(Some(evidence)) => evidence,
+            Ok(None) => panic!("second protocol loopback release should produce sampled import evidence"),
+            Err(VulkanError::UnsupportedOperation("sync-file semaphore export")) => {
+                eprintln!("skipping {test_name}: sync-file export unsupported on second release");
+                let release_without_export = candidate
+                    .renderer
+                    .release_dmabuf_render_target_for_sampled_loopback(&mut second_target, false);
+                retire_import_wl_surface_textures_and_wait_for_tests(
+                    &mut candidate.renderer,
+                    harness.surface(),
+                    &first_release_point_probe,
+                    "cleanup after second protocol sync-file export skip should signal first Wayland release point",
+                );
+                first_release_satisfied_for_cleanup = true;
+                let _ = release_without_export.expect(
+                    "release second protocol loopback render target without exported sync after export skip",
+                );
+                return false;
+            }
+            Err(err) => {
+                retire_import_wl_surface_textures_and_wait_for_tests(
+                    &mut candidate.renderer,
+                    harness.surface(),
+                    &first_release_point_probe,
+                    "cleanup after second protocol release failure should signal first Wayland release point",
+                );
+                first_release_satisfied_for_cleanup = true;
+                panic!(
+                    "release second protocol loopback render target to foreign GENERAL with exported sync: {err:?}"
+                )
+            }
+        };
+        drop(second_target);
+        assert!(second_evidence.is_for_dmabuf(&second_dmabuf));
+        second_evidence
+            .acquire_sync()
+            .wait()
+            .expect("wait for second loopback release before replacement protocol acquire signal");
+
+        let replacement_timeline_fd = match runtime_syncobj_timeline_fd_for_tests(&drm_device) {
+            Ok(fd) => fd,
+            Err(err) => {
+                retire_import_wl_surface_textures_and_wait_for_tests(
+                    &mut candidate.renderer,
+                    harness.surface(),
+                    &first_release_point_probe,
+                    "cleanup after replacement timeline creation failure should signal first Wayland release point",
+                );
+                first_release_satisfied_for_cleanup = true;
+                panic!("replacement protocol syncobj timeline fd: {err}");
+            }
+        };
+        let second_buffer = harness.commit_replacement_dmabuf(
+            replacement_timeline_fd,
+            second_dmabuf.clone(),
+            0x3_0000_0602,
+            0x3_0000_0603,
+        );
+        second_buffer_for_cleanup = Some(second_buffer.clone());
+        assert!(harness.evidence().imported_dmabuf_syncable);
+        assert!(harness.evidence().imported_dmabuf_matches_expected);
+        assert_eq!(harness.renderer_buffer_acquire_point(), Some(0x3_0000_0602));
+        assert_eq!(harness.renderer_buffer_release_point(), Some(0x3_0000_0603));
+        let second_release_point_probe = second_buffer
+            .release_point()
+            .expect("replacement protocol renderer-managed buffer should carry a release point");
+        second_release_point_for_cleanup = Some(second_release_point_probe.clone());
+        let second_committed_dmabuf = crate::wayland::dmabuf::get_dmabuf(&second_buffer)
+            .expect("replacement protocol renderer-managed buffer should contain a dmabuf")
+            .clone();
+        unsafe {
+            // SAFETY: `second_evidence` proves the controlled second loopback dmabuf was released to
+            // FOREIGN ownership in GENERAL layout, the runtime probe waited that release before the
+            // replacement protocol commit's acquire point completed, and renderer-utils retired the
+            // first cached texture on the same WlSurface before importing this replacement.
+            admit_loopback_current_surface_commit_for_tests(
+                &candidate.renderer,
+                harness.surface(),
+                &second_buffer,
+                &second_dmabuf,
+                &second_evidence,
+                &second_committed_dmabuf,
+            )
+            .unwrap();
+        }
+        assert!(
+            first_release_point_probe.wait(0).is_err(),
+            "first protocol release point should not signal before replacement import releases retired cache"
+        );
+
+        let second_render_elements: Vec<
+            crate::backend::renderer::element::surface::WaylandSurfaceRenderElement<VulkanRenderer>,
+        > = crate::backend::renderer::element::surface::render_elements_from_surface_tree(
+            &mut candidate.renderer,
+            harness.surface(),
+            crate::utils::Point::from((0, 0)),
+            1.0,
+            1.0,
+            crate::backend::renderer::element::Kind::Unspecified,
+        );
+        assert_eq!(
+            second_render_elements.len(),
+            1,
+            "replacement protocol render-element construction should import one sampled dmabuf surface"
+        );
+        first_release_point_probe
+            .wait(1_000_000_000)
+            .expect("replacement protocol import_surface should signal first Wayland release point");
+        first_release_satisfied_for_cleanup = true;
+        assert_eq!(
+            candidate
+                .renderer
+                .sampled_dmabuf_layout_history(&first_committed_dmabuf),
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+        );
+        assert!(
+            second_buffer.release_point().is_none(),
+            "replacement protocol render-element construction must take second Wayland release ownership"
+        );
+        second_cache_needs_release_for_cleanup = true;
+
+        let second_readback = runtime_draw_wayland_surface_elements_to_offscreen_and_assert_non_black(
+            &mut candidate.renderer,
+            &second_render_elements,
+            render_format,
+            test_name,
+        );
+        drop(second_render_elements);
+        assert_ne!(
+            first_readback, second_readback,
+            "protocol replacement ImportDmaWl cache should sample fresh second dmabuf contents"
+        );
+        assert!(candidate.renderer.dmabuf_formats().iter().next().is_none());
+        assert!(matches!(
+            candidate
+                .renderer
+                .validate_sampled_dmabuf_public_advertisement_contract(),
+            Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        ));
+
+        retire_import_wl_surface_textures_and_wait_for_tests(
+            &mut candidate.renderer,
+            harness.surface(),
+            &second_release_point_probe,
+            "replacement protocol sampled dmabuf release should signal second Wayland release point",
+        );
+        second_cache_needs_release_for_cleanup = false;
+        assert_eq!(
+            candidate
+                .renderer
+                .sampled_dmabuf_layout_history(&second_committed_dmabuf),
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+        );
+        true
+    }));
+
+    match replacement_result {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(payload) => {
+            let second_release_ownership_taken = second_buffer_for_cleanup
+                .as_ref()
+                .map(|buffer| buffer.release_point().is_none())
+                .unwrap_or(false);
+            if second_cache_needs_release_for_cleanup || second_release_ownership_taken {
+                if let Some(second_release_point) = second_release_point_for_cleanup.as_ref() {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        retire_import_wl_surface_textures_and_wait_for_tests(
+                            &mut candidate.renderer,
+                            harness.surface(),
+                            second_release_point,
+                            "panic cleanup should signal replacement protocol second Wayland release point",
+                        );
+                    }));
+                }
+            } else if !first_release_satisfied_for_cleanup && first_buffer.release_point().is_none() {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    retire_import_wl_surface_textures_and_wait_for_tests(
+                        &mut candidate.renderer,
+                        harness.surface(),
+                        &first_release_point_probe,
+                        "panic cleanup should signal replacement protocol first Wayland release point",
+                    );
+                }));
+            }
+
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
 #[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format and DRM syncobj"]
 fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
     let test_name = "Vulkan ImportDmaWl loopback same-dmabuf reacquire test";
