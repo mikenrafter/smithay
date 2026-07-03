@@ -11185,6 +11185,104 @@ fn import_surface_current_surface_marker_reaches_device_import_boundary() {
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
+fn import_surface_current_surface_marker_is_commit_local() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
+    renderer.capabilities.external_memory.foreign_queue_family = true;
+
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let (first_acquire_point, first_release_point) =
+        DrmSyncPoint::invalid_timeline_pair_for_tests(131, 132).unwrap();
+    let Some((display, _client_side, surface, first_buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+            dmabuf.clone(),
+            first_acquire_point,
+            first_release_point,
+        )
+    else {
+        return;
+    };
+    unsafe {
+        // SAFETY: This unit test validates wrapper-local marker storage only. It does not import,
+        // sample, or release a Vulkan image with the constructed external-state assumption.
+        renderer
+            .assume_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import(
+                &surface, &dmabuf,
+            )
+            .unwrap();
+    }
+    assert!(
+        renderer
+            .sampled_dmabuf_wayland_buffer_foreign_general_evidence(&first_buffer, &dmabuf)
+            .unwrap()
+            .is_some(),
+        "first current-surface marker should be stored only on the first renderer-managed buffer"
+    );
+
+    let display_handle = display.handle();
+    let (second_acquire_point, second_release_point) =
+        DrmSyncPoint::invalid_timeline_pair_for_tests(133, 134).unwrap();
+    let expected_second_release_point = second_release_point.clone();
+    let second_buffer = update_import_wl_surface_dmabuf_buffer_with_sync_points_for_tests(
+        &display_handle,
+        &surface,
+        dmabuf.clone(),
+        second_acquire_point,
+        second_release_point,
+    );
+    assert!(
+        renderer
+            .sampled_dmabuf_wayland_buffer_foreign_general_evidence(&second_buffer, &dmabuf)
+            .unwrap()
+            .is_none(),
+        "external-state marker from a previous commit must not carry over to the replacement buffer"
+    );
+    unsafe {
+        // SAFETY: This fixture supplies only lifecycle coverage for the second current buffer. It
+        // deliberately omits fresh external-state evidence to prove a stale marker from the previous
+        // commit cannot satisfy first-import layout policy.
+        renderer
+            .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&second_buffer, &dmabuf)
+            .unwrap();
+    }
+    assert_buffer_release_point_matches_for_tests(
+        &second_buffer,
+        &expected_second_release_point,
+        "commit-local marker fixture should keep replacement release point before failed import",
+    );
+
+    let import_result = crate::wayland::compositor::with_states(&surface, |states| {
+        crate::backend::renderer::utils::import_surface(&mut renderer, states)
+    });
+    assert!(matches!(
+        import_result,
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf Wayland Vulkan first-import layout policy"
+        ))
+    ));
+    assert_buffer_release_point_matches_for_tests(
+        &second_buffer,
+        &expected_second_release_point,
+        "stale external-state marker guard must not consume replacement release ownership",
+    );
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
 fn import_surface_current_surface_marker_rejects_missing_current_buffer() {
     let renderer = VulkanRenderer::new_scaffold_for_tests();
     let dmabuf = dmabuf_with_planes_for_tests(
