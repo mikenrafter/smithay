@@ -6130,8 +6130,8 @@ fn runtime_import_dma_wl_protocol_dmabuf_commit_samples_and_releases() {
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format, DRM syncobj and Wayland test display"]
-fn runtime_import_dma_wl_protocol_dmabuf_from_controlled_external_vulkan_producer_samples_and_releases() {
-    let test_name = "Vulkan ImportDmaWl controlled external-producer protocol dmabuf sampling test";
+fn runtime_import_dma_wl_protocol_controlled_vulkan_producer_sync_file_samples_and_releases() {
+    let test_name = "Vulkan ImportDmaWl controlled external-producer sync-file protocol dmabuf sampling test";
     let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
         return;
     };
@@ -6213,10 +6213,10 @@ fn runtime_import_dma_wl_protocol_dmabuf_from_controlled_external_vulkan_produce
     };
     drop(producer_target);
     assert!(producer_evidence.is_for_dmabuf(&candidate.dmabuf));
-    producer_evidence
-        .acquire_sync()
-        .wait()
-        .expect("CPU-wait controlled producer release before protocol acquire signal");
+    let Some(producer_release_sync_file) = producer_evidence.acquire_sync().export() else {
+        eprintln!("skipping {test_name}: controlled producer release sync was not exportable");
+        return;
+    };
 
     let timeline_fd = match runtime_syncobj_timeline_fd_for_tests(&drm_device) {
         Ok(fd) => fd,
@@ -6226,9 +6226,10 @@ fn runtime_import_dma_wl_protocol_dmabuf_from_controlled_external_vulkan_produce
         }
     };
     let Some(harness) =
-        crate::wayland::drm_syncobj::test_utils::commit_dmabuf_surface_with_renderer_buffer_through_client_for_tests(
+        crate::wayland::drm_syncobj::test_utils::commit_dmabuf_surface_with_renderer_buffer_and_acquire_sync_file_through_client_for_tests(
             drm_device,
             timeline_fd,
+            producer_release_sync_file,
             candidate.dmabuf.clone(),
             0x3_0000_0700,
             0x3_0000_0701,
@@ -6248,6 +6249,21 @@ fn runtime_import_dma_wl_protocol_dmabuf_from_controlled_external_vulkan_produce
     );
     assert_eq!(harness.renderer_buffer_acquire_point(), Some(0x3_0000_0700));
     assert_eq!(harness.renderer_buffer_release_point(), Some(0x3_0000_0701));
+    assert_eq!(
+        harness.evidence().transaction_acquire_source_installed,
+        Some(true),
+        "sync-file handoff fixture should install a transaction acquire source"
+    );
+    assert_eq!(
+        harness.evidence().transaction_pending_before_acquire_signal,
+        Some(true),
+        "protocol commit should remain pending until the imported producer sync-file releases the acquire point"
+    );
+    assert_eq!(
+        harness.evidence().transaction_released_after_acquire_signal,
+        Some(true),
+        "protocol commit should release after the imported producer sync-file satisfies the acquire point"
+    );
 
     let committed_dmabuf = crate::wayland::dmabuf::get_dmabuf(harness.renderer_buffer())
         .expect("controlled external-producer protocol renderer-managed buffer should contain a dmabuf")
@@ -6258,10 +6274,9 @@ fn runtime_import_dma_wl_protocol_dmabuf_from_controlled_external_vulkan_produce
         .expect("controlled external-producer protocol renderer-managed buffer should carry a release point");
     unsafe {
         // SAFETY: The controlled producer renderer above acquired, wrote, and released this dmabuf to
-        // FOREIGN ownership in GENERAL layout. The probe CPU-waited the release sync before allowing
-        // the protocol commit's acquire point to complete, and the consumer renderer below imports
-        // only through the normal renderer-utils surface path. This does not test sync-file handoff
-        // into the drm-syncobj acquire timeline.
+        // FOREIGN ownership in GENERAL layout. The probe imported the producer release sync-file into
+        // the Wayland acquire point before the protocol commit completed, and the consumer renderer
+        // below imports only through the normal renderer-utils surface path.
         admit_loopback_current_surface_commit_for_tests(
             &consumer_renderer,
             harness.surface(),

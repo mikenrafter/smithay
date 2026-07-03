@@ -986,11 +986,12 @@ pub(crate) mod test_utils {
         server_surface: wayland_server::protocol::wl_surface::WlSurface,
     }
 
-    #[derive(Clone, Copy, Default)]
+    #[derive(Default)]
     struct ClientDmabufCommitOptions {
         install_transaction_acquire_source: bool,
         remove_after_commit: bool,
         run_renderer_commit_handler: bool,
+        acquire_sync_file: Option<OwnedFd>,
     }
 
     #[derive(Debug)]
@@ -1790,6 +1791,48 @@ pub(crate) mod test_utils {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn commit_dmabuf_surface_with_renderer_buffer_and_acquire_sync_file_through_client_for_tests(
+        import_device: DrmDeviceFd,
+        timeline_fd: OwnedFd,
+        acquire_sync_file: OwnedFd,
+        source_dmabuf: Dmabuf,
+        acquire_point: u64,
+        release_point: u64,
+    ) -> Option<ClientRendererDmabufCommitHarness> {
+        let artifacts = commit_dmabuf_surface_with_sync_points_through_client_for_tests_impl(
+            import_device,
+            timeline_fd,
+            source_dmabuf,
+            acquire_point,
+            release_point,
+            ClientDmabufCommitOptions {
+                run_renderer_commit_handler: true,
+                install_transaction_acquire_source: true,
+                acquire_sync_file: Some(acquire_sync_file),
+                ..ClientDmabufCommitOptions::default()
+            },
+        )?;
+
+        let renderer_buffer =
+            renderer_utils::with_renderer_surface_state(&artifacts.server_surface, |state| {
+                state.buffer().cloned()
+            })
+            .flatten()
+            .expect("renderer commit handler should install a renderer-managed dmabuf buffer");
+
+        Some(ClientRendererDmabufCommitHarness {
+            evidence: artifacts.evidence,
+            server_surface: artifacts.server_surface,
+            renderer_buffer,
+            display: artifacts.display,
+            server_state: artifacts.server_state,
+            client_connection: artifacts.client_connection,
+            event_queue: artifacts.event_queue,
+            client_state: artifacts.client_state,
+        })
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn commit_dmabuf_surface_remove_and_probe_release_through_client_for_tests(
         import_device: DrmDeviceFd,
         timeline_fd: OwnedFd,
@@ -1943,9 +1986,15 @@ pub(crate) mod test_utils {
                     .expect("set_acquire_point should stage a pending acquire point")
                     .clone()
             });
-            pending_acquire
-                .signal()
-                .expect("signal acquire point for non-blocking explicit-sync commit helper");
+            if let Some(acquire_sync_file) = options.acquire_sync_file.as_ref() {
+                pending_acquire
+                    .import_sync_file(acquire_sync_file.as_fd())
+                    .expect("import acquire sync-file into pending explicit-sync commit point");
+            } else {
+                pending_acquire
+                    .signal()
+                    .expect("signal acquire point for non-blocking explicit-sync commit helper");
+            }
         }
         surface.attach(Some(&buffer), 0, 0);
         surface.commit();
@@ -2027,7 +2076,13 @@ pub(crate) mod test_utils {
                     Ok(())
                 })
                 .expect("insert acquire blocker event source");
-            acquire.signal().expect("signal transaction acquire point");
+            if let Some(acquire_sync_file) = options.acquire_sync_file.as_ref() {
+                acquire
+                    .import_sync_file(acquire_sync_file.as_fd())
+                    .expect("import acquire sync-file into transaction explicit-sync commit point");
+            } else {
+                acquire.signal().expect("signal transaction acquire point");
+            }
             event_loop
                 .dispatch(Duration::from_millis(100), &mut server_state)
                 .expect("dispatch transaction acquire event source");
@@ -2129,9 +2184,18 @@ pub(crate) mod test_utils {
             .iter()
             .filter_map(Weak::upgrade)
             .count();
-        let transaction_released_after_acquire_signal = options
-            .install_transaction_acquire_source
-            .then_some(server_state.committed_surfaces == 1 && current_has_dmabuf);
+        let renderer_current_has_dmabuf_after_acquire = options.run_renderer_commit_handler
+            && renderer_utils::with_renderer_surface_state(&server_surface, |state| {
+                state
+                    .buffer()
+                    .map(|buffer| get_dmabuf(buffer).is_ok())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let transaction_released_after_acquire_signal = options.install_transaction_acquire_source.then_some(
+            server_state.committed_surfaces == 1
+                && (current_has_dmabuf || renderer_current_has_dmabuf_after_acquire),
+        );
 
         let evidence = ClientDmabufCommitEvidence {
             known_timeline_count,
