@@ -6197,7 +6197,7 @@ fn runtime_import_dma_wl_protocol_controlled_vulkan_producer_sync_file_samples_a
 
     let producer_evidence = match candidate
         .renderer
-        .release_dmabuf_render_target_for_sampled_loopback(&mut producer_target, true)
+        .release_dmabuf_render_target_for_wayland_sampled_import(&mut producer_target, true)
     {
         Ok(Some(evidence)) => evidence,
         Ok(None) => panic!("controlled external producer release should produce sampled import evidence"),
@@ -6205,7 +6205,7 @@ fn runtime_import_dma_wl_protocol_controlled_vulkan_producer_sync_file_samples_a
             eprintln!("skipping {test_name}: sync-file export unsupported");
             candidate
                 .renderer
-                .release_dmabuf_render_target_for_sampled_loopback(&mut producer_target, false)
+                .release_dmabuf_render_target_for_wayland_sampled_import(&mut producer_target, false)
                 .expect("release controlled external-producer render target without exported sync after export skip");
             return;
         }
@@ -6277,15 +6277,19 @@ fn runtime_import_dma_wl_protocol_controlled_vulkan_producer_sync_file_samples_a
         // FOREIGN ownership in GENERAL layout. The probe imported the producer release sync-file into
         // the Wayland acquire point before the protocol commit completed, and the consumer renderer
         // below imports only through the normal renderer-utils surface path.
-        admit_loopback_current_surface_commit_for_tests(
-            &consumer_renderer,
-            harness.surface(),
-            harness.renderer_buffer(),
+        let contract = VulkanWaylandDmabufSampledImportProducerContract::from_vulkan_producer_release(
             &candidate.dmabuf,
-            &producer_evidence,
-            &committed_dmabuf,
+            producer_evidence,
         )
         .unwrap();
+        consumer_renderer
+            .admit_wayland_dmabuf_current_commit_from_vulkan_producer_release_for_sampled_import(
+                contract,
+                harness.surface(),
+                harness.renderer_buffer(),
+                &committed_dmabuf,
+            )
+            .unwrap();
     }
 
     let mut release_satisfied = false;
