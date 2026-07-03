@@ -6130,6 +6130,214 @@ fn runtime_import_dma_wl_protocol_dmabuf_commit_samples_and_releases() {
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format, DRM syncobj and Wayland test display"]
+fn runtime_import_dma_wl_protocol_dmabuf_from_controlled_external_vulkan_producer_samples_and_releases() {
+    let test_name = "Vulkan ImportDmaWl controlled external-producer protocol dmabuf sampling test";
+    let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
+        return;
+    };
+    let Some(drm_device) = candidate.drm_syncobj_device.clone() else {
+        eprintln!("skipping {test_name}: no DRM device for syncobj timeline");
+        return;
+    };
+
+    let mut consumer_renderer = match VulkanRenderer::builder()
+        .with_physical_device(candidate.allocator.physical_device().clone())
+        .build()
+    {
+        Ok(renderer) => renderer,
+        Err(err) => {
+            eprintln!("skipping {test_name}: failed to create consumer renderer: {err:?}");
+            return;
+        }
+    };
+    let Some(render_format) =
+        runtime_offscreen_sample_render_format(&consumer_renderer, candidate.format.code, test_name)
+    else {
+        return;
+    };
+
+    assert!(consumer_renderer.dmabuf_formats().iter().next().is_none());
+    assert!(matches!(
+        consumer_renderer.validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
+
+    let allocator_release = unsafe {
+        // SAFETY: The dmabuf was just exported from `candidate.image`, and this ignored runtime test
+        // hands it only to the controlled producer renderer below after releasing the allocator-owned
+        // image to FOREIGN/GENERAL.
+        candidate
+            .allocator
+            .release_dmabuf_to_foreign_general(&candidate.image, &candidate.dmabuf)
+    }
+    .expect("release allocator dmabuf to foreign GENERAL for controlled external producer");
+
+    let mut producer_target = unsafe {
+        // SAFETY: `allocator_release` proves that the allocator-owned image backing this exported
+        // dmabuf was released to VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL layout. The producer renderer
+        // is a distinct Vulkan logical device from `consumer_renderer`; it acquires, writes, and then
+        // releases the dmabuf before any consumer import below.
+        candidate
+            .renderer
+            .bind_allocator_released_dmabuf_render_target(&mut candidate.dmabuf, allocator_release)
+    }
+    .expect("bind allocator-released dmabuf as controlled external-producer Vulkan render target")
+    .expect("producer renderer should support selected dmabuf render-target modifier");
+
+    {
+        let full_damage = [Rectangle::from_size(Size::<i32, Physical>::from((4, 4)))];
+        let mut frame = candidate
+            .renderer
+            .render(&mut producer_target, (4, 4).into(), Transform::Normal)
+            .expect("render controlled external-producer dmabuf target");
+        frame
+            .clear(Color32F::new(0.625, 0.25, 0.875, 1.0), &full_damage)
+            .expect("clear controlled external-producer dmabuf render target");
+    }
+
+    let producer_evidence = match candidate
+        .renderer
+        .release_dmabuf_render_target_for_sampled_loopback(&mut producer_target, true)
+    {
+        Ok(Some(evidence)) => evidence,
+        Ok(None) => panic!("controlled external producer release should produce sampled import evidence"),
+        Err(VulkanError::UnsupportedOperation("sync-file semaphore export")) => {
+            eprintln!("skipping {test_name}: sync-file export unsupported");
+            candidate
+                .renderer
+                .release_dmabuf_render_target_for_sampled_loopback(&mut producer_target, false)
+                .expect("release controlled external-producer render target without exported sync after export skip");
+            return;
+        }
+        Err(err) => panic!("release controlled external-producer render target to foreign GENERAL: {err:?}"),
+    };
+    drop(producer_target);
+    assert!(producer_evidence.is_for_dmabuf(&candidate.dmabuf));
+    producer_evidence
+        .acquire_sync()
+        .wait()
+        .expect("CPU-wait controlled producer release before protocol acquire signal");
+
+    let timeline_fd = match runtime_syncobj_timeline_fd_for_tests(&drm_device) {
+        Ok(fd) => fd,
+        Err(err) => {
+            eprintln!("skipping {test_name}: syncobj timeline fd: {err}");
+            return;
+        }
+    };
+    let Some(harness) =
+        crate::wayland::drm_syncobj::test_utils::commit_dmabuf_surface_with_renderer_buffer_through_client_for_tests(
+            drm_device,
+            timeline_fd,
+            candidate.dmabuf.clone(),
+            0x3_0000_0700,
+            0x3_0000_0701,
+        )
+    else {
+        eprintln!("skipping {test_name}: failed to create Wayland test display");
+        return;
+    };
+    assert!(harness.renderer_buffer_has_dmabuf());
+    assert!(
+        harness.evidence().imported_dmabuf_syncable,
+        "controlled external-producer protocol wl_buffer should be backed by a kernel dma-buf fd"
+    );
+    assert!(
+        harness.evidence().imported_dmabuf_matches_expected,
+        "controlled external-producer protocol wl_buffer should preserve dmabuf metadata"
+    );
+    assert_eq!(harness.renderer_buffer_acquire_point(), Some(0x3_0000_0700));
+    assert_eq!(harness.renderer_buffer_release_point(), Some(0x3_0000_0701));
+
+    let committed_dmabuf = crate::wayland::dmabuf::get_dmabuf(harness.renderer_buffer())
+        .expect("controlled external-producer protocol renderer-managed buffer should contain a dmabuf")
+        .clone();
+    let release_point_probe = harness
+        .renderer_buffer()
+        .release_point()
+        .expect("controlled external-producer protocol renderer-managed buffer should carry a release point");
+    unsafe {
+        // SAFETY: The controlled producer renderer above acquired, wrote, and released this dmabuf to
+        // FOREIGN ownership in GENERAL layout. The probe CPU-waited the release sync before allowing
+        // the protocol commit's acquire point to complete, and the consumer renderer below imports
+        // only through the normal renderer-utils surface path. This does not test sync-file handoff
+        // into the drm-syncobj acquire timeline.
+        admit_loopback_current_surface_commit_for_tests(
+            &consumer_renderer,
+            harness.surface(),
+            harness.renderer_buffer(),
+            &candidate.dmabuf,
+            &producer_evidence,
+            &committed_dmabuf,
+        )
+        .unwrap();
+    }
+
+    let mut release_satisfied = false;
+    let sample_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let render_elements: Vec<
+            crate::backend::renderer::element::surface::WaylandSurfaceRenderElement<VulkanRenderer>,
+        > = crate::backend::renderer::element::surface::render_elements_from_surface_tree(
+            &mut consumer_renderer,
+            harness.surface(),
+            crate::utils::Point::from((0, 0)),
+            1.0,
+            1.0,
+            crate::backend::renderer::element::Kind::Unspecified,
+        );
+        assert_eq!(
+            render_elements.len(),
+            1,
+            "controlled external-producer render-element construction should import one sampled dmabuf surface"
+        );
+        assert!(
+            harness.renderer_buffer().release_point().is_none(),
+            "controlled external-producer render-element construction must take Wayland release ownership"
+        );
+        runtime_draw_wayland_surface_elements_to_offscreen_and_assert_non_black(
+            &mut consumer_renderer,
+            &render_elements,
+            render_format,
+            test_name,
+        );
+        drop(render_elements);
+        assert!(consumer_renderer.dmabuf_formats().iter().next().is_none());
+        assert!(matches!(
+            consumer_renderer.validate_sampled_dmabuf_public_advertisement_contract(),
+            Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        ));
+
+        retire_import_wl_surface_textures_and_wait_for_tests(
+            &mut consumer_renderer,
+            harness.surface(),
+            &release_point_probe,
+            "controlled external-producer sampled dmabuf release should signal Wayland release point",
+        );
+        release_satisfied = true;
+        assert_eq!(
+            consumer_renderer.sampled_dmabuf_layout_history(&committed_dmabuf),
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral
+        );
+    }));
+
+    if let Err(payload) = sample_result {
+        if !release_satisfied && harness.renderer_buffer().release_point().is_none() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                retire_import_wl_surface_textures_and_wait_for_tests(
+                    &mut consumer_renderer,
+                    harness.surface(),
+                    &release_point_probe,
+                    "panic cleanup should signal controlled external-producer Wayland release point",
+                );
+            }));
+        }
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+#[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format, DRM syncobj and Wayland test display"]
 fn runtime_import_dma_wl_protocol_dmabuf_replaces_cached_dmabuf_with_fresh_contents() {
     let test_name = "Vulkan ImportDmaWl client-protocol dmabuf replacement sampling test";
     let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
