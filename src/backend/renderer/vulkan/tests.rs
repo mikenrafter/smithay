@@ -7257,6 +7257,88 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
+#[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format, DRM syncobj and Wayland test display"]
+fn runtime_import_dma_wl_protocol_dmabuf_without_policy_fails_closed() {
+    let test_name = "Vulkan ImportDmaWl protocol dmabuf missing policy test";
+    let Some(candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
+        return;
+    };
+    let Some(drm_device) = candidate.drm_syncobj_device.clone() else {
+        eprintln!("skipping {test_name}: no DRM device for syncobj timeline");
+        return;
+    };
+
+    let (acquire_point, release_point) = DrmSyncPoint::timeline_pair_for_tests(&drm_device, 71, 72)
+        .expect("create first-import failure DRM syncobj acquire/release timeline points");
+    acquire_point
+        .signal()
+        .expect("signal first-import failure acquire point before renderer import attempt");
+    let release_point_probe = release_point.clone();
+
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_wl_surface_with_sync_points_for_tests(
+            candidate.dmabuf.clone(),
+            acquire_point,
+            release_point,
+        )
+    else {
+        return;
+    };
+    assert!(
+        buffer.release_point().is_some(),
+        "fresh protocol dmabuf should keep Wayland release ownership before import"
+    );
+
+    let mut renderer = candidate.renderer;
+    let import_error = crate::wayland::compositor::with_states(&surface, |states| {
+        crate::backend::renderer::element::surface::WaylandSurfaceRenderElement::from_surface(
+            &mut renderer,
+            &surface,
+            states,
+            crate::utils::Point::from((0.0, 0.0)),
+            1.0,
+            crate::backend::renderer::element::Kind::Unspecified,
+        )
+    })
+    .expect_err("first protocol dmabuf without Vulkan producer policy should fail closed");
+    assert!(matches!(
+        import_error,
+        VulkanError::MissingCapability("sampled dmabuf Wayland Vulkan first-import layout policy")
+    ));
+    assert!(
+        buffer.release_point().is_some(),
+        "failed first import must not consume Wayland release ownership"
+    );
+    assert!(
+        release_point_probe.wait(0).is_err(),
+        "failed first import must not signal the Wayland release point"
+    );
+    crate::wayland::compositor::with_states(&surface, |states| {
+        let data = states
+            .data_map
+            .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
+            .expect("failed first import should preserve renderer surface state");
+        let data = data.lock().unwrap();
+        assert!(
+            data.texture(renderer.context_id()).is_none(),
+            "failed first import should not cache a Vulkan texture"
+        );
+    });
+    assert_eq!(
+        renderer.sampled_dmabuf_layout_history(&candidate.dmabuf),
+        SampledDmabufWaylandLayoutHistory::NoRendererHistory
+    );
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+    assert!(matches!(
+        renderer.validate_sampled_dmabuf_public_advertisement_contract(),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+    ));
+    drop(buffer);
+    drop(surface);
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
 #[ignore = "requires a working Vulkan loader, physical device, dmabuf-exportable loopback format and DRM syncobj"]
 fn runtime_import_dma_wl_replacement_failure_releases_cached_dmabuf() {
     let test_name = "Vulkan ImportDmaWl replacement failure release test";
