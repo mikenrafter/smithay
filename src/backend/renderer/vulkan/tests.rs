@@ -7267,6 +7267,11 @@ fn runtime_import_dma_wl_replacement_failure_releases_cached_dmabuf() {
         eprintln!("skipping {test_name}: no DRM device for syncobj timeline");
         return;
     };
+    let Some(render_format) =
+        runtime_offscreen_sample_render_format(&candidate.renderer, candidate.format.code, test_name)
+    else {
+        return;
+    };
     let usage = ImageUsageFlags::COLOR_ATTACHMENT
         | ImageUsageFlags::SAMPLED
         | ImageUsageFlags::TRANSFER_SRC
@@ -7363,35 +7368,45 @@ fn runtime_import_dma_wl_replacement_failure_releases_cached_dmabuf() {
         .unwrap();
     }
 
-    crate::wayland::compositor::with_states(&surface, |states| {
-        crate::backend::renderer::utils::import_surface(&mut candidate.renderer, states)
-    })
-    .expect("normal ImportDmaWl import_surface should import first sampled loopback dmabuf");
-    assert!(
-        first_buffer.release_point().is_none(),
-        "first ImportDmaWl texture construction must take the first Wayland release ownership"
-    );
-    assert_eq!(
-        candidate
-            .renderer
-            .sampled_dmabuf_layout_history(&candidate.dmabuf),
-        SampledDmabufWaylandLayoutHistory::LocallyAcquired
-    );
-    crate::wayland::compositor::with_states(&surface, |states| {
-        let data = states
-            .data_map
-            .get::<crate::backend::renderer::utils::RendererSurfaceStateUserData>()
-            .expect("first import should preserve renderer surface state before failed replacement");
-        let data = data.lock().unwrap();
-        assert!(
-            data.texture(candidate.renderer.context_id()).is_some(),
-            "first import should cache a Vulkan texture before failed replacement"
-        );
-    });
-
+    let mut first_buffer = Some(first_buffer);
     let mut first_release_satisfied_for_cleanup = false;
+    let mut second_release_point_for_cleanup = None;
+    let mut second_buffer_for_cleanup = None;
     let replacement_failure_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drop(first_buffer);
+        let first_render_element = crate::wayland::compositor::with_states(&surface, |states| {
+            crate::backend::renderer::element::surface::WaylandSurfaceRenderElement::from_surface(
+                &mut candidate.renderer,
+                &surface,
+                states,
+                crate::utils::Point::from((0.0, 0.0)),
+                1.0,
+                crate::backend::renderer::element::Kind::Unspecified,
+            )
+        })
+        .expect("normal WaylandSurfaceRenderElement construction should import first sampled loopback dmabuf before failed replacement")
+        .expect("normal WaylandSurfaceRenderElement construction should create one first sampled element before failed replacement");
+        let first_buffer_ref = first_buffer.as_ref().expect(
+            "test should retain first buffer until after first sampled draw before failed replacement",
+        );
+        assert!(
+            first_buffer_ref.release_point().is_none(),
+            "first WaylandSurfaceRenderElement construction must take the first Wayland release ownership"
+        );
+        assert_eq!(
+            candidate
+                .renderer
+                .sampled_dmabuf_layout_history(&candidate.dmabuf),
+            SampledDmabufWaylandLayoutHistory::LocallyAcquired
+        );
+        let first_render_elements = [first_render_element];
+        runtime_draw_wayland_surface_elements_to_offscreen_and_assert_non_black(
+            &mut candidate.renderer,
+            &first_render_elements,
+            render_format,
+            test_name,
+        );
+        drop(first_render_elements);
+        drop(first_buffer.take());
 
         let second_image = candidate
             .allocator
@@ -7407,15 +7422,19 @@ fn runtime_import_dma_wl_replacement_failure_releases_cached_dmabuf() {
             .signal()
             .expect("signal replacement acquire point before expected admission failure");
         let second_release_point_probe = second_release_point.clone();
+        second_release_point_for_cleanup = Some(second_release_point_probe.clone());
 
         let display_handle = first_display.handle();
-        let second_buffer = update_import_wl_surface_dmabuf_buffer_with_sync_points_for_tests(
+        second_buffer_for_cleanup = Some(update_import_wl_surface_dmabuf_buffer_with_sync_points_for_tests(
             &display_handle,
             &surface,
             second_dmabuf.clone(),
             second_acquire_point,
             second_release_point,
-        );
+        ));
+        let second_buffer = second_buffer_for_cleanup
+            .as_ref()
+            .expect("replacement-failure test should retain replacement buffer through failed import");
         assert!(
             second_buffer.release_point().is_some(),
             "replacement buffer should keep release point before failed import"
@@ -7426,10 +7445,24 @@ fn runtime_import_dma_wl_replacement_failure_releases_cached_dmabuf() {
             "replacement buffer should keep exact release point before failed import",
         );
 
-        let replacement_error = crate::wayland::compositor::with_states(&surface, |states| {
-            crate::backend::renderer::utils::import_surface(&mut candidate.renderer, states)
-        })
-        .expect_err("replacement without external-state evidence should fail admission");
+        let replacement_error = match crate::wayland::compositor::with_states(&surface, |states| {
+            crate::backend::renderer::element::surface::WaylandSurfaceRenderElement::from_surface(
+                &mut candidate.renderer,
+                &surface,
+                states,
+                crate::utils::Point::from((0.0, 0.0)),
+                1.0,
+                crate::backend::renderer::element::Kind::Unspecified,
+            )
+        }) {
+            Err(err) => err,
+            Ok(None) => panic!(
+                "replacement without external-state evidence should fail admission, not skip element construction"
+            ),
+            Ok(Some(_)) => panic!(
+                "replacement without external-state evidence should fail admission, not create an element"
+            ),
+        };
         assert!(matches!(
             replacement_error,
             VulkanError::MissingCapability("sampled dmabuf Wayland Vulkan first-import layout policy")
@@ -7477,17 +7510,40 @@ fn runtime_import_dma_wl_replacement_failure_releases_cached_dmabuf() {
             Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
         ));
 
-        drop(second_buffer);
+        drop(second_buffer_for_cleanup.take());
     }));
 
     if let Err(payload) = replacement_failure_result {
-        if !first_release_satisfied_for_cleanup {
-            retire_import_wl_surface_textures_and_wait_for_tests(
-                &mut candidate.renderer,
-                &surface,
-                &first_release_point_probe,
-                "panic cleanup should signal first Wayland release point after failed replacement",
-            );
+        let second_release_ownership_taken = second_buffer_for_cleanup
+            .as_ref()
+            .map(|buffer| buffer.release_point().is_none())
+            .unwrap_or(false);
+        if second_release_ownership_taken {
+            if let Some(second_release_point) = second_release_point_for_cleanup.as_ref() {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    retire_import_wl_surface_textures_and_wait_for_tests(
+                        &mut candidate.renderer,
+                        &surface,
+                        second_release_point,
+                        "panic cleanup should signal replacement Wayland release point after unexpected ownership transfer",
+                    );
+                }));
+            }
+        } else {
+            let first_release_ownership_taken = first_buffer
+                .as_ref()
+                .map(|buffer| buffer.release_point().is_none())
+                .unwrap_or(true);
+            if !first_release_satisfied_for_cleanup && first_release_ownership_taken {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    retire_import_wl_surface_textures_and_wait_for_tests(
+                        &mut candidate.renderer,
+                        &surface,
+                        &first_release_point_probe,
+                        "panic cleanup should signal first Wayland release point after failed replacement",
+                    );
+                }));
+            }
         }
         std::panic::resume_unwind(payload);
     }
