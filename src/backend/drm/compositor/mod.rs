@@ -154,7 +154,7 @@ use crate::{
         allocator::{
             Allocator, Buffer, Slot, Swapchain,
             dmabuf::{AsDmabuf, Dmabuf},
-            format::{get_opaque, has_alpha},
+            format::{FormatSet, get_opaque, has_alpha},
             gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice},
         },
         drm::{DrmError, PlaneDamageClips, plane_has_property},
@@ -1010,6 +1010,46 @@ impl<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>> PreparedFrame
         // It can happen that we have no changes, but there is a pending commit or
         // we are forced to do a full update in which case we just set the previous state again
         self.kind == PreparedFrameKind::Partial && self.frame.planes.iter().all(|p| p.1.skip)
+    }
+}
+
+struct DrmDmabufRenderTarget<'target> {
+    dmabuf: &'target mut Dmabuf,
+}
+
+// Keep the primary-plane render path target-shaped even for the existing raw-dmabuf case. This is
+// behavior-preserving for current renderers and provides the normal insertion point for targets that
+// must carry stronger external ownership/layout evidence before binding.
+impl<'target, R> Bind<DrmDmabufRenderTarget<'target>> for R
+where
+    R: Bind<Dmabuf>,
+{
+    fn bind<'a>(
+        &mut self,
+        target: &'a mut DrmDmabufRenderTarget<'target>,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        <R as Bind<Dmabuf>>::bind(self, &mut *target.dmabuf)
+    }
+
+    fn supported_formats(&self) -> Option<FormatSet> {
+        <R as Bind<Dmabuf>>::supported_formats(self)
+    }
+}
+
+impl<'target, R> RenderTargetLifecycle<DrmDmabufRenderTarget<'target>> for R
+where
+    R: RenderTargetLifecycle<Dmabuf>,
+{
+    fn target_age(&self, target: &DrmDmabufRenderTarget<'target>, age: usize) -> usize {
+        <R as RenderTargetLifecycle<Dmabuf>>::target_age(self, &*target.dmabuf, age)
+    }
+
+    fn release_after_render_error(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
+        <R as RenderTargetLifecycle<Dmabuf>>::release_after_render_error(self, target)
+    }
+
+    fn release_after_no_render(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
+        <R as RenderTargetLifecycle<Dmabuf>>::release_after_no_render(self, target)
     }
 }
 
@@ -2248,9 +2288,13 @@ where
                 )
                 .collect::<Vec<_>>();
 
-            let age = RenderTargetLifecycle::target_age(renderer, &dmabuf, age);
-            let mut framebuffer = renderer
-                .bind(&mut dmabuf)
+            let mut render_target = DrmDmabufRenderTarget { dmabuf: &mut dmabuf };
+            let age = <R as RenderTargetLifecycle<DrmDmabufRenderTarget<'_>>>::target_age(
+                renderer,
+                &render_target,
+                age,
+            );
+            let mut framebuffer = <R as Bind<DrmDmabufRenderTarget<'_>>>::bind(renderer, &mut render_target)
                 .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
             let render_res =
                 self.damage_tracker
@@ -2264,7 +2308,10 @@ where
                     if render_output_result.damage.is_none() {
                         // if we receive no damage we can assume no rendering took place
                         if let Err(err) =
-                            RenderTargetLifecycle::release_after_no_render(renderer, &mut framebuffer)
+                            <R as RenderTargetLifecycle<DrmDmabufRenderTarget<'_>>>::release_after_no_render(
+                                renderer,
+                                &mut framebuffer,
+                            )
                         {
                             self.swapchain.reset_buffers();
                             return Err(RenderFrameError::RenderFrame(
@@ -2359,7 +2406,11 @@ where
                 }
                 Err(err) => {
                     let release_error =
-                        RenderTargetLifecycle::release_after_render_error(renderer, &mut framebuffer).err();
+                        <R as RenderTargetLifecycle<DrmDmabufRenderTarget<'_>>>::release_after_render_error(
+                            renderer,
+                            &mut framebuffer,
+                        )
+                        .err();
 
                     // Rendering failed at some point, reset the buffers
                     // as we probably now have some half drawn buffer
