@@ -1053,6 +1053,20 @@ where
     }
 }
 
+fn bind_primary_render_target<'bind, R, Target>(
+    renderer: &mut R,
+    target: &'bind mut Target,
+    age: usize,
+) -> Result<(usize, R::Framebuffer<'bind>), R::Error>
+where
+    R: RenderTargetLifecycle<Target>,
+{
+    let age = <R as RenderTargetLifecycle<Target>>::target_age(renderer, target, age);
+    let framebuffer = <R as Bind<Target>>::bind(renderer, target)?;
+
+    Ok((age, framebuffer))
+}
+
 impl<A, F> std::fmt::Debug for PreparedFrame<A, F>
 where
     A: Allocator,
@@ -2289,13 +2303,9 @@ where
                 .collect::<Vec<_>>();
 
             let mut render_target = DrmDmabufRenderTarget { dmabuf: &mut dmabuf };
-            let age = <R as RenderTargetLifecycle<DrmDmabufRenderTarget<'_>>>::target_age(
-                renderer,
-                &render_target,
-                age,
-            );
-            let mut framebuffer = <R as Bind<DrmDmabufRenderTarget<'_>>>::bind(renderer, &mut render_target)
-                .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
+            let (age, mut framebuffer) =
+                bind_primary_render_target::<R, DrmDmabufRenderTarget<'_>>(renderer, &mut render_target, age)
+                    .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
             let render_res =
                 self.damage_tracker
                     .render_output(renderer, &mut framebuffer, age, &elements, clear_color);
