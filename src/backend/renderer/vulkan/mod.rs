@@ -2817,6 +2817,52 @@ impl VulkanRenderer {
         }
     }
 
+    /// Admit the current dmabuf commit on `surface` from a controlled Vulkan producer release.
+    ///
+    /// This convenience wrapper derives the current renderer-managed buffer and committed dmabuf from
+    /// renderer-utils state, then delegates to
+    /// [`VulkanRenderer::admit_wayland_dmabuf_current_commit_from_vulkan_producer_release_for_sampled_import`].
+    /// Prefer this method when compositor code only has the surface after the Wayland commit has been
+    /// promoted into renderer-utils state. It still keeps sampled dmabuf support scoped to the explicit
+    /// controlled-producer `ImportDmaWl` contract and does not public-advertise generic [`ImportDma`].
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy the same storage identity, no-intervening-transition, acquire-ordering,
+    /// surface synchronization, and renderer-utils lifecycle requirements as
+    /// [`VulkanRenderer::admit_wayland_dmabuf_current_commit_from_vulkan_producer_release_for_sampled_import`].
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    pub unsafe fn admit_wayland_surface_current_dmabuf_from_vulkan_producer_release_for_sampled_import(
+        &self,
+        contract: VulkanWaylandDmabufSampledImportProducerContract<'_>,
+        surface: &WlSurface,
+    ) -> Result<(), VulkanError> {
+        let (buffer, committed_dmabuf) = super::utils::with_renderer_surface_state(surface, |state| {
+            let buffer = state.buffer().ok_or(VulkanError::MissingCapability(
+                "sampled dmabuf producer current buffer",
+            ))?;
+            let committed_dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
+                .map_err(|_| VulkanError::UnsupportedOperation("sampled dmabuf producer current buffer"))?;
+
+            Ok((buffer.clone(), committed_dmabuf.clone()))
+        })
+        .unwrap_or(Err(VulkanError::MissingCapability(
+            "sampled dmabuf producer renderer surface state",
+        )))?;
+
+        unsafe {
+            // SAFETY: This surface-level helper forwards the caller's contract to the stricter
+            // buffer-level admission method after deriving the current renderer-managed buffer and
+            // committed dmabuf from renderer-utils state.
+            self.admit_wayland_dmabuf_current_commit_from_vulkan_producer_release_for_sampled_import(
+                contract,
+                surface,
+                &buffer,
+                &committed_dmabuf,
+            )
+        }
+    }
+
     #[cfg(feature = "wayland_frontend")]
     unsafe fn mark_wayland_surface_current_dmabuf_commit_foreign_general_for_sampled_import_use(
         &self,

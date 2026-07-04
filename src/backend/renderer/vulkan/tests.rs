@@ -6283,11 +6283,9 @@ fn runtime_import_dma_wl_protocol_controlled_vulkan_producer_sync_file_samples_a
         )
         .unwrap();
         consumer_renderer
-            .admit_wayland_dmabuf_current_commit_from_vulkan_producer_release_for_sampled_import(
+            .admit_wayland_surface_current_dmabuf_from_vulkan_producer_release_for_sampled_import(
                 contract,
                 harness.surface(),
-                harness.renderer_buffer(),
-                &committed_dmabuf,
             )
             .unwrap();
     }
@@ -12511,11 +12509,9 @@ fn import_surface_protocol_policy_rejects_missing_producer_contracts() {
         unsafe {
             // SAFETY: This synthetic dmabuf is not DMA_BUF_SYNC-capable, so the public admission method
             // must reject before recording external-state or lifecycle evidence.
-            renderer.admit_wayland_dmabuf_current_commit_from_vulkan_producer_release_for_sampled_import(
+            renderer.admit_wayland_surface_current_dmabuf_from_vulkan_producer_release_for_sampled_import(
                 public_contract,
                 &surface,
-                &buffer,
-                &dmabuf,
             )
         },
         Err(VulkanError::MissingCapability(
