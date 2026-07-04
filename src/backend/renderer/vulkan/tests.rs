@@ -4164,6 +4164,83 @@ fn runtime_drm_syncobj_imports_exported_sync_file_to_timeline_point() {
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
+#[ignore = "requires a working Vulkan loader, physical device and DRM syncobj"]
+fn runtime_producer_contract_signals_acquire_point_for_reached_release() {
+    let test_name = "Vulkan producer contract reached-release acquire signal test";
+    let instance = match Instance::new(Version::VERSION_1_3, None) {
+        Ok(instance) => instance,
+        Err(err) => {
+            eprintln!("skipping {test_name}: failed to create instance: {err:?}");
+            return;
+        }
+    };
+
+    let devices = match PhysicalDevice::enumerate(&instance) {
+        Ok(devices) => devices,
+        Err(err) => {
+            eprintln!("skipping {test_name}: failed to enumerate devices: {err:?}");
+            return;
+        }
+    };
+
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let producer_release = unsafe {
+        // SAFETY: This test exercises only the already-reached acquire-point ordering branch of the
+        // controlled producer contract. It does not import, sample, or release a Vulkan image with the
+        // synthetic dmabuf evidence.
+        VulkanWaylandDmabufProducerRelease::new(dmabuf.weak(), SyncPoint::signaled())
+    };
+    let contract = VulkanWaylandDmabufSampledImportProducerContract::from_vulkan_producer_release(
+        &dmabuf,
+        producer_release,
+    )
+    .unwrap();
+    assert!(contract.acquire_sync().is_reached());
+    assert!(
+        !contract.acquire_sync().is_exportable(),
+        "signaled producer release fixture should exercise the direct acquire-point signal branch"
+    );
+
+    let mut setup_errors = Vec::new();
+    for physical_device in devices {
+        let Some(drm_device) = runtime_drm_syncobj_device_for_tests(&physical_device, test_name) else {
+            continue;
+        };
+
+        let (_unused_point, acquire_point) = match DrmSyncPoint::timeline_pair_for_tests(&drm_device, 77, 78)
+        {
+            Ok(points) => points,
+            Err(err) => {
+                setup_errors.push(format!("failed to create DRM syncobj timeline points: {err}"));
+                continue;
+            }
+        };
+
+        contract
+            .import_release_sync_into_acquire_point(&acquire_point)
+            .expect("already-reached producer release should signal the Wayland acquire point");
+        acquire_point
+            .wait(1_000_000_000)
+            .expect("producer contract signaled acquire point should wait successfully");
+        assert!(acquire_point.is_signaled());
+        return;
+    }
+
+    if setup_errors.is_empty() {
+        eprintln!("skipping {test_name}: no Vulkan physical device exposed a usable DRM node");
+    } else {
+        eprintln!("skipping {test_name}: {}", setup_errors.join("; "));
+    }
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
 #[ignore = "requires a working Vulkan loader, physical device, DRM syncobj and Wayland test display"]
 fn runtime_drm_syncobj_import_timeline_protocol_installs_server_timeline() {
     let test_name = "DRM syncobj client import_timeline protocol test";
