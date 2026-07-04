@@ -18,6 +18,9 @@ use crate::backend::{
     },
 };
 
+#[cfg(feature = "backend_vulkan")]
+use crate::backend::allocator::vulkan::VulkanImage;
+
 /// Error for [`GbmFramebufferExporter`]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -27,6 +30,19 @@ pub enum Error {
     /// Exporting the [`GbmBuffer`] failed
     #[error(transparent)]
     Gbm(#[from] GbmError),
+}
+
+/// Error for Vulkan buffers exported through [`GbmFramebufferExporter`].
+#[cfg(feature = "backend_vulkan")]
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum VulkanError {
+    /// Exporting a Wayland or dmabuf-backed buffer as a GBM framebuffer failed.
+    #[error(transparent)]
+    Gbm(#[from] GbmError),
+    /// Vulkan allocator buffers require an explicit external-state contract before DRM framebuffer export.
+    #[error("missing capability: {0}")]
+    MissingCapability(&'static str),
 }
 
 /// Export framebuffers based on [`gbm::Device`]
@@ -126,6 +142,68 @@ impl<A: AsFd + 'static> ExportFramebuffer<GbmBuffer> for GbmFramebufferExporter<
     fn can_add_framebuffer(&self, buffer: &ExportBuffer<'_, GbmBuffer>) -> bool {
         match buffer {
             ExportBuffer::Allocator(_) => true,
+        }
+    }
+}
+
+#[cfg(feature = "backend_vulkan")]
+impl<A: AsFd + 'static> ExportFramebuffer<VulkanImage> for GbmFramebufferExporter<A> {
+    type Framebuffer = GbmFramebuffer;
+    type Error = VulkanError;
+
+    #[profiling::function]
+    fn add_framebuffer(
+        &self,
+        drm: &DrmDeviceFd,
+        buffer: ExportBuffer<'_, VulkanImage>,
+        use_opaque: bool,
+    ) -> Result<Option<Self::Framebuffer>, Self::Error> {
+        #[cfg(not(feature = "wayland_frontend"))]
+        let _ = (drm, use_opaque);
+
+        match buffer {
+            #[cfg(feature = "wayland_frontend")]
+            ExportBuffer::Wayland(wl_buffer) => Ok(framebuffer_from_wayland_buffer(
+                drm, &self.gbm, wl_buffer, use_opaque,
+            )?),
+            ExportBuffer::Allocator(buffer) => {
+                let _ = buffer;
+                Err(VulkanError::MissingCapability(
+                    "Vulkan allocator DRM framebuffer external-state contract",
+                ))
+            }
+        }
+    }
+
+    #[inline]
+    #[cfg(feature = "wayland_frontend")]
+    fn can_add_framebuffer(&self, buffer: &ExportBuffer<'_, VulkanImage>) -> bool {
+        match buffer {
+            #[cfg(not(all(feature = "backend_egl", feature = "use_system_lib")))]
+            ExportBuffer::Wayland(buffer) => {
+                let node = crate::wayland::dmabuf::get_dmabuf(buffer)
+                    .ok()
+                    .and_then(|buf| buf.node());
+                self.import_node == node
+            }
+            #[cfg(all(feature = "backend_egl", feature = "use_system_lib"))]
+            ExportBuffer::Wayland(buffer) => match crate::backend::renderer::buffer_type(buffer) {
+                Some(crate::backend::renderer::BufferType::Dma) => {
+                    let node = crate::wayland::dmabuf::get_dmabuf(buffer).unwrap().node();
+                    self.import_node == node
+                }
+                Some(crate::backend::renderer::BufferType::Egl) => true,
+                _ => false,
+            },
+            ExportBuffer::Allocator(_) => false,
+        }
+    }
+
+    #[inline]
+    #[cfg(not(feature = "wayland_frontend"))]
+    fn can_add_framebuffer(&self, buffer: &ExportBuffer<'_, VulkanImage>) -> bool {
+        match buffer {
+            ExportBuffer::Allocator(_) => false,
         }
     }
 }
