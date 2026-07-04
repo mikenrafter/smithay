@@ -1549,6 +1549,52 @@ impl<'sync> VulkanOwnedDmabufRenderTarget<'sync> {
     }
 }
 
+/// Controlled allocator contract for binding a Vulkan allocator-owned dmabuf render target.
+///
+/// This token ties a mutable dmabuf wrapper to the allocator evidence that released the same Vulkan
+/// image to `VK_QUEUE_FAMILY_FOREIGN_EXT` in `VK_IMAGE_LAYOUT_GENERAL`. It is a validation-stage
+/// bridge for the normal DRM/GBM swapchain path; it does not advertise generic Vulkan dmabuf target
+/// support or prove that the image is safe for KMS scanout.
+#[derive(Debug)]
+pub(crate) struct VulkanAllocatorDmabufRenderTargetContract<'target> {
+    dmabuf: &'target mut Dmabuf,
+    foreign_general_release: Option<VulkanAllocatorDmabufForeignReleaseEvidence>,
+}
+
+impl<'target> VulkanAllocatorDmabufRenderTargetContract<'target> {
+    /// Construct the render-target contract from allocator FOREIGN/GENERAL release evidence.
+    pub(crate) fn from_allocator_release(
+        dmabuf: &'target mut Dmabuf,
+        foreign_general_release: VulkanAllocatorDmabufForeignReleaseEvidence,
+    ) -> Result<Self, VulkanError> {
+        if !foreign_general_release.is_for_dmabuf(dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "allocator dmabuf release evidence",
+            ));
+        }
+
+        Ok(Self {
+            dmabuf,
+            foreign_general_release: Some(foreign_general_release),
+        })
+    }
+
+    fn take_release_evidence(&mut self) -> Result<VulkanAllocatorDmabufForeignReleaseEvidence, VulkanError> {
+        self.foreign_general_release
+            .take()
+            .ok_or(VulkanError::UnsupportedOperation(
+                "allocator dmabuf render target contract",
+            ))
+    }
+
+    fn into_parts(
+        mut self,
+    ) -> Result<(&'target mut Dmabuf, VulkanAllocatorDmabufForeignReleaseEvidence), VulkanError> {
+        let evidence = self.take_release_evidence()?;
+        Ok((self.dmabuf, evidence))
+    }
+}
+
 /// Opaque evidence that a Vulkan dmabuf producer released an image for Wayland sampled import.
 ///
 /// This token is produced by Smithay's Vulkan renderer only after releasing an acquired dmabuf render
@@ -5257,6 +5303,28 @@ impl VulkanRenderer {
         dmabuf: &'target mut Dmabuf,
         evidence: VulkanAllocatorDmabufForeignReleaseEvidence,
     ) -> Result<Option<VulkanRenderTarget<'target>>, VulkanError> {
+        let contract = VulkanAllocatorDmabufRenderTargetContract::from_allocator_release(dmabuf, evidence)?;
+
+        // SAFETY: Forwarded from this helper's caller and backed by the consumed allocator evidence.
+        unsafe { self.bind_allocator_dmabuf_render_target_contract(contract) }
+    }
+
+    /// Bind a dmabuf render target after consuming the allocator render-target contract.
+    ///
+    /// This keeps the allocator-owned `FOREIGN + GENERAL` proof in a named normal-path shape before
+    /// the renderer reaches the unsafe Vulkan acquire. It still uses the same development-gated dmabuf
+    /// target implementation and does not enable generic KMS presentation or scanout advertisement.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure there was no intervening access, acquire, release, or layout/ownership
+    /// transition of the dmabuf after `contract` was constructed from allocator release evidence.
+    #[allow(dead_code)]
+    pub(crate) unsafe fn bind_allocator_dmabuf_render_target_contract<'target>(
+        &mut self,
+        contract: VulkanAllocatorDmabufRenderTargetContract<'target>,
+    ) -> Result<Option<VulkanRenderTarget<'target>>, VulkanError> {
+        let (dmabuf, evidence) = contract.into_parts()?;
         if !evidence.is_for_dmabuf(dmabuf) {
             return Err(VulkanError::UnsupportedOperation(
                 "allocator dmabuf release evidence",
@@ -6162,6 +6230,52 @@ impl<'sync> Bind<VulkanOwnedDmabufRenderTarget<'sync>> for VulkanRenderer {
 impl<'sync> RenderTargetLifecycle<VulkanOwnedDmabufRenderTarget<'sync>> for VulkanRenderer {
     fn target_age(&self, target: &VulkanOwnedDmabufRenderTarget<'sync>, age: usize) -> usize {
         if target.preserve_contents() { age } else { 0 }
+    }
+
+    fn release_after_render_error(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
+        self.release_dmabuf_render_target_after_render_error(target)
+    }
+
+    fn release_after_no_render(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
+        self.release_dmabuf_render_target_after_render_error(target)
+    }
+}
+
+impl<'target> Bind<VulkanAllocatorDmabufRenderTargetContract<'target>> for VulkanRenderer {
+    fn bind<'a>(
+        &mut self,
+        target: &'a mut VulkanAllocatorDmabufRenderTargetContract<'target>,
+    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
+        let evidence = target.take_release_evidence()?;
+        if !evidence.is_for_dmabuf(target.dmabuf) {
+            return Err(VulkanError::UnsupportedOperation(
+                "allocator dmabuf release evidence",
+            ));
+        }
+
+        unsafe {
+            // SAFETY: `VulkanAllocatorDmabufRenderTargetContract` can only be constructed from
+            // allocator release evidence for this dmabuf. The caller of the future DRM integration
+            // point must still ensure no intervening access, ownership transfer, or layout transition
+            // occurs between contract construction and this bind.
+            self.bind_dmabuf_render_target(
+                &mut *target.dmabuf,
+                VulkanDmabufRenderTargetAcquire::preserve(None),
+            )
+        }?
+        .ok_or(VulkanError::MissingCapability(
+            "dmabuf render target format/modifier",
+        ))
+    }
+
+    fn supported_formats(&self) -> Option<FormatSet> {
+        Some(self.development_gated_dmabuf_render_target_formats())
+    }
+}
+
+impl<'target> RenderTargetLifecycle<VulkanAllocatorDmabufRenderTargetContract<'target>> for VulkanRenderer {
+    fn target_age(&self, _target: &VulkanAllocatorDmabufRenderTargetContract<'target>, age: usize) -> usize {
+        age
     }
 
     fn release_after_render_error(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {

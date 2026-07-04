@@ -4025,10 +4025,7 @@ fn allocator_release_evidence_is_consumed_and_identity_bound_before_device_looku
         VulkanAllocatorDmabufForeignReleaseEvidence::new_for_tests(&dmabuf)
     };
     assert!(matches!(
-        unsafe {
-            // SAFETY: The helper must reject the mismatched dmabuf identity before reaching Vulkan.
-            renderer.bind_allocator_released_dmabuf_render_target(&mut unrelated_dmabuf, evidence)
-        },
+        VulkanAllocatorDmabufRenderTargetContract::from_allocator_release(&mut unrelated_dmabuf, evidence),
         Err(VulkanError::UnsupportedOperation(
             "allocator dmabuf release evidence"
         ))
@@ -4039,13 +4036,30 @@ fn allocator_release_evidence_is_consumed_and_identity_bound_before_device_looku
         // route as far as device lookup.
         VulkanAllocatorDmabufForeignReleaseEvidence::new_for_tests(&dmabuf)
     };
+    let mut contract =
+        VulkanAllocatorDmabufRenderTargetContract::from_allocator_release(&mut dmabuf, evidence)
+            .expect("matching allocator evidence should construct a render-target contract");
+    assert_eq!(
+        <VulkanRenderer as RenderTargetLifecycle<VulkanAllocatorDmabufRenderTargetContract<'_>>>::target_age(
+            &renderer, &contract, 3,
+        ),
+        3
+    );
     assert!(matches!(
-        unsafe {
-            // SAFETY: This test validates that matching evidence is consumed by the intended helper
-            // and then reaches the normal Vulkan render-target bind path, which fails at device lookup.
-            renderer.bind_allocator_released_dmabuf_render_target(&mut dmabuf, evidence)
-        },
+        <VulkanRenderer as Bind<VulkanAllocatorDmabufRenderTargetContract<'_>>>::bind(
+            &mut renderer,
+            &mut contract
+        ),
         Err(VulkanError::VulkanUnavailable)
+    ));
+    assert!(matches!(
+        <VulkanRenderer as Bind<VulkanAllocatorDmabufRenderTargetContract<'_>>>::bind(
+            &mut renderer,
+            &mut contract
+        ),
+        Err(VulkanError::UnsupportedOperation(
+            "allocator dmabuf render target contract"
+        ))
     ));
 }
 
@@ -8640,6 +8654,11 @@ fn public_dmabuf_bind_gates_render_target_formats() {
         <VulkanRenderer as Bind<VulkanOwnedDmabufRenderTarget<'static>>>::supported_formats(&renderer)
             .expect("Vulkan owned explicit dmabuf render targets have a gated format set");
     assert!(owned_explicit_formats.iter().next().is_none());
+    let allocator_contract_formats = <VulkanRenderer as Bind<
+        VulkanAllocatorDmabufRenderTargetContract<'static>,
+    >>::supported_formats(&renderer)
+    .expect("Vulkan allocator dmabuf render targets have a gated format set");
+    assert!(allocator_contract_formats.iter().next().is_none());
     assert!(matches!(
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut dmabuf),
         Err(VulkanError::NotPublicAdvertised("dmabuf render target"))
@@ -8702,6 +8721,15 @@ fn public_dmabuf_bind_gates_render_target_formats() {
             .expect("Vulkan owned explicit dmabuf render targets have a gated format set");
     assert!(
         owned_explicit_formats
+            .iter()
+            .any(|format| { format.code == Fourcc::Abgr8888 && format.modifier == Modifier::Linear })
+    );
+    let allocator_contract_formats = <VulkanRenderer as Bind<
+        VulkanAllocatorDmabufRenderTargetContract<'static>,
+    >>::supported_formats(&renderer)
+    .expect("Vulkan allocator dmabuf render targets have a gated format set");
+    assert!(
+        allocator_contract_formats
             .iter()
             .any(|format| { format.code == Fourcc::Abgr8888 && format.modifier == Modifier::Linear })
     );
