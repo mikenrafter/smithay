@@ -5805,7 +5805,7 @@ impl VulkanRenderer {
     /// through the explicit Vulkan dmabuf render-target path, so this does not make generic
     /// [`ImportDma`] or arbitrary producer dmabufs public-advertised.
     #[allow(dead_code)]
-    pub fn release_dmabuf_render_target_and_import_sampled_loopback(
+    pub(crate) fn release_dmabuf_render_target_and_import_sampled_loopback(
         &mut self,
         target: &mut Option<VulkanRenderTarget<'_>>,
         export_sync_file: bool,
