@@ -1565,10 +1565,10 @@ pub struct VulkanWaylandDmabufProducerRelease {
     foreign_general: SampledDmabufKnownLayoutEvidence,
 }
 
-/// Compatibility name for the original Smithay-controlled loopback producer-release token.
+/// Internal compatibility name for the original Smithay-controlled loopback producer-release token.
 ///
 /// New controlled producer `ImportDmaWl` code should prefer [`VulkanWaylandDmabufProducerRelease`].
-pub type VulkanDmabufLoopbackImportEvidence = VulkanWaylandDmabufProducerRelease;
+pub(crate) type VulkanDmabufLoopbackImportEvidence = VulkanWaylandDmabufProducerRelease;
 
 impl VulkanWaylandDmabufProducerRelease {
     unsafe fn new(dmabuf: WeakDmabuf, acquire_sync: SyncPoint) -> Self {
