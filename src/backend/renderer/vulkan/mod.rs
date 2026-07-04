@@ -1636,6 +1636,40 @@ impl<'a> VulkanWaylandDmabufSampledImportProducerContract<'a> {
     pub fn acquire_sync(&self) -> &SyncPoint {
         self.producer_release.acquire_sync()
     }
+
+    /// Import the producer release dependency into a Wayland DRM syncobj acquire point.
+    ///
+    /// This helper wires the controlled Vulkan producer release into the normal
+    /// linux-drm-syncobj-v1 acquire path. The sync-file import only orders the producer release; the
+    /// caller must still pass this contract to one of the `admit_wayland_*_from_vulkan_producer_release`
+    /// methods for the matching current commit before drawing through `ImportDmaWl`.
+    ///
+    /// If the producer release dependency is already reached, this signals the acquire point directly.
+    /// Otherwise it imports an exported Linux sync-file. Returns [`VulkanError::MissingCapability`] if a
+    /// pending producer release dependency cannot be exported as a Linux sync-file, and
+    /// [`VulkanError::UnsupportedOperation`] if the acquire point cannot be signaled or cannot import the
+    /// sync-file.
+    #[cfg(feature = "backend_drm")]
+    pub fn import_release_sync_into_acquire_point(
+        &self,
+        acquire_point: &crate::wayland::drm_syncobj::DrmSyncPoint,
+    ) -> Result<(), VulkanError> {
+        if self.acquire_sync().is_reached() {
+            return acquire_point.signal().map_err(|_| {
+                VulkanError::UnsupportedOperation("sampled dmabuf producer acquire sync signal")
+            });
+        }
+
+        let sync_file = self
+            .acquire_sync()
+            .export()
+            .ok_or(VulkanError::MissingCapability(
+                "sampled dmabuf producer release sync-file export",
+            ))?;
+        acquire_point.import_sync_file(sync_file.as_fd()).map_err(|_| {
+            VulkanError::UnsupportedOperation("sampled dmabuf producer acquire sync-file import")
+        })
+    }
 }
 
 /// Validation-stage admission for importing a current Wayland dmabuf commit as a sampled Vulkan image.

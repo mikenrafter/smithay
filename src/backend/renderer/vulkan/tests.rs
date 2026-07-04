@@ -6,6 +6,7 @@ use std::{
     cell::Cell,
     ffi::CStr,
     fs::File,
+    io,
     marker::PhantomData,
     os::unix::io::{AsFd, OwnedFd},
     sync::Arc,
@@ -6213,10 +6214,15 @@ fn runtime_import_dma_wl_protocol_controlled_vulkan_producer_sync_file_samples_a
     };
     drop(producer_target);
     assert!(producer_evidence.is_for_dmabuf(&candidate.dmabuf));
-    let Some(producer_release_sync_file) = producer_evidence.acquire_sync().export() else {
-        eprintln!("skipping {test_name}: controlled producer release sync was not exportable");
+    let contract = VulkanWaylandDmabufSampledImportProducerContract::from_vulkan_producer_release(
+        &candidate.dmabuf,
+        producer_evidence,
+    )
+    .unwrap();
+    if !contract.acquire_sync().is_exportable() && !contract.acquire_sync().is_reached() {
+        eprintln!("skipping {test_name}: controlled producer release sync was pending but not exportable");
         return;
-    };
+    }
 
     let timeline_fd = match runtime_syncobj_timeline_fd_for_tests(&drm_device) {
         Ok(fd) => fd,
@@ -6226,13 +6232,17 @@ fn runtime_import_dma_wl_protocol_controlled_vulkan_producer_sync_file_samples_a
         }
     };
     let Some(harness) =
-        crate::wayland::drm_syncobj::test_utils::commit_dmabuf_surface_with_renderer_buffer_and_acquire_sync_file_through_client_for_tests(
+        crate::wayland::drm_syncobj::test_utils::commit_dmabuf_surface_with_renderer_buffer_and_acquire_satisfier_through_client_for_tests(
             drm_device,
             timeline_fd,
-            producer_release_sync_file,
             candidate.dmabuf.clone(),
             0x3_0000_0700,
             0x3_0000_0701,
+            |acquire_point| {
+                contract
+                    .import_release_sync_into_acquire_point(acquire_point)
+                    .map_err(|err| io::Error::other(format!("{err:?}")))
+            },
         )
     else {
         eprintln!("skipping {test_name}: failed to create Wayland test display");
@@ -6252,17 +6262,17 @@ fn runtime_import_dma_wl_protocol_controlled_vulkan_producer_sync_file_samples_a
     assert_eq!(
         harness.evidence().transaction_acquire_source_installed,
         Some(true),
-        "sync-file handoff fixture should install a transaction acquire source"
+        "producer contract acquire handoff should install a transaction acquire source"
     );
     assert_eq!(
         harness.evidence().transaction_pending_before_acquire_signal,
         Some(true),
-        "protocol commit should remain pending until the imported producer sync-file releases the acquire point"
+        "protocol commit should remain pending until the producer contract satisfies the acquire point"
     );
     assert_eq!(
         harness.evidence().transaction_released_after_acquire_signal,
         Some(true),
-        "protocol commit should release after the imported producer sync-file satisfies the acquire point"
+        "protocol commit should release after the producer contract satisfies the acquire point"
     );
 
     let committed_dmabuf = crate::wayland::dmabuf::get_dmabuf(harness.renderer_buffer())
@@ -6274,14 +6284,9 @@ fn runtime_import_dma_wl_protocol_controlled_vulkan_producer_sync_file_samples_a
         .expect("controlled external-producer protocol renderer-managed buffer should carry a release point");
     unsafe {
         // SAFETY: The controlled producer renderer above acquired, wrote, and released this dmabuf to
-        // FOREIGN ownership in GENERAL layout. The probe imported the producer release sync-file into
-        // the Wayland acquire point before the protocol commit completed, and the consumer renderer
-        // below imports only through the normal renderer-utils surface path.
-        let contract = VulkanWaylandDmabufSampledImportProducerContract::from_vulkan_producer_release(
-            &candidate.dmabuf,
-            producer_evidence,
-        )
-        .unwrap();
+        // FOREIGN ownership in GENERAL layout. The producer contract ordered the release dependency
+        // through the Wayland acquire point before the protocol commit completed, and the consumer
+        // renderer below imports only through the normal renderer-utils surface path.
         consumer_renderer
             .admit_wayland_surface_current_dmabuf_from_vulkan_producer_release_for_sampled_import(
                 contract,

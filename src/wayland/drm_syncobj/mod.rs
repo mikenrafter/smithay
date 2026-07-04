@@ -698,6 +698,7 @@ where
 pub(crate) mod test_utils {
     use std::{
         cell::RefCell,
+        io,
         os::fd::{AsFd, OwnedFd},
         os::unix::net::UnixStream,
         sync::{Arc, Weak},
@@ -1747,6 +1748,7 @@ pub(crate) mod test_utils {
             acquire_point,
             release_point,
             ClientDmabufCommitOptions::default(),
+            None,
         )
         .map(|artifacts| artifacts.evidence)
     }
@@ -1769,6 +1771,7 @@ pub(crate) mod test_utils {
                 run_renderer_commit_handler: true,
                 ..ClientDmabufCommitOptions::default()
             },
+            None,
         )?;
 
         let renderer_buffer =
@@ -1811,6 +1814,54 @@ pub(crate) mod test_utils {
                 acquire_sync_file: Some(acquire_sync_file),
                 ..ClientDmabufCommitOptions::default()
             },
+            None,
+        )?;
+
+        let renderer_buffer =
+            renderer_utils::with_renderer_surface_state(&artifacts.server_surface, |state| {
+                state.buffer().cloned()
+            })
+            .flatten()
+            .expect("renderer commit handler should install a renderer-managed dmabuf buffer");
+
+        Some(ClientRendererDmabufCommitHarness {
+            evidence: artifacts.evidence,
+            server_surface: artifacts.server_surface,
+            renderer_buffer,
+            display: artifacts.display,
+            server_state: artifacts.server_state,
+            client_connection: artifacts.client_connection,
+            event_queue: artifacts.event_queue,
+            client_state: artifacts.client_state,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn commit_dmabuf_surface_with_renderer_buffer_and_acquire_satisfier_through_client_for_tests<
+        F,
+    >(
+        import_device: DrmDeviceFd,
+        timeline_fd: OwnedFd,
+        source_dmabuf: Dmabuf,
+        acquire_point: u64,
+        release_point: u64,
+        mut satisfy_acquire: F,
+    ) -> Option<ClientRendererDmabufCommitHarness>
+    where
+        F: FnMut(&DrmSyncPoint) -> io::Result<()>,
+    {
+        let artifacts = commit_dmabuf_surface_with_sync_points_through_client_for_tests_impl(
+            import_device,
+            timeline_fd,
+            source_dmabuf,
+            acquire_point,
+            release_point,
+            ClientDmabufCommitOptions {
+                run_renderer_commit_handler: true,
+                install_transaction_acquire_source: true,
+                ..ClientDmabufCommitOptions::default()
+            },
+            Some(&mut satisfy_acquire),
         )?;
 
         let renderer_buffer =
@@ -1850,6 +1901,7 @@ pub(crate) mod test_utils {
                 remove_after_commit: true,
                 ..ClientDmabufCommitOptions::default()
             },
+            None,
         )
         .map(|artifacts| artifacts.evidence)
     }
@@ -1872,6 +1924,7 @@ pub(crate) mod test_utils {
                 install_transaction_acquire_source: true,
                 ..ClientDmabufCommitOptions::default()
             },
+            None,
         )
         .map(|artifacts| artifacts.evidence)
     }
@@ -1883,6 +1936,7 @@ pub(crate) mod test_utils {
         acquire_point: u64,
         release_point: u64,
         options: ClientDmabufCommitOptions,
+        mut acquire_point_satisfier: Option<&mut dyn FnMut(&DrmSyncPoint) -> io::Result<()>>,
     ) -> Option<ClientDmabufCommitArtifacts> {
         let mut display = match Display::<SurfacePointProtocolServerState>::new() {
             Ok(display) => display,
@@ -2076,7 +2130,9 @@ pub(crate) mod test_utils {
                     Ok(())
                 })
                 .expect("insert acquire blocker event source");
-            if let Some(acquire_sync_file) = options.acquire_sync_file.as_ref() {
+            if let Some(satisfy_acquire) = acquire_point_satisfier.as_mut() {
+                satisfy_acquire(&acquire).expect("satisfy transaction explicit-sync acquire point");
+            } else if let Some(acquire_sync_file) = options.acquire_sync_file.as_ref() {
                 acquire
                     .import_sync_file(acquire_sync_file.as_fd())
                     .expect("import acquire sync-file into transaction explicit-sync commit point");
