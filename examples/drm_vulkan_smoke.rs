@@ -9,6 +9,9 @@
 //! Set `SMITHAY_DRM_VULKAN_ALLOCATOR_PROBE=1` to stop after probing the Vulkan allocator path through
 //! `DrmCompositor::new`. That mode expects the current fail-closed Vulkan allocator framebuffer export
 //! guard and does not render or commit a frame.
+//! Set `SMITHAY_DRM_VULKAN_ALLOCATOR_METADATA_PROBE=1` to test only whether a single explicit-modifier
+//! Vulkan-exported dmabuf can be imported by GBM and added as a DRM framebuffer, then immediately
+//! destroyed. That mode is metadata evidence only; it is not presentation or reuse evidence.
 
 use std::{env, error::Error, path::Path, thread, time::Duration};
 
@@ -16,8 +19,8 @@ use ash::ext;
 use smithay::{
     backend::{
         allocator::{
-            Fourcc,
-            dmabuf::Dmabuf,
+            Allocator, Fourcc, Modifier,
+            dmabuf::{AsDmabuf, Dmabuf},
             format::FormatSet,
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
             vulkan::{ImageUsageFlags, VulkanAllocator},
@@ -96,6 +99,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("Vulkan renderer did not advertise an 8-bit ARGB/ABGR dmabuf target format".into());
     }
     let cursor_size = drm.cursor_size();
+
+    if env::var_os("SMITHAY_DRM_VULKAN_ALLOCATOR_METADATA_PROBE").is_some() {
+        return probe_vulkan_allocator_framebuffer_metadata(&drm, &gbm, physical_device, renderer_formats);
+    }
 
     if env::var_os("SMITHAY_DRM_VULKAN_ALLOCATOR_PROBE").is_some() {
         return probe_vulkan_allocator_framebuffer_guard(
@@ -209,6 +216,79 @@ fn pick_connector_crtc_mode(
     }
 
     Err("no connected DRM connector with a usable CRTC/mode".into())
+}
+
+fn probe_vulkan_allocator_framebuffer_metadata(
+    drm: &DrmDevice,
+    gbm: &GbmDevice<DrmDeviceFd>,
+    physical_device: PhysicalDevice,
+    renderer_formats: FormatSet,
+) -> Result<(), Box<dyn Error>> {
+    let usage = ImageUsageFlags::COLOR_ATTACHMENT;
+    let mut allocator = VulkanAllocator::new(&physical_device, usage)?;
+    let formats = renderer_formats
+        .iter()
+        .copied()
+        .filter(|format| {
+            format.modifier != Modifier::Invalid
+                && matches!(format.code, Fourcc::Abgr8888 | Fourcc::Argb8888)
+                && allocator.is_format_supported(*format, usage)
+        })
+        .collect::<Vec<_>>();
+    if formats.is_empty() {
+        return Err(
+            "Vulkan allocator and renderer did not share an explicit-modifier 8-bit ARGB/ABGR target format"
+                .into(),
+        );
+    }
+
+    let mut last_error = None;
+    for format in formats {
+        let image = match allocator.create_buffer(64, 64, format.code, &[format.modifier]) {
+            Ok(image) => image,
+            Err(err) => {
+                last_error = Some(format!("{format:?}: create buffer failed: {err}"));
+                continue;
+            }
+        };
+        let dmabuf = match image.export() {
+            Ok(dmabuf) => dmabuf,
+            Err(err) => {
+                last_error = Some(format!("{format:?}: export dmabuf failed: {err}"));
+                continue;
+            }
+        };
+        if dmabuf.num_planes() != 1 {
+            last_error = Some(format!(
+                "{format:?}: metadata probe currently requires a single-plane Vulkan dmabuf"
+            ));
+            continue;
+        }
+
+        match smithay::backend::drm::gbm::framebuffer_from_dmabuf(drm.device_fd(), gbm, &dmabuf, false, false)
+        {
+            Ok(framebuffer) => {
+                drop(framebuffer);
+
+                tracing::info!(
+                    ?format,
+                    "Vulkan allocator metadata probe imported dmabuf and created/destroyed DRM framebuffer"
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                last_error = Some(format!("{format:?}: framebuffer import failed: {err}"));
+            }
+        }
+    }
+
+    Err(format!(
+        "no explicit-modifier Vulkan allocator metadata candidate produced a DRM framebuffer{}",
+        last_error
+            .map(|err| format!("; last error: {err}"))
+            .unwrap_or_default()
+    )
+    .into())
 }
 
 #[allow(clippy::too_many_arguments)]
