@@ -126,6 +126,7 @@
 //! ```
 use std::{
     collections::HashMap,
+    convert::Infallible,
     fmt::Debug,
     io::ErrorKind,
     os::unix::io::{AsFd, OwnedFd},
@@ -1015,6 +1016,35 @@ impl<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>> PreparedFrame
 
 struct DrmDmabufRenderTarget<'target> {
     dmabuf: &'target mut Dmabuf,
+}
+
+trait DrmPrimaryRenderTargetFactory<A: Allocator> {
+    type Target<'target>;
+    type Error;
+
+    fn prepare_render_target<'target>(
+        allocator: &mut A,
+        slot: &Slot<A::Buffer>,
+        dmabuf: &'target mut Dmabuf,
+    ) -> Result<Self::Target<'target>, Self::Error>;
+}
+
+struct RawDmabufRenderTargetFactory;
+
+impl<A> DrmPrimaryRenderTargetFactory<A> for RawDmabufRenderTargetFactory
+where
+    A: Allocator,
+{
+    type Target<'target> = DrmDmabufRenderTarget<'target>;
+    type Error = Infallible;
+
+    fn prepare_render_target<'target>(
+        _allocator: &mut A,
+        _slot: &Slot<A::Buffer>,
+        dmabuf: &'target mut Dmabuf,
+    ) -> Result<Self::Target<'target>, Self::Error> {
+        Ok(DrmDmabufRenderTarget { dmabuf })
+    }
 }
 
 // Keep the primary-plane render path target-shaped even for the existing raw-dmabuf case. This is
@@ -2257,7 +2287,7 @@ where
                 primary_plane_elements.len(),
                 self.surface.plane(),
             );
-            let (mut dmabuf, age) = {
+            let (slot, mut dmabuf, age) = {
                 let primary_plane_state = next_frame_state.plane_state(self.surface.plane()).unwrap();
                 let config = primary_plane_state.config.as_ref().unwrap();
                 let slot = match &config.buffer.buffer {
@@ -2268,7 +2298,16 @@ where
                 // It is safe to call export multiple times as the Slot will cache the dmabuf for us
                 let dmabuf = slot.export().map_err(FrameError::AsDmabufError)?;
                 let age = slot.age().into();
-                (dmabuf, age)
+                (slot.clone(), dmabuf, age)
+            };
+
+            let mut render_target = match RawDmabufRenderTargetFactory::prepare_render_target(
+                &mut self.swapchain.allocator,
+                slot.as_ref(),
+                &mut dmabuf,
+            ) {
+                Ok(target) => target,
+                Err(err) => match err {},
             };
 
             // store the current renderer debug flags and replace them
@@ -2322,7 +2361,6 @@ where
                 )
                 .collect::<Vec<_>>();
 
-            let mut render_target = DrmDmabufRenderTarget { dmabuf: &mut dmabuf };
             let (age, mut framebuffer) =
                 bind_primary_render_target::<R, DrmDmabufRenderTarget<'_>>(renderer, &mut render_target, age)
                     .map_err(|err| RenderFrameError::RenderFrame(OutputDamageTrackerError::Rendering(err)))?;
