@@ -56,6 +56,8 @@ fn missing_vulkan_allocator_drm_framebuffer_contract() -> VulkanError {
     //   from DRM before the Vulkan allocator or renderer reuses the slot,
     // - repeated swapchain-slot lifecycle after KMS presentation, not only the first fresh-image
     //   `UNDEFINED` release,
+    // - a queue/pageflip path with return evidence (`frame_submitted` today, or an explicit KMS
+    //   out-fence in the future); non-event `commit_frame` is not enough for Vulkan slot reuse,
     // - modifier, per-plane fd/offset/stride, and fd-index metadata matching the allocated Vulkan
     //   image and accepted DRM framebuffer.
     //
