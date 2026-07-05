@@ -101,7 +101,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cursor_size = drm.cursor_size();
 
     if env::var_os("SMITHAY_DRM_VULKAN_ALLOCATOR_METADATA_PROBE").is_some() {
-        return probe_vulkan_allocator_framebuffer_metadata(&drm, &gbm, physical_device, renderer_formats);
+        return probe_vulkan_allocator_framebuffer_metadata(
+            &drm,
+            crtc,
+            &gbm,
+            physical_device,
+            renderer_formats,
+        );
     }
 
     if env::var_os("SMITHAY_DRM_VULKAN_ALLOCATOR_PROBE").is_some() {
@@ -220,18 +226,25 @@ fn pick_connector_crtc_mode(
 
 fn probe_vulkan_allocator_framebuffer_metadata(
     drm: &DrmDevice,
+    crtc: crtc::Handle,
     gbm: &GbmDevice<DrmDeviceFd>,
     physical_device: PhysicalDevice,
     renderer_formats: FormatSet,
 ) -> Result<(), Box<dyn Error>> {
     let usage = ImageUsageFlags::COLOR_ATTACHMENT;
     let mut allocator = VulkanAllocator::new(&physical_device, usage)?;
+    let planes = drm.planes(&crtc)?;
+    let primary_plane = planes
+        .primary
+        .first()
+        .ok_or("DRM device did not report a primary plane for the selected CRTC")?;
     let formats = renderer_formats
         .iter()
         .copied()
         .filter(|format| {
             format.modifier != Modifier::Invalid
                 && matches!(format.code, Fourcc::Abgr8888 | Fourcc::Argb8888)
+                && primary_plane.formats.contains(format)
                 && allocator.is_format_supported(*format, usage)
         })
         .collect::<Vec<_>>();
