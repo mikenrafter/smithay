@@ -273,7 +273,10 @@ fn probe_vulkan_allocator_framebuffer_metadata(
         };
         if dmabuf.num_planes() != 1 {
             errors.push(format!(
-                "{format:?}: metadata probe currently requires a single-plane Vulkan dmabuf"
+                "{format:?}: metadata probe currently requires a single-plane Vulkan dmabuf; planes={}, offsets={:?}, strides={:?}",
+                dmabuf.num_planes(),
+                dmabuf.offsets().collect::<Vec<_>>(),
+                dmabuf.strides().collect::<Vec<_>>()
             ));
             continue;
         }
@@ -290,7 +293,12 @@ fn probe_vulkan_allocator_framebuffer_metadata(
                 return Ok(());
             }
             Err(err) => {
-                errors.push(format!("{format:?}: framebuffer import failed: {err}"));
+                errors.push(format!(
+                    "{format:?}: framebuffer import failed: {err:?}; planes={}, offsets={:?}, strides={:?}",
+                    dmabuf.num_planes(),
+                    dmabuf.offsets().collect::<Vec<_>>(),
+                    dmabuf.strides().collect::<Vec<_>>()
+                ));
             }
         }
     }
