@@ -5,6 +5,10 @@
 //! libseat session backend, may take over the connected display, and does not restore previous DRM
 //! state. It renders a solid colour into a GBM scanout buffer through Smithay's normal
 //! [`Bind<Dmabuf>`] DRM compositor path and commits it with DRM.
+//!
+//! Set `SMITHAY_DRM_VULKAN_ALLOCATOR_PROBE=1` to stop after probing the Vulkan allocator path through
+//! `DrmCompositor::new`. That mode expects the current fail-closed Vulkan allocator framebuffer export
+//! guard and does not render or commit a frame.
 
 use std::{env, error::Error, path::Path, thread, time::Duration};
 
@@ -14,12 +18,14 @@ use smithay::{
         allocator::{
             Fourcc,
             dmabuf::Dmabuf,
+            format::FormatSet,
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
+            vulkan::{ImageUsageFlags, VulkanAllocator},
         },
         drm::{
             DrmDevice, DrmDeviceFd, DrmNode,
-            compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement},
-            exporter::gbm::GbmFramebufferExporter,
+            compositor::{DrmCompositor, FrameError, FrameFlags, PrimaryPlaneElement},
+            exporter::gbm::{GbmFramebufferExporter, VulkanError as GbmVulkanError},
         },
         renderer::{
             Bind, Color32F,
@@ -34,7 +40,7 @@ use smithay::{
         drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc},
         rustix::fs::OFlags,
     },
-    utils::{DeviceFd, Physical, Rectangle, Size, Transform},
+    utils::{Buffer as BufferCoords, DeviceFd, Physical, Rectangle, Size, Transform},
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -69,13 +75,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let (mut drm, _notifier) = DrmDevice::new(drm_fd.clone(), false)?;
     let gbm = GbmDevice::new(drm_fd)?;
-    let allocator = GbmAllocator::new(gbm.clone(), GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
     let exporter = GbmFramebufferExporter::new(gbm.clone(), None.into());
 
     let instance = Instance::new(Version::VERSION_1_3, None)?;
     let physical_device = physical_device_for_node(&instance, drm_node)?;
     let mut renderer = VulkanRenderer::builder()
-        .with_physical_device(physical_device)
+        .with_physical_device(physical_device.clone())
         .build()?;
 
     let renderer_formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer).unwrap_or_default();
@@ -90,13 +95,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     if color_formats.is_empty() {
         return Err("Vulkan renderer did not advertise an 8-bit ARGB/ABGR dmabuf target format".into());
     }
+    let cursor_size = drm.cursor_size();
 
+    if env::var_os("SMITHAY_DRM_VULKAN_ALLOCATOR_PROBE").is_some() {
+        return probe_vulkan_allocator_framebuffer_guard(
+            &mut drm,
+            crtc,
+            mode,
+            connector,
+            size,
+            cursor_size,
+            gbm,
+            exporter,
+            physical_device,
+            renderer_formats,
+        );
+    }
+
+    let allocator = GbmAllocator::new(gbm.clone(), GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
     let mode_source = OutputModeSource::Static {
         size,
         scale: 1.0.into(),
         transform: Transform::Normal,
     };
-    let cursor_size = drm.cursor_size();
     let surface = drm.create_surface(crtc, mode, &[connector])?;
     let mut compositor = DrmCompositor::<_, _, (), _>::new(
         mode_source,
@@ -188,6 +209,60 @@ fn pick_connector_crtc_mode(
     }
 
     Err("no connected DRM connector with a usable CRTC/mode".into())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_vulkan_allocator_framebuffer_guard(
+    drm: &mut DrmDevice,
+    crtc: crtc::Handle,
+    mode: smithay::reexports::drm::control::Mode,
+    connector: connector::Handle,
+    size: Size<i32, Physical>,
+    cursor_size: Size<u32, BufferCoords>,
+    gbm: GbmDevice<DrmDeviceFd>,
+    exporter: GbmFramebufferExporter<DrmDeviceFd>,
+    physical_device: PhysicalDevice,
+    renderer_formats: FormatSet,
+) -> Result<(), Box<dyn Error>> {
+    let usage = ImageUsageFlags::COLOR_ATTACHMENT;
+    let allocator = VulkanAllocator::new(&physical_device, usage)?;
+    let color_formats = renderer_formats
+        .iter()
+        .filter(|format| allocator.is_format_supported(**format, usage))
+        .map(|format| format.code)
+        .filter(|format| matches!(*format, Fourcc::Abgr8888 | Fourcc::Argb8888))
+        .collect::<Vec<_>>();
+    if color_formats.is_empty() {
+        return Err("Vulkan allocator and renderer did not share an 8-bit ARGB/ABGR target format".into());
+    }
+
+    let mode_source = OutputModeSource::Static {
+        size,
+        scale: 1.0.into(),
+        transform: Transform::Normal,
+    };
+    let surface = drm.create_surface(crtc, mode, &[connector])?;
+
+    match DrmCompositor::<VulkanAllocator, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>::new(
+        mode_source,
+        surface,
+        None,
+        allocator,
+        exporter,
+        color_formats,
+        renderer_formats,
+        cursor_size,
+        Some(gbm),
+    ) {
+        Err(FrameError::FramebufferExport(GbmVulkanError::MissingCapability(
+            "Vulkan allocator DRM framebuffer external-state contract",
+        ))) => {
+            tracing::info!("Vulkan allocator DRM compositor probe reached expected framebuffer export guard");
+            Ok(())
+        }
+        Ok(_) => Err("Vulkan allocator DRM compositor unexpectedly passed framebuffer export guard".into()),
+        Err(err) => Err(format!("unexpected Vulkan allocator DRM compositor probe error: {err:?}").into()),
+    }
 }
 
 fn physical_device_for_node(instance: &Instance, node: DrmNode) -> Result<PhysicalDevice, Box<dyn Error>> {
