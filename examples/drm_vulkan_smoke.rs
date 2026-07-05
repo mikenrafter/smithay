@@ -255,24 +255,24 @@ fn probe_vulkan_allocator_framebuffer_metadata(
         );
     }
 
-    let mut last_error = None;
+    let mut errors = Vec::new();
     for format in formats {
         let image = match allocator.create_buffer(64, 64, format.code, &[format.modifier]) {
             Ok(image) => image,
             Err(err) => {
-                last_error = Some(format!("{format:?}: create buffer failed: {err}"));
+                errors.push(format!("{format:?}: create buffer failed: {err}"));
                 continue;
             }
         };
         let dmabuf = match image.export() {
             Ok(dmabuf) => dmabuf,
             Err(err) => {
-                last_error = Some(format!("{format:?}: export dmabuf failed: {err}"));
+                errors.push(format!("{format:?}: export dmabuf failed: {err}"));
                 continue;
             }
         };
         if dmabuf.num_planes() != 1 {
-            last_error = Some(format!(
+            errors.push(format!(
                 "{format:?}: metadata probe currently requires a single-plane Vulkan dmabuf"
             ));
             continue;
@@ -290,16 +290,15 @@ fn probe_vulkan_allocator_framebuffer_metadata(
                 return Ok(());
             }
             Err(err) => {
-                last_error = Some(format!("{format:?}: framebuffer import failed: {err}"));
+                errors.push(format!("{format:?}: framebuffer import failed: {err}"));
             }
         }
     }
 
     Err(format!(
-        "no explicit-modifier Vulkan allocator metadata candidate produced a DRM framebuffer{}",
-        last_error
-            .map(|err| format!("; last error: {err}"))
-            .unwrap_or_default()
+        "no explicit-modifier Vulkan allocator metadata candidate produced a DRM framebuffer; attempted {} candidates: {}",
+        errors.len(),
+        errors.join("; ")
     )
     .into())
 }
