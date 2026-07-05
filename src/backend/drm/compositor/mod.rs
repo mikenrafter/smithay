@@ -1067,6 +1067,26 @@ where
     Ok((age, framebuffer))
 }
 
+fn release_primary_render_target_after_no_render<R, Target>(
+    renderer: &mut R,
+    framebuffer: &mut R::Framebuffer<'_>,
+) -> Result<(), R::Error>
+where
+    R: RenderTargetLifecycle<Target>,
+{
+    <R as RenderTargetLifecycle<Target>>::release_after_no_render(renderer, framebuffer)
+}
+
+fn release_primary_render_target_after_render_error<R, Target>(
+    renderer: &mut R,
+    framebuffer: &mut R::Framebuffer<'_>,
+) -> Result<(), R::Error>
+where
+    R: RenderTargetLifecycle<Target>,
+{
+    <R as RenderTargetLifecycle<Target>>::release_after_render_error(renderer, framebuffer)
+}
+
 impl<A, F> std::fmt::Debug for PreparedFrame<A, F>
 where
     A: Allocator,
@@ -2317,11 +2337,10 @@ where
                 Ok(render_output_result) => {
                     if render_output_result.damage.is_none() {
                         // if we receive no damage we can assume no rendering took place
-                        if let Err(err) =
-                            <R as RenderTargetLifecycle<DrmDmabufRenderTarget<'_>>>::release_after_no_render(
-                                renderer,
-                                &mut framebuffer,
-                            )
+                        if let Err(err) = release_primary_render_target_after_no_render::<
+                            R,
+                            DrmDmabufRenderTarget<'_>,
+                        >(renderer, &mut framebuffer)
                         {
                             self.swapchain.reset_buffers();
                             return Err(RenderFrameError::RenderFrame(
@@ -2415,12 +2434,11 @@ where
                     }
                 }
                 Err(err) => {
-                    let release_error =
-                        <R as RenderTargetLifecycle<DrmDmabufRenderTarget<'_>>>::release_after_render_error(
-                            renderer,
-                            &mut framebuffer,
-                        )
-                        .err();
+                    let release_error = release_primary_render_target_after_render_error::<
+                        R,
+                        DrmDmabufRenderTarget<'_>,
+                    >(renderer, &mut framebuffer)
+                    .err();
 
                     // Rendering failed at some point, reset the buffers
                     // as we probably now have some half drawn buffer
