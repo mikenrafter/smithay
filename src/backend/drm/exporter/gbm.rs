@@ -45,6 +45,24 @@ pub enum VulkanError {
     MissingCapability(&'static str),
 }
 
+#[cfg(feature = "backend_vulkan")]
+fn missing_vulkan_allocator_drm_framebuffer_contract() -> VulkanError {
+    // This is the live fail-closed contract stub for Vulkan allocator-owned primary-plane
+    // buffers. Do not replace it with raw `VulkanImage::export()` + `framebuffer_from_dmabuf` until
+    // the normal Smithay path carries explicit evidence for:
+    //
+    // - the image layout and queue-family ownership state required before DRM/KMS may scan it out,
+    // - synchronization handed to DRM for the rendered contents, and synchronization received back
+    //   from DRM before the Vulkan allocator or renderer reuses the slot,
+    // - repeated swapchain-slot lifecycle after KMS presentation, not only the first fresh-image
+    //   `UNDEFINED` release,
+    // - modifier, per-plane fd/offset/stride, and fd-index metadata matching the allocated Vulkan
+    //   image and accepted DRM framebuffer.
+    //
+    // The normal-path smoke probe in `examples/drm_vulkan_smoke.rs` intentionally expects this guard.
+    VulkanError::MissingCapability("Vulkan allocator DRM framebuffer external-state contract")
+}
+
 /// Export framebuffers based on [`gbm::Device`]
 #[derive(Debug, Clone)]
 pub struct GbmFramebufferExporter<A: AsFd + 'static> {
@@ -168,9 +186,7 @@ impl<A: AsFd + 'static> ExportFramebuffer<VulkanImage> for GbmFramebufferExporte
             )?),
             ExportBuffer::Allocator(buffer) => {
                 let _ = buffer;
-                Err(VulkanError::MissingCapability(
-                    "Vulkan allocator DRM framebuffer external-state contract",
-                ))
+                Err(missing_vulkan_allocator_drm_framebuffer_contract())
             }
         }
     }
