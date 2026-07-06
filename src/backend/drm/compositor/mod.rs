@@ -155,7 +155,7 @@ use crate::{
         allocator::{
             Allocator, Buffer, Slot, Swapchain,
             dmabuf::{AsDmabuf, Dmabuf},
-            format::{FormatSet, get_opaque, has_alpha},
+            format::{get_opaque, has_alpha},
             gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice},
         },
         drm::{DrmError, PlaneDamageClips, plane_has_property},
@@ -1049,36 +1049,54 @@ where
 
 // Keep the primary-plane render path target-shaped even for the existing raw-dmabuf case. This is
 // behavior-preserving for current renderers and provides the normal insertion point for targets that
-// must carry stronger external ownership/layout evidence before binding.
-impl<'target, R> Bind<DrmDmabufRenderTarget<'target>> for R
-where
-    R: Bind<Dmabuf>,
-{
-    fn bind<'a>(
-        &mut self,
-        target: &'a mut DrmDmabufRenderTarget<'target>,
-    ) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        <R as Bind<Dmabuf>>::bind(self, &mut *target.dmabuf)
-    }
+// must carry stronger external ownership/layout evidence before binding. This stays as a private
+// adapter trait instead of a blanket `Bind<DrmDmabufRenderTarget>` impl to avoid overlapping with
+// renderers that already forward `Bind<T>` blanketly.
+trait DrmPrimaryRenderTargetBind<Target>: Renderer {
+    fn primary_target_age(&self, target: &Target, age: usize) -> usize;
 
-    fn supported_formats(&self) -> Option<FormatSet> {
-        <R as Bind<Dmabuf>>::supported_formats(self)
-    }
+    fn bind_primary_target<'bind>(
+        &mut self,
+        target: &'bind mut Target,
+    ) -> Result<Self::Framebuffer<'bind>, Self::Error>;
+
+    fn release_primary_target_after_render_error(
+        &mut self,
+        target: &mut Self::Framebuffer<'_>,
+    ) -> Result<(), Self::Error>;
+
+    fn release_primary_target_after_no_render(
+        &mut self,
+        target: &mut Self::Framebuffer<'_>,
+    ) -> Result<(), Self::Error>;
 }
 
-impl<'target, R> RenderTargetLifecycle<DrmDmabufRenderTarget<'target>> for R
+impl<'target, R> DrmPrimaryRenderTargetBind<DrmDmabufRenderTarget<'target>> for R
 where
     R: RenderTargetLifecycle<Dmabuf>,
 {
-    fn target_age(&self, target: &DrmDmabufRenderTarget<'target>, age: usize) -> usize {
+    fn primary_target_age(&self, target: &DrmDmabufRenderTarget<'target>, age: usize) -> usize {
         <R as RenderTargetLifecycle<Dmabuf>>::target_age(self, &*target.dmabuf, age)
     }
 
-    fn release_after_render_error(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
+    fn bind_primary_target<'bind>(
+        &mut self,
+        target: &'bind mut DrmDmabufRenderTarget<'target>,
+    ) -> Result<Self::Framebuffer<'bind>, Self::Error> {
+        <R as Bind<Dmabuf>>::bind(self, &mut *target.dmabuf)
+    }
+
+    fn release_primary_target_after_render_error(
+        &mut self,
+        target: &mut Self::Framebuffer<'_>,
+    ) -> Result<(), Self::Error> {
         <R as RenderTargetLifecycle<Dmabuf>>::release_after_render_error(self, target)
     }
 
-    fn release_after_no_render(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
+    fn release_primary_target_after_no_render(
+        &mut self,
+        target: &mut Self::Framebuffer<'_>,
+    ) -> Result<(), Self::Error> {
         <R as RenderTargetLifecycle<Dmabuf>>::release_after_no_render(self, target)
     }
 }
@@ -1089,10 +1107,10 @@ fn bind_primary_render_target<'bind, R, Target>(
     age: usize,
 ) -> Result<(usize, R::Framebuffer<'bind>), R::Error>
 where
-    R: RenderTargetLifecycle<Target>,
+    R: DrmPrimaryRenderTargetBind<Target>,
 {
-    let age = <R as RenderTargetLifecycle<Target>>::target_age(renderer, target, age);
-    let framebuffer = <R as Bind<Target>>::bind(renderer, target)?;
+    let age = DrmPrimaryRenderTargetBind::primary_target_age(renderer, target, age);
+    let framebuffer = DrmPrimaryRenderTargetBind::bind_primary_target(renderer, target)?;
 
     Ok((age, framebuffer))
 }
@@ -1102,9 +1120,9 @@ fn release_primary_render_target_after_no_render<R, Target>(
     framebuffer: &mut R::Framebuffer<'_>,
 ) -> Result<(), R::Error>
 where
-    R: RenderTargetLifecycle<Target>,
+    R: DrmPrimaryRenderTargetBind<Target>,
 {
-    <R as RenderTargetLifecycle<Target>>::release_after_no_render(renderer, framebuffer)
+    DrmPrimaryRenderTargetBind::release_primary_target_after_no_render(renderer, framebuffer)
 }
 
 fn release_primary_render_target_after_render_error<R, Target>(
@@ -1112,9 +1130,9 @@ fn release_primary_render_target_after_render_error<R, Target>(
     framebuffer: &mut R::Framebuffer<'_>,
 ) -> Result<(), R::Error>
 where
-    R: RenderTargetLifecycle<Target>,
+    R: DrmPrimaryRenderTargetBind<Target>,
 {
-    <R as RenderTargetLifecycle<Target>>::release_after_render_error(renderer, framebuffer)
+    DrmPrimaryRenderTargetBind::release_primary_target_after_render_error(renderer, framebuffer)
 }
 
 impl<A, F> std::fmt::Debug for PreparedFrame<A, F>
