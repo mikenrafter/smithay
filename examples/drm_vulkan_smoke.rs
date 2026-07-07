@@ -20,6 +20,9 @@
 //! path and wait for render completion without committing the frame.
 //! Set `SMITHAY_DRM_VULKAN_PAGEFLIP_PROBE=1` to queue two normal DRM frames, wait for page-flip
 //! events, and call `frame_submitted` after each event.
+//! Set `SMITHAY_DRM_VULKAN_REUSE_PROBE=1` to queue several normal DRM frames and require at least
+//! one swapchain buffer object to be reused after page-flip submission. Override the frame count with
+//! `SMITHAY_DRM_VULKAN_PAGEFLIP_FRAMES`.
 
 use std::{
     env,
@@ -179,20 +182,26 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let elements = [element];
 
-    if env::var_os("SMITHAY_DRM_VULKAN_PAGEFLIP_PROBE").is_some() {
+    let reuse_probe = env::var_os("SMITHAY_DRM_VULKAN_REUSE_PROBE").is_some();
+    if env::var_os("SMITHAY_DRM_VULKAN_PAGEFLIP_PROBE").is_some() || reuse_probe {
         let (mut event_loop, mut event_state) = pageflip_event_loop(drm_notifier, crtc)?;
+        let frame_count = env::var("SMITHAY_DRM_VULKAN_PAGEFLIP_FRAMES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(if reuse_probe { 8 } else { 2 });
+        if frame_count < 2 {
+            return Err("pageflip probe requires at least two frames".into());
+        }
 
         let mut previous_sequence = None;
-        for frame_index in 0..2 {
+        let mut swapchain_buffer_ids = Vec::new();
+        let mut observed_reuse = false;
+        for frame_index in 0..frame_count {
             let element = SolidColorRenderElement::new(
                 Id::new(),
                 Rectangle::from_size(size),
                 frame_index + 1,
-                if frame_index == 0 {
-                    Color32F::new(0.0, 0.25, 0.8, 1.0)
-                } else {
-                    Color32F::new(0.8, 0.25, 0.0, 1.0)
-                },
+                probe_frame_color(frame_index),
                 Kind::Unspecified,
             );
             let elements = [element];
@@ -205,8 +214,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             let needs_sync = frame.needs_sync();
             let mut primary_was_swapchain = false;
             let mut waited_render_sync = false;
+            let mut swapchain_buffer_id = None;
             if let PrimaryPlaneElement::Swapchain(primary) = frame.primary_element {
                 primary_was_swapchain = true;
+                let buffer_id = primary.buffer() as *const _ as usize;
+                observed_reuse |= swapchain_buffer_ids.contains(&buffer_id);
+                swapchain_buffer_ids.push(buffer_id);
+                swapchain_buffer_id = Some(buffer_id);
                 if needs_sync {
                     wait_sync_point(&primary.sync, "pageflip probe primary swapchain sync")?;
                     waited_render_sync = true;
@@ -247,10 +261,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 primary_was_swapchain,
                 needs_sync,
                 waited_render_sync,
+                ?swapchain_buffer_id,
                 ?metadata,
                 submitted,
                 "DRM Vulkan smoke queued frame, observed pageflip, and submitted frame"
             );
+        }
+        if reuse_probe && !observed_reuse {
+            return Err(format!(
+                "reuse probe did not observe swapchain buffer reuse after {frame_count} frames; ids={swapchain_buffer_ids:?}"
+            )
+            .into());
         }
 
         tracing::info!(
@@ -258,8 +279,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             ?connector,
             ?crtc,
             ?size,
+            frame_count,
+            reuse_probe,
+            observed_reuse,
             seconds,
-            "DRM Vulkan smoke pageflip probe completed two frames"
+            "DRM Vulkan smoke pageflip probe completed"
         );
         thread::sleep(Duration::from_secs(seconds));
         return Ok(());
@@ -320,6 +344,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     thread::sleep(Duration::from_secs(seconds));
     Ok(())
+}
+
+fn probe_frame_color(frame_index: usize) -> Color32F {
+    match frame_index % 3 {
+        0 => Color32F::new(0.0, 0.25, 0.8, 1.0),
+        1 => Color32F::new(0.8, 0.25, 0.0, 1.0),
+        _ => Color32F::new(0.1, 0.6, 0.2, 1.0),
+    }
 }
 
 fn pick_connector_crtc_mode(
