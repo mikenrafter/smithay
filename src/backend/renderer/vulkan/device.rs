@@ -545,6 +545,8 @@ pub(crate) struct VulkanDmabufImportCandidate {
 pub(crate) struct VulkanDmabufImportImage {
     pub(super) image: VulkanUnboundImage,
     pub(super) memory_requirements: vk::MemoryRequirements,
+    pub(super) memory_dedicated_required: bool,
+    pub(super) memory_dedicated_preferred: bool,
     pub(super) candidate: VulkanDmabufImportCandidate,
 }
 
@@ -1293,19 +1295,29 @@ impl VulkanDeviceState {
             usage,
             external_memory_handle_type: Some(VulkanExternalMemoryHandleType::Dmabuf),
         };
+        let mut dedicated_requirements = vk::MemoryDedicatedRequirements::default();
+        let mut memory_requirements2 =
+            vk::MemoryRequirements2::default().push_next(&mut dedicated_requirements);
+        let memory_requirements_info = vk::ImageMemoryRequirementsInfo2::default().image(unbound.image);
         // SAFETY: `unbound.image` was just created from `unbound.logical_device`, has not been
         // destroyed, and the call only queries requirements for that image. No memory has been bound
-        // yet, and the image owner remains alive for the duration of the query.
-        let memory_requirements = unsafe {
+        // yet, and the image owner remains alive for the duration of the query. Smithay's Vulkan
+        // instance requires Vulkan 1.1, where memory-requirements2 is core.
+        unsafe {
             unbound
                 .logical_device
                 .handle()
-                .get_image_memory_requirements(unbound.image)
+                .get_image_memory_requirements2(&memory_requirements_info, &mut memory_requirements2)
         };
+        let memory_requirements = memory_requirements2.memory_requirements;
+        let memory_dedicated_required = dedicated_requirements.requires_dedicated_allocation == vk::TRUE;
+        let memory_dedicated_preferred = dedicated_requirements.prefers_dedicated_allocation == vk::TRUE;
 
         Ok(Some(VulkanDmabufImportImage {
             image: unbound,
             memory_requirements,
+            memory_dedicated_required,
+            memory_dedicated_preferred,
             candidate,
         }))
     }
@@ -1486,7 +1498,7 @@ impl VulkanDeviceState {
             import_image.memory_requirements.size,
             memory_type_index,
             fd,
-            import_image.candidate.dedicated_only,
+            import_image.candidate.dedicated_only || import_image.memory_dedicated_required,
         )?;
 
         if let Err(err) = unsafe {
