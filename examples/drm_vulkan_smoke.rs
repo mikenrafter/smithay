@@ -55,7 +55,7 @@ use smithay::{
         renderer::{
             Bind, Color32F, Frame, RenderTargetLifecycle, Renderer,
             element::{Id, Kind, solid::SolidColorRenderElement},
-            vulkan::VulkanRenderer,
+            vulkan::{VulkanDmabufRenderTarget, VulkanRenderer},
         },
         session::{Session, libseat::LibSeatSession},
         vulkan::{Instance, PhysicalDevice, version::Version},
@@ -150,7 +150,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_physical_device(physical_device.clone())
         .build()?;
 
-    let renderer_formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer).unwrap_or_default();
+    let renderer_formats =
+        <VulkanRenderer as Bind<VulkanDmabufRenderTarget<'static, 'static>>>::supported_formats(&renderer)
+            .unwrap_or_default();
     if renderer_formats.iter().next().is_none() {
         return Err("Vulkan renderer did not advertise any dmabuf render-target formats".into());
     }

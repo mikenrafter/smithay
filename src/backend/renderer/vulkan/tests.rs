@@ -8703,11 +8703,11 @@ fn public_dmabuf_bind_gates_render_target_formats() {
     renderer.capabilities.rendering.dmabuf_target_development = true;
     let formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
         .expect("Vulkan dmabuf Bind has a gated render-target format set");
-    assert!(
-        formats
-            .iter()
-            .any(|format| { format.code == Fourcc::Abgr8888 && format.modifier == Modifier::Linear })
-    );
+    assert!(formats.iter().next().is_none());
+    assert!(matches!(
+        <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut dmabuf),
+        Err(VulkanError::VulkanUnavailable)
+    ));
     let explicit_formats =
         <VulkanRenderer as Bind<VulkanDmabufRenderTarget<'static, 'static>>>::supported_formats(&renderer)
             .expect("Vulkan explicit dmabuf render targets have a gated format set");

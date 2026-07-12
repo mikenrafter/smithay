@@ -3303,6 +3303,14 @@ impl VulkanRenderer {
         }
     }
 
+    fn public_dmabuf_render_target_formats(&self) -> FormatSet {
+        if self.capabilities.rendering.dmabuf_targets {
+            self.capabilities.formats.dmabuf_render_target.clone()
+        } else {
+            FormatSet::default()
+        }
+    }
+
     fn public_dmabuf_import_formats(&self) -> FormatSet {
         if self
             .validate_sampled_dmabuf_public_advertisement_contract()
@@ -6309,7 +6317,7 @@ impl Bind<Dmabuf> for VulkanRenderer {
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
-        Some(self.development_gated_dmabuf_render_target_formats())
+        Some(self.public_dmabuf_render_target_formats())
     }
 }
 
