@@ -100,6 +100,26 @@ impl VulkanDmabufRenderTargetForeignReleaseError {
     }
 }
 
+/// Error classification for acquiring a dmabuf render-target image from foreign ownership.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum VulkanDmabufRenderTargetForeignAcquireError {
+    /// The acquire was not submitted; no Vulkan ownership-transfer side effect occurred.
+    RetrySafe(VulkanError),
+    /// Queue acquire submission was accepted or completion became unknowable; ownership must not be
+    /// treated as still safely foreign without recovery.
+    AcquireSubmitted(VulkanError),
+}
+
+impl VulkanDmabufRenderTargetForeignAcquireError {
+    pub(crate) fn into_inner(self) -> VulkanError {
+        match self {
+            VulkanDmabufRenderTargetForeignAcquireError::RetrySafe(err)
+            | VulkanDmabufRenderTargetForeignAcquireError::AcquireSubmitted(err) => err,
+        }
+    }
+}
+
 /// Error classification for acquiring a sampled dmabuf image from foreign ownership.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -1376,8 +1396,17 @@ impl VulkanDeviceState {
             return Ok(None);
         };
 
-        if !self.submit_dmabuf_render_target_foreign_acquire(&image, preserve_contents, acquire_semaphore)? {
-            return Err(VulkanError::UnsupportedOperation("dmabuf external ownership"));
+        match self.submit_dmabuf_render_target_foreign_acquire_classified(
+            &image,
+            preserve_contents,
+            acquire_semaphore,
+        ) {
+            Ok(true) => {}
+            Ok(false) => return Err(VulkanError::UnsupportedOperation("dmabuf external ownership")),
+            Err(VulkanDmabufRenderTargetForeignAcquireError::RetrySafe(err)) => return Err(err),
+            Err(VulkanDmabufRenderTargetForeignAcquireError::AcquireSubmitted(err)) => {
+                return Err(self.recover_submitted_dmabuf_render_target_acquire(&image, err));
+            }
         }
 
         Ok(Some(image))
@@ -1424,12 +1453,17 @@ impl VulkanDeviceState {
             None
         };
 
-        if !self.submit_dmabuf_render_target_foreign_acquire(
+        match self.submit_dmabuf_render_target_foreign_acquire_classified(
             &image,
             preserve_contents,
             acquire_semaphore.as_ref(),
-        )? {
-            return Err(VulkanError::UnsupportedOperation("dmabuf external ownership"));
+        ) {
+            Ok(true) => {}
+            Ok(false) => return Err(VulkanError::UnsupportedOperation("dmabuf external ownership")),
+            Err(VulkanDmabufRenderTargetForeignAcquireError::RetrySafe(err)) => return Err(err),
+            Err(VulkanDmabufRenderTargetForeignAcquireError::AcquireSubmitted(err)) => {
+                return Err(self.recover_submitted_dmabuf_render_target_acquire(&image, err));
+            }
         }
 
         Ok(Some(image))
@@ -1943,18 +1977,40 @@ impl VulkanDeviceState {
         preserve_contents: bool,
         acquire_semaphore: Option<&VulkanSyncFileSemaphore>,
     ) -> Result<bool, VulkanError> {
-        let mut command_buffer = self.allocate_graphics_command_buffer()?;
-        self.begin_command_buffer(&mut command_buffer)?;
-        if !self.record_dmabuf_render_target_foreign_acquire_barrier(
-            &mut command_buffer,
+        self.submit_dmabuf_render_target_foreign_acquire_classified(
             image,
             preserve_contents,
-        )? {
+            acquire_semaphore,
+        )
+        .map_err(VulkanDmabufRenderTargetForeignAcquireError::into_inner)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn submit_dmabuf_render_target_foreign_acquire_classified(
+        &self,
+        image: &VulkanOwnedImage,
+        preserve_contents: bool,
+        acquire_semaphore: Option<&VulkanSyncFileSemaphore>,
+    ) -> Result<bool, VulkanDmabufRenderTargetForeignAcquireError> {
+        let mut command_buffer = self
+            .allocate_graphics_command_buffer()
+            .map_err(VulkanDmabufRenderTargetForeignAcquireError::RetrySafe)?;
+        self.begin_command_buffer(&mut command_buffer)
+            .map_err(VulkanDmabufRenderTargetForeignAcquireError::RetrySafe)?;
+        if !self
+            .record_dmabuf_render_target_foreign_acquire_barrier(
+                &mut command_buffer,
+                image,
+                preserve_contents,
+            )
+            .map_err(VulkanDmabufRenderTargetForeignAcquireError::RetrySafe)?
+        {
             return Ok(false);
         }
-        self.end_command_buffer(&mut command_buffer)?;
+        self.end_command_buffer(&mut command_buffer)
+            .map_err(VulkanDmabufRenderTargetForeignAcquireError::RetrySafe)?;
 
-        if let Some(acquire_semaphore) = acquire_semaphore {
+        let acquire_result = if let Some(acquire_semaphore) = acquire_semaphore {
             let synchronization = VulkanSubmitSynchronization::default()
                 .wait_sync_file(acquire_semaphore, vk::PipelineStageFlags::TOP_OF_PIPE);
             // SAFETY: This helper fixes the wait stage to TOP_OF_PIPE, which is supported by every
@@ -1965,13 +2021,38 @@ impl VulkanDeviceState {
                 self.submit_graphics_command_buffer_and_wait_with_synchronization(
                     &mut command_buffer,
                     &synchronization,
-                )?
-            };
+                )
+            }
         } else {
-            self.submit_graphics_command_buffer_and_wait(&mut command_buffer)?;
-        }
+            self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
+        };
+
+        acquire_result
+            .map_err(|err| classify_dmabuf_render_target_acquire_submit_error(command_buffer.state, err))?;
 
         Ok(true)
+    }
+
+    fn recover_submitted_dmabuf_render_target_acquire(
+        &self,
+        image: &VulkanOwnedImage,
+        acquire_err: VulkanError,
+    ) -> VulkanError {
+        let Ok(sync) = image.sync_state() else {
+            return acquire_err;
+        };
+        if !sync.is_locally_usable() {
+            return acquire_err;
+        }
+
+        match self.release_dmabuf_render_target_to_foreign_general_classified(image, false) {
+            Ok((true, None)) => acquire_err,
+            Ok((_, Some(_))) => {
+                VulkanError::UnsupportedOperation("dmabuf render-target acquire recovery fence")
+            }
+            Ok((false, None)) => VulkanError::UnsupportedOperation("dmabuf render-target acquire recovery"),
+            Err(err) => err.into_inner(),
+        }
     }
 
     #[allow(dead_code)]
@@ -6305,6 +6386,21 @@ fn classify_dmabuf_render_target_release_submit_error(
     }
 }
 
+fn classify_dmabuf_render_target_acquire_submit_error(
+    state: VulkanCommandBufferState,
+    err: VulkanError,
+) -> VulkanDmabufRenderTargetForeignAcquireError {
+    match state {
+        VulkanCommandBufferState::Submitted | VulkanCommandBufferState::SubmitCompletionUnknown => {
+            VulkanDmabufRenderTargetForeignAcquireError::AcquireSubmitted(err)
+        }
+        VulkanCommandBufferState::Initial
+        | VulkanCommandBufferState::Recording
+        | VulkanCommandBufferState::Executable
+        | VulkanCommandBufferState::Invalid => VulkanDmabufRenderTargetForeignAcquireError::RetrySafe(err),
+    }
+}
+
 fn classify_sampled_dmabuf_acquire_submit_error(
     state: VulkanCommandBufferState,
     err: VulkanError,
@@ -6349,6 +6445,20 @@ pub(super) fn classify_dmabuf_render_target_release_submit_error_for_tests(
         (false, false) => VulkanCommandBufferState::Executable,
     };
     classify_dmabuf_render_target_release_submit_error(state, err)
+}
+
+#[cfg(test)]
+pub(super) fn classify_dmabuf_render_target_acquire_submit_error_for_tests(
+    submitted: bool,
+    completion_unknown: bool,
+    err: VulkanError,
+) -> VulkanDmabufRenderTargetForeignAcquireError {
+    let state = match (submitted, completion_unknown) {
+        (_, true) => VulkanCommandBufferState::SubmitCompletionUnknown,
+        (true, false) => VulkanCommandBufferState::Submitted,
+        (false, false) => VulkanCommandBufferState::Executable,
+    };
+    classify_dmabuf_render_target_acquire_submit_error(state, err)
 }
 
 #[cfg(test)]
