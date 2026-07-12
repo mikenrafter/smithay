@@ -745,6 +745,7 @@ pub struct VulkanImage {
     width: u32,
     height: u32,
     format: DrmFormat,
+    allocation_info: VulkanImageAllocationInfo,
     #[cfg(feature = "backend_drm")]
     node: Option<DrmNode>,
     /// The number of planes the image has for dmabuf export.
@@ -761,6 +762,7 @@ impl fmt::Debug for VulkanImage {
             .field("width", &self.width)
             .field("height", &self.height)
             .field("format", &self.format)
+            .field("allocation_info", &self.allocation_info)
             .field("inner", &self.inner)
             .finish()
     }
@@ -935,6 +937,37 @@ struct FormatEntry {
 struct ExternalImageFormatInfo {
     image_format_properties: vk::ImageFormatProperties,
     dedicated_only: bool,
+}
+
+#[derive(Clone, Copy)]
+struct VulkanImageAllocationInfo {
+    modifier_tiling_features: vk::FormatFeatureFlags,
+    memory_type_bits: u32,
+    memory_size: vk::DeviceSize,
+    memory_alignment: vk::DeviceSize,
+    memory_type_index: u32,
+    memory_type_flags: vk::MemoryPropertyFlags,
+    external_dedicated_only: bool,
+    memory_dedicated_required: bool,
+    memory_dedicated_preferred: bool,
+    dedicated: bool,
+}
+
+impl fmt::Debug for VulkanImageAllocationInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VulkanImageAllocationInfo")
+            .field("modifier_tiling_features", &self.modifier_tiling_features)
+            .field("memory_type_bits", &self.memory_type_bits)
+            .field("memory_size", &self.memory_size)
+            .field("memory_alignment", &self.memory_alignment)
+            .field("memory_type_index", &self.memory_type_index)
+            .field("memory_type_flags", &self.memory_type_flags)
+            .field("external_dedicated_only", &self.external_dedicated_only)
+            .field("memory_dedicated_required", &self.memory_dedicated_required)
+            .field("memory_dedicated_preferred", &self.memory_dedicated_preferred)
+            .field("dedicated", &self.dedicated)
+            .finish()
+    }
 }
 
 struct ExtensionFns {
@@ -1147,12 +1180,29 @@ impl VulkanAllocator {
         };
 
         // Now that we know the plane count, get the number of planes for the format + modifier
-        let format_plane_count = self.format_plane_count(format).ok_or(Error::UnsupportedFormat)?;
+        let format_entry = self
+            .formats
+            .iter()
+            .find(|entry| entry.format == format)
+            .ok_or(Error::UnsupportedFormat)?;
+        let format_plane_count =
+            dmabuf_plane_count(format_entry.modifier_properties.drm_format_modifier_plane_count)
+                .ok_or(Error::UnsupportedFormat)?;
         let external_format_info =
             unsafe { self.get_format_info(format, vk_usage)? }.ok_or(Error::UnsupportedFormat)?;
 
-        // Allocate image memory
-        let memory_reqs = unsafe { self.device.get_image_memory_requirements(guard.image) };
+        // Allocate image memory.
+        let mut dedicated_requirements = vk::MemoryDedicatedRequirements::default();
+        let mut memory_requirements =
+            vk::MemoryRequirements2::default().push_next(&mut dedicated_requirements);
+        let memory_requirements_info = vk::ImageMemoryRequirementsInfo2::default().image(guard.image);
+        unsafe {
+            self.device
+                .get_image_memory_requirements2(&memory_requirements_info, &mut memory_requirements)
+        };
+        let memory_reqs = memory_requirements.memory_requirements;
+        let memory_dedicated_required = dedicated_requirements.requires_dedicated_allocation == vk::TRUE;
+        let memory_dedicated_preferred = dedicated_requirements.prefers_dedicated_allocation == vk::TRUE;
         let memory_properties = unsafe {
             self.phd
                 .instance()
@@ -1160,14 +1210,16 @@ impl VulkanAllocator {
                 .get_physical_device_memory_properties(self.phd.handle())
         };
         let memory_type_index = find_memory_type_index(&memory_properties, memory_reqs.memory_type_bits)?;
+        let memory_type_flags = memory_properties.memory_types[memory_type_index as usize].property_flags;
         let mut export_memory_allocate_info = vk::ExportMemoryAllocateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let dedicated = external_format_info.dedicated_only || memory_dedicated_required;
         let mut dedicated_allocate_info = vk::MemoryDedicatedAllocateInfo::default().image(guard.image);
         let alloc_create_info = vk::MemoryAllocateInfo::default()
             .allocation_size(memory_reqs.size)
             .memory_type_index(memory_type_index)
             .push_next(&mut export_memory_allocate_info);
-        let alloc_create_info = if external_format_info.dedicated_only {
+        let alloc_create_info = if dedicated {
             alloc_create_info.push_next(&mut dedicated_allocate_info)
         } else {
             alloc_create_info
@@ -1195,6 +1247,20 @@ impl VulkanAllocator {
             width,
             height,
             format,
+            allocation_info: VulkanImageAllocationInfo {
+                modifier_tiling_features: format_entry
+                    .modifier_properties
+                    .drm_format_modifier_tiling_features,
+                memory_type_bits: memory_reqs.memory_type_bits,
+                memory_size: memory_reqs.size,
+                memory_alignment: memory_reqs.alignment,
+                memory_type_index,
+                memory_type_flags,
+                external_dedicated_only: external_format_info.dedicated_only,
+                memory_dedicated_required,
+                memory_dedicated_preferred,
+                dedicated,
+            },
             format_plane_count,
             khr_external_memory_fd: self.extension_fns.khr_external_memory_fd.clone(),
             dropped_sender: self.dropped_sender.clone(),
