@@ -19,10 +19,13 @@
 //! Set `SMITHAY_DRM_VULKAN_RENDER_FRAME_PROBE=1` to run the normal `DrmCompositor::render_frame`
 //! path and wait for render completion without committing the frame.
 //! Set `SMITHAY_DRM_VULKAN_PAGEFLIP_PROBE=1` to queue two normal DRM frames, wait for page-flip
-//! events, and call `frame_submitted` after each event.
+//! events, and call `frame_submitted` after each event. The probe logs whether Smithay expects to
+//! submit a KMS `IN_FENCE_FD` for each frame.
 //! Set `SMITHAY_DRM_VULKAN_REUSE_PROBE=1` to queue several normal DRM frames and require at least
 //! one swapchain buffer object to be reused after page-flip submission. Override the frame count with
 //! `SMITHAY_DRM_VULKAN_PAGEFLIP_FRAMES`.
+//! Any mode that queues a DRM pageflip requires `SMITHAY_DRM_VULKAN_REAL_GPU_PAGEFLIP_OK=1`. Prefer
+//! Mesa llvmpipe/lavapipe software Vulkan checks and no-commit probes before setting that flag.
 
 use std::{
     env,
@@ -83,6 +86,44 @@ fn main() -> Result<(), Box<dyn Error>> {
         .and_then(|seconds| seconds.parse::<u64>().ok())
         .unwrap_or(5);
 
+    let gbm_target_probe = env::var_os("SMITHAY_DRM_VULKAN_GBM_TARGET_PROBE").is_some();
+    let allocator_metadata_probe = env::var_os("SMITHAY_DRM_VULKAN_ALLOCATOR_METADATA_PROBE").is_some();
+    let allocator_probe = env::var_os("SMITHAY_DRM_VULKAN_ALLOCATOR_PROBE").is_some();
+    let render_frame_only_probe = env::var_os("SMITHAY_DRM_VULKAN_RENDER_FRAME_PROBE").is_some();
+    let pageflip_probe = env::var_os("SMITHAY_DRM_VULKAN_PAGEFLIP_PROBE").is_some();
+    let reuse_probe = env::var_os("SMITHAY_DRM_VULKAN_REUSE_PROBE").is_some();
+
+    let mode = if gbm_target_probe {
+        "gbm-target-no-commit"
+    } else if allocator_metadata_probe {
+        "allocator-metadata-no-commit"
+    } else if allocator_probe {
+        "allocator-guard-no-commit"
+    } else if reuse_probe {
+        "pageflip-reuse"
+    } else if pageflip_probe {
+        "pageflip"
+    } else if render_frame_only_probe {
+        "render-frame-no-commit"
+    } else {
+        "default-pageflip"
+    };
+    let queues_pageflip = !gbm_target_probe
+        && !allocator_metadata_probe
+        && !allocator_probe
+        && (pageflip_probe || reuse_probe || !render_frame_only_probe);
+    let real_gpu_pageflip_acknowledged = real_gpu_pageflip_acknowledged();
+    tracing::info!(
+        mode,
+        queues_pageflip,
+        real_gpu_pageflip_acknowledged,
+        ?device_path,
+        "DRM Vulkan smoke selected mode"
+    );
+    if queues_pageflip {
+        require_real_gpu_pageflip_ack()?;
+    }
+
     let (mut session, _session_notifier) = LibSeatSession::new()?;
     if !session.is_active() {
         return Err(format!(
@@ -123,11 +164,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let cursor_size = drm.cursor_size();
 
-    if env::var_os("SMITHAY_DRM_VULKAN_GBM_TARGET_PROBE").is_some() {
+    if gbm_target_probe {
         return probe_gbm_dmabuf_vulkan_render_target(&mut drm, &gbm, &mut renderer, renderer_formats);
     }
 
-    if env::var_os("SMITHAY_DRM_VULKAN_ALLOCATOR_METADATA_PROBE").is_some() {
+    if allocator_metadata_probe {
         return probe_vulkan_allocator_framebuffer_metadata(
             &mut drm,
             crtc,
@@ -137,7 +178,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    if env::var_os("SMITHAY_DRM_VULKAN_ALLOCATOR_PROBE").is_some() {
+    if allocator_probe {
         return probe_vulkan_allocator_framebuffer_guard(
             &mut drm,
             crtc,
@@ -170,7 +211,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         cursor_size,
         Some(gbm),
     )?;
-    let render_frame_only_probe = env::var_os("SMITHAY_DRM_VULKAN_RENDER_FRAME_PROBE").is_some();
     let _pause_drm_on_return = render_frame_only_probe.then(|| PauseDrmOnReturn(&mut drm));
 
     let element = SolidColorRenderElement::new(
@@ -182,8 +222,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let elements = [element];
 
-    let reuse_probe = env::var_os("SMITHAY_DRM_VULKAN_REUSE_PROBE").is_some();
-    if env::var_os("SMITHAY_DRM_VULKAN_PAGEFLIP_PROBE").is_some() || reuse_probe {
+    if pageflip_probe || reuse_probe {
         let (mut event_loop, mut event_state) = pageflip_event_loop(drm_notifier, crtc)?;
         let frame_count = env::var("SMITHAY_DRM_VULKAN_PAGEFLIP_FRAMES")
             .ok()
@@ -215,12 +254,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut primary_was_swapchain = false;
             let mut waited_render_sync = false;
             let mut swapchain_buffer_id = None;
+            let mut sync_contains_fence = false;
+            let mut sync_exportable = false;
+            let mut kms_in_fence_expected = false;
             if let PrimaryPlaneElement::Swapchain(primary) = frame.primary_element {
                 primary_was_swapchain = true;
                 let buffer_id = primary.buffer() as *const _ as usize;
                 observed_reuse |= swapchain_buffer_ids.contains(&buffer_id);
                 swapchain_buffer_ids.push(buffer_id);
                 swapchain_buffer_id = Some(buffer_id);
+                sync_contains_fence = primary.sync.contains_fence();
+                sync_exportable = primary.sync.is_exportable();
+                kms_in_fence_expected = sync_exportable && !needs_sync;
                 if needs_sync {
                     wait_sync_point(&primary.sync, "pageflip probe primary swapchain sync")?;
                     waited_render_sync = true;
@@ -260,6 +305,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 frame_index,
                 primary_was_swapchain,
                 needs_sync,
+                sync_contains_fence,
+                sync_exportable,
+                kms_in_fence_expected,
                 waited_render_sync,
                 ?swapchain_buffer_id,
                 ?metadata,
@@ -298,8 +346,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let needs_sync = frame.needs_sync();
     let mut primary_was_swapchain = false;
     let mut waited_render_sync = false;
+    let mut sync_contains_fence = false;
+    let mut sync_exportable = false;
+    let mut kms_in_fence_expected = false;
     if let PrimaryPlaneElement::Swapchain(primary) = frame.primary_element {
         primary_was_swapchain = true;
+        sync_contains_fence = primary.sync.contains_fence();
+        sync_exportable = primary.sync.is_exportable();
+        kms_in_fence_expected = sync_exportable && !needs_sync;
         if render_frame_only_probe || needs_sync {
             wait_sync_point(&primary.sync, "render_frame primary swapchain sync")?;
             waited_render_sync = true;
@@ -312,6 +366,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             ?crtc,
             ?size,
             needs_sync,
+            sync_contains_fence,
+            sync_exportable,
+            kms_in_fence_expected,
             waited_render_sync,
             "DRM Vulkan smoke render_frame completed without commit"
         );
@@ -336,6 +393,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         ?size,
         primary_was_swapchain,
         needs_sync,
+        sync_contains_fence,
+        sync_exportable,
+        kms_in_fence_expected,
         waited_render_sync,
         ?metadata,
         submitted,
@@ -352,6 +412,21 @@ fn probe_frame_color(frame_index: usize) -> Color32F {
         1 => Color32F::new(0.8, 0.25, 0.0, 1.0),
         _ => Color32F::new(0.1, 0.6, 0.2, 1.0),
     }
+}
+
+fn require_real_gpu_pageflip_ack() -> Result<(), Box<dyn Error>> {
+    if real_gpu_pageflip_acknowledged() {
+        return Ok(());
+    }
+
+    Err("DRM pageflip probes submit work to the real GPU/display; run llvmpipe-safe checks and no-commit probes first, then set SMITHAY_DRM_VULKAN_REAL_GPU_PAGEFLIP_OK=1 to acknowledge the risk".into())
+}
+
+fn real_gpu_pageflip_acknowledged() -> bool {
+    matches!(
+        env::var("SMITHAY_DRM_VULKAN_REAL_GPU_PAGEFLIP_OK").as_deref(),
+        Ok("1")
+    )
 }
 
 fn pick_connector_crtc_mode(
@@ -658,6 +733,7 @@ fn probe_vulkan_allocator_framebuffer_metadata(
                 ?format,
                 width,
                 height,
+                image = ?image,
                 metadata = %describe_dmabuf_metadata(&dmabuf),
                 "trying Vulkan allocator dmabuf metadata framebuffer probe candidate"
             );
@@ -695,7 +771,7 @@ fn probe_vulkan_allocator_framebuffer_metadata(
                         probe_direct_prime_addfb2(pause_drm_on_return.0.device_fd(), &dmabuf)
                             .map_err(|err| format!("direct PRIME AddFB2 cleanup failed: {err}"))?;
                     errors.push(format!(
-                        "{format:?} at {width}x{height}: framebuffer import failed: {}; GBM allocator baseline: {}; direct PRIME AddFB2 probe: {}; {}; {err:?}",
+                        "{format:?} at {width}x{height}: framebuffer import failed: {}; GBM allocator baseline: {}; direct PRIME AddFB2 probe: {}; {}; image={image:?}; {err:?}",
                         describe_drm_gbm_error(&err),
                         gbm_baseline_result,
                         direct_addfb2_result,
@@ -782,14 +858,35 @@ fn probe_direct_prime_addfb2(drm: &DrmDeviceFd, dmabuf: &Dmabuf) -> Result<Strin
 
     match drm.add_planar_framebuffer(&direct_buffer, flags) {
         Ok(framebuffer) => match drm.destroy_framebuffer(framebuffer) {
-            Ok(()) => Ok("direct AddFB2 succeeded and framebuffer was destroyed".to_owned()),
+            Ok(()) => Ok(format!(
+                "direct AddFB2 succeeded and framebuffer was destroyed; {}",
+                describe_direct_dmabuf_buffer(&direct_buffer)
+            )),
             Err(err) => Err(format!(
-                "direct AddFB2 succeeded but framebuffer destroy failed: {}",
-                describe_io_error(&err)
+                "direct AddFB2 succeeded but framebuffer destroy failed: {}; {}",
+                describe_io_error(&err),
+                describe_direct_dmabuf_buffer(&direct_buffer)
             )),
         },
-        Err(err) => Ok(format!("direct AddFB2 failed: {}", describe_io_error(&err))),
+        Err(err) => Ok(format!(
+            "direct AddFB2 failed: {}; {}",
+            describe_io_error(&err),
+            describe_direct_dmabuf_buffer(&direct_buffer)
+        )),
     }
+}
+
+fn describe_direct_dmabuf_buffer(buffer: &DirectDmabufBuffer<'_>) -> String {
+    let handles = buffer
+        .handles
+        .iter()
+        .map(|handle| handle.map(u32::from))
+        .collect::<Vec<_>>();
+
+    format!(
+        "direct GEM buffer size={}x{}, format={:?}, modifier={:?}, handles={:?}, pitches={:?}, offsets={:?}",
+        buffer.size.0, buffer.size.1, buffer.format, buffer.modifier, handles, buffer.pitches, buffer.offsets
+    )
 }
 
 struct DirectDmabufBuffer<'drm> {
@@ -912,17 +1009,45 @@ fn describe_io_error(source: &std::io::Error) -> String {
 }
 
 fn describe_dmabuf_metadata(dmabuf: &Dmabuf) -> String {
+    let fds = dmabuf.handles().map(|fd| fd.as_raw_fd()).collect::<Vec<_>>();
+    let fdinfo = fds
+        .iter()
+        .map(|fd| describe_dmabuf_fdinfo(*fd))
+        .collect::<Vec<_>>();
+
     format!(
-        "size={}x{}, format={:?}, modifier={:?}, planes={}, fds={:?}, offsets={:?}, strides={:?}",
+        "size={}x{}, format={:?}, modifier={:?}, planes={}, fds={:?}, offsets={:?}, strides={:?}, fdinfo={:?}",
         dmabuf.width(),
         dmabuf.height(),
         dmabuf.format().code,
         dmabuf.format().modifier,
         dmabuf.num_planes(),
-        dmabuf.handles().map(|fd| fd.as_raw_fd()).collect::<Vec<_>>(),
+        fds,
         dmabuf.offsets().collect::<Vec<_>>(),
-        dmabuf.strides().collect::<Vec<_>>()
+        dmabuf.strides().collect::<Vec<_>>(),
+        fdinfo
     )
+}
+
+fn describe_dmabuf_fdinfo(fd: i32) -> String {
+    let path = format!("/proc/self/fdinfo/{fd}");
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return "fdinfo=unavailable".to_owned();
+    };
+
+    contents
+        .lines()
+        .filter(|line| {
+            line.starts_with("flags:")
+                || line.starts_with("mnt_id:")
+                || line.starts_with("ino:")
+                || line.starts_with("size:")
+                || line.starts_with("count:")
+                || line.starts_with("exp_name:")
+                || line.starts_with("name:")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn describe_gbm_buffer_metadata(buffer: &GbmBuffer) -> String {
