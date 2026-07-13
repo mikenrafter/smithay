@@ -1,16 +1,12 @@
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+use std::io;
+#[cfg(feature = "wayland_frontend")]
+use std::os::unix::io::AsFd;
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use std::os::unix::net::UnixStream;
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use std::sync::Mutex;
-use std::{
-    cell::Cell,
-    ffi::CStr,
-    fs::File,
-    io,
-    marker::PhantomData,
-    os::unix::io::{AsFd, OwnedFd},
-    sync::Arc,
-};
+use std::{cell::Cell, ffi::CStr, fs::File, marker::PhantomData, os::unix::io::OwnedFd, sync::Arc};
 
 use ash::{ext, khr, vk};
 
@@ -35,7 +31,9 @@ use crate::backend::renderer::{
 use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use crate::utils::DeviceFd;
-use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform, user_data::UserDataMap};
+#[cfg(feature = "wayland_frontend")]
+use crate::utils::user_data::UserDataMap;
+use crate::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use crate::wayland::drm_syncobj::DrmSyncPoint;
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
@@ -9017,6 +9015,7 @@ fn public_dmabuf_import_gates_formats() {
     assert!(!release_ownership_called.get());
 }
 
+#[cfg(feature = "wayland_frontend")]
 #[test]
 fn sampled_dmabuf_wayland_policy_does_not_public_advertise_import_dma() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
@@ -9113,6 +9112,7 @@ fn sampled_dmabuf_wayland_policy_does_not_public_advertise_import_dma() {
     ));
 }
 
+#[cfg(feature = "wayland_frontend")]
 #[test]
 fn sampled_dmabuf_import_context_preserves_wayland_policy_inputs() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
@@ -9288,6 +9288,7 @@ fn sampled_dmabuf_import_validation_guards_metadata_before_device_lookup() {
     ));
 }
 
+#[cfg(feature = "wayland_frontend")]
 #[test]
 fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
