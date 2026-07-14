@@ -12,8 +12,8 @@
 //! Set `SMITHAY_DRM_VULKAN_ALLOCATOR_METADATA_PROBE=1` to test only whether a single explicit-modifier
 //! Vulkan-exported dmabuf can be imported by GBM and added as a DRM framebuffer, then immediately
 //! destroyed. That mode reports GBM-allocation and GBM-exported dmabuf baselines, GBM-import vs
-//! AddFB2 errno details, and a direct PRIME fd -> GEM handle AddFB2 comparison as metadata evidence
-//! only; it is not presentation or reuse evidence.
+//! AddFB2 errno details, a GBM-imported BO metadata AddFB2 comparison, and a direct PRIME fd -> GEM
+//! handle AddFB2 comparison as metadata evidence only; it is not presentation or reuse evidence.
 //! Set `SMITHAY_DRM_VULKAN_GBM_TARGET_PROBE=1` to bind a GBM-allocated scanout dmabuf as a Vulkan
 //! render target, clear it, finish, and release it without a DRM commit.
 //! Set `SMITHAY_DRM_VULKAN_RENDER_FRAME_PROBE=1` to run the normal `DrmCompositor::render_frame`
@@ -772,10 +772,14 @@ fn probe_vulkan_allocator_framebuffer_metadata(
                     let direct_addfb2_result =
                         probe_direct_prime_addfb2(pause_drm_on_return.0.device_fd(), &dmabuf)
                             .map_err(|err| format!("direct PRIME AddFB2 cleanup failed: {err}"))?;
+                    let imported_bo_addfb2_result =
+                        probe_gbm_imported_bo_addfb2(gbm, pause_drm_on_return.0.device_fd(), &dmabuf)
+                            .map_err(|err| format!("GBM-imported BO AddFB2 cleanup failed: {err}"))?;
                     errors.push(format!(
-                        "{format:?} at {width}x{height}: framebuffer import failed: {}; GBM allocator baseline: {}; direct PRIME AddFB2 probe: {}; {}; image={image:?}; {err:?}",
+                        "{format:?} at {width}x{height}: framebuffer import failed: {}; GBM allocator baseline: {}; GBM-imported BO AddFB2 probe: {}; direct PRIME AddFB2 probe: {}; {}; image={image:?}; {err:?}",
                         describe_drm_gbm_error(&err),
                         gbm_baseline_result,
+                        imported_bo_addfb2_result,
                         direct_addfb2_result,
                         describe_dmabuf_metadata(&dmabuf)
                     ));
@@ -845,6 +849,100 @@ fn probe_gbm_exported_dmabuf_direct_prime_addfb2(
         )),
         Err(err) => Ok(format!("GBM dmabuf export failed: {err}")),
     }
+}
+
+fn probe_gbm_imported_bo_addfb2(
+    gbm: &GbmDevice<DrmDeviceFd>,
+    drm: &DrmDeviceFd,
+    dmabuf: &Dmabuf,
+) -> Result<String, String> {
+    let buffer = match dmabuf.import_to(gbm, GbmBufferFlags::SCANOUT) {
+        Ok(buffer) => buffer,
+        Err(err) => return Ok(format!("GBM import failed: {}", describe_io_error(&err))),
+    };
+    let modifier = dmabuf.format().modifier;
+    let flags = if modifier != Modifier::Invalid {
+        FbCmd2Flags::MODIFIERS
+    } else {
+        FbCmd2Flags::empty()
+    };
+    let buffer_with_modifier = ImportedBoWithDmabufModifier {
+        buffer: &buffer,
+        modifier,
+    };
+
+    match drm.add_planar_framebuffer(&buffer_with_modifier, flags) {
+        Ok(framebuffer) => match drm.destroy_framebuffer(framebuffer) {
+            Ok(()) => Ok(format!(
+                "GBM-imported BO AddFB2 succeeded and framebuffer was destroyed; {}",
+                describe_imported_bo_with_dmabuf_modifier(&buffer_with_modifier)
+            )),
+            Err(err) => Err(format!(
+                "GBM-imported BO AddFB2 succeeded but framebuffer destroy failed: {}; {}",
+                describe_io_error(&err),
+                describe_imported_bo_with_dmabuf_modifier(&buffer_with_modifier)
+            )),
+        },
+        Err(err) => Ok(format!(
+            "GBM-imported BO AddFB2 failed: {}; {}",
+            describe_io_error(&err),
+            describe_imported_bo_with_dmabuf_modifier(&buffer_with_modifier)
+        )),
+    }
+}
+
+struct ImportedBoWithDmabufModifier<'buffer> {
+    buffer: &'buffer GbmBuffer,
+    modifier: Modifier,
+}
+
+impl buffer::PlanarBuffer for ImportedBoWithDmabufModifier<'_> {
+    fn size(&self) -> (u32, u32) {
+        buffer::PlanarBuffer::size(self.buffer)
+    }
+
+    fn format(&self) -> Fourcc {
+        buffer::PlanarBuffer::format(self.buffer)
+    }
+
+    fn modifier(&self) -> Option<Modifier> {
+        match self.modifier {
+            Modifier::Invalid => None,
+            modifier => Some(modifier),
+        }
+    }
+
+    fn pitches(&self) -> [u32; 4] {
+        buffer::PlanarBuffer::pitches(self.buffer)
+    }
+
+    fn handles(&self) -> [Option<buffer::Handle>; 4] {
+        buffer::PlanarBuffer::handles(self.buffer)
+    }
+
+    fn offsets(&self) -> [u32; 4] {
+        buffer::PlanarBuffer::offsets(self.buffer)
+    }
+}
+
+fn describe_imported_bo_with_dmabuf_modifier(buffer: &ImportedBoWithDmabufModifier<'_>) -> String {
+    let reported_format = AllocatorBuffer::format(buffer.buffer);
+    let handles = buffer::PlanarBuffer::handles(buffer)
+        .iter()
+        .map(|handle| handle.map(u32::from))
+        .collect::<Vec<_>>();
+    let (width, height) = buffer::PlanarBuffer::size(buffer);
+    format!(
+        "GBM-imported BO size={}x{}, reported_format={:?}, reported_modifier={:?}, AddFB2_modifier={:?}, handles={:?}, pitches={:?}, offsets={:?}",
+        width,
+        height,
+        reported_format.code,
+        reported_format.modifier,
+        buffer.modifier,
+        handles,
+        buffer::PlanarBuffer::pitches(buffer),
+        buffer::PlanarBuffer::offsets(buffer)
+    )
 }
 
 fn probe_direct_prime_addfb2(drm: &DrmDeviceFd, dmabuf: &Dmabuf) -> Result<String, String> {
