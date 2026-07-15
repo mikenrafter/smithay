@@ -116,12 +116,44 @@ const SUPPORTED_FORMATS: &[Fourcc] = &[
 ];
 const SUPPORTED_FORMATS_8BIT_ONLY: &[Fourcc] = &[Fourcc::Abgr8888, Fourcc::Argb8888];
 
-type UdevRenderer<'a> = MultiRenderer<
-    'a,
-    'a,
-    GbmGlesBackend<GlesRenderer, DrmDeviceFd>,
-    GbmGlesBackend<GlesRenderer, DrmDeviceFd>,
->;
+type UdevGraphicsApi = GbmGlesBackend<GlesRenderer, DrmDeviceFd>;
+type UdevGpuManager = GpuManager<UdevGraphicsApi>;
+type UdevGpuManagerError = smithay::backend::renderer::multigpu::Error<UdevGraphicsApi, UdevGraphicsApi>;
+type UdevRenderer<'a> = MultiRenderer<'a, 'a, UdevGraphicsApi, UdevGraphicsApi>;
+
+fn create_udev_gpu_manager() -> Result<UdevGpuManager, UdevGpuManagerError> {
+    GpuManager::new(GbmGlesBackend::with_factory(|display| {
+        let context = EGLContext::new_with_priority(display, ContextPriority::High)?;
+        let mut capabilities = unsafe { GlesRenderer::supported_capabilities(&context)? };
+        if std::env::var("ANVIL_GLES_DISABLE_INSTANCING").is_ok() {
+            capabilities.retain(|capability| *capability != Capability::Instancing);
+        }
+        Ok(unsafe { GlesRenderer::with_capabilities(context, capabilities)? })
+    }))
+}
+
+fn add_udev_gpu_node(
+    gpus: &mut UdevGpuManager,
+    render_node: DrmNode,
+    gbm: GbmDevice<DrmDeviceFd>,
+) -> Result<(), egl::Error> {
+    gpus.as_mut().add_node(render_node, gbm)
+}
+
+fn renderer_dmabuf_formats(gpus: &mut UdevGpuManager, node: &DrmNode) -> Option<FormatSet> {
+    Some(gpus.single_renderer(node).ok()?.dmabuf_formats())
+}
+
+fn render_node_formats(renderer: &mut UdevRenderer<'_>, has_render_node: bool) -> FormatSet {
+    renderer
+        .as_mut()
+        .egl_context()
+        .dmabuf_render_formats()
+        .iter()
+        .filter(|format| has_render_node || format.modifier == Modifier::Linear)
+        .copied()
+        .collect::<FormatSet>()
+}
 
 #[derive(Debug, PartialEq)]
 struct UdevOutputId {
@@ -137,7 +169,7 @@ pub struct UdevData {
     syncobj_acquire_source_tokens: HashMap<u64, RegistrationToken>,
     next_syncobj_acquire_source_id: u64,
     primary_gpu: DrmNode,
-    gpus: GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>,
+    gpus: UdevGpuManager,
     backends: HashMap<DrmNode, BackendData>,
     pointer_images: Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
     pointer_element: PointerElement,
@@ -278,15 +310,7 @@ pub fn run_udev() {
     };
     info!("Using {} as primary gpu.", primary_gpu);
 
-    let gpus = GpuManager::new(GbmGlesBackend::with_factory(|display| {
-        let context = EGLContext::new_with_priority(display, ContextPriority::High)?;
-        let mut capabilities = unsafe { GlesRenderer::supported_capabilities(&context)? };
-        if std::env::var("ANVIL_GLES_DISABLE_INSTANCING").is_ok() {
-            capabilities.retain(|capability| *capability != Capability::Instancing);
-        }
-        Ok(unsafe { GlesRenderer::with_capabilities(context, capabilities)? })
-    }))
-    .unwrap();
+    let gpus = create_udev_gpu_manager().unwrap();
 
     let data = UdevData {
         dh: display_handle.clone(),
@@ -762,12 +786,12 @@ fn get_surface_dmabuf_feedback(
     primary_gpu: DrmNode,
     render_node: Option<DrmNode>,
     scanout_node: DrmNode,
-    gpus: &mut GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>,
+    gpus: &mut UdevGpuManager,
     surface: &DrmSurface,
 ) -> Option<SurfaceDmabufFeedback> {
-    let primary_formats = gpus.single_renderer(&primary_gpu).ok()?.dmabuf_formats();
+    let primary_formats = renderer_dmabuf_formats(gpus, &primary_gpu)?;
     let render_formats = if let Some(render_node) = render_node {
-        gpus.single_renderer(&render_node).ok()?.dmabuf_formats()
+        renderer_dmabuf_formats(gpus, &render_node)?
     } else {
         FormatSet::default()
     };
@@ -880,10 +904,7 @@ impl AnvilState<UdevData> {
             }
 
             let render_node = egl_device.try_get_render_node().ok().flatten().unwrap_or(node);
-            self.backend_data
-                .gpus
-                .as_mut()
-                .add_node(render_node, gbm.clone())
+            add_udev_gpu_node(&mut self.backend_data.gpus, render_node, gbm.clone())
                 .map_err(DeviceAddError::AddNode)?;
 
             std::result::Result::<DrmNode, DeviceAddError>::Ok(render_node)
@@ -924,14 +945,7 @@ impl AnvilState<UdevData> {
             .gpus
             .single_renderer(&render_node.unwrap_or(self.backend_data.primary_gpu))
             .unwrap();
-        let render_formats = renderer
-            .as_mut()
-            .egl_context()
-            .dmabuf_render_formats()
-            .iter()
-            .filter(|format| render_node.is_some() || format.modifier == Modifier::Linear)
-            .copied()
-            .collect::<FormatSet>();
+        let render_formats = render_node_formats(&mut renderer, render_node.is_some());
 
         let drm_output_manager = DrmOutputManager::new(
             drm,
