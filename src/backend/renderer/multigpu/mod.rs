@@ -2478,6 +2478,39 @@ where
         }
         res
     }
+
+    #[instrument(level = "trace", parent = &self.span, skip(self))]
+    #[profiling::function]
+    fn import_dma_buffer_from_surface_state(
+        &mut self,
+        buffer: &super::utils::Buffer,
+        surface: Option<&SurfaceData>,
+        damage: &[Rectangle<i32, BufferCoords>],
+    ) -> Result<<Self as RendererSuper>::TextureId, <Self as RendererSuper>::Error> {
+        let dmabuf =
+            get_dmabuf(buffer).expect("import_dma_buffer_from_surface_state without checking buffer type?");
+        let Some(node) = dmabuf.node() else {
+            return self.import_dma_buffer(buffer, surface, damage);
+        };
+        if node != *self.render.node() {
+            return self.import_dma_buffer(buffer, surface, damage);
+        }
+
+        let mut texture = MultiTexture::from_surface(surface, dmabuf.size(), dmabuf.format());
+        let texture_ref = texture.0.clone();
+
+        let renderer = self.render.renderer_mut();
+        let imported = renderer
+            .import_dma_buffer_from_surface_state(buffer, surface, damage)
+            .map_err(Error::Render)?;
+        texture.insert_texture::<R>(&renderer.context_id(), imported);
+
+        if let Some(surface) = surface {
+            surface.data_map.insert_if_missing_threadsafe(|| texture_ref);
+        }
+
+        Ok(texture)
+    }
 }
 
 impl<R: GraphicsApi, T: GraphicsApi> ImportDma for MultiRenderer<'_, '_, R, T>
@@ -3970,7 +4003,7 @@ where
 impl<'a, 'frame, 'buffer, R: GraphicsApi, T: GraphicsApi> ImportDmaWl
     for LocalMultiRenderer<'a, '_, '_, 'frame, 'buffer, R, T>
 where
-    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf>,
+    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ImportDmaWl,
     <T::Device as ApiDevice>::Renderer: ExportMem + Bind<Dmabuf>,
     // TODO: comment
     R: 'static,
@@ -4008,6 +4041,39 @@ where
             }
         }
         res
+    }
+
+    fn import_dma_buffer_from_surface_state(
+        &mut self,
+        buffer: &super::utils::Buffer,
+        surface: Option<&crate::wayland::compositor::SurfaceData>,
+        damage: &[Rectangle<i32, BufferCoords>],
+    ) -> Result<Self::TextureId, Self::Error> {
+        let dmabuf =
+            get_dmabuf(buffer).expect("import_dma_buffer_from_surface_state without checking buffer type?");
+        let Some(node) = dmabuf.node() else {
+            return self.import_dma_buffer(buffer, surface, damage);
+        };
+        if node != *(unsafe { &*self.render }.node()) {
+            return self.import_dma_buffer(buffer, surface, damage);
+        }
+
+        let mut texture = MultiTexture::from_surface(surface, dmabuf.size(), dmabuf.format());
+        let texture_ref = texture.0.clone();
+
+        let context_id = self.guard.as_ref().context_id();
+        let imported = self
+            .guard
+            .as_mut()
+            .import_dma_buffer_from_surface_state(buffer, surface, damage)
+            .map_err(Error::Render)?;
+        texture.insert_texture::<R>(&context_id, imported);
+
+        if let Some(surface) = surface {
+            surface.data_map.insert_if_missing_threadsafe(|| texture_ref);
+        }
+
+        Ok(texture)
     }
 }
 
@@ -4164,9 +4230,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::allocator::Modifier;
-    use crate::backend::renderer::{DebugFlags, Frame, SurfaceCacheTextureReleaseError};
+    use crate::backend::allocator::{Modifier, dmabuf::DmabufFlags};
+    use crate::backend::renderer::{Bind, DebugFlags, Frame, ImportMem, SurfaceCacheTextureReleaseError};
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    use crate::reexports::wayland_server::{
+        Display,
+        backend::{ClientData, ClientId, DisconnectReason, InitError},
+        protocol::wl_buffer::WlBuffer,
+    };
     use std::error::Error as StdError;
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    use std::{os::unix::net::UnixStream, sync::atomic::AtomicUsize};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct TestTexture(u32);
@@ -4191,12 +4265,16 @@ mod tests {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum TestError {
+        RawImport,
         Release,
     }
 
     impl fmt::Display for TestError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "test release error")
+            match self {
+                TestError::RawImport => write!(f, "test raw import error"),
+                TestError::Release => write!(f, "test release error"),
+            }
         }
     }
 
@@ -4205,6 +4283,8 @@ mod tests {
     #[derive(Debug)]
     struct TestFrame {
         context_id: ContextId<TestTexture>,
+        #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+        surface_state_imports: Arc<AtomicUsize>,
     }
 
     impl Frame for TestFrame {
@@ -4258,9 +4338,55 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    #[derive(Debug)]
+    struct TestFrameGuard {
+        renderer: TestRenderer,
+    }
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    impl AsRef<TestRenderer> for TestFrameGuard {
+        fn as_ref(&self) -> &TestRenderer {
+            &self.renderer
+        }
+    }
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    impl AsMut<TestRenderer> for TestFrameGuard {
+        fn as_mut(&mut self) -> &mut TestRenderer {
+            &mut self.renderer
+        }
+    }
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    impl<'a, 'frame, 'buffer> FrameContext<'a, 'frame, 'buffer, TestRenderer> for TestFrame {
+        type Guard = TestFrameGuard;
+
+        fn renderer(&'a mut self) -> Self::Guard {
+            TestFrameGuard {
+                renderer: TestRenderer {
+                    context_id: self.context_id.clone(),
+                    surface_state_imports: self.surface_state_imports.clone(),
+                },
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct TestRenderer {
         context_id: ContextId<TestTexture>,
+        #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+        surface_state_imports: Arc<AtomicUsize>,
+    }
+
+    impl TestRenderer {
+        fn new(context_id: ContextId<TestTexture>) -> Self {
+            Self {
+                context_id,
+                #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+                surface_state_imports: Arc::new(AtomicUsize::new(0)),
+            }
+        }
     }
 
     impl RendererSuper for TestRenderer {
@@ -4306,10 +4432,136 @@ mod tests {
         {
             Ok(TestFrame {
                 context_id: self.context_id.clone(),
+                #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+                surface_state_imports: self.surface_state_imports.clone(),
             })
         }
 
         fn wait(&mut self, _sync: &SyncPoint) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+    }
+
+    impl ImportMem for TestRenderer {
+        fn import_memory(
+            &mut self,
+            _data: &[u8],
+            _format: Fourcc,
+            _size: Size<i32, BufferCoords>,
+            _flipped: bool,
+        ) -> Result<Self::TextureId, Self::Error> {
+            unreachable!()
+        }
+
+        fn update_memory(
+            &mut self,
+            _texture: &Self::TextureId,
+            _data: &[u8],
+            _region: Rectangle<i32, BufferCoords>,
+        ) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
+            Box::new([Fourcc::Argb8888].into_iter())
+        }
+    }
+
+    impl ImportDma for TestRenderer {
+        fn dmabuf_formats(&self) -> FormatSet {
+            [test_format()].into_iter().collect()
+        }
+
+        fn import_dmabuf(
+            &mut self,
+            _dmabuf: &Dmabuf,
+            _damage: Option<&[Rectangle<i32, BufferCoords>]>,
+        ) -> Result<Self::TextureId, Self::Error> {
+            Err(TestError::RawImport)
+        }
+    }
+
+    #[cfg(feature = "wayland_frontend")]
+    impl ImportDmaWl for TestRenderer {
+        fn import_dma_buffer_from_surface_state(
+            &mut self,
+            _buffer: &crate::backend::renderer::utils::Buffer,
+            _surface: Option<&SurfaceData>,
+            _damage: &[Rectangle<i32, BufferCoords>],
+        ) -> Result<Self::TextureId, Self::Error> {
+            #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+            self.surface_state_imports
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(TestTexture(42))
+        }
+    }
+
+    impl Bind<Dmabuf> for TestRenderer {
+        fn bind<'a>(&mut self, _dmabuf: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
+            unreachable!()
+        }
+
+        fn supported_formats(&self) -> Option<FormatSet> {
+            Some([test_format()].into_iter().collect())
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestMapping;
+
+    impl Texture for TestMapping {
+        fn size(&self) -> Size<i32, BufferCoords> {
+            (1, 1).into()
+        }
+
+        fn width(&self) -> u32 {
+            1
+        }
+
+        fn height(&self) -> u32 {
+            1
+        }
+
+        fn format(&self) -> Option<Fourcc> {
+            Some(Fourcc::Argb8888)
+        }
+    }
+
+    impl TextureMapping for TestMapping {
+        fn flipped(&self) -> bool {
+            false
+        }
+    }
+
+    impl ExportMem for TestRenderer {
+        type TextureMapping = TestMapping;
+
+        fn copy_framebuffer(
+            &mut self,
+            _target: &Self::Framebuffer<'_>,
+            _region: Rectangle<i32, BufferCoords>,
+            _format: Fourcc,
+        ) -> Result<Self::TextureMapping, Self::Error> {
+            unreachable!()
+        }
+
+        fn copy_texture(
+            &mut self,
+            _texture: &Self::TextureId,
+            _region: Rectangle<i32, BufferCoords>,
+            _format: Fourcc,
+        ) -> Result<Self::TextureMapping, Self::Error> {
+            unreachable!()
+        }
+
+        fn can_read_texture(&mut self, _texture: &Self::TextureId) -> Result<bool, Self::Error> {
+            unreachable!()
+        }
+
+        fn map_texture<'a>(
+            &mut self,
+            _texture_mapping: &'a Self::TextureMapping,
+        ) -> Result<&'a [u8], Self::Error> {
             unreachable!()
         }
     }
@@ -4364,6 +4616,201 @@ mod tests {
             code: Fourcc::Argb8888,
             modifier: Modifier::Linear,
         }
+    }
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    #[derive(Default)]
+    struct TestClientData;
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    impl ClientData for TestClientData {
+        fn initialized(&self, _client_id: ClientId) {}
+
+        fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+    }
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    struct TestWaylandState;
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    impl wayland_server::Dispatch<WlBuffer, Dmabuf> for TestWaylandState {
+        fn request(
+            _state: &mut Self,
+            _client: &wayland_server::Client,
+            _resource: &WlBuffer,
+            _request: <WlBuffer as wayland_server::Resource>::Request,
+            _data: &Dmabuf,
+            _dhandle: &wayland_server::DisplayHandle,
+            _data_init: &mut wayland_server::DataInit<'_, Self>,
+        ) {
+        }
+    }
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    fn test_drm_node(minor: u32) -> DrmNode {
+        DrmNode::from_dev_id(rustix::fs::makedev(drm::node::constants::DRM_MAJOR, minor))
+            .expect("test DRM node id")
+    }
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    fn inert_test_dmabuf(node: DrmNode) -> Dmabuf {
+        let plane_fd = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
+            .expect("create inert test dmabuf fd");
+        let mut builder = Dmabuf::builder((1, 1), Fourcc::Argb8888, Modifier::Linear, DmabufFlags::empty());
+        assert!(builder.add_plane(plane_fd, 0, 0, 4));
+        builder.set_node(node);
+        builder.build().expect("test dmabuf should have one plane")
+    }
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    fn dmabuf_wl_buffer_for_tests(
+        dmabuf: Dmabuf,
+    ) -> Option<(Display<TestWaylandState>, UnixStream, WlBuffer)> {
+        let display = match Display::<TestWaylandState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return None,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let mut display_handle = display.handle();
+        let (client_side, server_side) = UnixStream::pair().unwrap();
+        let client = display_handle
+            .insert_client(server_side, Arc::new(TestClientData))
+            .unwrap();
+        let wl_buffer = client
+            .create_resource::<WlBuffer, Dmabuf, TestWaylandState>(&display_handle, 1, dmabuf)
+            .unwrap();
+
+        Some((display, client_side, wl_buffer))
+    }
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    #[test]
+    fn import_dma_buffer_from_surface_state_forwards_to_node_renderer() {
+        let node = test_drm_node(128);
+        let context_id = ContextId::<TestTexture>::new();
+        let renderer = TestRenderer::new(context_id.clone());
+        let surface_state_imports = renderer.surface_state_imports.clone();
+        let mut device = TestDevice { renderer, node };
+        let (_display, _client_side, wl_buffer) = match dmabuf_wl_buffer_for_tests(inert_test_dmabuf(node)) {
+            Some(fixture) => fixture,
+            None => return,
+        };
+        let buffer = crate::backend::renderer::utils::Buffer::with_implicit(wl_buffer);
+        let mut renderer = MultiRenderer::<TestApi, TestApi> {
+            render: &mut device,
+            target: None,
+            other_renderers: Vec::new(),
+            span: tracing::Span::current(),
+        };
+
+        let texture = renderer
+            .import_dma_buffer_from_surface_state(&buffer, None, &[])
+            .expect("surface-state dmabuf import should use state-aware renderer hook");
+
+        assert_eq!(
+            surface_state_imports.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(texture.get::<TestApi>(&context_id), Some(TestTexture(42)));
+    }
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    #[test]
+    fn import_dma_buffer_from_surface_state_uses_raw_path_for_non_render_node() {
+        let render_node = test_drm_node(128);
+        let target_node = test_drm_node(0);
+        let render_context_id = ContextId::<TestTexture>::new();
+        let target_context_id = ContextId::<TestTexture>::new();
+        let render_renderer = TestRenderer::new(render_context_id);
+        let target_renderer = TestRenderer::new(target_context_id);
+        let render_surface_state_imports = render_renderer.surface_state_imports.clone();
+        let target_surface_state_imports = target_renderer.surface_state_imports.clone();
+        let mut render_device = TestDevice {
+            renderer: render_renderer,
+            node: render_node,
+        };
+        let mut target_device = TestDevice {
+            renderer: target_renderer,
+            node: target_node,
+        };
+        let (_display, _client_side, wl_buffer) =
+            match dmabuf_wl_buffer_for_tests(inert_test_dmabuf(target_node)) {
+                Some(fixture) => fixture,
+                None => return,
+            };
+        let buffer = crate::backend::renderer::utils::Buffer::with_implicit(wl_buffer);
+        let mut cached_buffer = None;
+        let mut renderer = MultiRenderer::<TestApi, TestApi> {
+            render: &mut render_device,
+            target: Some(TargetData {
+                device: &mut target_device,
+                cached_buffer: &mut cached_buffer,
+                format: Fourcc::Argb8888,
+            }),
+            other_renderers: Vec::new(),
+            span: tracing::Span::current(),
+        };
+
+        let err = match renderer.import_dma_buffer_from_surface_state(&buffer, None, &[]) {
+            Ok(_) => panic!("non-render-node surface-state import must use the raw multigpu path"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, Error::Target(TestError::RawImport)));
+        assert_eq!(
+            render_surface_state_imports.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            target_surface_state_imports.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+    #[test]
+    fn local_import_dma_buffer_from_surface_state_uses_frame_guard_renderer() {
+        let node = test_drm_node(128);
+        let guard_context_id = ContextId::<TestTexture>::new();
+        let guard_renderer = TestRenderer::new(guard_context_id.clone());
+        let guard_surface_state_imports = guard_renderer.surface_state_imports.clone();
+        let render_renderer = TestRenderer::new(ContextId::<TestTexture>::new());
+        let render_surface_state_imports = render_renderer.surface_state_imports.clone();
+        let mut device = TestDevice {
+            renderer: render_renderer,
+            node,
+        };
+        let (_display, _client_side, wl_buffer) = match dmabuf_wl_buffer_for_tests(inert_test_dmabuf(node)) {
+            Some(fixture) => fixture,
+            None => return,
+        };
+        let buffer = crate::backend::renderer::utils::Buffer::with_implicit(wl_buffer);
+        let mut render_ref = &mut device;
+        let mut other_renderers: [&mut TestDevice; 0] = [];
+        let span = tracing::trace_span!("local_import_dma_buffer_from_surface_state_test").entered();
+        let mut renderer = LocalMultiRenderer::<TestApi, TestApi> {
+            guard: TestFrameGuard {
+                renderer: guard_renderer,
+            },
+            render: &mut render_ref,
+            target: None,
+            other_renderers: &mut other_renderers,
+            span,
+        };
+
+        let texture = renderer
+            .import_dma_buffer_from_surface_state(&buffer, None, &[])
+            .expect("local surface-state import should use the frame guard renderer");
+
+        assert_eq!(
+            guard_surface_state_imports.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            render_surface_state_imports.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(texture.get::<TestApi>(&guard_context_id), Some(TestTexture(42)));
     }
 
     #[test]

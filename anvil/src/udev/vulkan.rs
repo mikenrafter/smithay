@@ -1,14 +1,11 @@
 //! Vulkan renderer-family support for Anvil's udev backend.
 //!
-//! This module intentionally does not select Vulkan for `--tty-udev` yet. It only models the
-//! renderer-family side in the same `GpuManager`/`MultiRenderer` shape used by the existing GLES
-//! path, while keeping GBM as the dmabuf allocator for DRM scanout buffers.
+//! This module models the renderer-family side in the same `GpuManager`/`MultiRenderer` shape used
+//! by the existing GLES path, while keeping GBM as the dmabuf allocator for DRM scanout buffers.
 //!
-//! The remaining integration blocker is Anvil's scene/render-element path: it currently requires
-//! `ImportAll`, and the existing `MultiRenderer` `ImportAll` bridge is GLES/EGL-backed. Selecting
-//! this renderer family for the full udev backend should happen only after the Vulkan multi-gpu
-//! import path satisfies those render-element bounds or Anvil narrows the rendered element set for
-//! the initial Vulkan validation mode.
+//! Anvil selects this family for no-default `udev_vulkan` builds. Builds that enable Anvil's `egl`
+//! feature keep the GLES renderer family so wl_drm/EGL buffer support is not advertised through a
+//! Vulkan renderer that cannot provide it.
 
 use std::{
     collections::HashMap,
@@ -54,10 +51,10 @@ pub fn add_gpu_node(
     gpus: &mut GpuManager,
     node: DrmNode,
     gbm: GbmDevice<DrmDeviceFd>,
-) -> Result<(), VulkanGbmError> {
-    gpus.as_ref().ensure_physical_device_for_node(node)?;
+) -> Result<DrmNode, VulkanGbmError> {
+    let node = gpus.as_ref().preferred_node_for_node(node)?;
     gpus.as_mut().add_node(node, gbm);
-    Ok(())
+    Ok(node)
 }
 
 /// Return Vulkan's explicit dmabuf render-target formats for Anvil's DRM output manager.
@@ -109,14 +106,13 @@ impl VulkanGbmBackend {
         }
     }
 
-    /// Ensure a Vulkan physical device maps to the given DRM node.
-    pub fn ensure_physical_device_for_node(&self, node: DrmNode) -> Result<(), VulkanGbmError> {
+    /// Return the preferred Vulkan node matching a DRM node opened by Anvil.
+    pub fn preferred_node_for_node(&self, node: DrmNode) -> Result<DrmNode, VulkanGbmError> {
         let mut physical_devices = PhysicalDevice::enumerate(&self.instance).map_err(VulkanError::from)?;
-        if physical_devices.any(|physical_device| physical_device_matches_node(&physical_device, node)) {
-            Ok(())
-        } else {
-            Err(VulkanGbmError::NoPhysicalDevice(node))
-        }
+        physical_devices
+            .find(|physical_device| physical_device_matches_node(physical_device, node))
+            .and_then(|physical_device| preferred_physical_device_node(&physical_device))
+            .ok_or(VulkanGbmError::NoPhysicalDevice(node))
     }
 }
 

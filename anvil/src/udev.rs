@@ -25,11 +25,19 @@ use smithay::backend::drm::compositor::PrimaryPlaneElement;
 use smithay::backend::renderer::ImportEgl;
 #[cfg(feature = "debug")]
 use smithay::backend::renderer::{ImportMem, multigpu::MultiTexture};
+#[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
+use smithay::backend::{
+    egl::{self, EGLContext, EGLDevice, EGLDisplay, context::ContextPriority},
+    renderer::{
+        gles::{Capability, GlesRenderer},
+        multigpu::{GpuManager, MultiRenderer, gbm::GbmGlesBackend},
+    },
+};
 use smithay::{
     backend::{
         SwapBuffersError,
         allocator::{
-            Fourcc, Modifier,
+            Fourcc,
             dmabuf::Dmabuf,
             format::FormatSet,
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
@@ -41,15 +49,12 @@ use smithay::{
             exporter::gbm::GbmFramebufferExporter,
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
         },
-        egl::{self, EGLContext, EGLDevice, EGLDisplay, context::ContextPriority},
         input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
             DebugFlags, ImportDma, ImportMemWl,
             damage::Error as OutputDamageTrackerError,
             element::{AsRenderElements, RenderElementStates, memory::MemoryRenderBuffer},
-            gles::{Capability, GlesRenderer},
-            multigpu::{GpuManager, MultiRenderer, gbm::GbmGlesBackend},
         },
         session::{
             Event as SessionEvent, Session,
@@ -119,11 +124,27 @@ const SUPPORTED_FORMATS: &[Fourcc] = &[
 ];
 const SUPPORTED_FORMATS_8BIT_ONLY: &[Fourcc] = &[Fourcc::Abgr8888, Fourcc::Argb8888];
 
+#[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
 type UdevGraphicsApi = GbmGlesBackend<GlesRenderer, DrmDeviceFd>;
+#[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
 type UdevGpuManager = GpuManager<UdevGraphicsApi>;
+#[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
 type UdevGpuManagerError = smithay::backend::renderer::multigpu::Error<UdevGraphicsApi, UdevGraphicsApi>;
+#[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
 type UdevRenderer<'a> = MultiRenderer<'a, 'a, UdevGraphicsApi, UdevGraphicsApi>;
+#[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
+type UdevAddNodeError = egl::Error;
 
+#[cfg(all(feature = "udev_vulkan", not(feature = "egl")))]
+type UdevGpuManager = vulkan::GpuManager;
+#[cfg(all(feature = "udev_vulkan", not(feature = "egl")))]
+type UdevGpuManagerError = vulkan::GpuManagerError;
+#[cfg(all(feature = "udev_vulkan", not(feature = "egl")))]
+type UdevRenderer<'a> = vulkan::Renderer<'a>;
+#[cfg(all(feature = "udev_vulkan", not(feature = "egl")))]
+type UdevAddNodeError = vulkan::VulkanGbmError;
+
+#[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
 fn create_udev_gpu_manager() -> Result<UdevGpuManager, UdevGpuManagerError> {
     GpuManager::new(GbmGlesBackend::with_factory(|display| {
         let context = EGLContext::new_with_priority(display, ContextPriority::High)?;
@@ -135,27 +156,49 @@ fn create_udev_gpu_manager() -> Result<UdevGpuManager, UdevGpuManagerError> {
     }))
 }
 
+#[cfg(all(feature = "udev_vulkan", not(feature = "egl")))]
+fn create_udev_gpu_manager() -> Result<UdevGpuManager, UdevGpuManagerError> {
+    vulkan::create_gpu_manager()
+}
+
+#[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
 fn add_udev_gpu_node(
     gpus: &mut UdevGpuManager,
     render_node: DrmNode,
     gbm: GbmDevice<DrmDeviceFd>,
-) -> Result<(), egl::Error> {
-    gpus.as_mut().add_node(render_node, gbm)
+) -> Result<DrmNode, UdevAddNodeError> {
+    gpus.as_mut().add_node(render_node, gbm)?;
+    Ok(render_node)
+}
+
+#[cfg(all(feature = "udev_vulkan", not(feature = "egl")))]
+fn add_udev_gpu_node(
+    gpus: &mut UdevGpuManager,
+    render_node: DrmNode,
+    gbm: GbmDevice<DrmDeviceFd>,
+) -> Result<DrmNode, UdevAddNodeError> {
+    vulkan::add_gpu_node(gpus, render_node, gbm)
 }
 
 fn renderer_dmabuf_formats(gpus: &mut UdevGpuManager, node: &DrmNode) -> Option<FormatSet> {
     Some(gpus.single_renderer(node).ok()?.dmabuf_formats())
 }
 
+#[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
 fn render_node_formats(renderer: &mut UdevRenderer<'_>, has_render_node: bool) -> FormatSet {
     renderer
         .as_mut()
         .egl_context()
         .dmabuf_render_formats()
         .iter()
-        .filter(|format| has_render_node || format.modifier == Modifier::Linear)
+        .filter(|format| has_render_node || format.modifier == smithay::backend::allocator::Modifier::Linear)
         .copied()
         .collect::<FormatSet>()
+}
+
+#[cfg(all(feature = "udev_vulkan", not(feature = "egl")))]
+fn render_node_formats(renderer: &mut UdevRenderer<'_>, has_render_node: bool) -> FormatSet {
+    vulkan::render_target_formats(renderer, has_render_node)
 }
 
 #[derive(Debug, PartialEq)]
@@ -778,7 +821,8 @@ enum DeviceAddError {
     #[error("Failed to access drm node: {0}")]
     DrmNode(CreateDrmNodeError),
     #[error("Failed to add device to GpuManager: {0}")]
-    AddNode(egl::Error),
+    AddNode(UdevAddNodeError),
+    #[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
     #[error("The device has no render node")]
     NoRenderNode,
     #[error("Primary GPU is missing")]
@@ -898,6 +942,7 @@ impl AnvilState<UdevData> {
             )
             .unwrap();
 
+        #[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
         let mut try_initialize_gpu = || {
             let display = unsafe { EGLDisplay::new(gbm.clone()).map_err(DeviceAddError::AddNode)? };
             let egl_device = EGLDevice::device_for_display(&display).map_err(DeviceAddError::AddNode)?;
@@ -908,6 +953,14 @@ impl AnvilState<UdevData> {
 
             let render_node = egl_device.try_get_render_node().ok().flatten().unwrap_or(node);
             add_udev_gpu_node(&mut self.backend_data.gpus, render_node, gbm.clone())
+                .map_err(DeviceAddError::AddNode)?;
+
+            std::result::Result::<DrmNode, DeviceAddError>::Ok(render_node)
+        };
+
+        #[cfg(all(feature = "udev_vulkan", not(feature = "egl")))]
+        let mut try_initialize_gpu = || {
+            let render_node = add_udev_gpu_node(&mut self.backend_data.gpus, node, gbm.clone())
                 .map_err(DeviceAddError::AddNode)?;
 
             std::result::Result::<DrmNode, DeviceAddError>::Ok(render_node)
