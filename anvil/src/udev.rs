@@ -102,6 +102,9 @@ use smithay_drm_extras::{
 };
 use tracing::{debug, error, info, trace, warn};
 
+#[cfg(feature = "udev_vulkan")]
+pub mod vulkan;
+
 // we cannot simply pick the first supported format of the intersection of *all* formats, because:
 // - we do not want something like Abgr4444, which looses color information, if something better is available
 // - some formats might perform terribly
