@@ -154,7 +154,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         <VulkanRenderer as Bind<VulkanDmabufRenderTarget<'static, 'static>>>::supported_formats(&renderer)
             .unwrap_or_default();
     if renderer_formats.iter().next().is_none() {
-        return Err("Vulkan renderer did not advertise any dmabuf render-target formats".into());
+        return Err(
+            "Vulkan renderer did not expose any development-gated dmabuf render-target formats".into(),
+        );
     }
     let color_formats = renderer_formats
         .iter()
@@ -162,7 +164,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .filter(|format| matches!(*format, Fourcc::Abgr8888 | Fourcc::Argb8888))
         .collect::<Vec<_>>();
     if color_formats.is_empty() {
-        return Err("Vulkan renderer did not advertise an 8-bit ARGB/ABGR dmabuf target format".into());
+        return Err(
+            "Vulkan renderer did not expose a development-gated 8-bit ARGB/ABGR dmabuf target format".into(),
+        );
     }
     let cursor_size = drm.cursor_size();
 
@@ -494,7 +498,7 @@ fn probe_gbm_dmabuf_vulkan_render_target(
         .collect::<Vec<_>>();
     if formats.is_empty() {
         return Err(
-            "Vulkan renderer did not advertise an explicit-modifier 8-bit ARGB/ABGR dmabuf target format"
+            "Vulkan renderer did not expose a development-gated explicit-modifier 8-bit ARGB/ABGR dmabuf target format"
                 .into(),
         );
     }

@@ -48,8 +48,11 @@ pub enum VulkanError {
 #[cfg(feature = "backend_vulkan")]
 fn missing_vulkan_allocator_drm_framebuffer_contract() -> VulkanError {
     // This is the live fail-closed contract stub for Vulkan allocator-owned primary-plane
-    // buffers. Do not replace it with raw `VulkanImage::export()` + `framebuffer_from_dmabuf` until
-    // the normal Smithay path carries explicit evidence for:
+    // buffers. Vulkan dma-buf export and DRM modifier metadata do not imply that KMS will accept
+    // the allocation as a framebuffer: drivers may require scanout/display allocation provenance
+    // that ordinary external-memory allocations do not carry. Do not replace this with raw
+    // `VulkanImage::export()` + `framebuffer_from_dmabuf` until the normal Smithay path carries
+    // explicit evidence for:
     //
     // - the image layout and queue-family ownership state required before DRM/KMS may scan it out,
     // - synchronization handed to DRM for the rendered contents, and synchronization received back
