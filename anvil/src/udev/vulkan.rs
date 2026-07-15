@@ -3,6 +3,12 @@
 //! This module intentionally does not select Vulkan for `--tty-udev` yet. It only models the
 //! renderer-family side in the same `GpuManager`/`MultiRenderer` shape used by the existing GLES
 //! path, while keeping GBM as the dmabuf allocator for DRM scanout buffers.
+//!
+//! The remaining integration blocker is Anvil's scene/render-element path: it currently requires
+//! `ImportAll`, and the existing `MultiRenderer` `ImportAll` bridge is GLES/EGL-backed. Selecting
+//! this renderer family for the full udev backend should happen only after the Vulkan multi-gpu
+//! import path satisfies those render-element bounds or Anvil narrows the rendered element set for
+//! the initial Vulkan validation mode.
 
 use std::{
     collections::HashMap,
@@ -11,6 +17,7 @@ use std::{
 };
 
 use smithay::backend::{
+    SwapBuffersError,
     allocator::{
         Allocator,
         dmabuf::{AnyError, Dmabuf, DmabufAllocator},
@@ -18,12 +25,49 @@ use smithay::backend::{
     },
     drm::{DrmDeviceFd, DrmNode},
     renderer::{
+        Bind,
         multigpu::{ApiDevice, GraphicsApi},
-        vulkan::{VulkanError, VulkanRenderer},
+        vulkan::{VulkanError, VulkanOwnedDmabufRenderTarget, VulkanRenderer},
     },
-    vulkan::{Instance, PhysicalDevice},
+    vulkan::{Instance, InstanceError, PhysicalDevice, version::Version},
 };
 use tracing::warn;
+
+/// The Vulkan udev graphics API type.
+pub type Graphics = VulkanGbmBackend;
+/// The Vulkan udev GPU manager type.
+pub type GpuManager = smithay::backend::renderer::multigpu::GpuManager<Graphics>;
+/// The Vulkan udev renderer type.
+pub type Renderer<'a> = smithay::backend::renderer::multigpu::MultiRenderer<'a, 'a, Graphics, Graphics>;
+/// The Vulkan udev GPU manager creation error type.
+pub type GpuManagerError = smithay::backend::renderer::multigpu::Error<Graphics, Graphics>;
+
+/// Create the Vulkan udev GPU manager.
+pub fn create_gpu_manager() -> Result<GpuManager, GpuManagerError> {
+    let instance = Instance::new(Version::VERSION_1_3, None)
+        .map_err(|err| GpuManagerError::RenderApiError(VulkanGbmError::from(err)))?;
+    smithay::backend::renderer::multigpu::GpuManager::new(VulkanGbmBackend::new(instance))
+}
+
+/// Add a GBM device to the Vulkan udev GPU manager after verifying Vulkan can identify it.
+pub fn add_gpu_node(
+    gpus: &mut GpuManager,
+    node: DrmNode,
+    gbm: GbmDevice<DrmDeviceFd>,
+) -> Result<(), VulkanGbmError> {
+    gpus.as_ref().ensure_physical_device_for_node(node)?;
+    gpus.as_mut().add_node(node, gbm);
+    Ok(())
+}
+
+/// Return Vulkan's explicit dmabuf render-target formats for Anvil's DRM output manager.
+pub fn render_target_formats(
+    renderer: &mut Renderer<'_>,
+    _has_render_node: bool,
+) -> smithay::backend::allocator::format::FormatSet {
+    <Renderer<'_> as Bind<VulkanOwnedDmabufRenderTarget<'static>>>::supported_formats(renderer)
+        .unwrap_or_default()
+}
 
 /// A Vulkan [`GraphicsApi`] backed by GBM dmabuf allocation for DRM scanout targets.
 pub struct VulkanGbmBackend {
@@ -64,14 +108,41 @@ impl VulkanGbmBackend {
             self.needs_enumeration.store(true, Ordering::SeqCst);
         }
     }
+
+    /// Ensure a Vulkan physical device maps to the given DRM node.
+    pub fn ensure_physical_device_for_node(&self, node: DrmNode) -> Result<(), VulkanGbmError> {
+        let mut physical_devices = PhysicalDevice::enumerate(&self.instance).map_err(VulkanError::from)?;
+        if physical_devices.any(|physical_device| physical_device_matches_node(&physical_device, node)) {
+            Ok(())
+        } else {
+            Err(VulkanGbmError::NoPhysicalDevice(node))
+        }
+    }
 }
 
 /// Errors raised by the Vulkan udev renderer family.
 #[derive(Debug, thiserror::Error)]
 pub enum VulkanGbmError {
+    /// Vulkan instance creation failed.
+    #[error(transparent)]
+    Instance(#[from] InstanceError),
     /// Vulkan renderer error.
     #[error(transparent)]
     Vulkan(#[from] VulkanError),
+    /// No Vulkan physical device maps to the DRM node.
+    #[error("No Vulkan physical device maps to DRM node {0}")]
+    NoPhysicalDevice(DrmNode),
+}
+
+impl From<VulkanGbmError> for SwapBuffersError {
+    fn from(err: VulkanGbmError) -> Self {
+        match err {
+            VulkanGbmError::Vulkan(err) => err.into(),
+            VulkanGbmError::Instance(_) | VulkanGbmError::NoPhysicalDevice(_) => {
+                SwapBuffersError::ContextLost(Box::new(err))
+            }
+        }
+    }
 }
 
 impl GraphicsApi for VulkanGbmBackend {
@@ -88,30 +159,20 @@ impl GraphicsApi for VulkanGbmBackend {
 
         let physical_devices = PhysicalDevice::enumerate(&self.instance).map_err(VulkanError::from)?;
         for physical_device in physical_devices {
-            let Some(node) = physical_device_node(&physical_device) else {
+            let Some(node) = preferred_physical_device_node(&physical_device) else {
                 continue;
             };
-            if !self
-                .devices
-                .keys()
-                .any(|configured| configured.dev_id() == node.dev_id())
-            {
+            let Some((configured_node, allocator)) = self.devices.iter().find(|(configured_node, _)| {
+                physical_device_matches_node(&physical_device, **configured_node)
+            }) else {
                 continue;
-            }
+            };
             if list
                 .iter()
                 .any(|renderer| renderer.node.dev_id() == node.dev_id())
             {
                 continue;
             }
-
-            let Some((configured_node, allocator)) = self
-                .devices
-                .iter()
-                .find(|(configured_node, _)| configured_node.dev_id() == node.dev_id())
-            else {
-                continue;
-            };
 
             let renderer = match VulkanRenderer::builder()
                 .with_physical_device(physical_device.clone())
@@ -183,10 +244,15 @@ impl ApiDevice for VulkanGbmDevice {
     }
 }
 
-fn physical_device_node(physical_device: &PhysicalDevice) -> Option<DrmNode> {
+fn preferred_physical_device_node(physical_device: &PhysicalDevice) -> Option<DrmNode> {
     physical_device
         .render_node()
         .ok()
         .flatten()
         .or_else(|| physical_device.primary_node().ok().flatten())
+}
+
+fn physical_device_matches_node(physical_device: &PhysicalDevice, node: DrmNode) -> bool {
+    physical_device.render_node().ok().flatten() == Some(node)
+        || physical_device.primary_node().ok().flatten() == Some(node)
 }
