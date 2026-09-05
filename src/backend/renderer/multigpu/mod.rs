@@ -4657,7 +4657,7 @@ mod tests {
         let plane_fd = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
             .expect("create inert test dmabuf fd");
         let mut builder = Dmabuf::builder((1, 1), Fourcc::Argb8888, Modifier::Linear, DmabufFlags::empty());
-        assert!(builder.add_plane(plane_fd, 0, 0, 4));
+        assert!(builder.add_plane(plane_fd, 0, 4));
         builder.set_node(node);
         builder.build().expect("test dmabuf should have one plane")
     }
