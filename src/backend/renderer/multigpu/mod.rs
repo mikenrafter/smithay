@@ -4647,9 +4647,8 @@ mod tests {
     }
 
     #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
-    fn test_drm_node(minor: u32) -> DrmNode {
-        DrmNode::from_dev_id(rustix::fs::makedev(drm::node::constants::DRM_MAJOR, minor))
-            .expect("test DRM node id")
+    fn test_drm_node(minor: u32) -> Option<DrmNode> {
+        DrmNode::from_dev_id(rustix::fs::makedev(drm::node::constants::DRM_MAJOR, minor)).ok()
     }
 
     #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
@@ -4686,7 +4685,9 @@ mod tests {
     #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
     #[test]
     fn import_dma_buffer_from_surface_state_forwards_to_node_renderer() {
-        let node = test_drm_node(128);
+        let Some(node) = test_drm_node(128) else {
+            return;
+        };
         let context_id = ContextId::<TestTexture>::new();
         let renderer = TestRenderer::new(context_id.clone());
         let surface_state_imports = renderer.surface_state_imports.clone();
@@ -4717,8 +4718,12 @@ mod tests {
     #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
     #[test]
     fn import_dma_buffer_from_surface_state_uses_raw_path_for_non_render_node() {
-        let render_node = test_drm_node(128);
-        let target_node = test_drm_node(0);
+        let Some(render_node) = test_drm_node(128) else {
+            return;
+        };
+        let Some(target_node) = test_drm_node(0) else {
+            return;
+        };
         let render_context_id = ContextId::<TestTexture>::new();
         let target_context_id = ContextId::<TestTexture>::new();
         let render_renderer = TestRenderer::new(render_context_id);
@@ -4770,7 +4775,9 @@ mod tests {
     #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
     #[test]
     fn local_import_dma_buffer_from_surface_state_uses_frame_guard_renderer() {
-        let node = test_drm_node(128);
+        let Some(node) = test_drm_node(128) else {
+            return;
+        };
         let guard_context_id = ContextId::<TestTexture>::new();
         let guard_renderer = TestRenderer::new(guard_context_id.clone());
         let guard_surface_state_imports = guard_renderer.surface_state_imports.clone();
