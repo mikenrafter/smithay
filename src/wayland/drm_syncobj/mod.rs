@@ -5,15 +5,13 @@
 //!
 //! Acquire fences can delay the surface transaction through [`DrmSyncPointBlocker`]
 //! when the compositor installs the accompanying [`DrmSyncPointSource`] from
-//! [`DrmSyncobjHandler::drm_syncobj_install_acquire_point_source`]. Compositors that
-//! do not install the source may only accept already-signalled acquire points; unsignalled
-//! acquire commits fail closed before the buffer becomes current.
+//! [`DrmSyncobjHandler::drm_syncobj_install_acquire_point_source`].
 //!
-//! The server should only expose the protocol if [`supports_syncobj_eventfd`] returns
-//! `true` and the compositor installs acquire sources through
-//! [`DrmSyncobjHandler::drm_syncobj_install_acquire_point_source`]. Otherwise normal
-//! unsignalled acquire commits cannot be delayed safely and will fail closed before the
-//! buffer becomes current.
+//! The default handler returns `false` and does **not** discard the commit. That matches
+//! Smithay `e3d461a` (cosmic-comp's pin): protocol validation lives here, waiting on
+//! acquire is compositor-owned. Compositors that install the source get transaction
+//! blockers; compositors that do not (including cosmic-comp until it implements the
+//! hook) keep the pin's fail-open apply path.
 //!
 //! The committed release fence is signalled when all references to a
 //! [`Buffer`][crate::backend::renderer::utils::Buffer] are dropped. Pending
@@ -95,8 +93,8 @@ pub trait DrmSyncobjHandler {
     /// Returning `true` tells the protocol implementation that the source has been registered and will
     /// arrange for [`compositor::CompositorClientState::blocker_cleared`] to be called when it fires, so
     /// the current commit may be delayed with the matching [`DrmSyncPointBlocker`]. Returning `false`
-    /// means no source was installed; the commit will then proceed only if the acquire point is already
-    /// signalled, otherwise the pending commit is discarded instead of exposing an unsignalled buffer.
+    /// (the default) means no source was installed and the commit is applied without a protocol
+    /// blocker, matching the pin's compositor-owned wait. Do not use `false` as "fail closed".
     fn drm_syncobj_install_acquire_point_source(
         &mut self,
         _dh: &DisplayHandle,
@@ -152,6 +150,7 @@ fn discard_invalid_pending_commit(
     }
 }
 
+#[allow(dead_code)] // fail-closed discard is opt-in via acquire-source install, not the pin default
 fn discard_unwaitable_acquire_commit(surface: &WlSurface) {
     compositor::with_states(surface, |states| {
         let mut surface_cached = states.cached_state.get::<SurfaceAttributes>();
@@ -546,10 +545,11 @@ fn commit_hook<D: DrmSyncobjHandler>(data: &mut D, dh: &DisplayHandle, surface: 
                     "DRM syncobj acquire point source was not installed, but acquire point is already signalled"
                 );
             } else {
+                // Pin-compatible: cosmic-comp and other compositors that do not implement the
+                // hook own acquire waiting. Do not discard a protocol-valid commit.
                 warn!(
-                    "DRM syncobj acquire point source was not installed; discarding unsignalled acquire buffer/sync state"
+                    "DRM syncobj acquire point source was not installed; compositor must wait (pin-compatible)"
                 );
-                discard_unwaitable_acquire_commit(surface);
             }
         }
         Err(err) => {
@@ -561,9 +561,8 @@ fn commit_hook<D: DrmSyncobjHandler>(data: &mut D, dh: &DisplayHandle, surface: 
             } else {
                 warn!(
                     ?err,
-                    "failed to create DRM syncobj acquire point blocker; discarding unsignalled acquire buffer/sync state"
+                    "failed to create DRM syncobj acquire point blocker; compositor must wait (pin-compatible)"
                 );
-                discard_unwaitable_acquire_commit(surface);
             }
         }
     }
@@ -2959,7 +2958,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_unwaitable_acquire_without_source_discards_buffer_and_sync_state() {
+    fn commit_unwaitable_acquire_without_source_keeps_pin_apply_path() {
         let Some((_display, display_handle, mut server_state, _client_side, server_client, surface)) =
             focused_commit_state()
         else {
@@ -2978,8 +2977,10 @@ mod tests {
             Some(buffer),
         );
 
-        assert!(current_sync_points_are_empty(&surface));
-        assert!(current_buffer_is_none(&surface));
+        // Default handler does not install an acquire source. Pin (e3d461a) applies the
+        // protocol-valid commit and leaves waiting to the compositor.
+        assert!(!current_sync_points_are_empty(&surface));
+        assert!(current_buffer_is_some(&surface));
     }
 
     #[test]
