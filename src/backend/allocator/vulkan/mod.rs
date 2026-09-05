@@ -1267,15 +1267,15 @@ mod tests {
     fn dmabuf_for_identity_tests() -> Dmabuf {
         let fd = OwnedFd::from(File::open("/dev/null").unwrap());
         let mut builder = Dmabuf::builder((1, 1), Fourcc::Abgr8888, Modifier::Linear, DmabufFlags::empty());
-        assert!(builder.add_plane(fd, 0, 0, 4));
+        assert!(builder.add_plane(fd, 0, 4));
         builder.build().unwrap()
     }
 
     fn dmabuf_with_planes_for_identity_tests(planes: &[(u32, u32, u32)]) -> Dmabuf {
         let mut builder = Dmabuf::builder((1, 1), Fourcc::Abgr8888, Modifier::Linear, DmabufFlags::empty());
-        for &(idx, offset, stride) in planes {
+        for &(_idx, offset, stride) in planes {
             let fd = OwnedFd::from(File::open("/dev/null").unwrap());
-            assert!(builder.add_plane(fd, idx, offset, stride));
+            assert!(builder.add_plane(fd, offset, stride));
         }
         builder.build().unwrap()
     }

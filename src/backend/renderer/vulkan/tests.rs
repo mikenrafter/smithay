@@ -219,8 +219,8 @@ fn dmabuf_with_planes_for_tests(
     planes: &[(u32, u32, u32)],
 ) -> Dmabuf {
     let mut builder = Dmabuf::builder(size, format, modifier, flags);
-    for &(idx, offset, stride) in planes {
-        builder.add_plane(File::open("/dev/null").unwrap().into(), idx, offset, stride);
+    for &(_idx, offset, stride) in planes {
+        builder.add_plane(OwnedFd::from(File::open("/dev/null").unwrap()), offset, stride);
     }
     builder.build().unwrap()
 }
@@ -9725,41 +9725,9 @@ fn dmabuf_import_state_rejects_invalid_metadata() {
         Err(VulkanError::UnsupportedOperation("dmabuf size"))
     ));
 
-    let missing_plane_zero = dmabuf_with_planes_for_tests(
-        (1, 1).into(),
-        Fourcc::Abgr8888,
-        Modifier::Linear,
-        DmabufFlags::empty(),
-        &[(1, 0, 4)],
-    );
-    assert!(matches!(
-        VulkanDmabufImportState::from_dmabuf(&missing_plane_zero),
-        Err(VulkanError::UnsupportedOperation("dmabuf plane index"))
-    ));
-
-    let duplicate_plane_zero = dmabuf_with_planes_for_tests(
-        (1, 1).into(),
-        Fourcc::Nv12,
-        Modifier::Linear,
-        DmabufFlags::empty(),
-        &[(0, 0, 4), (0, 4, 4)],
-    );
-    assert!(matches!(
-        VulkanDmabufImportState::from_dmabuf(&duplicate_plane_zero),
-        Err(VulkanError::UnsupportedOperation("dmabuf plane index"))
-    ));
-
-    let plane_gap = dmabuf_with_planes_for_tests(
-        (1, 1).into(),
-        Fourcc::Nv12,
-        Modifier::Linear,
-        DmabufFlags::empty(),
-        &[(0, 0, 4), (2, 4, 4)],
-    );
-    assert!(matches!(
-        VulkanDmabufImportState::from_dmabuf(&plane_gap),
-        Err(VulkanError::UnsupportedOperation("dmabuf plane index"))
-    ));
+    // DmabufBuilder now assigns plane indices from insertion order, so missing,
+    // duplicate, and gapped plane indices cannot be constructed here. Those
+    // cases are rejected at protocol import (`Incomplete`) instead.
 
     let zero_stride = dmabuf_with_planes_for_tests(
         (1, 1).into(),
