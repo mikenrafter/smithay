@@ -2863,6 +2863,114 @@ mod tests {
         compositor::test_utils::commit_pending_state_with_serial(surface, display_handle, serial);
     }
 
+    fn queued_new_buffer_count(surface: &wayland_server::protocol::wl_surface::WlSurface) -> usize {
+        compositor::with_states(surface, |states| {
+            let attributes = states.cached_state.get::<SurfaceAttributes>();
+            attributes
+                .cached()
+                .filter(|state| matches!(state.buffer, Some(BufferAssignment::NewBuffer(_))))
+                .count()
+        })
+    }
+
+    struct CancelledBlocker;
+
+    impl compositor::Blocker for CancelledBlocker {
+        fn state(&self) -> compositor::BlockerState {
+            compositor::BlockerState::Cancelled
+        }
+    }
+
+    #[test]
+    fn merge_into_both_points_replaces_current_like_pin() {
+        let display = match Display::<ProtocolServerState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let dh = display.handle();
+        let (old_acquire, old_release) =
+            DrmSyncPoint::invalid_timeline_pair_for_tests(1, 2).expect("create current pair");
+        let (new_acquire, new_release) =
+            DrmSyncPoint::invalid_timeline_pair_for_tests(3, 4).expect("create incoming pair");
+        let mut current = DrmSyncobjCachedState {
+            acquire_point: Some(old_acquire),
+            release_point: Some(old_release),
+        };
+        let incoming = DrmSyncobjCachedState {
+            acquire_point: Some(new_acquire.clone()),
+            release_point: Some(new_release.clone()),
+        };
+
+        incoming.merge_into(&mut current, &dh);
+
+        assert!(same_sync_point(
+            current.acquire_point.as_ref().expect("acquire should be replaced"),
+            &new_acquire
+        ));
+        assert!(same_sync_point(
+            current.release_point.as_ref().expect("release should be replaced"),
+            &new_release
+        ));
+    }
+
+    #[test]
+    fn merge_into_empty_pair_is_pin_noop() {
+        let display = match Display::<ProtocolServerState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let dh = display.handle();
+        let (acquire, release) =
+            DrmSyncPoint::invalid_timeline_pair_for_tests(5, 6).expect("create current pair");
+        let mut current = DrmSyncobjCachedState {
+            acquire_point: Some(acquire.clone()),
+            release_point: Some(release.clone()),
+        };
+
+        DrmSyncobjCachedState::default().merge_into(&mut current, &dh);
+
+        // Pin merge_into only replaced when both points were present. An empty
+        // committed pair is still a no-op.
+        assert!(same_sync_point(
+            current.acquire_point.as_ref().expect("empty merge must keep acquire"),
+            &acquire
+        ));
+        assert!(same_sync_point(
+            current.release_point.as_ref().expect("empty merge must keep release"),
+            &release
+        ));
+    }
+
+    #[test]
+    fn merge_into_acquire_only_clears_current_as_internal_marker() {
+        let display = match Display::<ProtocolServerState>::new() {
+            Ok(display) => display,
+            Err(InitError::NoWaylandLib) => return,
+            Err(err) => panic!("failed to create test Wayland display: {err}"),
+        };
+        let dh = display.handle();
+        let (current_acquire, current_release) =
+            DrmSyncPoint::invalid_timeline_pair_for_tests(7, 8).expect("create current pair");
+        let marker = DrmSyncPoint::invalid_for_tests(9).expect("create acquire-only marker");
+        let mut current = DrmSyncobjCachedState {
+            acquire_point: Some(current_acquire),
+            release_point: Some(current_release),
+        };
+        let incoming = DrmSyncobjCachedState {
+            acquire_point: Some(marker),
+            release_point: None,
+        };
+
+        incoming.merge_into(&mut current, &dh);
+
+        // Pin treated incomplete pairs as a no-op. HEAD uses acquire-only as an
+        // internal clear marker after accepted implicit buffer removal.
+        assert!(current.acquire_point.is_none());
+        assert!(current.release_point.is_none());
+    }
+
     #[test]
     fn invalid_commit_new_buffer_without_acquire_discards_buffer_and_sync_state() {
         let Some((_display, display_handle, mut server_state, _client_side, server_client, surface)) =
@@ -2981,6 +3089,67 @@ mod tests {
         // protocol-valid commit and leaves waiting to the compositor.
         assert!(!current_sync_points_are_empty(&surface));
         assert!(current_buffer_is_some(&surface));
+    }
+
+    #[test]
+    fn commit_buffer_without_sync_points_on_syncobj_surface_is_spec_error() {
+        let Some((_display, display_handle, mut server_state, _client_side, server_client, surface)) =
+            focused_commit_state()
+        else {
+            return;
+        };
+        test_utils::install_surface_for_tests::<ProtocolServerState>(&display_handle, &surface);
+        let buffer = protocol_dmabuf_buffer(&server_client, &display_handle);
+
+        compositor::test_utils::commit_buffer_assignment(
+            &mut server_state,
+            &display_handle,
+            &surface,
+            Some(buffer),
+        );
+
+        // Pin e3d461a commit_hook allowed a new buffer on a syncobj surface with
+        // neither acquire nor release. merge_into then no-op'd the empty pair, so a
+        // previous current point pair could stay attached to the new buffer.
+        // linux-drm-syncobj-v1 requires both points with a buffer; this path posts
+        // NoAcquirePoint and discards so cosmic-comp does not inherit that stale-point
+        // bug. Partial-point commits already errored on the pin.
+        assert!(current_sync_points_are_empty(&surface));
+        assert!(current_buffer_is_none(&surface));
+    }
+
+    #[test]
+    fn cancelled_blocker_discards_queued_buffer_instead_of_leaving_pin_cache_entry() {
+        let Some((_display, display_handle, mut server_state, _client_side, server_client, surface)) =
+            focused_commit_state()
+        else {
+            return;
+        };
+        let cancel_once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancel_once_for_hook = cancel_once.clone();
+        compositor::add_pre_commit_hook::<ProtocolServerState, _>(
+            &surface,
+            move |_data, _dh, surface| {
+                if cancel_once_for_hook.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    compositor::add_blocker(surface, CancelledBlocker);
+                }
+            },
+        );
+        let buffer = protocol_dmabuf_buffer(&server_client, &display_handle);
+
+        compositor::test_utils::commit_buffer_assignment(
+            &mut server_state,
+            &display_handle,
+            &surface,
+            Some(buffer),
+        );
+
+        // Pin take_ready dropped Cancelled transactions without discard_state_range, so
+        // the queued serial stayed in the cache and a later apply_state could still
+        // merge it. Pin's Blocker docs already said Cancelled discards changes; HEAD
+        // implements that. The buffer must not remain queued or become current.
+        assert!(current_buffer_is_none(&surface));
+        assert_eq!(queued_new_buffer_count(&surface), 0);
     }
 
     #[test]
