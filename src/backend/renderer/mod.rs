@@ -3,9 +3,11 @@
 //! Collection of common traits and implementations
 //! to facilitate (possible hardware-accelerated) rendering.
 //!
-//! Supported rendering apis:
+//! Renderer implementations and scaffolds:
 //!
 //! - Raw OpenGL ES 2
+//! - Pixman software rendering
+//! - Vulkan renderer scaffold, gated behind `renderer_vulkan` and intentionally non-functional
 
 use crate::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Scale, Size, Transform, ids::id_gen};
 use glam::Affine2;
@@ -32,6 +34,9 @@ pub mod glow;
 
 #[cfg(feature = "renderer_pixman")]
 pub mod pixman;
+
+#[cfg(feature = "renderer_vulkan")]
+pub mod vulkan;
 
 mod color;
 pub use color::Color32F;
