@@ -2714,6 +2714,17 @@ impl VulkanRenderer {
         self.wayland_linux_dmabuf_interop
     }
 
+    /// Formats the Wayland linux-dmabuf global may advertise for [`ImportDmaWl`].
+    ///
+    /// Empty unless Linux dma-buf interop is enabled. This is not [`ImportDma::dmabuf_formats`].
+    pub fn wayland_sampled_dmabuf_formats(&self) -> FormatSet {
+        if self.wayland_linux_dmabuf_interop {
+            self.capabilities.formats.dmabuf_import.clone()
+        } else {
+            FormatSet::default()
+        }
+    }
+
     /// Wraps a swapchain image the renderer must not destroy.
     ///
     /// Layout tracking starts at `UNDEFINED`. That is the WSI discard path: this backend does not

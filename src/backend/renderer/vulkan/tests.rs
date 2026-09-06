@@ -9113,6 +9113,21 @@ fn public_dmabuf_import_gates_formats() {
             "sampled dmabuf generic ImportDma external-state contract"
         ))
     ));
+    assert!(renderer.wayland_sampled_dmabuf_formats().iter().next().is_none());
+    renderer.set_wayland_linux_dmabuf_interop(true);
+    assert!(
+        renderer
+            .wayland_sampled_dmabuf_formats()
+            .iter()
+            .any(|candidate| *candidate == format)
+    );
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+    assert!(matches!(
+        renderer.import_dmabuf(&dmabuf, None),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf generic ImportDma external-state contract"
+        ))
+    ));
     assert!(renderer.sampled_dmabuf_import_supported(&dmabuf));
     let sampled_import = unsafe {
         // SAFETY: This scaffold has no Vulkan device. Construction only names the foreign-GENERAL
