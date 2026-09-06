@@ -6,6 +6,9 @@
 //! Anvil selects this family for no-default `udev_vulkan` builds. Builds that enable Anvil's `egl`
 //! feature keep the GLES renderer family so wl_drm/EGL buffer support is not advertised through a
 //! Vulkan renderer that cannot provide it.
+//!
+//! Enumerated devices opt into Linux dma-buf interop so the linux-dmabuf global can advertise
+//! [`wayland_sampled_dmabuf_formats`]. Generic `ImportDma` stays fail-closed.
 
 use std::{
     collections::HashMap,
@@ -18,6 +21,7 @@ use smithay::backend::{
     allocator::{
         Allocator,
         dmabuf::{AnyError, Dmabuf, DmabufAllocator},
+        format::FormatSet,
         gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
     },
     drm::{DrmDeviceFd, DrmNode},
@@ -58,12 +62,22 @@ pub fn add_gpu_node(
 }
 
 /// Return Vulkan's explicit dmabuf render-target formats for Anvil's DRM output manager.
-pub fn render_target_formats(
-    renderer: &mut Renderer<'_>,
-    _has_render_node: bool,
-) -> smithay::backend::allocator::format::FormatSet {
+pub fn render_target_formats(renderer: &mut Renderer<'_>, _has_render_node: bool) -> FormatSet {
     <Renderer<'_> as Bind<VulkanOwnedDmabufRenderTarget<'static>>>::supported_formats(renderer)
         .unwrap_or_default()
+}
+
+/// Formats the linux-dmabuf global may advertise for Vulkan Wayland sampled import.
+///
+/// This is not generic `ImportDma::dmabuf_formats`. Empty unless Linux dma-buf interop is enabled
+/// on the inner renderer.
+pub fn wayland_sampled_dmabuf_formats(renderer: &Renderer<'_>) -> FormatSet {
+    renderer.as_ref().wayland_sampled_dmabuf_formats()
+}
+
+/// Protocol-create admission for a sampled dmabuf. Does not import or acquire.
+pub fn sampled_dmabuf_import_supported(renderer: &Renderer<'_>, dmabuf: &Dmabuf) -> bool {
+    renderer.as_ref().sampled_dmabuf_import_supported(dmabuf)
 }
 
 /// A Vulkan [`GraphicsApi`] backed by GBM dmabuf allocation for DRM scanout targets.
@@ -174,7 +188,12 @@ impl GraphicsApi for VulkanGbmBackend {
                 .with_physical_device(physical_device.clone())
                 .build()
             {
-                Ok(renderer) => renderer,
+                Ok(mut renderer) => {
+                    // Same opt-in as `--winit-vulkan`: ImportDmaWl may record FOREIGN/GENERAL marks
+                    // after acquire. Generic ImportDma stays fail-closed.
+                    renderer.set_wayland_linux_dmabuf_interop(true);
+                    renderer
+                }
                 Err(err) => {
                     warn!(?node, ?err, "Skipping Vulkan renderer device");
                     continue;

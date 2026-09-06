@@ -21,6 +21,8 @@ use crate::{
 };
 #[cfg(feature = "renderer_sync")]
 use smithay::backend::drm::compositor::PrimaryPlaneElement;
+#[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
+use smithay::backend::renderer::ImportDma;
 #[cfg(feature = "egl")]
 use smithay::backend::renderer::ImportEgl;
 #[cfg(feature = "debug")]
@@ -52,7 +54,7 @@ use smithay::{
         input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            DebugFlags, ImportDma, ImportMemWl,
+            DebugFlags, ImportMemWl,
             damage::Error as OutputDamageTrackerError,
             element::{AsRenderElements, RenderElementStates, memory::MemoryRenderBuffer},
         },
@@ -180,8 +182,15 @@ fn add_udev_gpu_node(
     vulkan::add_gpu_node(gpus, render_node, gbm)
 }
 
+#[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
 fn renderer_dmabuf_formats(gpus: &mut UdevGpuManager, node: &DrmNode) -> Option<FormatSet> {
     Some(gpus.single_renderer(node).ok()?.dmabuf_formats())
+}
+
+#[cfg(all(feature = "udev_vulkan", not(feature = "egl")))]
+fn renderer_dmabuf_formats(gpus: &mut UdevGpuManager, node: &DrmNode) -> Option<FormatSet> {
+    let renderer = gpus.single_renderer(node).ok()?;
+    Some(vulkan::wayland_sampled_dmabuf_formats(&renderer))
 }
 
 #[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
@@ -259,13 +268,25 @@ impl DmabufHandler for AnvilState<UdevData> {
     }
 
     fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
-        if self
-            .backend_data
-            .gpus
-            .single_renderer(&self.backend_data.primary_gpu)
-            .and_then(|mut renderer| renderer.import_dmabuf(&dmabuf, None))
-            .is_ok()
-        {
+        let admitted = {
+            #[cfg(all(feature = "udev_vulkan", not(feature = "egl")))]
+            {
+                self.backend_data
+                    .gpus
+                    .single_renderer(&self.backend_data.primary_gpu)
+                    .map(|renderer| vulkan::sampled_dmabuf_import_supported(&renderer, &dmabuf))
+                    .unwrap_or(false)
+            }
+            #[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
+            {
+                self.backend_data
+                    .gpus
+                    .single_renderer(&self.backend_data.primary_gpu)
+                    .and_then(|mut renderer| renderer.import_dmabuf(&dmabuf, None))
+                    .is_ok()
+            }
+        };
+        if admitted {
             if dmabuf.node().is_none() {
                 dmabuf.set_node(self.backend_data.primary_gpu);
             }
@@ -548,7 +569,10 @@ pub fn run_udev() {
     }
 
     // init dmabuf support with format list from our primary gpu
+    #[cfg(not(all(feature = "udev_vulkan", not(feature = "egl"))))]
     let dmabuf_formats = renderer.dmabuf_formats();
+    #[cfg(all(feature = "udev_vulkan", not(feature = "egl")))]
+    let dmabuf_formats = vulkan::wayland_sampled_dmabuf_formats(&renderer);
     let default_feedback = DmabufFeedbackBuilder::new(primary_gpu.dev_id(), dmabuf_formats)
         .build()
         .unwrap();
