@@ -717,6 +717,8 @@ impl VulkanDeviceState {
         capabilities.formats =
             super::VulkanFormatCapabilities::discover(&physical_device, &capabilities.external_memory)?;
         capabilities.import.memory = capabilities.formats.memory_import.iter().next().is_some();
+        capabilities.import.dmabuf = capabilities.formats.dmabuf_import.iter().next().is_some();
+        capabilities.import.modifiers = capabilities.import.dmabuf;
         let has_public_render_target_formats = capabilities
             .formats
             .render_target_formats()

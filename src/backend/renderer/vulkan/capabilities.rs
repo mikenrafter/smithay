@@ -40,8 +40,9 @@ pub struct VulkanRendererCapabilities {
 /// Raw per-format Vulkan image feature capabilities.
 ///
 /// Records describe renderer-internal Vulkan support. Smithay-facing [`FormatSet`] values are
-/// limited to implemented renderer traits. The dmabuf render-target set is deliberately a probed
-/// development-path set and is separated from the fully integrated rendering capability bits below.
+/// limited to implemented renderer traits. The dmabuf import and render-target sets are probed
+/// development-path sets and are separated from the fully integrated rendering capability bits
+/// below.
 #[non_exhaustive]
 #[derive(Debug, Default, Clone)]
 pub struct VulkanFormatCapabilities {
@@ -52,7 +53,10 @@ pub struct VulkanFormatCapabilities {
     pub(crate) modifier_records: Vec<VulkanDrmFormatModifierCapabilityRecord>,
     /// Formats usable for shared-memory uploads.
     pub memory_import: FormatSet,
-    /// Formats usable for dmabuf imports.
+    /// Probed sampled single-plane dmabuf import format/modifier pairs.
+    ///
+    /// This is a raw Vulkan external-memory format set. Public ImportDma advertisement remains
+    /// gated separately.
     pub dmabuf_import: FormatSet,
     /// Formats exportable as dmabufs.
     pub dmabuf_export: FormatSet,
@@ -130,8 +134,9 @@ impl VulkanFormatCapabilities {
     /// Discovers Vulkan renderer format capabilities for a physical device.
     ///
     /// This probes sampled, color-attachment, blit, transfer, and linear tiling support for the
-    /// renderer's static format table. Import and export format sets remain empty until those
-    /// traits are implemented and can import or export the advertised pairs.
+    /// renderer's static format table. Sampled single-plane modifier pairs are recorded in
+    /// `dmabuf_import`; public ImportDma advertisement remains gated. Export stays empty until
+    /// that trait is implemented.
     pub fn discover(
         physical_device: &PhysicalDevice,
         external_memory: &VulkanExternalMemoryCapabilities,
@@ -139,6 +144,7 @@ impl VulkanFormatCapabilities {
         let mut records = Vec::new();
         let mut modifier_records = Vec::new();
         let mut memory_import = Vec::new();
+        let mut dmabuf_import = Vec::new();
         let mut dmabuf_render_target = Vec::new();
 
         for info in renderer_format_infos() {
@@ -193,6 +199,12 @@ impl VulkanFormatCapabilities {
                             modifier: record.modifier,
                         });
                     }
+                    if record.usages.sampled && record.plane_count == 1 {
+                        dmabuf_import.push(Format {
+                            code: record.format,
+                            modifier: record.modifier,
+                        });
+                    }
                     if record.usages.any_supported() {
                         modifier_records.push(record);
                     }
@@ -204,7 +216,7 @@ impl VulkanFormatCapabilities {
             records,
             modifier_records,
             memory_import: memory_import.into_iter().collect(),
-            dmabuf_import: FormatSet::default(),
+            dmabuf_import: dmabuf_import.into_iter().collect(),
             dmabuf_export: FormatSet::default(),
             dmabuf_render_target: dmabuf_render_target.into_iter().collect(),
         })
@@ -588,9 +600,11 @@ pub struct VulkanDeviceCapabilities {
 pub struct VulkanImportCapabilities {
     /// Whether memory imports are supported.
     pub memory: bool,
-    /// Whether dmabuf imports are supported.
+    /// Whether sampled dmabuf import formats were probed.
+    ///
+    /// This is raw Vulkan capability, not public ImportDma advertisement.
     pub dmabuf: bool,
-    /// Whether modifier-aware dmabuf imports are supported.
+    /// Whether modifier-aware sampled dmabuf import formats were probed.
     pub modifiers: bool,
 }
 

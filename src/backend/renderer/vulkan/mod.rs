@@ -42,7 +42,8 @@
 //! 10. crop/scale/transform (output `Frame` transforms use the same `Transform::transform_rect_in`
 //!     compositor-space mapping as pixman; crop/scale are dest/src rectangles)
 //! 11. readback test path
-//! 12. `ImportDma`
+//! 12. `ImportDma` (Wayland `ImportDmaWl` is validation-stage; generic `ImportDma` stays
+//!     fail-closed. Public foreign-GENERAL import uses [`VulkanSampledDmabufImport`].)
 //! 13. dmabuf modifier handling
 //! 14. export dmabuf
 //! 15. KMS presentation path
@@ -1422,6 +1423,49 @@ impl<'a> VulkanDmabufRenderTargetAcquire<'a> {
 impl Default for VulkanDmabufRenderTargetAcquire<'_> {
     fn default() -> Self {
         Self::discard()
+    }
+}
+
+/// Acquire options for importing a foreign dmabuf as a sampled Vulkan texture.
+///
+/// A plain [`Dmabuf`] does not encode Vulkan queue-family ownership or image layout. Generic
+/// [`ImportDma`] therefore stays fail-closed. Callers that can prove foreign `GENERAL` release
+/// construct [`VulkanSampledDmabufImport`] instead.
+#[derive(Debug, Clone, Copy)]
+pub struct VulkanSampledDmabufAcquire<'a> {
+    /// Optional producer-completion dependency for the foreign release into Vulkan ownership.
+    pub acquire_sync: Option<&'a SyncPoint>,
+}
+
+impl<'a> VulkanSampledDmabufAcquire<'a> {
+    /// Acquire after `acquire_sync` is satisfied, or immediately if it is `None`.
+    pub fn with_sync(acquire_sync: Option<&'a SyncPoint>) -> Self {
+        Self { acquire_sync }
+    }
+}
+
+/// Typed wrapper for sampled dmabuf import through Vulkan's explicit foreign-GENERAL contract.
+///
+/// Creating this wrapper is unsafe because the caller must prove the same external-memory ownership
+/// and layout requirements as [`VulkanRenderer::import_dmabuf_texture_with_known_general_layout`].
+/// Once constructed, [`VulkanRenderer::import_sampled_dmabuf`] can import without smuggling those
+/// requirements through generic [`ImportDma`].
+#[derive(Debug)]
+pub struct VulkanSampledDmabufImport<'a, 'sync> {
+    dmabuf: &'a Dmabuf,
+    acquire: VulkanSampledDmabufAcquire<'sync>,
+}
+
+impl<'a, 'sync> VulkanSampledDmabufImport<'a, 'sync> {
+    /// Creates a sampled-import wrapper for a dmabuf released to foreign ownership in `GENERAL`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy the safety requirements documented on
+    /// [`VulkanRenderer::import_dmabuf_texture_with_known_general_layout`] for `dmabuf` and
+    /// `acquire.acquire_sync`.
+    pub unsafe fn foreign_general(dmabuf: &'a Dmabuf, acquire: VulkanSampledDmabufAcquire<'sync>) -> Self {
+        Self { dmabuf, acquire }
     }
 }
 
@@ -3716,15 +3760,15 @@ impl VulkanRenderer {
 
     /// Gather public sampled-dmabuf [`ImportDma`] readiness without advertising it.
     ///
-    /// Raw Vulkan probing may populate format records used by validation tests and development paths,
-    /// but the generic public import trait still lacks an external-state and lifecycle contract for
-    /// arbitrary dmabufs, and the direct generic import implementation is still pending. Keep those
-    /// fields false until real Smithay-facing contracts replace the current fail-closed markers.
+    /// Raw Vulkan probing may populate format records used by validation tests and development paths.
+    /// The public external-state policy is the explicit [`VulkanSampledDmabufImport`] wrapper: a raw
+    /// [`Dmabuf`] still cannot prove layout or ownership. Generic [`ImportDma`] stays fail-closed
+    /// until a lifecycle contract and a direct generic implementation exist for arbitrary callers.
     fn sampled_dmabuf_public_import_contracts(&self) -> SampledDmabufPublicImportContracts {
         SampledDmabufPublicImportContracts {
             raw_import_capability: self.capabilities.import.dmabuf,
             advertised_formats: self.capabilities.formats.dmabuf_import.iter().next().is_some(),
-            public_external_state_policy: false,
+            public_external_state_policy: true,
             public_import_lifecycle: false,
             public_import_implementation: false,
         }
@@ -3732,10 +3776,9 @@ impl VulkanRenderer {
 
     /// Check whether the normal sampled-dmabuf external-state policy is ready for public import.
     ///
-    /// Raw probed Vulkan formats are not enough for public [`ImportDma`] advertisement. The normal
-    /// path must also have Smithay-owned first-import and reacquire layout/ownership evidence sources
-    /// that can prove the external image state before the Vulkan acquire helper runs. Keep this as a
-    /// separate guard so enabling raw dmabuf import flags cannot skip the currently missing contracts.
+    /// The policy is the explicit [`VulkanSampledDmabufImport`] wrapper. Raw probed formats still
+    /// cannot prove layout or ownership for generic [`ImportDma`]. Lifecycle and implementation
+    /// gates remain closed.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_public_external_state_contract(&self) -> Result<(), VulkanError> {
         if self
@@ -5464,6 +5507,29 @@ impl VulkanRenderer {
 
         // SAFETY: Forwarded from this helper's caller and backed by the consumed allocator evidence.
         unsafe { self.bind_dmabuf_render_target(dmabuf, VulkanDmabufRenderTargetAcquire::preserve(None)) }
+    }
+
+    /// Returns whether this dmabuf's format, modifier, and plane count can be sampled.
+    ///
+    /// This is protocol-admission metadata only. It does not import the image, acquire ownership, or
+    /// advertise generic [`ImportDma`].
+    pub fn sampled_dmabuf_import_supported(&self, dmabuf: &Dmabuf) -> bool {
+        self.validate_sampled_dmabuf_import_metadata(dmabuf).is_ok()
+    }
+
+    /// Import a sampled dmabuf through the explicit foreign-GENERAL contract.
+    ///
+    /// This does not enable generic [`ImportDma`]. Callers that cannot construct
+    /// [`VulkanSampledDmabufImport`] still cannot import.
+    pub fn import_sampled_dmabuf(
+        &mut self,
+        import: VulkanSampledDmabufImport<'_, '_>,
+    ) -> Result<Option<VulkanTexture>, VulkanError> {
+        unsafe {
+            // SAFETY: Constructing `VulkanSampledDmabufImport` requires the same proof as
+            // `import_dmabuf_texture_with_known_general_layout`.
+            self.import_dmabuf_texture_with_known_general_layout(import.dmabuf, import.acquire.acquire_sync)
+        }
     }
 
     /// Import a dmabuf as a sampled texture when the producer's Vulkan external state is known.

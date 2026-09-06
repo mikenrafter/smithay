@@ -5066,7 +5066,12 @@ fn runtime_dmabuf_loopback_candidate(test_name: &str) -> Option<RuntimeDmabufLoo
             assert_eq!(dmabuf.format(), format);
             assert!(validate_dmabuf_render_target_metadata(&dmabuf).is_ok());
             assert!(renderer.validate_sampled_dmabuf_import_metadata(&dmabuf).is_ok());
-            assert!(!renderer.capabilities().import.dmabuf);
+            assert!(renderer.sampled_dmabuf_import_supported(&dmabuf));
+            assert!(renderer.capabilities().import.dmabuf);
+            assert_eq!(
+                renderer.capabilities().import.modifiers,
+                renderer.capabilities().import.dmabuf
+            );
             assert!(
                 renderer
                     .capabilities()
@@ -5074,12 +5079,12 @@ fn runtime_dmabuf_loopback_candidate(test_name: &str) -> Option<RuntimeDmabufLoo
                     .dmabuf_import
                     .iter()
                     .next()
-                    .is_none()
+                    .is_some()
             );
             assert!(renderer.dmabuf_formats().iter().next().is_none());
             assert!(matches!(
                 renderer.validate_sampled_dmabuf_public_advertisement_contract(),
-                Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+                Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
             ));
 
             return Some(RuntimeDmabufLoopbackCandidate {
@@ -5270,7 +5275,7 @@ fn runtime_dmabuf_loopback_imports_released_render_target_as_sampled_texture() {
         candidate
             .renderer
             .validate_sampled_dmabuf_public_advertisement_contract(),
-        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     ));
     let allocator_release = unsafe {
         // SAFETY: The dmabuf was just exported from `candidate.image`, and this ignored runtime test
@@ -5347,7 +5352,7 @@ fn runtime_dmabuf_loopback_imports_released_render_target_as_sampled_texture() {
         candidate
             .renderer
             .validate_sampled_dmabuf_public_advertisement_contract(),
-        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     ));
 
     let (released, release_sync) = candidate
@@ -5487,7 +5492,7 @@ fn runtime_cleanup_texture_cache_releases_pending_sampled_release_point() {
 
 #[test]
 #[ignore = "requires a working Vulkan loader, physical device and dmabuf-exportable loopback format"]
-fn runtime_import_dma_known_layout_helper_samples_released_loopback_dmabuf() {
+fn runtime_import_sampled_dmabuf_samples_released_loopback_dmabuf() {
     let test_name = "Vulkan known-layout sampled dmabuf loopback sampling test";
     let Some(mut candidate) = runtime_dmabuf_loopback_candidate(test_name) else {
         return;
@@ -5498,7 +5503,7 @@ fn runtime_import_dma_known_layout_helper_samples_released_loopback_dmabuf() {
         candidate
             .renderer
             .validate_sampled_dmabuf_public_advertisement_contract(),
-        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     ));
     let Some(render_format) =
         runtime_offscreen_sample_render_format(&candidate.renderer, candidate.format.code, test_name)
@@ -5552,17 +5557,20 @@ fn runtime_import_dma_known_layout_helper_samples_released_loopback_dmabuf() {
         "known-layout sampled import uses the loopback release dependency as acquire sync"
     );
 
-    let texture = unsafe {
+    let sampled_import = unsafe {
         // SAFETY: `evidence` proves this exact loopback dmabuf was released to FOREIGN ownership in
-        // GENERAL layout, and its acquire SyncPoint represents that completed release. This explicit
-        // helper is the normal Vulkan contract boundary; the safe generic ImportDma trait intentionally
-        // has no parameter for this evidence and remains fail-closed below.
-        candidate
-            .renderer
-            .import_dmabuf_texture_with_known_general_layout(&candidate.dmabuf, Some(evidence.acquire_sync()))
-    }
-    .expect("known-layout sampled dmabuf import should reach Vulkan")
-    .expect("known-layout sampled dmabuf import should produce a texture");
+        // GENERAL layout, and its acquire SyncPoint represents that completed release. Constructing
+        // the wrapper is the public contract boundary; generic ImportDma remains fail-closed below.
+        VulkanSampledDmabufImport::foreign_general(
+            &candidate.dmabuf,
+            VulkanSampledDmabufAcquire::with_sync(Some(evidence.acquire_sync())),
+        )
+    };
+    let texture = candidate
+        .renderer
+        .import_sampled_dmabuf(sampled_import)
+        .expect("known-layout sampled dmabuf import should reach Vulkan")
+        .expect("known-layout sampled dmabuf import should produce a texture");
     drop(evidence);
     assert_eq!(texture.width(), 4);
     assert_eq!(texture.height(), 4);
@@ -5580,7 +5588,7 @@ fn runtime_import_dma_known_layout_helper_samples_released_loopback_dmabuf() {
         candidate
             .renderer
             .validate_sampled_dmabuf_public_advertisement_contract(),
-        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     ));
     assert!(matches!(
         <VulkanRenderer as ImportDma>::import_dmabuf(&mut candidate.renderer, &candidate.dmabuf, None),
@@ -5613,7 +5621,7 @@ fn runtime_import_dma_known_layout_helper_samples_released_loopback_dmabuf() {
         candidate
             .renderer
             .validate_sampled_dmabuf_public_advertisement_contract(),
-        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     ));
 }
 
@@ -5869,7 +5877,7 @@ fn runtime_dmabuf_loopback_cache_release_hook_releases_sampled_texture() {
         candidate
             .renderer
             .validate_sampled_dmabuf_public_advertisement_contract(),
-        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     ));
 }
 
@@ -6010,7 +6018,7 @@ fn runtime_import_dma_wl_loopback_samples_and_releases_with_drm_syncobj() {
             candidate
                 .renderer
                 .validate_sampled_dmabuf_public_advertisement_contract(),
-            Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+            Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
         ));
 
         retire_import_wl_surface_textures_and_wait_for_tests(
@@ -6231,7 +6239,7 @@ fn runtime_import_dma_wl_protocol_dmabuf_commit_samples_and_releases() {
             candidate
                 .renderer
                 .validate_sampled_dmabuf_public_advertisement_contract(),
-            Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+            Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
         ));
 
         retire_import_wl_surface_textures_and_wait_for_tests(
@@ -6294,7 +6302,7 @@ fn runtime_import_dma_wl_protocol_controlled_vulkan_producer_sync_file_samples_a
     assert!(consumer_renderer.dmabuf_formats().iter().next().is_none());
     assert!(matches!(
         consumer_renderer.validate_sampled_dmabuf_public_advertisement_contract(),
-        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     ));
 
     let allocator_release = unsafe {
@@ -6460,7 +6468,7 @@ fn runtime_import_dma_wl_protocol_controlled_vulkan_producer_sync_file_samples_a
         assert!(consumer_renderer.dmabuf_formats().iter().next().is_none());
         assert!(matches!(
             consumer_renderer.validate_sampled_dmabuf_public_advertisement_contract(),
-            Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+            Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
         ));
 
         retire_import_wl_surface_textures_and_wait_for_tests(
@@ -6833,7 +6841,7 @@ fn runtime_import_dma_wl_protocol_dmabuf_replaces_cached_dmabuf_with_fresh_conte
             candidate
                 .renderer
                 .validate_sampled_dmabuf_public_advertisement_contract(),
-            Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+            Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
         ));
 
         retire_import_wl_surface_textures_and_wait_for_tests(
@@ -7164,7 +7172,7 @@ fn runtime_import_dma_wl_loopback_reacquires_same_dmabuf_after_cache_release() {
             candidate
                 .renderer
                 .validate_sampled_dmabuf_public_advertisement_contract(),
-            Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+            Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
         ));
 
         retire_import_wl_surface_textures_and_wait_for_tests(
@@ -7396,7 +7404,7 @@ fn runtime_import_dma_wl_loopback_removed_buffer_releases_cached_dmabuf() {
             candidate
                 .renderer
                 .validate_sampled_dmabuf_public_advertisement_contract(),
-            Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+            Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
         ));
     }));
 
@@ -7578,7 +7586,7 @@ fn runtime_import_dma_wl_loopback_surface_tree_teardown_releases_cached_dmabuf()
             candidate
                 .renderer
                 .validate_sampled_dmabuf_public_advertisement_contract(),
-            Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+            Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
         ));
     }));
 
@@ -7955,7 +7963,7 @@ fn runtime_import_dma_wl_loopback_replaces_cached_dmabuf_with_fresh_contents() {
             candidate
                 .renderer
                 .validate_sampled_dmabuf_public_advertisement_contract(),
-            Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+            Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
         ));
 
         retire_import_wl_surface_textures_and_wait_for_tests(
@@ -8091,7 +8099,7 @@ fn runtime_import_dma_wl_protocol_dmabuf_without_policy_fails_closed() {
     assert!(renderer.dmabuf_formats().iter().next().is_none());
     assert!(matches!(
         renderer.validate_sampled_dmabuf_public_advertisement_contract(),
-        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     ));
     drop(buffer);
     drop(surface);
@@ -8349,7 +8357,7 @@ fn runtime_import_dma_wl_replacement_failure_releases_cached_dmabuf() {
             candidate
                 .renderer
                 .validate_sampled_dmabuf_public_advertisement_contract(),
-            Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+            Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
         ));
 
         drop(second_buffer_for_cleanup.take());
@@ -8543,7 +8551,7 @@ fn runtime_direct_import_dma_fails_closed_after_released_render_target() {
         candidate
             .renderer
             .validate_sampled_dmabuf_public_advertisement_contract(),
-        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     ));
     let allocator_release = unsafe {
         // SAFETY: The dmabuf was just exported from `candidate.image`, and this ignored runtime test
@@ -8599,7 +8607,7 @@ fn runtime_direct_import_dma_fails_closed_after_released_render_target() {
         candidate
             .renderer
             .validate_sampled_dmabuf_public_advertisement_contract(),
-        Err(VulkanError::NotPublicAdvertised("sampled dmabuf import"))
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     ));
 }
 
@@ -9000,6 +9008,16 @@ fn public_dmabuf_import_gates_formats() {
             "sampled dmabuf generic ImportDma external-state contract"
         ))
     ));
+    assert!(renderer.sampled_dmabuf_import_supported(&dmabuf));
+    let sampled_import = unsafe {
+        // SAFETY: This scaffold has no Vulkan device. Construction only names the foreign-GENERAL
+        // contract; import_sampled_dmabuf returns before any Vulkan import.
+        VulkanSampledDmabufImport::foreign_general(&dmabuf, VulkanSampledDmabufAcquire::with_sync(None))
+    };
+    assert!(matches!(
+        renderer.import_sampled_dmabuf(sampled_import),
+        Err(VulkanError::VulkanUnavailable)
+    ));
     assert!(matches!(
         // SAFETY: This scaffold renderer has no Vulkan device, so the explicit validation-stage
         // helper returns before any Vulkan import, fd import, or ownership-transfer operation can
@@ -9133,7 +9151,7 @@ fn sampled_dmabuf_wayland_policy_does_not_public_advertise_import_dma() {
         SampledDmabufPublicImportContracts {
             raw_import_capability: true,
             advertised_formats: true,
-            public_external_state_policy: false,
+            public_external_state_policy: true,
             public_import_lifecycle: false,
             public_import_implementation: false,
         }
@@ -9141,9 +9159,7 @@ fn sampled_dmabuf_wayland_policy_does_not_public_advertise_import_dma() {
 
     assert!(matches!(
         renderer.validate_sampled_dmabuf_public_advertisement_contract(),
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf public external-state policy"
-        ))
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     ));
     assert!(renderer.dmabuf_formats().iter().next().is_none());
     assert!(!renderer.has_dmabuf_format(format));
@@ -9345,7 +9361,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         SampledDmabufPublicImportContracts {
             raw_import_capability: false,
             advertised_formats: false,
-            public_external_state_policy: false,
+            public_external_state_policy: true,
             public_import_lifecycle: false,
             public_import_implementation: false,
         }
@@ -9360,7 +9376,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         SampledDmabufPublicImportContracts {
             raw_import_capability: true,
             advertised_formats: false,
-            public_external_state_policy: false,
+            public_external_state_policy: true,
             public_import_lifecycle: false,
             public_import_implementation: false,
         }
@@ -9377,23 +9393,20 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         SampledDmabufPublicImportContracts {
             raw_import_capability: true,
             advertised_formats: true,
-            public_external_state_policy: false,
+            public_external_state_policy: true,
             public_import_lifecycle: false,
             public_import_implementation: false,
         }
     );
     assert!(matches!(
         renderer.validate_sampled_dmabuf_public_advertisement_contract(),
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf public external-state policy"
-        ))
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     ));
-    assert!(matches!(
-        renderer.validate_sampled_dmabuf_public_external_state_contract(),
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf public external-state policy"
-        ))
-    ));
+    assert!(
+        renderer
+            .validate_sampled_dmabuf_public_external_state_contract()
+            .is_ok()
+    );
     assert!(matches!(
         SampledDmabufPublicImportContracts {
             raw_import_capability: true,
@@ -10543,9 +10556,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     ));
     assert!(matches!(
         renderer.validate_sampled_dmabuf_public_advertisement_contract(),
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf public external-state policy"
-        ))
+        Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
     ));
     assert!(
         renderer
@@ -16386,7 +16397,12 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         caps.import.memory,
         caps.formats.memory_import.iter().next().is_some()
     );
-    assert!(!caps.import.dmabuf);
+    assert_eq!(
+        caps.import.dmabuf,
+        caps.formats.dmabuf_import.iter().next().is_some()
+    );
+    assert_eq!(caps.import.modifiers, caps.import.dmabuf);
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
     assert_eq!(caps.export.memory, caps.rendering.offscreen);
     assert!(!caps.export.dmabuf);
     let has_dmabuf_render_target_formats = caps.formats.dmabuf_render_target.iter().next().is_some();
@@ -16436,8 +16452,13 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
             assert!(candidate.properties.supports_sampled_import(&import));
             assert_eq!(candidate.dedicated_only, candidate.properties.dedicated_only);
         }
-        assert!(!caps.import.dmabuf);
-        assert!(caps.formats.dmabuf_import.iter().next().is_none());
+        assert_eq!(
+            caps.formats
+                .dmabuf_import
+                .iter()
+                .any(|format| { format.code == record.format && format.modifier == record.modifier }),
+            record.usages.sampled && record.plane_count == 1
+        );
     }
     assert!(caps.rendering.offscreen);
     assert!(!caps.rendering.blit);
@@ -16574,7 +16595,14 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     } else {
         None
     };
-    assert!(caps.formats.dmabuf_import.iter().next().is_none());
+    assert_eq!(
+        caps.formats.dmabuf_import.iter().next().is_some(),
+        caps.formats
+            .modifier_records
+            .iter()
+            .any(|record| record.usages.sampled && record.plane_count == 1)
+    );
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
     assert!(caps.formats.dmabuf_export.iter().next().is_none());
     assert!(
         caps.formats
@@ -18312,7 +18340,20 @@ fn runtime_format_discovery_finds_device_backed_formats_without_import_export() 
         caps.memory_import.iter().next().is_some(),
         caps.records.iter().any(|record| record.usages.memory_import)
     );
-    assert!(caps.dmabuf_import.iter().next().is_none());
+    assert_eq!(
+        caps.dmabuf_import.iter().next().is_some(),
+        caps.modifier_records
+            .iter()
+            .any(|record| record.usages.sampled && record.plane_count == 1)
+    );
+    assert!(caps.dmabuf_import.iter().all(|format| {
+        caps.modifier_records.iter().any(|record| {
+            record.format == format.code
+                && record.modifier == format.modifier
+                && record.usages.sampled
+                && record.plane_count == 1
+        })
+    }));
     assert!(caps.dmabuf_export.iter().next().is_none());
     assert!(
         caps.dmabuf_render_target
