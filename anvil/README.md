@@ -36,7 +36,8 @@ The currently available backends are:
 
 - `--x11`: start anvil as an X11 client. This allows you to run the compositor inside an X11 session or any compositor supporting XWayland. Should be preferred over the winit backend where possible.
 - `--winit`: start anvil as a [Winit](https://github.com/tomaka/winit) application. This allows you to run it
-  inside of an other X11 or Wayland session.
+  inside of an other X11 or Wayland session. GLES remains the default nested renderer.
+- `--winit-vulkan`: same nested window as `--winit`, presenting with `VulkanRenderer` (`winit_vulkan` feature).
 - `--tty-udev`: start anvil in a tty with udev support. This is the "traditional" launch of a Wayland
   compositor. Note that this requires you to start anvil as root if your system does not have logind
   available.

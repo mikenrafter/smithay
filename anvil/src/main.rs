@@ -1,6 +1,8 @@
 static POSSIBLE_BACKENDS: &[&str] = &[
     #[cfg(feature = "winit")]
     "--winit : Run anvil as a X11 or Wayland client using winit.",
+    #[cfg(feature = "winit_vulkan")]
+    "--winit-vulkan : Run anvil as a X11 or Wayland client using winit with VulkanRenderer.",
     #[cfg(feature = "udev")]
     "--tty-udev : Run anvil as a tty udev client (requires root if without logind).",
     #[cfg(feature = "x11")]
@@ -40,6 +42,11 @@ fn main() {
         Some("--winit") => {
             tracing::info!("Starting anvil with winit backend");
             anvil::winit::run_winit();
+        }
+        #[cfg(feature = "winit_vulkan")]
+        Some("--winit-vulkan") => {
+            tracing::info!("Starting anvil with Vulkan winit backend");
+            anvil::winit_vulkan::run_winit_vulkan();
         }
         #[cfg(feature = "udev")]
         Some("--tty-udev") => {

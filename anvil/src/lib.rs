@@ -21,6 +21,8 @@ pub mod state;
 pub mod udev;
 #[cfg(feature = "winit")]
 pub mod winit;
+#[cfg(feature = "winit_vulkan")]
+pub mod winit_vulkan;
 #[cfg(feature = "x11")]
 pub mod x11;
 

@@ -57,6 +57,7 @@ udev = [
 ]
 udev_vulkan = ["udev", "smithay/renderer_vulkan"]
 winit = ["smithay/backend_winit", "smithay/backend_drm"]
+winit_vulkan = ["winit", "egl", "smithay/renderer_vulkan"]
 x11 = ["smithay/backend_x11", "x11rb", "smithay/renderer_gl", "smithay/backend_vulkan"]
 xwayland = ["smithay/xwayland", "x11rb", "smithay/x11rb_event_source", "xcursor"]
 libei = ["smithay/backend_libei", "udev"]
