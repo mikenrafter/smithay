@@ -3846,7 +3846,13 @@ impl VulkanRenderer {
                     "sampled dmabuf acquire sync buffer identity",
                 ));
             }
-            let acquire_sync = buffer.acquire_point().cloned().map(SyncPoint::from);
+            let acquire_sync = match buffer.acquire_point().cloned().map(SyncPoint::from) {
+                Some(sync) => Some(sync),
+                None => match dmabuf.export_sync_file(0, DmabufSyncFlags::READ) {
+                    Ok(fd) => Some(sync_point_from_sync_file(Some(fd))),
+                    Err(_) => None,
+                },
+            };
             self.validate_sampled_dmabuf_wayland_acquire_sync_contract(acquire_sync.as_ref())?;
             let commit_token_slot = buffer
                 .user_data()
@@ -3949,10 +3955,9 @@ impl VulkanRenderer {
 
     /// Validate the Wayland acquire synchronization part of sampled dmabuf import.
     ///
-    /// `linux-dmabuf` alone implies implicit synchronization. Vulkan sampled import remains
-    /// not public-advertised for that case until a tested implicit-sync policy exists. The current
-    /// validation-stage path accepts only commits that carry explicit acquire synchronization through
-    /// Smithay's renderer-managed surface-state buffer.
+    /// `linux-dmabuf` alone implies implicit synchronization. The Wayland acquire-evidence helper
+    /// may export a dma-buf read fence as a [`SyncPoint`] in that case. This contract still requires
+    /// a fence-bearing [`SyncPoint`]; a missing fence is not treated as ready.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_wayland_acquire_sync_contract(
         &self,

@@ -345,6 +345,36 @@ fn import_surface_dmabuf_buffer_with_sync_points_for_tests(
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+fn import_surface_dmabuf_buffer_without_sync_points_for_tests(
+    dmabuf: Dmabuf,
+) -> Option<(
+    Display<DmabufBufferTestState>,
+    UnixStream,
+    SurfaceData,
+    crate::backend::renderer::utils::Buffer,
+)> {
+    let (display, client_side, wl_buffer) = dmabuf_wl_buffer_for_tests(dmabuf)?;
+    let surface = SurfaceData {
+        role: None,
+        data_map: Default::default(),
+        cached_state: MultiCache::new(),
+    };
+    {
+        let mut attributes = surface.cached_state.get::<SurfaceAttributes>();
+        attributes.current().buffer = Some(BufferAssignment::NewBuffer(wl_buffer));
+    }
+
+    let mut surface_state = crate::backend::renderer::utils::RendererSurfaceState::default();
+    surface_state.update_buffer(&surface);
+    let buffer = surface_state.buffer().unwrap().clone();
+    surface
+        .data_map
+        .insert_if_missing_threadsafe(|| Mutex::new(surface_state));
+
+    Some((display, client_side, surface, buffer))
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 fn assert_buffer_release_point_matches_for_tests(
     buffer: &crate::backend::renderer::utils::Buffer,
     expected_release_point: &DrmSyncPoint,
@@ -11222,6 +11252,29 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             .satisfy_wayland_release_once(Some(invalid_sync_file.as_fd()))
             .is_ok()
     );
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn sampled_dmabuf_implicit_acquire_export_fails_closed_without_dmabuf_fence() {
+    let renderer = VulkanRenderer::new_scaffold_for_tests();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (4, 3).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 16)],
+    );
+    let Some((_display, _client, _surface, buffer)) =
+        import_surface_dmabuf_buffer_without_sync_points_for_tests(dmabuf.clone())
+    else {
+        return;
+    };
+    assert!(buffer.acquire_point().is_none());
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_acquire_sync_evidence(&dmabuf, &buffer),
+        Err(VulkanError::NotPublicAdvertised("sampled dmabuf implicit sync"))
+    ));
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
