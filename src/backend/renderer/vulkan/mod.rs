@@ -13,11 +13,9 @@
 //! functionality.
 //!
 //! Smithay's optional renderer traits are capability surfaces. The CPU-memory/offscreen path is the
-//! most complete path. Dmabuf render-target support is development-gated in this fork, and its Vulkan
-//! external-ownership and synchronization preconditions are explicit on
-//! [`VulkanRenderer::bind_dmabuf_render_target`]. Generic [`Bind<Dmabuf>`] uses that path with a
-//! conservative discard/full-repaint acquire policy so DRM/GBM compositor rendering follows the same
-//! target abstraction as the other renderers once the validation-stage gate is true. Generic
+//! most complete path. Explicit dmabuf render-target wrappers remain ownership-contract APIs on
+//! [`VulkanRenderer::bind_dmabuf_render_target`]. Public [`Bind<Dmabuf>`] is the compositor GBM
+//! scanout path: discard/full-repaint acquire, no sampled client import. Generic
 //! texture `ExportMem`, `ExportDma`, broad explicit sync, blit/copy, and full presentation remain
 //! unsupported until their corresponding capability bits can become true with coverage. Sampled dmabuf
 //! import is validation-stage implemented for the normal `ImportDmaWl` path when callers provide
@@ -108,6 +106,9 @@ mod device;
 mod error;
 pub mod format;
 mod image;
+
+#[cfg(feature = "backend_winit")]
+pub(crate) use self::error::{HOST_FENCE_WAIT_TIMEOUT_NS, wait_for_fences};
 
 pub use self::{
     capabilities::{
@@ -6650,18 +6651,16 @@ impl<'target> RenderTargetLifecycle<VulkanAllocatorDmabufRenderTargetContract<'t
 
 impl Bind<Dmabuf> for VulkanRenderer {
     fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<Self::Framebuffer<'a>, Self::Error> {
-        if !self.capabilities.rendering.dmabuf_target_development {
+        if !self.capabilities.rendering.dmabuf_targets {
             return Err(VulkanError::NotPublicAdvertised("dmabuf render target"));
         }
 
         unsafe {
-            // SAFETY: `Bind<Dmabuf>` follows Smithay's renderer target contract. For externally
-            // shared targets, that contract requires callers to ensure no concurrent foreign access
-            // and to satisfy renderer-specific external ownership/layout requirements before
-            // binding. The Vulkan dmabuf target path uses a discard/full-repaint acquire policy here,
-            // so previous contents are not preserved and no acquire fence is required by this
-            // binding. Successful frames release the image for foreign/KMS use from `Frame::finish`;
-            // failed or skipped renders are handled by `RenderTargetLifecycle<Dmabuf>` below.
+            // SAFETY: Public `Bind<Dmabuf>` is the compositor GBM scanout contract: the caller
+            // owns the buffer for this frame, previous contents are discarded, and no acquire
+            // fence is required. This is not sampled client-buffer import. Successful frames
+            // release the image for KMS from `Frame::finish`; failed or skipped renders are
+            // handled by `RenderTargetLifecycle<Dmabuf>` below.
             self.bind_dmabuf_render_target(target, VulkanDmabufRenderTargetAcquire::discard())
         }?
         .ok_or(VulkanError::MissingCapability(

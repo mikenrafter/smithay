@@ -28,7 +28,9 @@ use crate::{
         allocator::Fourcc,
         renderer::{
             Bind,
-            vulkan::{VulkanError, VulkanRenderTarget, VulkanRenderer},
+            vulkan::{
+                HOST_FENCE_WAIT_TIMEOUT_NS, VulkanError, VulkanRenderTarget, VulkanRenderer, wait_for_fences,
+            },
         },
         vulkan::{Instance, InstanceError, PhysicalDevice, version::Version},
     },
@@ -201,12 +203,15 @@ impl WinitVulkanGraphicsBackend {
         let (index, suboptimal) = match unsafe {
             self.swapchain_fn.acquire_next_image(
                 self.swapchain,
-                u64::MAX,
+                HOST_FENCE_WAIT_TIMEOUT_NS,
                 vk::Semaphore::null(),
                 self.acquire_fence,
             )
         } {
             Ok(acquired) => acquired,
+            Err(vk::Result::TIMEOUT) => {
+                return Err(VulkanError::SyncTimeout.into());
+            }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) | Err(vk::Result::SUBOPTIMAL_KHR) => {
                 self.recreate_swapchain()?;
                 return Err(SwapBuffersError::TemporaryFailure(Box::new(
@@ -217,8 +222,7 @@ impl WinitVulkanGraphicsBackend {
         };
         self.suboptimal = suboptimal;
         // SAFETY: acquire was submitted against `acquire_fence` on this device.
-        unsafe { logical_device.wait_for_fences(&[self.acquire_fence], true, u64::MAX) }
-            .map_err(VulkanError::from)?;
+        wait_for_fences(logical_device, &[self.acquire_fence], true)?;
 
         let image = *self
             .images

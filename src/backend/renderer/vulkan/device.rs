@@ -18,7 +18,7 @@ use crate::backend::{
 
 use super::{
     VulkanError, VulkanRendererCapabilities,
-    error::vulkan_api_result_invalidates_context,
+    error::{vulkan_api_result_invalidates_context, wait_for_fences},
     format::get_render_vk_format,
     image::{
         VulkanDmabufImportState, VulkanDmabufRenderTargetAcquireRestore, VulkanExternalImageOwnership,
@@ -729,6 +729,9 @@ impl VulkanDeviceState {
         let has_dmabuf_render_target_formats =
             capabilities.formats.dmabuf_render_target.iter().next().is_some();
         capabilities.rendering.dmabuf_target_development = has_dmabuf_render_target_formats;
+        // Compositor GBM scanout uses public `Bind<Dmabuf>` discard/full-repaint. Same probed
+        // format set as the explicit wrapper path; sampled `ImportDma` stays fail-closed.
+        capabilities.rendering.dmabuf_targets = has_dmabuf_render_target_formats;
         capabilities.export.memory = has_public_render_target_formats;
 
         let queue_priorities = [1.0];
@@ -3862,6 +3865,7 @@ fn vulkan_error_invalidates_context(err: &VulkanError) -> bool {
         | VulkanError::DeviceInitializationFailed(_)
         | VulkanError::QueueFamilyUnsupported
         | VulkanError::ExternalMemoryUnsupported => true,
+        VulkanError::SyncTimeout => true,
         VulkanError::UnsupportedOperation(_)
         | VulkanError::NotPublicAdvertised(_)
         | VulkanError::MissingCapability(_)
@@ -4041,35 +4045,43 @@ where
     }
 
     command_buffer.state = VulkanCommandBufferState::Submitted;
-    let wait_result = unsafe { logical_device.handle().wait_for_fences(&[fence], true, u64::MAX) }
-        .map_err(VulkanError::from);
+    let wait_result = wait_for_fences(logical_device.handle(), &[fence], true);
     let mut queue_completed = wait_result.is_ok();
     let mut can_destroy_submitted_objects = wait_result.is_ok();
     let wait_error = match wait_result {
         Ok(()) => None,
         Err(wait_err) => {
-            let wait_reported_device_lost = vulkan_error_is_device_lost(&wait_err);
-            let queue_idle_result = queue.lock_host_access().and_then(|_queue_guard| {
-                // SAFETY: `queue.handle` belongs to `logical_device`, and queue host access is
-                // externally synchronized by the queue mutex. Waiting the queue after a fence wait
-                // error either proves the submitted command buffer completed or reports device loss,
-                // which makes the context unusable and prevents later false ownership completion.
-                unsafe { logical_device.handle().queue_wait_idle(queue.handle) }.map_err(VulkanError::from)
-            });
-            match queue_idle_result {
-                Ok(()) => {
-                    queue_completed = true;
-                    can_destroy_submitted_objects = true;
-                    Some(wait_err)
-                }
-                Err(idle_err) => {
-                    can_destroy_submitted_objects =
-                        wait_reported_device_lost || vulkan_error_is_device_lost(&idle_err);
-                    Some(if wait_reported_device_lost {
-                        wait_err
-                    } else {
-                        idle_err
-                    })
+            if matches!(wait_err, VulkanError::SyncTimeout) {
+                // Bounded wait expired. `vkQueueWaitIdle` has no timeout and would reintroduce the
+                // hang this bound exists to prevent. Leave submitted objects leaked until device
+                // teardown.
+                can_destroy_submitted_objects = false;
+                Some(wait_err)
+            } else {
+                let wait_reported_device_lost = vulkan_error_is_device_lost(&wait_err);
+                let queue_idle_result = queue.lock_host_access().and_then(|_queue_guard| {
+                    // SAFETY: `queue.handle` belongs to `logical_device`, and queue host access is
+                    // externally synchronized by the queue mutex. Waiting the queue after a fence wait
+                    // error either proves the submitted command buffer completed or reports device loss,
+                    // which makes the context unusable and prevents later false ownership completion.
+                    unsafe { logical_device.handle().queue_wait_idle(queue.handle) }
+                        .map_err(VulkanError::from)
+                });
+                match queue_idle_result {
+                    Ok(()) => {
+                        queue_completed = true;
+                        can_destroy_submitted_objects = true;
+                        Some(wait_err)
+                    }
+                    Err(idle_err) => {
+                        can_destroy_submitted_objects =
+                            wait_reported_device_lost || vulkan_error_is_device_lost(&idle_err);
+                        Some(if wait_reported_device_lost {
+                            wait_err
+                        } else {
+                            idle_err
+                        })
+                    }
                 }
             }
         }
@@ -6797,15 +6809,9 @@ impl VulkanSubmittedCommandBuffer {
             "submitted command buffer fence",
         ))?;
         // SAFETY: `fence` belongs to `self.logical_device` and remains live while this submission
-        // owner exists. Waiting for all fences with an infinite timeout proves that the queue batch no
-        // longer references the retained command buffer, image resources, or semaphores before they
-        // are completed and dropped below.
-        unsafe {
-            self.logical_device
-                .handle()
-                .wait_for_fences(&[fence], true, u64::MAX)
-        }
-        .map_err(VulkanError::from)?;
+        // owner exists. A bounded host wait proves the queue batch no longer references the retained
+        // command buffer, image resources, or semaphores before they are completed and dropped below.
+        wait_for_fences(self.logical_device.handle(), &[fence], true)?;
         self.complete_inner()
     }
 

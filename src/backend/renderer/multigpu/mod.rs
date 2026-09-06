@@ -6,6 +6,7 @@
 //!
 //! smithay provides the following graphics apis:
 //! - [`gbm::GbmGlesBackend`]
+//! - `vulkan::VulkanGbmBackend` (feature `renderer_vulkan`)
 //!
 //! A [`MultiRenderer`] gets created using two [`DrmNode`]s to identify gpus.
 //! One gpu will be referred to as the render-gpu, the other as the target-gpu.
@@ -80,6 +81,8 @@ use wayland_server::protocol::{wl_buffer, wl_shm, wl_surface::WlSurface};
 
 #[cfg(all(feature = "backend_gbm", feature = "backend_egl", feature = "renderer_gl"))]
 pub mod gbm;
+#[cfg(all(feature = "backend_gbm", feature = "renderer_vulkan"))]
+pub mod vulkan;
 
 /// Tracks available gpus from a given [`GraphicsApi`]
 #[derive(Debug)]

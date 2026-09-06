@@ -3773,7 +3773,7 @@ fn public_bind_rejects_invalid_vulkan_targets_before_device_lookup() {
 #[test]
 fn public_dmabuf_bind_uses_discard_acquire_path() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
-    renderer.capabilities.rendering.dmabuf_target_development = true;
+    renderer.capabilities.rendering.dmabuf_targets = true;
     let mut dmabuf = dmabuf_for_tests();
     let default_acquire = VulkanDmabufRenderTargetAcquire::default();
     let signaled_sync = SyncPoint::signaled();
@@ -4020,7 +4020,7 @@ fn sampled_pending_obligations_block_dmabuf_render_target_acquire_paths() {
     ));
 
     let mut generic_dmabuf = dmabuf();
-    renderer.capabilities.rendering.dmabuf_target_development = true;
+    renderer.capabilities.rendering.dmabuf_targets = true;
     retain_release_only(&mut renderer, &generic_dmabuf);
     assert!(matches!(
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut generic_dmabuf),
@@ -8862,6 +8862,18 @@ fn public_dmabuf_bind_gates_render_target_formats() {
     assert!(formats.iter().next().is_none());
     assert!(matches!(
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut dmabuf),
+        Err(VulkanError::NotPublicAdvertised("dmabuf render target"))
+    ));
+    renderer.capabilities.rendering.dmabuf_targets = true;
+    let public_formats = <VulkanRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
+        .expect("public Bind<Dmabuf> advertises probed GBM scanout formats");
+    assert!(
+        public_formats
+            .iter()
+            .any(|format| { format.code == Fourcc::Abgr8888 && format.modifier == Modifier::Linear })
+    );
+    assert!(matches!(
+        <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut dmabuf),
         Err(VulkanError::VulkanUnavailable)
     ));
     let explicit_formats =
@@ -8894,7 +8906,7 @@ fn public_dmabuf_bind_gates_render_target_formats() {
 #[test]
 fn public_dmabuf_bind_validates_metadata_before_device_lookup() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
-    renderer.capabilities.rendering.dmabuf_target_development = true;
+    renderer.capabilities.rendering.dmabuf_targets = true;
     let mut zero_width = dmabuf_with_planes_for_tests(
         (0, 1).into(),
         Fourcc::Abgr8888,
@@ -14518,6 +14530,7 @@ fn vulkan_errors_map_to_swap_buffers_error() {
         VulkanError::DeviceInitializationFailed("test".to_owned()),
         VulkanError::QueueFamilyUnsupported,
         VulkanError::ExternalMemoryUnsupported,
+        VulkanError::SyncTimeout,
         VulkanError::VulkanApi(ash::vk::Result::ERROR_DEVICE_LOST),
         VulkanError::VulkanApi(ash::vk::Result::ERROR_OUT_OF_HOST_MEMORY),
         VulkanError::VulkanApi(ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
@@ -14554,6 +14567,21 @@ fn vulkan_errors_map_to_swap_buffers_error() {
             "expected temporary-failure classification"
         );
     }
+}
+
+#[test]
+fn host_fence_wait_timeout_is_finite_and_context_lost() {
+    assert_ne!(super::error::HOST_FENCE_WAIT_TIMEOUT_NS, u64::MAX);
+    assert!(super::error::HOST_FENCE_WAIT_TIMEOUT_NS > 0);
+    assert!(matches!(
+        crate::backend::SwapBuffersError::from(VulkanError::SyncTimeout),
+        crate::backend::SwapBuffersError::ContextLost(_)
+    ));
+    // Unrelated Vulkan TIMEOUT results stay operation-local; fence waits map TIMEOUT to SyncTimeout.
+    assert!(matches!(
+        VulkanError::from(ash::vk::Result::TIMEOUT),
+        VulkanError::VulkanApi(ash::vk::Result::TIMEOUT)
+    ));
 }
 
 #[test]
@@ -16721,7 +16749,7 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     assert_eq!(caps.export.memory, caps.rendering.offscreen);
     assert!(!caps.export.dmabuf);
     let has_dmabuf_render_target_formats = caps.formats.dmabuf_render_target.iter().next().is_some();
-    assert!(!caps.rendering.dmabuf_targets);
+    assert_eq!(caps.rendering.dmabuf_targets, has_dmabuf_render_target_formats);
     assert!(!caps.rendering.dmabuf_target_modifiers);
     assert_eq!(
         caps.rendering.dmabuf_target_development,

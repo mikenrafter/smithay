@@ -626,23 +626,23 @@ pub struct VulkanExportCapabilities {
 pub struct VulkanRenderingCapabilities {
     /// Whether offscreen rendering is supported.
     pub offscreen: bool,
-    /// Whether fully integrated imported dmabuf renderer framebuffers are supported.
+    /// Whether public [`Bind<Dmabuf>`](crate::backend::renderer::Bind) for compositor-owned GBM
+    /// scanout targets is available.
     ///
-    /// This remains false while Vulkan dmabuf render targets require explicit development-fork
-    /// ownership/layout/synchronization contracts.
+    /// This is the discard/full-repaint compositor render-target path. It is not sampled
+    /// client-buffer import (`ImportDma` stays fail-closed) and not the preserve/acquire
+    /// explicit wrapper path.
     pub dmabuf_targets: bool,
     /// Whether modifier-aware fully integrated imported dmabuf render targets are supported.
     ///
     /// This remains false while Vulkan dmabuf render targets require explicit development-fork
     /// ownership/layout/synchronization contracts.
     pub dmabuf_target_modifiers: bool,
-    /// Whether the Vulkan dmabuf render-target development path has probed formats.
+    /// Whether the explicit dmabuf render-target API has probed formats.
     ///
-    /// This indicates the explicit unsafe development API has probed formats and gates this fork's
-    /// conservative generic [`Bind<Dmabuf>`](crate::backend::renderer::Bind) path. The generic path
-    /// discards previous contents and forces full repaint; callers using the explicit path must satisfy
-    /// [`crate::backend::renderer::vulkan::VulkanRenderer::bind_dmabuf_render_target`] safety
-    /// requirements. This flag does not imply broad imported-dmabuf renderer-framebuffer support.
+    /// Gates [`crate::backend::renderer::vulkan::VulkanRenderer::bind_dmabuf_render_target`]
+    /// wrappers. Callers must satisfy that API's ownership, layout, and synchronization
+    /// contract. This is not public sampled `ImportDma`.
     pub dmabuf_target_development: bool,
     /// Whether Smithay `Blit` operations are supported.
     pub blit: bool,
