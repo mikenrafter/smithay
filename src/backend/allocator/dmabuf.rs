@@ -12,7 +12,7 @@
 
 use calloop::generic::Generic;
 use calloop::{EventSource, Interest, Mode, PostAction};
-use rustix::ioctl::Setter;
+use rustix::ioctl::{Setter, Updater};
 
 use super::{Allocator, Buffer, Format, Fourcc, Modifier};
 #[cfg(feature = "backend_drm")]
@@ -21,7 +21,7 @@ use crate::utils::{Buffer as BufferCoords, Size};
 #[cfg(feature = "wayland_frontend")]
 use crate::wayland::compositor::{Blocker, BlockerState};
 use std::hash::{Hash, Hasher};
-use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::io::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
 #[cfg(feature = "backend_drm")]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -325,6 +325,40 @@ impl Dmabuf {
             .map_err(std::io::Error::from)?;
         Ok(())
     }
+
+    /// Export a Linux sync-file for the implicit fence on the plane at `idx`.
+    ///
+    /// `flags` should contain [`DmabufSyncFlags::READ`] and/or [`DmabufSyncFlags::WRITE`].
+    /// [`DmabufSyncFlags::START`] and [`DmabufSyncFlags::END`] are ignored; this is not
+    /// [`Dmabuf::sync_plane`].
+    ///
+    /// Returns `Err` if the plane does not exist, neither READ nor WRITE is set, or the
+    /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` ioctl failed.
+    pub fn export_sync_file(&self, idx: usize, flags: DmabufSyncFlags) -> Result<OwnedFd, DmabufSyncFailed> {
+        let plane = self
+            .0
+            .planes
+            .get(idx)
+            .ok_or(DmabufSyncFailed::PlaneIndexOutOfBound)?;
+        let flags = flags.intersection(DmabufSyncFlags::READ | DmabufSyncFlags::WRITE);
+        if flags.is_empty() {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
+        }
+
+        let mut args = dma_buf_export_sync_file {
+            flags: flags.bits() as u32,
+            fd: -1,
+        };
+        unsafe { rustix::ioctl::ioctl(&plane.fd, Updater::<DMA_BUF_EXPORT_SYNC_FILE, _>::new(&mut args)) }
+            .map_err(std::io::Error::from)?;
+
+        if args.fd < 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData).into());
+        }
+
+        // SAFETY: A successful EXPORT_SYNC_FILE ioctl returns a new fd owned by the caller.
+        Ok(unsafe { OwnedFd::from_raw_fd(args.fd) })
+    }
 }
 
 bitflags::bitflags! {
@@ -400,6 +434,16 @@ struct dma_buf_sync {
 }
 
 const DMA_BUF_SYNC: rustix::ioctl::Opcode = rustix::ioctl::opcode::write::<dma_buf_sync>(b'b', 0);
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct dma_buf_export_sync_file {
+    flags: u32,
+    fd: i32,
+}
+
+const DMA_BUF_EXPORT_SYNC_FILE: rustix::ioctl::Opcode =
+    rustix::ioctl::opcode::read_write::<dma_buf_export_sync_file>(b'b', 2);
 
 /// A mapping into a [`Dmabuf`]
 #[derive(Debug)]
@@ -711,5 +755,44 @@ impl EventSource for DmabufSource {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+
+    fn dmabuf_with_null_plane() -> Dmabuf {
+        let mut builder = Dmabuf::builder((1, 1), Fourcc::Abgr8888, Modifier::Linear, DmabufFlags::empty());
+        builder.add_plane(OwnedFd::from(File::open("/dev/null").unwrap()), 0, 4);
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn export_sync_file_rejects_missing_plane() {
+        let dmabuf = dmabuf_with_null_plane();
+        assert!(matches!(
+            dmabuf.export_sync_file(1, DmabufSyncFlags::READ),
+            Err(DmabufSyncFailed::PlaneIndexOutOfBound)
+        ));
+    }
+
+    #[test]
+    fn export_sync_file_rejects_empty_read_write_flags() {
+        let dmabuf = dmabuf_with_null_plane();
+        assert!(matches!(
+            dmabuf.export_sync_file(0, DmabufSyncFlags::START | DmabufSyncFlags::END),
+            Err(DmabufSyncFailed::Io(_))
+        ));
+    }
+
+    #[test]
+    fn export_sync_file_fails_on_non_dmabuf_fd() {
+        let dmabuf = dmabuf_with_null_plane();
+        assert!(matches!(
+            dmabuf.export_sync_file(0, DmabufSyncFlags::READ),
+            Err(DmabufSyncFailed::Io(_))
+        ));
     }
 }
