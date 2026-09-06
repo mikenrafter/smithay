@@ -2643,6 +2643,11 @@ impl VulkanRenderer {
         self.device.as_ref()?.physical_device.as_ref()
     }
 
+    /// Wraps a swapchain image the renderer must not destroy.
+    ///
+    /// Layout tracking starts at `UNDEFINED`. That is the WSI discard path: this backend does not
+    /// preserve prior contents (`buffer_age` is 0), so `oldLayout=UNDEFINED` is valid even after
+    /// the image was previously `PRESENT_SRC_KHR`.
     pub(crate) fn wrap_swapchain_image(
         &self,
         image: ash::vk::Image,
@@ -2702,6 +2707,27 @@ impl VulkanRenderer {
             .as_ref()
             .ok_or(VulkanError::QueueFamilyUnsupported)?;
         Ok((queue.handle(), queue.queue_family_index()))
+    }
+
+    /// Runs `f` with the graphics queue while holding its host-access lock.
+    ///
+    /// Vulkan requires host access to a `VkQueue` to be externally synchronized, including
+    /// `vkQueueSubmit` and `vkQueuePresentKHR`. Renderer submits already take this lock; window
+    /// present must use this helper instead of the raw handle from [`Self::graphics_queue`].
+    pub(crate) fn with_locked_graphics_queue<T, F>(&self, f: F) -> Result<T, VulkanError>
+    where
+        F: FnOnce(vk::Queue) -> Result<T, VulkanError>,
+    {
+        let queue = self
+            .device
+            .as_ref()
+            .ok_or(VulkanError::VulkanUnavailable)?
+            .queues
+            .graphics
+            .as_ref()
+            .ok_or(VulkanError::QueueFamilyUnsupported)?;
+        let _guard = queue.lock_host_access()?;
+        f(queue.handle())
     }
 
     pub(crate) fn logical_device(&self) -> Result<&ash::Device, VulkanError> {

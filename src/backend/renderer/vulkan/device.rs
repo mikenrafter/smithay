@@ -6318,7 +6318,7 @@ impl VulkanQueue {
         self.handle
     }
 
-    fn lock_host_access(&self) -> Result<MutexGuard<'_, ()>, VulkanError> {
+    pub(super) fn lock_host_access(&self) -> Result<MutexGuard<'_, ()>, VulkanError> {
         self.host_access.lock().map_err(|_| host_synchronization_failed())
     }
 }
