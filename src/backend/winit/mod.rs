@@ -10,9 +10,9 @@
 //! you want on the initialization of the backend. These functions will provide you
 //! with two objects:
 //!
-//! - a [`WinitGraphicsBackend`], which can give you an implementation of a [`Renderer`](crate::backend::renderer::Renderer)
-//!   (or even [`GlesRenderer`]) through its `renderer` method in addition to further
-//!   functionality to access and manage the created winit-window.
+//! - a graphics backend for the created window. [`init`] attaches the EGL/GLES implementation
+//!   [`WinitGraphicsBackend`]. [`init_window`] creates only the window and event loop so a different
+//!   present path (for example Vulkan) can attach its own swapchain.
 //! - a [`WinitEventLoop`], which dispatches some [`WinitEvent`] from the host graphics server.
 //!
 //! The other types in this module are the instances of the associated types of these
@@ -57,8 +57,12 @@ use crate::{
 };
 
 mod input;
+#[cfg(feature = "renderer_vulkan")]
+mod vulkan;
 
 pub use self::input::*;
+#[cfg(feature = "renderer_vulkan")]
+pub use self::vulkan::{WinitVulkanGraphicsBackend, init_vulkan, init_vulkan_from_attributes};
 
 /// Create a new [`WinitGraphicsBackend`], which implements the
 /// [`Renderer`](crate::backend::renderer::Renderer) trait and a corresponding [`WinitEventLoop`].
@@ -108,6 +112,18 @@ where
     R: From<GlesRenderer> + Bind<EGLSurface>,
     crate::backend::SwapBuffersError: From<R::Error>,
 {
+    let (window, event_loop) = init_window(attributes)?;
+    let winit_graphics_backend =
+        WinitGraphicsBackend::new_with_gl_attr(window, &event_loop.span, gl_attributes)?;
+    Ok((winit_graphics_backend, event_loop))
+}
+
+/// Creates a winit window and event loop without attaching a renderer.
+///
+/// The GLES/EGL graphics path is [`init`]. Window-system backends that present with a different
+/// renderer (for example Vulkan) should use this constructor and keep their swapchain or surface
+/// state outside [`WinitGraphicsBackend`], which is the EGL window implementation.
+pub fn init_window(attributes: WindowAttributes) -> Result<(Arc<dyn WinitWindow>, WinitEventLoop), Error> {
     let span = info_span!("backend_winit", window = tracing::field::Empty);
     let _guard = span.enter();
     info!("Initializing a winit backend");
@@ -146,16 +162,13 @@ where
     span.record("window", window.id().into_raw());
     debug!("Window created");
 
-    let winit_graphics_backend =
-        WinitGraphicsBackend::new_with_gl_attr(window.clone(), &span, gl_attributes)?;
-
     drop(_guard);
 
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let event_loop = Generic::new(event_loop, Interest::READ, calloop::Mode::Level);
 
     Ok((
-        winit_graphics_backend,
+        window,
         WinitEventLoop {
             inner: window_event_loop_inner,
             fake_token: None,
@@ -188,6 +201,10 @@ pub enum Error {
     /// Renderer initialization failed.
     #[error("Renderer creation failed: {0}")]
     RendererCreationError(#[from] GlesError),
+    /// Vulkan window presentation failed.
+    #[cfg(feature = "renderer_vulkan")]
+    #[error("Vulkan winit presentation error: {0}")]
+    Vulkan(#[from] crate::backend::renderer::vulkan::VulkanError),
 }
 
 /// Window with an active EGL Context created by `winit`.

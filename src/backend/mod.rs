@@ -77,8 +77,10 @@
 //! [winit](https://crates.io/crates/winit), which makes it possible to run your compositor as
 //! a Wayland or X11 client. You are encouraged to use the X11 backend where possible since winit
 //! does not integrate into calloop too well. This backend is generally quite helpful for
-//! development and debugging. That backend is both a renderer and an input provider, and is
-//! accessible in the [`winit`] module, gated by the `backend_winit` cargo feature.
+//! development and debugging. The window and input path is shared; GLES presentation lives on
+//! [`winit::WinitGraphicsBackend`] and, with `renderer_vulkan`, Vulkan window presentation lives
+//! on a separate swapchain backend in the [`winit`] module. Both are gated by the `backend_winit`
+//! cargo feature.
 //!
 
 pub mod allocator;
