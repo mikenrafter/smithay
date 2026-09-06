@@ -4,6 +4,11 @@
 //! window implementation. The event loop and window come from [`super::init_window`]; this module
 //! owns the `VkSurfaceKHR` / swapchain and binds acquired images as
 //! [`VulkanRenderTarget`]s.
+//!
+//! Vulkan WSI framebuffers are top-left, matching Wayland. Nested compositors should keep the
+//! output transform at [`crate::utils::Transform::Normal`]. GLES winit's `Flipped180` compensates
+//! for OpenGL's bottom-left origin and is not needed here; [`VulkanRenderer`] still rejects
+//! non-identity frame transforms.
 
 use std::sync::Arc;
 

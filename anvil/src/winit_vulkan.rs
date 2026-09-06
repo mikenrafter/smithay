@@ -126,7 +126,9 @@ pub fn run_winit_vulkan() {
         },
     );
     let _global = output.create_global::<AnvilState<WinitVulkanData>>(&display.handle());
-    output.change_current_state(Some(mode), Some(Transform::Flipped180), None, Some((0, 0).into()));
+    // GLES winit uses Flipped180 to compensate for OpenGL's bottom-left origin. Vulkan WSI
+    // framebuffers are top-left, matching Wayland, so the output transform is identity.
+    output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
     output.set_preferred(mode);
 
     #[cfg(feature = "debug")]
