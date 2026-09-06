@@ -380,6 +380,11 @@ impl Instance {
     pub fn handle(&self) -> &ash::Instance {
         &self.0.instance
     }
+
+    /// Returns the loaded Vulkan entry used to create instances.
+    pub fn loaded_entry() -> Result<&'static Entry, LoadError> {
+        LIBRARY.as_ref().map_err(|_| LoadError)
+    }
 }
 
 /// A Vulkan physical device.
