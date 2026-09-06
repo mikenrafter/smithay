@@ -7,8 +7,13 @@
 //!
 //! Vulkan WSI framebuffers are top-left, matching Wayland. Nested compositors should keep the
 //! output transform at [`crate::utils::Transform::Normal`]. GLES winit's `Flipped180` compensates
-//! for OpenGL's bottom-left origin and is not needed here; [`VulkanRenderer`] still rejects
-//! non-identity frame transforms.
+//! for OpenGL's bottom-left origin and is not needed here.
+//!
+//! Presentation is host-synchronized WSI, not a pipelined acquire/render/present semaphore
+//! graph: acquire waits on a fence, renderer submits wait on the CPU, then `vkQueuePresentKHR`
+//! runs with no wait semaphores while the graphics queue host-access lock is held. That satisfies
+//! queue external synchronization without changing GLES. GPU-timeline present can replace this
+//! later behind tests.
 
 use std::sync::Arc;
 
@@ -49,6 +54,7 @@ pub struct WinitVulkanGraphicsBackend {
     current_image: Option<u32>,
     bound_target: Option<VulkanRenderTarget<'static>>,
     acquire_fence: vk::Fence,
+    suboptimal: bool,
 }
 
 /// Creates a [`WinitVulkanGraphicsBackend`] and corresponding [`WinitEventLoop`].
@@ -83,6 +89,7 @@ impl std::fmt::Debug for WinitVulkanGraphicsBackend {
             .field("current_image", &self.current_image)
             .field("bound_target", &self.bound_target)
             .field("acquire_fence", &self.acquire_fence)
+            .field("suboptimal", &self.suboptimal)
             .finish_non_exhaustive()
     }
 }
@@ -149,6 +156,7 @@ impl WinitVulkanGraphicsBackend {
             current_image: None,
             bound_target: None,
             acquire_fence,
+            suboptimal: false,
         };
         backend.recreate_swapchain()?;
         Ok(backend)
@@ -190,7 +198,7 @@ impl WinitVulkanGraphicsBackend {
         // SAFETY: `acquire_fence` was created from `logical_device` and is not in use after the
         // previous acquire wait or swapchain recreate.
         unsafe { logical_device.reset_fences(&[self.acquire_fence]) }.map_err(VulkanError::from)?;
-        let (index, _suboptimal) = match unsafe {
+        let (index, suboptimal) = match unsafe {
             self.swapchain_fn.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
@@ -199,7 +207,7 @@ impl WinitVulkanGraphicsBackend {
             )
         } {
             Ok(acquired) => acquired,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) | Err(vk::Result::SUBOPTIMAL_KHR) => {
                 self.recreate_swapchain()?;
                 return Err(SwapBuffersError::TemporaryFailure(Box::new(
                     VulkanError::UnsupportedOperation("swapchain out of date"),
@@ -207,6 +215,7 @@ impl WinitVulkanGraphicsBackend {
             }
             Err(err) => return Err(VulkanError::from(err).into()),
         };
+        self.suboptimal = suboptimal;
         // SAFETY: acquire was submitted against `acquire_fence` on this device.
         unsafe { logical_device.wait_for_fences(&[self.acquire_fence], true, u64::MAX) }
             .map_err(VulkanError::from)?;
@@ -251,25 +260,39 @@ impl WinitVulkanGraphicsBackend {
             .transition_swapchain_target(&target, vk::ImageLayout::PRESENT_SRC_KHR)?;
 
         self.window.pre_present_notify();
+        let swapchain_fn = &self.swapchain_fn;
         let present_info = vk::PresentInfoKHR::default()
             .swapchains(std::slice::from_ref(&self.swapchain))
             .image_indices(std::slice::from_ref(&index));
-        let (queue, _) = self.renderer.graphics_queue()?;
-        // SAFETY: `queue` is the renderer graphics queue, which was checked to support present on
-        // `surface`, and `index` was acquired from `swapchain`.
-        match unsafe { self.swapchain_fn.queue_present(queue, &present_info) } {
-            Ok(_) | Err(vk::Result::SUBOPTIMAL_KHR) => Ok(()),
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+        let present = self.renderer.with_locked_graphics_queue(|queue| {
+            // SAFETY: the graphics-queue host-access lock is held for `vkQueuePresentKHR`, matching
+            // renderer `vkQueueSubmit` (queue external synchronization). Rendering already waited
+            // on the CPU, so `waitSemaphoreCount` is 0. `index` was acquired from `swapchain`.
+            unsafe { swapchain_fn.queue_present(queue, &present_info) }.map_err(VulkanError::from)
+        });
+        match present {
+            Ok(true) | Err(VulkanError::VulkanApi(vk::Result::SUBOPTIMAL_KHR)) => {
                 self.recreate_swapchain()?;
                 Ok(())
             }
-            Err(err) => Err(VulkanError::from(err).into()),
+            Ok(false) => {
+                if self.suboptimal {
+                    self.recreate_swapchain()?;
+                }
+                Ok(())
+            }
+            Err(VulkanError::VulkanApi(vk::Result::ERROR_OUT_OF_DATE_KHR)) => {
+                self.recreate_swapchain()?;
+                Ok(())
+            }
+            Err(err) => Err(err.into()),
         }
     }
 
     fn recreate_swapchain(&mut self) -> Result<(), VulkanError> {
         self.current_image = None;
         self.bound_target = None;
+        self.suboptimal = false;
         let physical_device = self
             .renderer
             .physical_device()
