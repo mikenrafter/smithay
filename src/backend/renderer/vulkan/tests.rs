@@ -11740,6 +11740,54 @@ fn import_surface_real_buffer_reaches_device_import_boundary() {
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 #[test]
+fn import_surface_linux_dmabuf_interop_reaches_device_import_without_assume_marks() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
+    renderer.capabilities.external_memory.foreign_queue_family = true;
+    renderer.set_wayland_linux_dmabuf_interop(true);
+
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let (acquire_point, release_point) = DrmSyncPoint::invalid_timeline_pair_for_tests(23, 24).unwrap();
+    let expected_release_point = release_point.clone();
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_buffer_with_sync_points_for_tests(dmabuf.clone(), acquire_point, release_point)
+    else {
+        return;
+    };
+    assert_buffer_release_point_matches_for_tests(
+        &buffer,
+        &expected_release_point,
+        "linux-interop fixture should keep initial release point",
+    );
+
+    let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
+    assert!(
+        matches!(import_result, Err(VulkanError::VulkanUnavailable)),
+        "unexpected linux-interop import_surface result: {import_result:?}"
+    );
+    assert_buffer_release_point_matches_for_tests(
+        &buffer,
+        &expected_release_point,
+        "linux-interop scaffold must not consume Wayland release ownership before texture construction",
+    );
+    assert!(renderer.dmabuf_formats().iter().next().is_none());
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
 fn import_surface_external_state_marker_requires_separate_lifecycle_evidence() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();
     renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(

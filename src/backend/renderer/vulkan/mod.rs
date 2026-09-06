@@ -2620,6 +2620,7 @@ pub struct VulkanRenderer {
     device: Option<VulkanDeviceState>,
     sampled_dmabuf_layout_history: HashMap<WeakDmabuf, SampledDmabufWaylandLayoutHistoryRecord>,
     pending_sampled_dmabuf_import_obligations: Vec<PendingSampledDmabufImportObligation>,
+    wayland_linux_dmabuf_interop: bool,
 }
 
 /// Builder for explicit Vulkan renderer initialization.
@@ -2674,6 +2675,7 @@ impl VulkanRendererBuilder {
             device: Some(device),
             sampled_dmabuf_layout_history: HashMap::new(),
             pending_sampled_dmabuf_import_obligations: Vec::new(),
+            wayland_linux_dmabuf_interop: false,
         })
     }
 }
@@ -2687,6 +2689,22 @@ impl VulkanRenderer {
     /// Physical device this renderer was created from.
     pub fn physical_device(&self) -> Option<&PhysicalDevice> {
         self.device.as_ref()?.physical_device.as_ref()
+    }
+
+    /// Enable or disable the opt-in Linux dma-buf external interop policy for Wayland sampled import.
+    ///
+    /// Default is off. When enabled, [`ImportDmaWl`] may record the existing FOREIGN/`GENERAL` and
+    /// texture-cache lifecycle marks for commits that have not already been admitted by the
+    /// controlled Vulkan producer path. That is the Linux EGL/Vulkan dma-buf convention after
+    /// acquire is satisfied, not a proof from linux-dmabuf metadata. Generic [`ImportDma`] stays
+    /// fail-closed.
+    pub fn set_wayland_linux_dmabuf_interop(&mut self, enabled: bool) {
+        self.wayland_linux_dmabuf_interop = enabled;
+    }
+
+    /// Returns whether the Linux dma-buf external interop policy is enabled.
+    pub fn wayland_linux_dmabuf_interop(&self) -> bool {
+        self.wayland_linux_dmabuf_interop
     }
 
     /// Wraps a swapchain image the renderer must not destroy.
@@ -2871,6 +2889,73 @@ impl VulkanRenderer {
                 None,
             )
         }
+    }
+
+    /// Admit a Wayland dmabuf commit under the opt-in Linux dma-buf external interop policy.
+    ///
+    /// This writes the same buffer-local FOREIGN/`GENERAL` and texture-cache lifecycle marks as
+    /// [`VulkanRenderer::assume_wayland_dmabuf_current_commit_foreign_general_for_sampled_import`]
+    /// and
+    /// [`VulkanRenderer::mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import`].
+    /// It does not replace the controlled Vulkan producer admission path. If those marks are already
+    /// present, this is a no-op.
+    ///
+    /// Acquire must already be representable as a fence-bearing [`SyncPoint`]: either a drm-syncobj
+    /// acquire point or a dma-buf exported read fence. This helper does not infer layout from
+    /// format/modifier metadata.
+    #[cfg(feature = "wayland_frontend")]
+    fn admit_wayland_linux_dmabuf_interop_for_sampled_import(
+        &self,
+        buffer: &super::utils::Buffer,
+    ) -> Result<(), VulkanError> {
+        if !self.wayland_linux_dmabuf_interop {
+            return Ok(());
+        }
+
+        let dmabuf = crate::wayland::dmabuf::get_dmabuf(buffer)
+            .map_err(|_| VulkanError::UnsupportedOperation("sampled dmabuf linux interop buffer"))?;
+        if self
+            .sampled_dmabuf_wayland_buffer_foreign_general_evidence(buffer, dmabuf)?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        self.sampled_dmabuf_wayland_acquire_sync_evidence(dmabuf, buffer)?;
+
+        let (use_case, release_generation) = match self.sampled_dmabuf_layout_history_snapshot(dmabuf) {
+            SampledDmabufWaylandLayoutHistory::NoRendererHistory => {
+                (SampledDmabufWaylandExternalStateUse::FirstImport, None)
+            }
+            SampledDmabufWaylandLayoutHistory::ReleasedByRendererToForeignGeneral => (
+                SampledDmabufWaylandExternalStateUse::CurrentReacquire,
+                self.sampled_dmabuf_release_generation_snapshot(dmabuf),
+            ),
+            SampledDmabufWaylandLayoutHistory::LocallyAcquired => {
+                return Err(VulkanError::MissingCapability(
+                    "sampled dmabuf Wayland Vulkan unreleased local acquire",
+                ));
+            }
+        };
+
+        unsafe {
+            // SAFETY: The Linux-interop flag is an explicit compositor opt-in that acquire has been
+            // satisfied and the imported dma-buf follows FOREIGN + GENERAL external layout. This
+            // records the existing commit-local marks consumed by ImportDmaWl; it does not advertise
+            // generic ImportDma.
+            Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+                buffer.user_data(),
+                dmabuf,
+                use_case,
+                release_generation,
+            )?;
+            self.mark_wayland_dmabuf_user_data_texture_cache_release_lifecycle_for_sampled_import(
+                buffer.user_data(),
+                dmabuf,
+            )?;
+        }
+
+        Ok(())
     }
 
     /// Assume a renderer-managed Wayland dmabuf commit's external state for validation-stage sampled import.
@@ -3441,6 +3526,7 @@ impl VulkanRenderer {
             device: None,
             sampled_dmabuf_layout_history: HashMap::new(),
             pending_sampled_dmabuf_import_obligations: Vec::new(),
+            wayland_linux_dmabuf_interop: false,
         }
     }
 
@@ -6625,6 +6711,7 @@ impl ImportDmaWl for VulkanRenderer {
         surface: Option<&crate::wayland::compositor::SurfaceData>,
         _damage: &[Rectangle<i32, BufferCoord>],
     ) -> Result<Self::TextureId, Self::Error> {
+        self.admit_wayland_linux_dmabuf_interop_for_sampled_import(buffer)?;
         let context = self.wayland_sampled_dmabuf_import_context(buffer, surface)?;
         self.import_wayland_dmabuf_with_context(context, buffer)
     }
