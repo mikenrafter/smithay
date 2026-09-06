@@ -1374,6 +1374,13 @@ impl SampledDmabufReleaseOwnership {
         }
     }
 
+    fn cache_only(dmabuf: &Dmabuf) -> Self {
+        Self {
+            dmabuf: dmabuf.weak(),
+            release: image::VulkanSampledDmabufRelease::validation_stage_without_wayland_point(),
+        }
+    }
+
     fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
         self.dmabuf.upgrade().as_ref() == Some(dmabuf)
     }
@@ -3980,7 +3987,7 @@ impl VulkanRenderer {
                     "sampled dmabuf release point buffer identity",
                 ));
             }
-            if buffer.release_point().is_none() {
+            if buffer.release_point().is_none() && !self.wayland_linux_dmabuf_interop {
                 return Err(VulkanError::MissingCapability(
                     "sampled dmabuf release point contract",
                 ));
@@ -4738,7 +4745,7 @@ impl VulkanRenderer {
                     "sampled dmabuf Wayland release ownership buffer identity",
                 ));
             }
-            if buffer.release_point().is_none() {
+            if buffer.release_point().is_none() && !self.wayland_linux_dmabuf_interop {
                 return Err(VulkanError::MissingCapability(
                     "sampled dmabuf Wayland release ownership transfer",
                 ));
@@ -4766,9 +4773,18 @@ impl VulkanRenderer {
         dmabuf: &Dmabuf,
         #[cfg(feature = "backend_drm")] buffer: &super::utils::Buffer,
         #[cfg(not(feature = "backend_drm"))] _buffer: &super::utils::Buffer,
+        linux_interop: bool,
     ) -> Result<SampledDmabufReleaseOwnership, VulkanError> {
         #[cfg(feature = "backend_drm")]
         {
+            if buffer.release_point().is_none() {
+                if !linux_interop {
+                    return Err(VulkanError::UnsupportedOperation(
+                        "sampled dmabuf Wayland release ownership transfer",
+                    ));
+                }
+                return Ok(SampledDmabufReleaseOwnership::cache_only(dmabuf));
+            }
             let release_point =
                 buffer
                     .take_release_point_for_renderer()
@@ -4784,6 +4800,7 @@ impl VulkanRenderer {
         #[cfg(not(feature = "backend_drm"))]
         {
             let _ = dmabuf;
+            let _ = linux_interop;
             Err(VulkanError::MissingCapability(
                 "sampled dmabuf Wayland release ownership transfer",
             ))
@@ -5992,8 +6009,9 @@ impl VulkanRenderer {
     ) -> Result<VulkanTexture, VulkanError> {
         let dmabuf = context.dmabuf;
         let policy_context = context.wayland_policy_context();
+        let linux_interop = self.wayland_linux_dmabuf_interop;
         self.import_wayland_dmabuf_with_policy_context(policy_context, || {
-            Self::sampled_dmabuf_take_wayland_release_ownership(dmabuf, buffer)
+            Self::sampled_dmabuf_take_wayland_release_ownership(dmabuf, buffer, linux_interop)
         })
     }
 

@@ -375,6 +375,41 @@ fn import_surface_dmabuf_buffer_without_sync_points_for_tests(
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+fn import_surface_dmabuf_buffer_with_acquire_only_for_tests(
+    dmabuf: Dmabuf,
+    acquire_point: DrmSyncPoint,
+) -> Option<(
+    Display<DmabufBufferTestState>,
+    UnixStream,
+    SurfaceData,
+    crate::backend::renderer::utils::Buffer,
+)> {
+    let (display, client_side, wl_buffer) = dmabuf_wl_buffer_for_tests(dmabuf)?;
+    let surface = SurfaceData {
+        role: None,
+        data_map: Default::default(),
+        cached_state: MultiCache::new(),
+    };
+    {
+        let mut attributes = surface.cached_state.get::<SurfaceAttributes>();
+        attributes.current().buffer = Some(BufferAssignment::NewBuffer(wl_buffer));
+    }
+    {
+        let mut syncobj = surface.cached_state.get::<DrmSyncobjCachedState>();
+        syncobj.current().acquire_point = Some(acquire_point);
+    }
+
+    let mut surface_state = crate::backend::renderer::utils::RendererSurfaceState::default();
+    surface_state.update_buffer(&surface);
+    let buffer = surface_state.buffer().unwrap().clone();
+    surface
+        .data_map
+        .insert_if_missing_threadsafe(|| Mutex::new(surface_state));
+
+    Some((display, client_side, surface, buffer))
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 fn assert_buffer_release_point_matches_for_tests(
     buffer: &crate::backend::renderer::utils::Buffer,
     expected_release_point: &DrmSyncPoint,
@@ -11330,8 +11365,9 @@ fn import_dma_wl_release_ownership_transfer_preserves_syncobj_point() {
     let buffer =
         crate::backend::renderer::utils::Buffer::with_explicit(wl_buffer, acquire_point, release_point);
 
-    let release_ownership = VulkanRenderer::sampled_dmabuf_take_wayland_release_ownership(&dmabuf, &buffer)
-        .expect("release ownership transfer should take the Wayland syncobj point");
+    let release_ownership =
+        VulkanRenderer::sampled_dmabuf_take_wayland_release_ownership(&dmabuf, &buffer, false)
+            .expect("release ownership transfer should take the Wayland syncobj point");
     assert!(buffer.release_point().is_none());
     let release = release_ownership.into_release();
     let moved_release_point = release
@@ -11784,6 +11820,44 @@ fn import_surface_linux_dmabuf_interop_reaches_device_import_without_assume_mark
         "linux-interop scaffold must not consume Wayland release ownership before texture construction",
     );
     assert!(renderer.dmabuf_formats().iter().next().is_none());
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn import_surface_linux_dmabuf_interop_allows_missing_release_point() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    renderer.capabilities.formats.modifier_records = vec![modifier_record_from_properties(
+        Fourcc::Abgr8888,
+        vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: Modifier::Linear.into(),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        },
+    )];
+    renderer.capabilities.external_memory.foreign_queue_family = true;
+    renderer.set_wayland_linux_dmabuf_interop(true);
+
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let acquire_point = DrmSyncPoint::invalid_for_tests(25).unwrap();
+    let Some((_display, _client_side, surface, buffer)) =
+        import_surface_dmabuf_buffer_with_acquire_only_for_tests(dmabuf.clone(), acquire_point)
+    else {
+        return;
+    };
+    assert!(buffer.release_point().is_none());
+
+    let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
+    assert!(
+        matches!(import_result, Err(VulkanError::VulkanUnavailable)),
+        "unexpected missing-release linux-interop result: {import_result:?}"
+    );
+    assert!(buffer.release_point().is_none());
 }
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
