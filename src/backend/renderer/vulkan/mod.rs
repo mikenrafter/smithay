@@ -25,8 +25,9 @@
 //! linux-dmabuf, drm-syncobj, `wl_surface.commit`, renderer-utils cache import, sampling, and release
 //! point signaling. The safe generic `ImportDma` path still fails closed because it receives only a raw
 //! [`Dmabuf`] and damage, without Wayland acquire/release points or renderer-utils cache lifecycle.
-//! Public sampled `ImportDma` advertisement remains closed until production external-state evidence and
-//! direct generic import lifecycle contracts are proven by tests.
+//! Public sampled `ImportDma` advertisement remains closed until a direct generic import
+//! implementation exists. The explicit [`VulkanSampledDmabufImport`] path already tracks local
+//! ownership until foreign-GENERAL release.
 //!
 //! Intended implementation order:
 //!
@@ -43,7 +44,8 @@
 //!     compositor-space mapping as pixman; crop/scale are dest/src rectangles)
 //! 11. readback test path
 //! 12. `ImportDma` (Wayland `ImportDmaWl` is validation-stage; generic `ImportDma` stays
-//!     fail-closed. Public foreign-GENERAL import uses [`VulkanSampledDmabufImport`].)
+//!     fail-closed. Public foreign-GENERAL import uses [`VulkanSampledDmabufImport`] and blocks
+//!     reimport until foreign-GENERAL release.)
 //! 13. dmabuf modifier handling
 //! 14. export dmabuf
 //! 15. KMS presentation path
@@ -3548,6 +3550,21 @@ impl VulkanRenderer {
         Ok(())
     }
 
+    /// Public sampled-import lifecycle: pending obligations and outstanding local ownership both
+    /// block another acquire of the same dmabuf.
+    fn validate_sampled_dmabuf_public_import_lifecycle(&self, dmabuf: &Dmabuf) -> Result<(), VulkanError> {
+        self.validate_no_pending_sampled_dmabuf_import_obligation(dmabuf)?;
+        if self.sampled_dmabuf_layout_history_snapshot(dmabuf)
+            == SampledDmabufWaylandLayoutHistory::LocallyAcquired
+        {
+            return Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf locally acquired",
+            ));
+        }
+
+        Ok(())
+    }
+
     #[allow(dead_code)]
     fn retain_pending_sampled_dmabuf_import_obligation(
         &mut self,
@@ -3762,14 +3779,15 @@ impl VulkanRenderer {
     ///
     /// Raw Vulkan probing may populate format records used by validation tests and development paths.
     /// The public external-state policy is the explicit [`VulkanSampledDmabufImport`] wrapper: a raw
-    /// [`Dmabuf`] still cannot prove layout or ownership. Generic [`ImportDma`] stays fail-closed
-    /// until a lifecycle contract and a direct generic implementation exist for arbitrary callers.
+    /// [`Dmabuf`] still cannot prove layout or ownership. The public lifecycle is local ownership
+    /// until foreign-GENERAL release; the same dmabuf cannot be imported again while outstanding.
+    /// Generic [`ImportDma`] stays fail-closed until a direct generic implementation exists.
     fn sampled_dmabuf_public_import_contracts(&self) -> SampledDmabufPublicImportContracts {
         SampledDmabufPublicImportContracts {
             raw_import_capability: self.capabilities.import.dmabuf,
             advertised_formats: self.capabilities.formats.dmabuf_import.iter().next().is_some(),
             public_external_state_policy: true,
-            public_import_lifecycle: false,
+            public_import_lifecycle: true,
             public_import_implementation: false,
         }
     }
@@ -3777,8 +3795,8 @@ impl VulkanRenderer {
     /// Check whether the normal sampled-dmabuf external-state policy is ready for public import.
     ///
     /// The policy is the explicit [`VulkanSampledDmabufImport`] wrapper. Raw probed formats still
-    /// cannot prove layout or ownership for generic [`ImportDma`]. Lifecycle and implementation
-    /// gates remain closed.
+    /// cannot prove layout or ownership for generic [`ImportDma`]. The implementation gate remains
+    /// closed.
     #[allow(dead_code)]
     fn validate_sampled_dmabuf_public_external_state_contract(&self) -> Result<(), VulkanError> {
         if self
@@ -3790,6 +3808,24 @@ impl VulkanRenderer {
             Err(VulkanError::MissingCapability(
                 "sampled dmabuf public external-state policy",
             ))
+        }
+    }
+
+    /// Check whether the public sampled-dmabuf import lifecycle is ready.
+    ///
+    /// After [`VulkanRenderer::import_sampled_dmabuf`], this renderer owns the image locally until
+    /// [`VulkanRenderer::release_imported_dmabuf_texture_to_foreign_general_sync_point`]. The same
+    /// dmabuf cannot be imported again while that ownership is outstanding. Generic [`ImportDma`]
+    /// still has no place to put that pair.
+    #[allow(dead_code)]
+    fn validate_sampled_dmabuf_public_import_lifecycle_contract(&self) -> Result<(), VulkanError> {
+        if self
+            .sampled_dmabuf_public_import_contracts()
+            .public_import_lifecycle
+        {
+            Ok(())
+        } else {
+            Err(VulkanError::MissingCapability("sampled dmabuf import lifecycle"))
         }
     }
 
@@ -5519,8 +5555,11 @@ impl VulkanRenderer {
 
     /// Import a sampled dmabuf through the explicit foreign-GENERAL contract.
     ///
-    /// This does not enable generic [`ImportDma`]. Callers that cannot construct
-    /// [`VulkanSampledDmabufImport`] still cannot import.
+    /// On success this renderer owns the image locally until
+    /// [`VulkanRenderer::release_imported_dmabuf_texture_to_foreign_general_sync_point`]. The same
+    /// dmabuf cannot be imported again while that ownership is outstanding. This does not enable
+    /// generic [`ImportDma`]. Callers that cannot construct [`VulkanSampledDmabufImport`] still
+    /// cannot import.
     pub fn import_sampled_dmabuf(
         &mut self,
         import: VulkanSampledDmabufImport<'_, '_>,
@@ -5557,7 +5596,7 @@ impl VulkanRenderer {
         dmabuf: &Dmabuf,
         acquire_sync: Option<&SyncPoint>,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
-        self.validate_no_pending_sampled_dmabuf_import_obligation(dmabuf)?;
+        self.validate_sampled_dmabuf_public_import_lifecycle(dmabuf)?;
         let foreign_general = unsafe {
             // SAFETY: This public unsafe method requires its caller to prove the producer released
             // the dmabuf to FOREIGN ownership in GENERAL layout.
@@ -6039,7 +6078,7 @@ impl VulkanRenderer {
         dmabuf: &Dmabuf,
         evidence: VulkanDmabufLoopbackImportEvidence,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
-        self.validate_no_pending_sampled_dmabuf_import_obligation(dmabuf)?;
+        self.validate_sampled_dmabuf_public_import_lifecycle(dmabuf)?;
         let foreign_general = self.validate_dmabuf_loopback_import_evidence(dmabuf, &evidence)?;
         let acquire_sync = evidence.acquire_sync;
         let texture = unsafe {
@@ -6086,7 +6125,7 @@ impl VulkanRenderer {
         let dmabuf = weak_dmabuf
             .upgrade()
             .ok_or(VulkanError::UnsupportedOperation("dmabuf loopback render target"))?;
-        self.validate_no_pending_sampled_dmabuf_import_obligation(&dmabuf)?;
+        self.validate_sampled_dmabuf_public_import_lifecycle(&dmabuf)?;
         let _ = self.validate_sampled_dmabuf_import_metadata(&dmabuf)?;
         let _ = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
         let (released, acquire_sync) = match self
@@ -6157,7 +6196,7 @@ impl VulkanRenderer {
         evidence: VulkanDmabufLoopbackImportEvidence,
         release_ownership: SampledDmabufReleaseOwnership,
     ) -> Result<Option<VulkanTexture>, VulkanError> {
-        self.validate_no_pending_sampled_dmabuf_import_obligation(dmabuf)?;
+        self.validate_sampled_dmabuf_public_import_lifecycle(dmabuf)?;
         let foreign_general = self.validate_dmabuf_loopback_import_evidence(dmabuf, &evidence)?;
         let acquire_sync = evidence.acquire_sync;
         let texture = unsafe {
