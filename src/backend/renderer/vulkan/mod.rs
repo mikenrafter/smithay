@@ -76,8 +76,9 @@ use crate::backend::renderer::{ImportDmaWl, ImportMemWl};
 use crate::utils::user_data::UserDataMap;
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use crate::wayland::drm_syncobj::DrmSyncPoint;
+
 use crate::{
-    backend::vulkan::PhysicalDevice,
+    backend::vulkan::{Instance, PhysicalDevice},
     backend::{
         allocator::{
             Format, Fourcc, Modifier,
@@ -2581,6 +2582,7 @@ pub struct VulkanRenderer {
 #[derive(Debug, Default, Clone)]
 pub struct VulkanRendererBuilder {
     physical_device: Option<PhysicalDevice>,
+    extra_device_extensions: Vec<&'static std::ffi::CStr>,
 }
 
 impl VulkanRendererBuilder {
@@ -2598,12 +2600,22 @@ impl VulkanRendererBuilder {
         self
     }
 
+    /// Enables additional logical-device extensions when the renderer device is created.
+    ///
+    /// Window-system integration (for example `VK_KHR_swapchain`) is not implied by the offscreen
+    /// renderer. Callers that present to a `VkSurfaceKHR` must request the swapchain extension here
+    /// after confirming the physical device supports it.
+    pub fn with_device_extensions(mut self, extensions: &[&'static std::ffi::CStr]) -> Self {
+        self.extra_device_extensions.extend_from_slice(extensions);
+        self
+    }
+
     /// Builds a Vulkan renderer.
     ///
     /// This returns [`VulkanError::VulkanUnavailable`] unless a [`PhysicalDevice`] was provided.
     pub fn build(self) -> Result<VulkanRenderer, VulkanError> {
         let physical_device = self.physical_device.ok_or(VulkanError::VulkanUnavailable)?;
-        let device = VulkanDeviceState::new(physical_device)?;
+        let device = VulkanDeviceState::new(physical_device, &self.extra_device_extensions)?;
         let capabilities = device.capabilities.clone();
 
         Ok(VulkanRenderer {
@@ -2616,6 +2628,90 @@ impl VulkanRendererBuilder {
             sampled_dmabuf_layout_history: HashMap::new(),
             pending_sampled_dmabuf_import_obligations: Vec::new(),
         })
+    }
+}
+
+impl VulkanRenderer {
+    /// Vulkan instance this renderer was created from.
+    pub fn instance(&self) -> Option<&Instance> {
+        self.device.as_ref()?.instance.as_ref()
+    }
+
+    /// Physical device this renderer was created from.
+    pub fn physical_device(&self) -> Option<&PhysicalDevice> {
+        self.device.as_ref()?.physical_device.as_ref()
+    }
+
+    pub(crate) fn wrap_swapchain_image(
+        &self,
+        image: ash::vk::Image,
+        size: crate::utils::Size<i32, crate::utils::Buffer>,
+        format: Fourcc,
+    ) -> Result<VulkanRenderTarget<'static>, VulkanError> {
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+        let logical_device = device
+            .logical_device
+            .as_ref()
+            .ok_or(VulkanError::VulkanUnavailable)?
+            .clone();
+        let extent = vk::Extent3D {
+            width: size.w.max(0) as u32,
+            height: size.h.max(0) as u32,
+            depth: 1,
+        };
+        let vk_format = get_render_vk_format(format)?;
+        let color_image =
+            device::VulkanOwnedImage::from_unowned_swapchain_image(logical_device, image, extent, vk_format);
+        Ok(image::VulkanRenderTarget::from_swapchain_image(
+            self.context_id.clone(),
+            size,
+            format,
+            color_image,
+        ))
+    }
+
+    pub(crate) fn transition_swapchain_target(
+        &self,
+        target: &VulkanRenderTarget<'_>,
+        new_layout: vk::ImageLayout,
+    ) -> Result<(), VulkanError> {
+        if target.image.source != image::VulkanImageSource::Swapchain {
+            return Err(VulkanError::UnsupportedOperation("swapchain target"));
+        }
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+        let color_image = target
+            .color_image
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("swapchain target image"))?;
+        let mut command_buffer = device.allocate_graphics_command_buffer()?;
+        device.begin_command_buffer(&mut command_buffer)?;
+        device.transition_image_layout(&mut command_buffer, color_image, new_layout)?;
+        device.end_command_buffer(&mut command_buffer)?;
+        device.submit_graphics_command_buffer_and_wait(&mut command_buffer)?;
+        Ok(())
+    }
+
+    pub(crate) fn graphics_queue(&self) -> Result<(vk::Queue, u32), VulkanError> {
+        let queue = self
+            .device
+            .as_ref()
+            .ok_or(VulkanError::VulkanUnavailable)?
+            .queues
+            .graphics
+            .as_ref()
+            .ok_or(VulkanError::QueueFamilyUnsupported)?;
+        Ok((queue.handle(), queue.queue_family_index()))
+    }
+
+    pub(crate) fn logical_device(&self) -> Result<&ash::Device, VulkanError> {
+        Ok(self
+            .device
+            .as_ref()
+            .ok_or(VulkanError::VulkanUnavailable)?
+            .logical_device
+            .as_ref()
+            .ok_or(VulkanError::VulkanUnavailable)?
+            .handle())
     }
 }
 
@@ -6102,7 +6198,9 @@ impl Renderer for VulkanRenderer {
         }
         if !matches!(
             framebuffer.image.source,
-            image::VulkanImageSource::Offscreen | image::VulkanImageSource::RenderTarget
+            image::VulkanImageSource::Offscreen
+                | image::VulkanImageSource::RenderTarget
+                | image::VulkanImageSource::Swapchain
         ) {
             return Err(VulkanError::UnsupportedOperation("render target"));
         }
@@ -6156,7 +6254,10 @@ impl<'target> Bind<VulkanRenderTarget<'target>> for VulkanRenderer {
         if target.context_id != self.context_id {
             return Err(VulkanError::UnsupportedOperation("foreign render target"));
         }
-        if target.image.source != image::VulkanImageSource::Offscreen {
+        if !matches!(
+            target.image.source,
+            image::VulkanImageSource::Offscreen | image::VulkanImageSource::Swapchain
+        ) {
             return Err(VulkanError::UnsupportedOperation("render target"));
         }
         if target.color_image.is_none() {

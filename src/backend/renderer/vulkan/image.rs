@@ -1099,6 +1099,31 @@ impl VulkanRenderTarget<'_> {
         }
     }
 
+    pub(crate) fn from_swapchain_image(
+        context_id: ContextId<VulkanTexture>,
+        size: Size<i32, BufferCoord>,
+        format: Fourcc,
+        color_image: VulkanOwnedImage,
+    ) -> Self {
+        Self {
+            context_id,
+            image: VulkanImageState {
+                size,
+                format: Some(format),
+                source: VulkanImageSource::Swapchain,
+                usage: VulkanImageUsage {
+                    color_attachment: true,
+                    ..VulkanImageUsage::default()
+                },
+                layout: VulkanImageLayoutState::Undefined,
+                sync: VulkanImageSyncState::default(),
+            },
+            color_image: Some(color_image),
+            dmabuf: None,
+            _target: PhantomData,
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn from_acquired_dmabuf_render_target(
         context_id: ContextId<VulkanTexture>,

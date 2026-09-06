@@ -663,7 +663,10 @@ pub(crate) struct VulkanDeviceState {
 }
 
 impl VulkanDeviceState {
-    pub(super) fn new(physical_device: PhysicalDevice) -> Result<Self, VulkanError> {
+    pub(super) fn new(
+        physical_device: PhysicalDevice,
+        extra_device_extensions: &[&'static std::ffi::CStr],
+    ) -> Result<Self, VulkanError> {
         let instance = physical_device.instance().clone();
         let queue_properties = unsafe {
             instance
@@ -692,6 +695,16 @@ impl VulkanDeviceState {
                     physical_device.api_version(),
                 ),
             );
+        }
+        for extension in extra_device_extensions.iter().copied() {
+            if !physical_device.has_device_extension(extension) {
+                return Err(VulkanError::MissingRequiredExtension(
+                    extension.to_string_lossy().into_owned(),
+                ));
+            }
+            if !enabled_device_extensions.contains(&extension) {
+                enabled_device_extensions.push(extension);
+            }
         }
         let enabled_extension_pointers = enabled_device_extensions
             .iter()
@@ -5734,7 +5747,8 @@ pub(super) fn image_layout_transition(
                 dst_access: vk::AccessFlags::TRANSFER_WRITE,
             })
         }
-        (vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) => {
+        (vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        | (vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) => {
             if !usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
                 return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
             }
@@ -5791,6 +5805,18 @@ pub(super) fn image_layout_transition(
                 dst_stage: vk::PipelineStageFlags::TRANSFER,
                 src_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
                 dst_access: vk::AccessFlags::TRANSFER_READ,
+            })
+        }
+        (vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR) => {
+            if !usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+                return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
+            }
+
+            Ok(VulkanLayoutTransition {
+                src_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                dst_stage: vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                src_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                dst_access: vk::AccessFlags::empty(),
             })
         }
         _ => Err(VulkanError::UnsupportedOperation("image layout transition")),
@@ -6129,6 +6155,7 @@ fn create_bound_image(
             format,
             usage,
             external_memory_handle_type: None,
+            destroy_on_drop: true,
             layout: Mutex::new(vk::ImageLayout::UNDEFINED),
             sync: VulkanSharedImageSyncState::new(VulkanImageSyncState::default()),
         }),
@@ -6285,6 +6312,10 @@ impl VulkanQueue {
 
     pub(super) fn queue_family_index(&self) -> u32 {
         self.queue_family_index
+    }
+
+    pub(super) fn handle(&self) -> vk::Queue {
+        self.handle
     }
 
     fn lock_host_access(&self) -> Result<MutexGuard<'_, ()>, VulkanError> {
@@ -6850,12 +6881,35 @@ struct VulkanOwnedImageInner {
     format: vk::Format,
     usage: vk::ImageUsageFlags,
     external_memory_handle_type: Option<VulkanExternalMemoryHandleType>,
+    destroy_on_drop: bool,
     layout: Mutex<vk::ImageLayout>,
     sync: VulkanSharedImageSyncState,
 }
 
 #[allow(dead_code)]
 impl VulkanOwnedImage {
+    pub(super) fn from_unowned_swapchain_image(
+        logical_device: VulkanLogicalDevice,
+        image: vk::Image,
+        extent: vk::Extent3D,
+        format: vk::Format,
+    ) -> Self {
+        Self {
+            inner: Arc::new(VulkanOwnedImageInner {
+                logical_device,
+                image,
+                memory: vk::DeviceMemory::null(),
+                extent,
+                format,
+                usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                external_memory_handle_type: None,
+                destroy_on_drop: false,
+                layout: Mutex::new(vk::ImageLayout::UNDEFINED),
+                sync: VulkanSharedImageSyncState::new(VulkanImageSyncState::default()),
+            }),
+        }
+    }
+
     pub(super) fn image(&self) -> vk::Image {
         self.inner.image
     }
@@ -7130,6 +7184,7 @@ impl VulkanUnboundImage {
                 format: this.format,
                 usage: this.usage,
                 external_memory_handle_type: this.external_memory_handle_type,
+                destroy_on_drop: true,
                 layout: Mutex::new(vk::ImageLayout::UNDEFINED),
                 sync: VulkanSharedImageSyncState::new(sync),
             }),
@@ -7149,9 +7204,14 @@ impl Drop for VulkanUnboundImage {
 
 impl Drop for VulkanOwnedImageInner {
     fn drop(&mut self) {
+        if !self.destroy_on_drop {
+            return;
+        }
         unsafe {
             self.logical_device.handle().destroy_image(self.image, None);
-            self.logical_device.handle().free_memory(self.memory, None);
+            if self.memory != vk::DeviceMemory::null() {
+                self.logical_device.handle().free_memory(self.memory, None);
+            }
         }
     }
 }

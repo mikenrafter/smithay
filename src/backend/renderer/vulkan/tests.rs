@@ -2151,6 +2151,38 @@ fn image_layout_transition_requires_matching_image_usage() {
         )
         .is_ok()
     );
+    assert!(
+        image_layout_transition(
+            vk::ImageLayout::PRESENT_SRC_KHR,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        image_layout_transition(
+            vk::ImageLayout::PRESENT_SRC_KHR,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageUsageFlags::SAMPLED,
+        ),
+        Err(VulkanError::UnsupportedOperation("image color attachment usage"))
+    ));
+    assert!(
+        image_layout_transition(
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        image_layout_transition(
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+            vk::ImageUsageFlags::SAMPLED,
+        ),
+        Err(VulkanError::UnsupportedOperation("image color attachment usage"))
+    ));
 }
 
 #[test]
@@ -3647,6 +3679,12 @@ fn public_bind_rejects_invalid_vulkan_targets_before_device_lookup() {
         (1, 1).into(),
         Some(Fourcc::Abgr8888),
     );
+    let mut swapchain_target = render_target_for_tests(
+        renderer.context_id(),
+        VulkanImageSource::Swapchain,
+        (1, 1).into(),
+        Some(Fourcc::Abgr8888),
+    );
 
     assert!(matches!(
         Bind::bind(&mut renderer, &mut foreign_target),
@@ -3658,6 +3696,10 @@ fn public_bind_rejects_invalid_vulkan_targets_before_device_lookup() {
     ));
     assert!(matches!(
         Bind::bind(&mut renderer, &mut missing_image_target),
+        Err(VulkanError::UnsupportedOperation("render target image"))
+    ));
+    assert!(matches!(
+        Bind::bind(&mut renderer, &mut swapchain_target),
         Err(VulkanError::UnsupportedOperation("render target image"))
     ));
 }
