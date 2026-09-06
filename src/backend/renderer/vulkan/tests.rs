@@ -87,6 +87,7 @@ use super::image::{
     VulkanSampledDmabufRelease, clear_damage_to_clear_areas, clip_render_texture_draw_area,
     damage_to_scissor_areas, dmabuf_acquired_image_state, dmabuf_acquired_render_target_image_state,
     dmabuf_import_image_state, dmabuf_render_target_image_state, draw_solid_damage_to_clear_areas,
+    map_dest_relative_rects_to_framebuffer, map_output_rect_to_framebuffer,
     render_texture_damage_to_scissor_areas, source_to_uv_rect,
 };
 use super::*;
@@ -14575,7 +14576,7 @@ fn frame_clear_accepts_partial_damage_before_device_lookup() {
     let mut transformed_frame = frame_for_tests(ContextId::new(), (4, 4).into(), Transform::Flipped270);
     assert!(matches!(
         transformed_frame.clear(Color32F::TRANSPARENT, &partial_damage),
-        Err(VulkanError::UnsupportedOperation("clear transform"))
+        Err(VulkanError::UnsupportedOperation("clear device"))
     ));
 }
 
@@ -14607,7 +14608,7 @@ fn frame_draw_solid_rejects_preconditions_before_device_lookup() {
         Rectangle::from_size((4, 4).into()),
         &full_damage,
         Color32F::BLACK,
-        "draw solid transform",
+        "draw solid device",
     );
     assert_draw_solid_error(
         Transform::Normal,
@@ -14748,6 +14749,46 @@ fn frame_render_texture_supports_source_transforms_before_device_lookup() {
                 Err(VulkanError::UnsupportedOperation("render texture device"))
             ),
             "transform {transform:?}"
+        );
+    }
+}
+
+#[test]
+fn frame_render_texture_supports_output_transforms_before_device_lookup() {
+    let context_id = ContextId::new();
+    let mut texture = texture_for_tests((2, 3).into(), Some(Fourcc::Argb8888));
+    texture.context_id = context_id.clone();
+    let output_size = Size::<i32, Physical>::from((8, 6));
+
+    for transform in [
+        Transform::Normal,
+        Transform::_90,
+        Transform::_180,
+        Transform::_270,
+        Transform::Flipped,
+        Transform::Flipped90,
+        Transform::Flipped180,
+        Transform::Flipped270,
+    ] {
+        let compositor_size = transform.transform_size(output_size);
+        let dest = Rectangle::from_size(compositor_size);
+        let damage = [Rectangle::from_size(compositor_size)];
+        let mut frame = frame_for_tests(context_id.clone(), output_size, transform);
+
+        assert!(
+            matches!(
+                frame.render_texture_from_to(
+                    &texture,
+                    Rectangle::from_size((2.0, 3.0).into()),
+                    dest,
+                    &damage,
+                    &[],
+                    Transform::Normal,
+                    0.5,
+                ),
+                Err(VulkanError::UnsupportedOperation("render texture device"))
+            ),
+            "output transform {transform:?}"
         );
     }
 }
@@ -14938,7 +14979,7 @@ fn frame_render_texture_rejects_narrow_path_preconditions_before_device_lookup()
         &[],
         Transform::Normal,
         1.0,
-        "render texture transform",
+        "render texture device",
     );
     for alpha in [-0.1, 1.1, f32::NAN] {
         assert_render_texture_error(
@@ -15046,6 +15087,57 @@ fn source_to_uv_rect_supports_source_transforms() {
     assert_eq!(
         source_to_uv_rect(texture_size, src, false, Transform::Flipped270),
         Some(([0.75, 0.75], [0.0, -0.5], [-0.5, 0.0]))
+    );
+}
+
+#[test]
+fn map_output_rect_to_framebuffer_matches_pixman_compositor_space() {
+    let output_size = Size::<i32, Physical>::from((8, 6));
+    let dest = Rectangle::new((1, 2).into(), (3, 2).into());
+
+    assert_eq!(
+        map_output_rect_to_framebuffer(dest, output_size, Transform::Normal),
+        dest
+    );
+    assert_eq!(
+        map_output_rect_to_framebuffer(
+            Rectangle::new((1, 0).into(), (3, 2).into()),
+            output_size,
+            Transform::Flipped180
+        ),
+        Rectangle::new((1, 4).into(), (3, 2).into())
+    );
+    assert_eq!(
+        map_output_rect_to_framebuffer(dest, output_size, Transform::_180),
+        Rectangle::new((4, 2).into(), (3, 2).into())
+    );
+    assert_eq!(
+        map_output_rect_to_framebuffer(dest, output_size, Transform::_90),
+        Rectangle::new((4, 1).into(), (2, 3).into())
+    );
+}
+
+#[test]
+fn map_dest_relative_rects_to_framebuffer_keeps_identity_for_normal_frames() {
+    let output_size = Size::<i32, Physical>::from((8, 6));
+    let dest = Rectangle::new((2, 1).into(), (4, 3).into());
+    let damage = [Rectangle::new((1, 1).into(), (2, 1).into())];
+
+    assert_eq!(
+        map_dest_relative_rects_to_framebuffer(dest, &damage, output_size, Transform::Normal),
+        Some(vec![Rectangle::new((1, 1).into(), (2, 1).into())])
+    );
+}
+
+#[test]
+fn map_dest_relative_rects_to_framebuffer_flips_damage_with_output() {
+    let output_size = Size::<i32, Physical>::from((8, 6));
+    let dest = Rectangle::new((2, 0).into(), (4, 2).into());
+    let damage = [Rectangle::new((0, 0).into(), (2, 1).into())];
+
+    assert_eq!(
+        map_dest_relative_rects_to_framebuffer(dest, &damage, output_size, Transform::Flipped180),
+        Some(vec![Rectangle::new((0, 1).into(), (2, 1).into())])
     );
 }
 
@@ -17254,6 +17346,91 @@ fn runtime_frame_render_texture_flips_y_inverted_texture() {
                 &texture,
                 Rectangle::from_size((1.0, 2.0).into()),
                 Rectangle::from_size((1, 2).into()),
+                &full_damage,
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .unwrap();
+        assert!(frame.finish().unwrap().is_reached());
+    }
+
+    let readback = renderer.read_offscreen_render_target(&mut framebuffer).unwrap();
+    assert_eq!(readback, [0, 0, 255, 255, 255, 0, 0, 255]);
+}
+
+#[test]
+#[ignore = "requires a working Vulkan loader and physical device"]
+fn runtime_frame_render_texture_applies_flipped180_output_transform() {
+    let instance = Instance::new(Version::VERSION_1_3, None).unwrap();
+    let physical_device = PhysicalDevice::enumerate(&instance)
+        .unwrap()
+        .next()
+        .expect("No physical devices");
+
+    let mut renderer = VulkanRenderer::builder()
+        .with_physical_device(physical_device)
+        .build()
+        .unwrap();
+    let Some(render_format) = renderer
+        .capabilities()
+        .formats
+        .records
+        .iter()
+        .find(|record| {
+            record.format == Fourcc::Abgr8888
+                && record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.sampled
+                && record.usages.color_attachment
+                && record.usages.color_attachment_blend
+                && record.usages.transfer_src
+                && record.usages.transfer_dst
+        })
+        .map(|record| record.format)
+    else {
+        return;
+    };
+
+    let sampled_image = renderer
+        .device
+        .as_ref()
+        .unwrap()
+        .create_uploaded_sampled_image(
+            vk::Extent3D {
+                width: 1,
+                height: 2,
+                depth: 1,
+            },
+            super::get_render_vk_format(render_format).unwrap(),
+            &[255, 0, 0, 255, 0, 0, 255, 255],
+            TextureFilter::Nearest,
+            TextureFilter::Nearest,
+        )
+        .unwrap();
+    let texture = VulkanTexture::from_sampled_image(
+        renderer.context_id(),
+        (1, 2).into(),
+        render_format,
+        sampled_image,
+        false,
+    );
+    let mut target =
+        Offscreen::<VulkanRenderTarget<'static>>::create_buffer(&mut renderer, render_format, (1, 2).into())
+            .unwrap();
+    let mut framebuffer = Bind::bind(&mut renderer, &mut target).unwrap();
+
+    {
+        let compositor_size = Transform::Flipped180.transform_size(Size::<i32, Physical>::from((1, 2)));
+        let full_damage = [Rectangle::from_size(compositor_size)];
+        let mut frame = renderer
+            .render(&mut framebuffer, (1, 2).into(), Transform::Flipped180)
+            .unwrap();
+
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::from_size((1.0, 2.0).into()),
+                Rectangle::from_size(compositor_size),
                 &full_damage,
                 &[],
                 Transform::Normal,

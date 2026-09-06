@@ -39,7 +39,8 @@
 //! 7. clear frame
 //! 8. textured quad rendering
 //! 9. alpha blending
-//! 10. crop/scale/transform
+//! 10. crop/scale/transform (output `Frame` transforms use the same `Transform::transform_rect_in`
+//!     compositor-space mapping as pixman; crop/scale are dest/src rectangles)
 //! 11. readback test path
 //! 12. `ImportDma`
 //! 13. dmabuf modifier handling

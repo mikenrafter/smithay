@@ -1222,6 +1222,24 @@ impl TextureMapping for VulkanMemoryMapping {
     }
 }
 
+impl VulkanFrame<'_, '_> {
+    fn compositor_size(&self) -> Size<i32, Physical> {
+        self.transform.transform_size(self.output_size)
+    }
+
+    fn map_output_rect_to_framebuffer(&self, rect: Rectangle<i32, Physical>) -> Rectangle<i32, Physical> {
+        map_output_rect_to_framebuffer(rect, self.output_size, self.transform)
+    }
+
+    fn map_dest_relative_rects_to_framebuffer(
+        &self,
+        dest: Rectangle<i32, Physical>,
+        rects: &[Rectangle<i32, Physical>],
+    ) -> Option<Vec<Rectangle<i32, Physical>>> {
+        map_dest_relative_rects_to_framebuffer(dest, rects, self.output_size, self.transform)
+    }
+}
+
 impl Frame for VulkanFrame<'_, '_> {
     type Error = VulkanError;
     type TextureId = VulkanTexture;
@@ -1235,14 +1253,17 @@ impl Frame for VulkanFrame<'_, '_> {
             return Ok(());
         }
 
-        let full_target_clear = is_full_target_damage(self.output_size, at);
+        let compositor_size = self.compositor_size();
+        let full_target_clear = is_full_target_damage(compositor_size, at);
+        let framebuffer_damage = at
+            .iter()
+            .copied()
+            .map(|rect| self.map_output_rect_to_framebuffer(rect))
+            .collect::<Vec<_>>();
         let clear_areas = if full_target_clear {
             None
         } else {
-            if self.transform != Transform::Normal {
-                return Err(VulkanError::UnsupportedOperation("clear transform"));
-            }
-            let clear_areas = clear_damage_to_clear_areas(self.output_size, at)
+            let clear_areas = clear_damage_to_clear_areas(self.output_size, &framebuffer_damage)
                 .ok_or(VulkanError::UnsupportedOperation("clear damage"))?;
             if clear_areas.is_empty() {
                 return Ok(());
@@ -1286,11 +1307,13 @@ impl Frame for VulkanFrame<'_, '_> {
             return Ok(());
         }
 
-        if self.transform != Transform::Normal {
-            return Err(VulkanError::UnsupportedOperation("draw solid transform"));
-        }
-        let clear_areas = draw_solid_damage_to_clear_areas(self.output_size, dst, damage)
+        let framebuffer_dst = self.map_output_rect_to_framebuffer(dst);
+        let framebuffer_damage = self
+            .map_dest_relative_rects_to_framebuffer(dst, damage)
             .ok_or(VulkanError::UnsupportedOperation("draw solid damage"))?;
+        let clear_areas =
+            draw_solid_damage_to_clear_areas(self.output_size, framebuffer_dst, &framebuffer_damage)
+                .ok_or(VulkanError::UnsupportedOperation("draw solid damage"))?;
         if clear_areas.is_empty() {
             return Ok(());
         }
@@ -1298,7 +1321,7 @@ impl Frame for VulkanFrame<'_, '_> {
             return Err(VulkanError::UnsupportedOperation("draw solid damage"));
         }
         let draw_region = Rectangle::from_size(self.output_size)
-            .intersection(dst)
+            .intersection(framebuffer_dst)
             .ok_or(VulkanError::UnsupportedOperation("draw solid destination"))?;
         let draw_area = output_destination_to_vk_rect(self.output_size, draw_region)
             .ok_or(VulkanError::UnsupportedOperation("draw solid destination"))?;
@@ -1364,17 +1387,25 @@ impl Frame for VulkanFrame<'_, '_> {
         if !texture.sync_state()?.is_locally_usable() {
             return Err(VulkanError::UnsupportedOperation("dmabuf external ownership"));
         }
-        if self.transform != Transform::Normal {
-            return Err(VulkanError::UnsupportedOperation("render texture transform"));
-        }
-        let (uv_origin, uv_x_axis, uv_y_axis) =
-            source_to_uv_rect(texture.image.size, src, texture.y_inverted, src_transform)
-                .ok_or(VulkanError::UnsupportedOperation("render texture source"))?;
+        let framebuffer_dst = self.map_output_rect_to_framebuffer(dst);
+        let framebuffer_damage = self
+            .map_dest_relative_rects_to_framebuffer(dst, damage)
+            .ok_or(VulkanError::UnsupportedOperation("render texture damage"))?;
+        let framebuffer_opaque_regions = self
+            .map_dest_relative_rects_to_framebuffer(dst, opaque_regions)
+            .ok_or(VulkanError::UnsupportedOperation("render texture damage"))?;
+        let (uv_origin, uv_x_axis, uv_y_axis) = source_to_uv_rect(
+            texture.image.size,
+            src,
+            texture.y_inverted,
+            src_transform + self.transform,
+        )
+        .ok_or(VulkanError::UnsupportedOperation("render texture source"))?;
         if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
             return Err(VulkanError::UnsupportedOperation("render texture alpha"));
         }
         let Some((draw_area, uv_origin, uv_x_axis, uv_y_axis)) =
-            clip_render_texture_draw_area(self.output_size, dst, uv_origin, uv_x_axis, uv_y_axis)
+            clip_render_texture_draw_area(self.output_size, framebuffer_dst, uv_origin, uv_x_axis, uv_y_axis)
                 .ok_or(VulkanError::UnsupportedOperation("render texture destination"))?
         else {
             return Ok(());
@@ -1405,9 +1436,9 @@ impl Frame for VulkanFrame<'_, '_> {
         let force_opaque_alpha = get_format_info(texture_format)?.opaque_alpha;
         let (non_opaque_scissor_areas, opaque_scissor_areas) = render_texture_damage_to_scissor_areas(
             self.output_size,
-            dst,
-            damage,
-            opaque_regions,
+            framebuffer_dst,
+            &framebuffer_damage,
+            &framebuffer_opaque_regions,
             force_opaque_alpha && alpha == 1.0,
             alpha,
         )
@@ -1529,6 +1560,48 @@ impl Frame for VulkanFrame<'_, '_> {
 
 fn is_full_target_damage(output_size: Size<i32, Physical>, damage: &[Rectangle<i32, Physical>]) -> bool {
     damage.len() == 1 && damage[0] == Rectangle::from_size(output_size)
+}
+
+pub(super) fn map_output_rect_to_framebuffer(
+    rect: Rectangle<i32, Physical>,
+    output_size: Size<i32, Physical>,
+    transform: Transform,
+) -> Rectangle<i32, Physical> {
+    transform.transform_rect_in(rect, &transform.transform_size(output_size))
+}
+
+pub(super) fn map_dest_relative_rects_to_framebuffer(
+    dest: Rectangle<i32, Physical>,
+    rects: &[Rectangle<i32, Physical>],
+    output_size: Size<i32, Physical>,
+    transform: Transform,
+) -> Option<Vec<Rectangle<i32, Physical>>> {
+    let compositor_size = transform.transform_size(output_size);
+    let framebuffer_dest = transform.transform_rect_in(dest, &compositor_size);
+    let mut mapped = Vec::new();
+    for rect in rects {
+        if rect.size.w <= 0 || rect.size.h <= 0 {
+            continue;
+        }
+        let compositor_rect = Rectangle::new(
+            (
+                dest.loc.x.checked_add(rect.loc.x)?,
+                dest.loc.y.checked_add(rect.loc.y)?,
+            )
+                .into(),
+            rect.size,
+        );
+        let framebuffer_rect = transform.transform_rect_in(compositor_rect, &compositor_size);
+        mapped.push(Rectangle::new(
+            (
+                framebuffer_rect.loc.x - framebuffer_dest.loc.x,
+                framebuffer_rect.loc.y - framebuffer_dest.loc.y,
+            )
+                .into(),
+            framebuffer_rect.size,
+        ));
+    }
+    Some(mapped)
 }
 
 pub(super) fn clear_damage_to_clear_areas(
