@@ -68,8 +68,7 @@ impl DmabufHandler for AnvilState<WinitVulkanData> {
             .backend_data
             .backend
             .renderer()
-            .import_dmabuf(&dmabuf, None)
-            .is_ok()
+            .sampled_dmabuf_import_supported(&dmabuf)
         {
             let _ = notifier.successful::<AnvilState<WinitVulkanData>>();
         } else {
