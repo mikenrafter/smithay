@@ -15,7 +15,7 @@ use smithay::{
         SwapBuffersError,
         allocator::dmabuf::Dmabuf,
         renderer::{
-            ImportDma, ImportMemWl,
+            ImportMemWl,
             damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
             element::AsRenderElements,
             vulkan::VulkanRenderer,
@@ -149,7 +149,8 @@ pub fn run_winit_vulkan() {
     #[cfg(feature = "debug")]
     let mut fps_element = FpsElement::new(fps_texture);
 
-    let dmabuf_formats = backend.renderer().dmabuf_formats();
+    backend.renderer().set_wayland_linux_dmabuf_interop(true);
+    let dmabuf_formats = backend.renderer().wayland_sampled_dmabuf_formats();
     let main_device = backend
         .renderer()
         .physical_device()
