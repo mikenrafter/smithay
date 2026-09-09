@@ -49,7 +49,7 @@ use std::{
     os::unix::io::AsFd,
     sync::{Arc, Weak},
 };
-use tracing::{debug, warn};
+use tracing::warn;
 use wayland_protocols::wp::linux_drm_syncobj::v1::server::{
     wp_linux_drm_syncobj_manager_v1::{self, WpLinuxDrmSyncobjManagerV1},
     wp_linux_drm_syncobj_surface_v1::{self, WpLinuxDrmSyncobjSurfaceV1},
@@ -541,13 +541,14 @@ fn commit_hook<D: DrmSyncobjHandler>(data: &mut D, dh: &DisplayHandle, surface: 
             if data.drm_syncobj_install_acquire_point_source(dh, surface, &acquire_point, source) {
                 compositor::add_blocker(surface, blocker);
             } else if acquire_point.is_signaled() {
-                debug!(
+                warn!(
                     "DRM syncobj acquire point source was not installed, but acquire point is already signalled"
                 );
             } else {
                 // Pin-compatible: compositors that do not implement the hook own acquire waiting.
-                // Do not discard a protocol-valid commit. This is debug: the wait still happens.
-                debug!(
+                // Do not discard a protocol-valid commit. Keep this at warn so a failed
+                // install is visible in release cosmic-comp (release_max_level_info).
+                warn!(
                     "DRM syncobj acquire point source was not installed; compositor must wait (pin-compatible)"
                 );
             }
