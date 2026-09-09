@@ -1482,7 +1482,8 @@ fn drm_modifier_capability_lookup_requires_single_plane_color_attachment_target(
         &[(0, 0, 16)],
     );
     let ten_bit_import = VulkanDmabufImportState::from_dmabuf(&ten_bit_dmabuf).unwrap();
-    assert!(!caps.has_dmabuf_render_target_modifier_record(&ten_bit_import));
+    assert!(caps.has_dmabuf_render_target_modifier_record(&ten_bit_import));
+    assert!(caps.dmabuf_render_target_record(&ten_bit_import).is_some());
 
     let sampled_only_dmabuf = dmabuf_with_planes_for_tests(
         (4, 3).into(),
@@ -3688,6 +3689,19 @@ fn clear_color_value_preserves_format_alpha_semantics() {
         super::clear_color_value_for_format(Fourcc::Xrgb8888, Color32F::new(0.25, 0.5, 0.75, 0.5)).unwrap();
 
     assert_eq!(unsafe { opaque_clear.float32 }, [0.25, 0.5, 0.75, 1.0]);
+
+    #[cfg(target_endian = "little")]
+    {
+        let ten_bit_opaque =
+            super::clear_color_value_for_format(Fourcc::Xrgb2101010, Color32F::new(0.25, 0.5, 0.75, 0.5))
+                .unwrap();
+        assert_eq!(unsafe { ten_bit_opaque.float32 }, [0.25, 0.5, 0.75, 1.0]);
+
+        let ten_bit_alpha =
+            super::clear_color_value_for_format(Fourcc::Argb2101010, Color32F::new(0.25, 0.5, 0.75, 0.5))
+                .unwrap();
+        assert_eq!(unsafe { ten_bit_alpha.float32 }, [0.25, 0.5, 0.75, 0.5]);
+    }
 }
 
 #[test]
@@ -14285,7 +14299,7 @@ fn public_bind_supported_formats_filter_provisional_render_target_capabilities()
         code: Fourcc::Abgr8888,
         modifier: Modifier::Invalid,
     }));
-    assert!(!formats.contains(&Format {
+    assert!(formats.contains(&Format {
         code: Fourcc::Xrgb2101010,
         modifier: Modifier::Invalid,
     }));
@@ -14298,9 +14312,10 @@ fn public_bind_supported_formats_filter_provisional_render_target_capabilities()
         modifier: Modifier::Invalid,
     }));
     assert!(renderer.render_target_format_supported(Fourcc::Abgr8888));
-    assert!(!renderer.render_target_format_supported(Fourcc::Xrgb2101010));
+    assert!(renderer.render_target_format_supported(Fourcc::Xrgb2101010));
     assert!(!renderer.render_target_format_supported(Fourcc::Argb8888));
     assert!(!renderer.render_target_format_supported(Fourcc::Xrgb8888));
+    assert!(renderer.capabilities.formats.has_10bit_render_targets());
 }
 
 #[test]
@@ -16770,11 +16785,9 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         caps.rendering.dmabuf_target_development,
         has_dmabuf_render_target_formats
     );
-    assert!(
-        caps.formats
-            .dmabuf_render_target
-            .iter()
-            .all(|format| matches!(is_10bit(format.code), Ok(false)))
+    assert_eq!(
+        caps.rendering.render_target_10bit,
+        caps.formats.has_10bit_render_targets()
     );
     assert!(!caps.sync.explicit);
     if let Some(record) = caps
@@ -16986,11 +16999,9 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
     );
     assert!(renderer.dmabuf_formats().iter().next().is_none());
     assert!(caps.formats.dmabuf_export.iter().next().is_none());
-    assert!(
-        caps.formats
-            .dmabuf_render_target
-            .iter()
-            .all(|format| matches!(is_10bit(format.code), Ok(false)))
+    assert_eq!(
+        caps.rendering.render_target_10bit,
+        caps.formats.has_10bit_render_targets()
     );
     drop(renderer);
     drop(retained_offscreen_target);
@@ -18737,10 +18748,11 @@ fn runtime_format_discovery_finds_device_backed_formats_without_import_export() 
         })
     }));
     assert!(caps.dmabuf_export.iter().next().is_none());
-    assert!(
-        caps.dmabuf_render_target
+    assert_eq!(
+        caps.has_10bit_render_targets(),
+        caps.render_target_formats()
             .iter()
-            .all(|format| matches!(is_10bit(format.code), Ok(false)))
+            .any(|format| matches!(is_10bit(format.code), Ok(true)))
     );
 }
 

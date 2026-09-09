@@ -9,7 +9,7 @@ use crate::backend::{
 
 use super::{
     VulkanError,
-    format::{get_format_info, renderer_format_infos},
+    format::{get_format_info, is_10bit, renderer_format_infos},
     image::VulkanDmabufImportState,
 };
 
@@ -184,8 +184,7 @@ impl VulkanFormatCapabilities {
                     .unwrap_or_default()
                 {
                     let record = modifier_record_from_properties(info.fourcc, modifier_properties);
-                    let is_importable_render_target = !info.is_10bit
-                        && record.plane_count == 1
+                    let is_importable_render_target = record.plane_count == 1
                         && record.usages.color_attachment
                         && record.usages.color_attachment_blend
                         && dmabuf_render_target_external_importable(
@@ -227,9 +226,7 @@ impl VulkanFormatCapabilities {
             .iter()
             .filter(|record| {
                 record.tiling == VulkanFormatTiling::Optimal
-                    && get_format_info(record.format)
-                        .map(|info| !info.is_10bit)
-                        .unwrap_or(false)
+                    && get_format_info(record.format).is_ok()
                     && record.usages.color_attachment
                     && record.usages.color_attachment_blend
                     && record.usages.transfer_src
@@ -240,6 +237,12 @@ impl VulkanFormatCapabilities {
                 modifier: Modifier::Invalid,
             })
             .collect()
+    }
+
+    pub(crate) fn has_10bit_render_targets(&self) -> bool {
+        self.render_target_formats()
+            .iter()
+            .any(|format| matches!(is_10bit(format.code), Ok(true)))
     }
 
     #[allow(dead_code)]
@@ -263,9 +266,7 @@ impl VulkanFormatCapabilities {
         self.modifier_records.iter().find(|record| {
             record.format == import.format()
                 && record.modifier == import.modifier()
-                && get_format_info(record.format)
-                    .map(|info| !info.is_10bit)
-                    .unwrap_or(false)
+                && get_format_info(record.format).is_ok()
                 && record.plane_count == 1
                 && record.plane_count as usize == import.plane_count()
                 && record.usages.color_attachment

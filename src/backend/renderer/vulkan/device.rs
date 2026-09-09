@@ -726,6 +726,7 @@ impl VulkanDeviceState {
             .next()
             .is_some();
         capabilities.rendering.offscreen = has_public_render_target_formats;
+        capabilities.rendering.render_target_10bit = capabilities.formats.has_10bit_render_targets();
         capabilities.rendering.blit = capabilities.formats.records.iter().any(|record| {
             record.tiling == super::VulkanFormatTiling::Optimal
                 && record.usages.color_attachment
@@ -4536,7 +4537,9 @@ fn record_dmabuf_render_target_foreign_acquire_barrier(
         preserve_contents,
     )?
     else {
-        return Ok(false);
+        // Already locally usable: no queue-family acquire is required. Treating this as
+        // failure made public Bind<Dmabuf> report "dmabuf external ownership" on re-bind.
+        return Ok(image.sync_state()?.is_locally_usable());
     };
 
     let restore = image

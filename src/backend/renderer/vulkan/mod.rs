@@ -50,7 +50,8 @@
 //! 16. explicit sync
 //! 17. blit/copy (same-device framebuffer `Blit` + sampled `ExportMem::copy_texture`)
 //! 18. multi-GPU integration
-//! 19. colour-capable render targets
+//! 19. colour-capable render targets (10-bit UNORM scanout/offscreen when probed;
+//!     no silent 10-to-8 product fallback)
 //! 20. HDR-ready hooks
 //!
 //! Every future feature should follow this pattern: capability flag first, test second, stub
