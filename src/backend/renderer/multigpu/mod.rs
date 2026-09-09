@@ -2439,6 +2439,38 @@ where
     }
 }
 
+/// Sample a Wayland dmabuf on the render GPU through [`ImportDmaWl`].
+///
+/// Generic [`ImportDma`] is fail-closed on [`super::vulkan::VulkanRenderer`]. The GLES
+/// copy path in [`import_dmabuf_internal`] still exists as a fallback when this import
+/// cannot sample the buffer on the compositor GPU (typically a foreign-node modifier).
+#[cfg(feature = "wayland_frontend")]
+fn import_wayland_dmabuf_on_render_device<R, T>(
+    render: &mut R::Device,
+    buffer: &super::utils::Buffer,
+    surface: Option<&SurfaceData>,
+    dmabuf: &Dmabuf,
+    damage: &[Rectangle<i32, BufferCoords>],
+) -> Result<MultiTexture, Error<R, T>>
+where
+    R: GraphicsApi + 'static,
+    <R::Device as ApiDevice>::Renderer: ImportDmaWl,
+    <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
+    T: GraphicsApi + 'static,
+{
+    let mut texture = MultiTexture::from_surface(surface, dmabuf.size(), dmabuf.format());
+    let texture_ref = texture.0.clone();
+    let renderer = render.renderer_mut();
+    let imported = renderer
+        .import_dma_buffer_from_surface_state(buffer, surface, damage)
+        .map_err(Error::Render)?;
+    texture.insert_texture::<R>(&renderer.context_id(), imported);
+    if let Some(surface) = surface {
+        surface.data_map.insert_if_missing_threadsafe(|| texture_ref);
+    }
+    Ok(texture)
+}
+
 #[cfg(feature = "wayland_frontend")]
 impl<R: GraphicsApi, T: GraphicsApi> ImportDmaWl for MultiRenderer<'_, '_, R, T>
 where
@@ -2495,24 +2527,31 @@ where
         let Some(node) = dmabuf.node() else {
             return self.import_dma_buffer(buffer, surface, damage);
         };
-        if node != *self.render.node() {
-            return self.import_dma_buffer(buffer, surface, damage);
+        if node == *self.render.node() {
+            return import_wayland_dmabuf_on_render_device::<R, T>(
+                self.render,
+                buffer,
+                surface,
+                dmabuf,
+                damage,
+            );
         }
 
-        let mut texture = MultiTexture::from_surface(surface, dmabuf.size(), dmabuf.format());
-        let texture_ref = texture.0.clone();
-
-        let renderer = self.render.renderer_mut();
-        let imported = renderer
-            .import_dma_buffer_from_surface_state(buffer, surface, damage)
-            .map_err(Error::Render)?;
-        texture.insert_texture::<R>(&renderer.context_id(), imported);
-
-        if let Some(surface) = surface {
-            surface.data_map.insert_if_missing_threadsafe(|| texture_ref);
+        // Foreign-node clients (NVIDIA PRIME, etc.): sample on the compositor GPU first.
+        // Vulkan has no blit copy path; generic ImportDma stays fail-closed.
+        match import_wayland_dmabuf_on_render_device::<R, T>(self.render, buffer, surface, dmabuf, damage) {
+            Ok(texture) => Ok(texture),
+            Err(err) => {
+                debug!(
+                    ?err,
+                    src = ?node,
+                    render = ?self.render.node(),
+                    format = ?dmabuf.format(),
+                    "sampled dmabuf import on render gpu failed; trying src-node copy"
+                );
+                self.import_dma_buffer(buffer, surface, damage)
+            }
         }
-
-        Ok(texture)
     }
 }
 
@@ -4057,26 +4096,35 @@ where
         let Some(node) = dmabuf.node() else {
             return self.import_dma_buffer(buffer, surface, damage);
         };
-        if node != *(unsafe { &*self.render }.node()) {
-            return self.import_dma_buffer(buffer, surface, damage);
+        if node == *unsafe { &*self.render }.node() {
+            return import_wayland_dmabuf_on_render_device::<R, T>(
+                unsafe { *self.render },
+                buffer,
+                surface,
+                dmabuf,
+                damage,
+            );
         }
 
-        let mut texture = MultiTexture::from_surface(surface, dmabuf.size(), dmabuf.format());
-        let texture_ref = texture.0.clone();
-
-        let context_id = self.guard.as_ref().context_id();
-        let imported = self
-            .guard
-            .as_mut()
-            .import_dma_buffer_from_surface_state(buffer, surface, damage)
-            .map_err(Error::Render)?;
-        texture.insert_texture::<R>(&context_id, imported);
-
-        if let Some(surface) = surface {
-            surface.data_map.insert_if_missing_threadsafe(|| texture_ref);
+        match import_wayland_dmabuf_on_render_device::<R, T>(
+            unsafe { *self.render },
+            buffer,
+            surface,
+            dmabuf,
+            damage,
+        ) {
+            Ok(texture) => Ok(texture),
+            Err(err) => {
+                debug!(
+                    ?err,
+                    src = ?node,
+                    render = ?unsafe { &*self.render }.node(),
+                    format = ?dmabuf.format(),
+                    "sampled dmabuf import on render gpu failed; trying src-node copy"
+                );
+                self.import_dma_buffer(buffer, surface, damage)
+            }
         }
-
-        Ok(texture)
     }
 }
 

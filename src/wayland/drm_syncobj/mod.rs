@@ -49,7 +49,7 @@ use std::{
     os::unix::io::AsFd,
     sync::{Arc, Weak},
 };
-use tracing::warn;
+use tracing::{debug, warn};
 use wayland_protocols::wp::linux_drm_syncobj::v1::server::{
     wp_linux_drm_syncobj_manager_v1::{self, WpLinuxDrmSyncobjManagerV1},
     wp_linux_drm_syncobj_surface_v1::{self, WpLinuxDrmSyncobjSurfaceV1},
@@ -541,13 +541,13 @@ fn commit_hook<D: DrmSyncobjHandler>(data: &mut D, dh: &DisplayHandle, surface: 
             if data.drm_syncobj_install_acquire_point_source(dh, surface, &acquire_point, source) {
                 compositor::add_blocker(surface, blocker);
             } else if acquire_point.is_signaled() {
-                warn!(
+                debug!(
                     "DRM syncobj acquire point source was not installed, but acquire point is already signalled"
                 );
             } else {
-                // Pin-compatible: cosmic-comp and other compositors that do not implement the
-                // hook own acquire waiting. Do not discard a protocol-valid commit.
-                warn!(
+                // Pin-compatible: compositors that do not implement the hook own acquire waiting.
+                // Do not discard a protocol-valid commit. This is debug: the wait still happens.
+                debug!(
                     "DRM syncobj acquire point source was not installed; compositor must wait (pin-compatible)"
                 );
             }
@@ -2905,11 +2905,17 @@ mod tests {
         incoming.merge_into(&mut current, &dh);
 
         assert!(same_sync_point(
-            current.acquire_point.as_ref().expect("acquire should be replaced"),
+            current
+                .acquire_point
+                .as_ref()
+                .expect("acquire should be replaced"),
             &new_acquire
         ));
         assert!(same_sync_point(
-            current.release_point.as_ref().expect("release should be replaced"),
+            current
+                .release_point
+                .as_ref()
+                .expect("release should be replaced"),
             &new_release
         ));
     }
@@ -2934,11 +2940,17 @@ mod tests {
         // Pin merge_into only replaced when both points were present. An empty
         // committed pair is still a no-op.
         assert!(same_sync_point(
-            current.acquire_point.as_ref().expect("empty merge must keep acquire"),
+            current
+                .acquire_point
+                .as_ref()
+                .expect("empty merge must keep acquire"),
             &acquire
         ));
         assert!(same_sync_point(
-            current.release_point.as_ref().expect("empty merge must keep release"),
+            current
+                .release_point
+                .as_ref()
+                .expect("empty merge must keep release"),
             &release
         ));
     }
@@ -3127,14 +3139,11 @@ mod tests {
         };
         let cancel_once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let cancel_once_for_hook = cancel_once.clone();
-        compositor::add_pre_commit_hook::<ProtocolServerState, _>(
-            &surface,
-            move |_data, _dh, surface| {
-                if cancel_once_for_hook.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                    compositor::add_blocker(surface, CancelledBlocker);
-                }
-            },
-        );
+        compositor::add_pre_commit_hook::<ProtocolServerState, _>(&surface, move |_data, _dh, surface| {
+            if cancel_once_for_hook.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                compositor::add_blocker(surface, CancelledBlocker);
+            }
+        });
         let buffer = protocol_dmabuf_buffer(&server_client, &display_handle);
 
         compositor::test_utils::commit_buffer_assignment(
