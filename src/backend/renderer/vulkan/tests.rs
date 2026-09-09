@@ -2673,6 +2673,18 @@ fn dmabuf_render_target_foreign_barriers_distinguish_discard_and_preserve_acquir
             "dmabuf render-target still locally owned"
         ))
     ));
+    let mut already_unknown = fresh_import_sync;
+    already_unknown
+        .forget_known_foreign_layout_for_discard_reacquire()
+        .unwrap();
+    assert_eq!(
+        already_unknown.external_ownership(),
+        VulkanExternalImageOwnership::ForeignUnknown
+    );
+    assert_eq!(
+        plan_dmabuf_render_target_foreign_acquire_barrier(&released_sync, 2, usage, true).unwrap(),
+        Some(preserve_acquire)
+    );
     assert!(matches!(
         dmabuf_render_target_foreign_acquire_barrier(vk::ImageLayout::PREINITIALIZED, 2, usage),
         Err(VulkanError::UnsupportedOperation("dmabuf external layout"))
@@ -3860,12 +3872,14 @@ fn public_dmabuf_bind_uses_discard_acquire_path() {
         <VulkanRenderer as Bind<Dmabuf>>::bind(&mut renderer, &mut dmabuf),
         Err(VulkanError::VulkanUnavailable)
     ));
+    assert_eq!(renderer.dmabuf_render_target_image_cache_len_for_tests(), 0);
     assert!(matches!(
         // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
         // Vulkan import or ownership-transfer operation can occur.
         unsafe { renderer.create_acquired_dmabuf_render_target(&dmabuf, false, None) },
         Err(VulkanError::VulkanUnavailable)
     ));
+    assert_eq!(renderer.dmabuf_render_target_image_cache_len_for_tests(), 0);
     assert!(matches!(
         // SAFETY: This scaffold renderer has no Vulkan device, so the helper returns before any
         // sync-point wait, Vulkan import, or ownership-transfer operation can occur.
@@ -3892,6 +3906,7 @@ fn public_dmabuf_bind_uses_discard_acquire_path() {
         unsafe { renderer.bind_dmabuf_render_target(&mut dmabuf, preserve_acquire) },
         Err(VulkanError::VulkanUnavailable)
     ));
+    assert_eq!(renderer.dmabuf_render_target_image_cache_len_for_tests(), 0);
 
     let mut discard_target = unsafe {
         // SAFETY: This scaffold renderer has no Vulkan device, so binding the wrapper returns before
