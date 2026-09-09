@@ -796,6 +796,38 @@ pub trait ApiDevice: fmt::Debug {
     fn should_do_cross_device_exports(&self) -> bool {
         true
     }
+
+    /// Formats this renderer can sample from a compositor-owned dmabuf after the source
+    /// GPU released it. Not public client [`ImportDma`] advertisement.
+    fn compositor_owned_sampled_dmabuf_formats(&self) -> FormatSet
+    where
+        Self::Renderer: ImportDma,
+    {
+        ImportDma::dmabuf_formats(self.renderer())
+    }
+
+    /// Whether [`ApiDevice::import_released_compositor_dmabuf`] can import a buffer the
+    /// source GPU just released to foreign ownership. Independent of generic client
+    /// [`ImportDma`].
+    fn can_import_released_compositor_dmabuf(&self) -> bool {
+        false
+    }
+
+    /// Import a compositor-owned dmabuf after the source renderer released it.
+    ///
+    /// Default is generic [`ImportDma`], which GLES uses for EGL images. Vulkan keeps
+    /// generic client import fail-closed and overrides this with the known-GENERAL
+    /// compositor-owned path.
+    fn import_released_compositor_dmabuf(
+        &mut self,
+        dmabuf: &Dmabuf,
+        _acquire: Option<&SyncPoint>,
+    ) -> Result<<Self::Renderer as RendererSuper>::TextureId, <Self::Renderer as RendererSuper>::Error>
+    where
+        Self::Renderer: ImportDma,
+    {
+        self.renderer_mut().import_dmabuf(dmabuf, None)
+    }
 }
 
 /// Renderer, that transparently copies rendering results to another gpu,
@@ -2963,6 +2995,142 @@ where
     Ok(())
 }
 
+/// GPU copy for renderers that cannot import a dmabuf until the source has released it.
+///
+/// GLES `dma_shadow_copy` imports first (EGL images stay live). Vulkan generic `ImportDma`
+/// is fail-closed, so the compositor-owned path draws on the source GPU, `Frame::finish`
+/// releases FOREIGN+GENERAL, then the target imports that evidence.
+fn dma_release_then_import_copy<S, T>(
+    src_texture: &<<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
+    damage: Option<&[Rectangle<i32, BufferCoords>]>,
+    slot: &mut Option<(Dmabuf, Box<dyn Any + 'static>, Option<SyncPoint>)>,
+    src: &mut S::Device,
+    mut target: Option<&mut T::Device>,
+    transfer_format: Option<Fourcc>,
+) -> Result<(), Error<S, T>>
+where
+    S: GraphicsApi,
+    T: GraphicsApi,
+    <S::Device as ApiDevice>::Renderer: Renderer + ImportDma + Bind<Dmabuf>,
+    <T::Device as ApiDevice>::Renderer: Renderer + ImportDma,
+    <<S::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
+    <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
+{
+    let Some(target_device) = target.as_mut() else {
+        return Err(Error::ImportFailed);
+    };
+    if !target_device.can_import_released_compositor_dmabuf() || !src.should_do_cross_device_exports() {
+        return Err(Error::ImportFailed);
+    }
+
+    let format = src_texture.format().unwrap_or(Fourcc::Abgr8888);
+    let is_new_buffer = slot.is_none();
+    if is_new_buffer {
+        let read_formats = target_device.compositor_owned_sampled_dmabuf_formats();
+        let write_formats = Bind::<Dmabuf>::supported_formats(src.renderer()).ok_or(Error::ImportFailed)?;
+        let candidates = read_formats
+            .intersection(&write_formats)
+            .filter(|f| f.modifier != Modifier::Invalid)
+            .copied()
+            .collect::<FormatSet>();
+
+        if candidates.indexset().is_empty() {
+            return Err(Error::ImportFailed);
+        }
+
+        let transfer_format = match transfer_format {
+            Some(fmt) if candidates.iter().any(|f| f.code == fmt) => fmt,
+            Some(_) => return Err(Error::ImportFailed),
+            None => {
+                if candidates.iter().any(|f| f.code == format) {
+                    format
+                } else {
+                    let bpp = get_bpp(format).unwrap_or(8);
+                    if let Some(f) = candidates
+                        .iter()
+                        .find(|f| get_bpp(f.code).is_some_and(|val| val == bpp))
+                    {
+                        f.code
+                    } else {
+                        candidates
+                            .iter()
+                            .find(|f| get_bpp(f.code).is_some_and(|val| val == 8))
+                            .map(|f| f.code)
+                            .ok_or(Error::ImportFailed)?
+                    }
+                }
+            }
+        };
+
+        let modifiers = candidates
+            .into_iter()
+            .filter(|f| f.code == transfer_format)
+            .map(|f| f.modifier)
+            .collect::<Vec<_>>();
+        if modifiers.is_empty() {
+            return Err(Error::ImportFailed);
+        }
+
+        let shadow_buffer = src
+            .allocator()
+            .create_buffer(
+                src_texture.width(),
+                src_texture.height(),
+                transfer_format,
+                &modifiers,
+            )
+            .map_err(Error::AllocatorError)?;
+        slot.replace((shadow_buffer, Box::new(()) as Box<dyn Any + 'static>, None));
+    }
+
+    let (shadow_buffer, target_texture, existing_sync_point) = slot.as_mut().unwrap();
+    let src_renderer = src.renderer_mut();
+    if let Some(sync) = existing_sync_point.take() {
+        if let Err(err) = src_renderer.wait(&sync) {
+            debug!(?err, "Unable to wait for existing sync_point, blocking..");
+            let _ = sync.wait();
+        }
+    }
+    let mut framebuffer = src_renderer.bind(shadow_buffer).map_err(Error::Render)?;
+    let shadow_size = Size::from((src_texture.width() as i32, src_texture.height() as i32));
+    let mut frame = src_renderer
+        .render(&mut framebuffer, shadow_size, Transform::Normal)
+        .map_err(Error::Render)?;
+
+    let damage_slice = [Rectangle::from_size(shadow_size)];
+    let damage = unsafe {
+        std::mem::transmute::<Option<&[Rectangle<i32, BufferCoords>]>, Option<&[Rectangle<i32, Physical>]>>(
+            damage,
+        )
+    }
+    .filter(|_| !is_new_buffer)
+    .unwrap_or(&damage_slice);
+
+    frame
+        .clear(Color32F::TRANSPARENT, damage)
+        .map_err(Error::Render)?;
+    frame
+        .render_texture_from_to(
+            src_texture,
+            Rectangle::from_size(src_texture.size()).to_f64(),
+            Rectangle::from_size(shadow_size),
+            damage,
+            &[],
+            Transform::Normal,
+            1.0,
+        )
+        .map_err(Error::Render)?;
+    let release_sync = frame.finish().map_err(Error::Render)?;
+    drop(framebuffer);
+
+    let imported = target_device
+        .import_released_compositor_dmabuf(shadow_buffer, Some(&release_sync))
+        .map_err(Error::Target)?;
+    *target_texture = Box::new(imported) as Box<dyn Any + 'static>;
+    *existing_sync_point = Some(release_sync);
+    Ok(())
+}
+
 type BoxedTextureMappingAndDamage<S> = (
     Box<<<<S as GraphicsApi>::Device as ApiDevice>::Renderer as ExportMem>::TextureMapping>,
     Rectangle<i32, BufferCoords>,
@@ -3191,7 +3359,23 @@ where
             sync,
         }) => {
             let mut slot = Some((dmabuf, texture, sync));
-            let res = dma_shadow_copy::<S, T>(src_texture, damage, &mut slot, src, Some(target), None);
+            let res = match dma_shadow_copy::<S, T>(src_texture, damage, &mut slot, src, Some(target), None) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    trace!(
+                        ?err,
+                        "Dma shadow copy failed, trying compositor-owned release-then-import"
+                    );
+                    dma_release_then_import_copy::<S, T>(
+                        src_texture,
+                        damage,
+                        &mut slot,
+                        src,
+                        Some(target),
+                        None,
+                    )
+                }
+            };
             *target_texture = slot.map(|(dmabuf, texture, sync)| GpuSingleTexture::Dma {
                 texture,
                 dmabuf,
@@ -3201,7 +3385,22 @@ where
         }
         None => {
             let mut slot = None;
-            match dma_shadow_copy::<S, T>(src_texture, damage, &mut slot, src, Some(target), None) {
+            match dma_shadow_copy::<S, T>(src_texture, damage, &mut slot, src, Some(target), None).or_else(
+                |err| {
+                    trace!(
+                        ?err,
+                        "Dma shadow copy failed, trying compositor-owned release-then-import"
+                    );
+                    dma_release_then_import_copy::<S, T>(
+                        src_texture,
+                        damage,
+                        &mut slot,
+                        src,
+                        Some(target),
+                        None,
+                    )
+                },
+            ) {
                 Ok(()) => {
                     *target_texture = slot.map(|(dmabuf, texture, sync)| GpuSingleTexture::Dma {
                         texture: texture as Box<dyn Any + 'static>,

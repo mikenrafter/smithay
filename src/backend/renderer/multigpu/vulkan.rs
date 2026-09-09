@@ -18,12 +18,13 @@ use crate::backend::{
     allocator::{
         Allocator,
         dmabuf::{AnyError, Dmabuf, DmabufAllocator},
+        format::FormatSet,
         gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
     },
     drm::{CreateDrmNodeError, DrmNode},
     renderer::{
         multigpu::{ApiDevice, Error as MultiError, GraphicsApi},
-        vulkan::{VulkanError, VulkanRenderer},
+        vulkan::{VulkanError, VulkanRenderer, VulkanTexture},
     },
     vulkan::{Instance, InstanceError, PhysicalDevice},
 };
@@ -240,6 +241,37 @@ impl ApiDevice for VulkanGbmDevice {
 
     fn can_do_cross_device_imports(&self) -> bool {
         false
+    }
+
+    fn compositor_owned_sampled_dmabuf_formats(&self) -> FormatSet {
+        self.renderer.capabilities().formats.dmabuf_import.clone()
+    }
+
+    fn can_import_released_compositor_dmabuf(&self) -> bool {
+        self.renderer.capabilities().rendering.dmabuf_targets
+            && self
+                .renderer
+                .capabilities()
+                .formats
+                .dmabuf_import
+                .iter()
+                .next()
+                .is_some()
+    }
+
+    fn import_released_compositor_dmabuf(
+        &mut self,
+        dmabuf: &Dmabuf,
+        acquire: Option<&crate::backend::renderer::sync::SyncPoint>,
+    ) -> Result<VulkanTexture, VulkanError> {
+        // SAFETY: The MultiRenderer hybrid copy path binds this compositor-owned dmabuf on
+        // the source GPU, draws, and `Frame::finish` releases it to FOREIGN+GENERAL before
+        // this import. Generic client `ImportDma` stays fail-closed.
+        unsafe {
+            self.renderer
+                .import_dmabuf_texture_with_known_general_layout(dmabuf, acquire)
+        }?
+        .ok_or(VulkanError::MissingCapability("compositor-owned sampled dmabuf"))
     }
 }
 
