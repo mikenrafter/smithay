@@ -16,7 +16,8 @@
 //! most complete path. Explicit dmabuf render-target wrappers remain ownership-contract APIs on
 //! [`VulkanRenderer::bind_dmabuf_render_target`]. Public [`Bind<Dmabuf>`] is the compositor GBM
 //! scanout path: wait for the buffer's implicit WRITE sync-file (KMS readers+writers), then
-//! discard/full-repaint acquire. It is not sampled client import. Generic
+//! discard/full-repaint acquire from `UNDEFINED`. Cached GBM images forget known-GENERAL after
+//! KMS; preserve is not inferred from scanout. It is not sampled client import. Generic
 //! texture `ExportMem`, `ExportDma`, broad explicit sync, blit/copy, and full presentation remain
 //! unsupported until their corresponding capability bits can become true with coverage. Sampled dmabuf
 //! import is validation-stage implemented for the normal `ImportDmaWl` path when callers provide
@@ -2635,6 +2636,7 @@ pub struct VulkanRenderer {
     capabilities: VulkanRendererCapabilities,
     device: Option<VulkanDeviceState>,
     sampled_dmabuf_layout_history: HashMap<WeakDmabuf, SampledDmabufWaylandLayoutHistoryRecord>,
+    dmabuf_render_target_images: HashMap<WeakDmabuf, device::VulkanOwnedImage>,
     pending_sampled_dmabuf_import_obligations: Vec<PendingSampledDmabufImportObligation>,
     wayland_linux_dmabuf_interop: bool,
 }
@@ -2690,6 +2692,7 @@ impl VulkanRendererBuilder {
             capabilities,
             device: Some(device),
             sampled_dmabuf_layout_history: HashMap::new(),
+            dmabuf_render_target_images: HashMap::new(),
             pending_sampled_dmabuf_import_obligations: Vec::new(),
             wayland_linux_dmabuf_interop: false,
         })
@@ -3552,6 +3555,7 @@ impl VulkanRenderer {
             capabilities: VulkanRendererCapabilities::default(),
             device: None,
             sampled_dmabuf_layout_history: HashMap::new(),
+            dmabuf_render_target_images: HashMap::new(),
             pending_sampled_dmabuf_import_obligations: Vec::new(),
             wayland_linux_dmabuf_interop: false,
         }
@@ -3607,6 +3611,11 @@ impl VulkanRenderer {
     #[allow(dead_code)]
     fn prune_sampled_dmabuf_layout_history(&mut self) {
         self.sampled_dmabuf_layout_history
+            .retain(|dmabuf, _| !dmabuf.is_gone());
+    }
+
+    fn prune_dmabuf_render_target_images(&mut self) {
+        self.dmabuf_render_target_images
             .retain(|dmabuf, _| !dmabuf.is_gone());
     }
 
@@ -5562,17 +5571,44 @@ impl VulkanRenderer {
     ) -> Result<Option<VulkanRenderTarget<'target>>, VulkanError> {
         self.validate_no_pending_sampled_dmabuf_import_obligation(dmabuf)?;
         let import = validate_dmabuf_render_target_metadata(dmabuf)?;
-        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
-        let Some(color_image) = (unsafe {
-            // SAFETY: Forwarded from this method's caller.
-            device.create_acquired_dmabuf_render_target_image_with_sync_point(
-                dmabuf,
-                preserve_contents,
-                acquire_sync,
-            )
-        })?
-        else {
-            return Ok(None);
+        self.prune_dmabuf_render_target_images();
+        let cache_key = dmabuf.weak();
+        let color_image = if let Some(cached) = self.dmabuf_render_target_images.get(&cache_key).cloned() {
+            if cached.sync_state()?.is_locally_usable() {
+                return Err(VulkanError::UnsupportedOperation(
+                    "dmabuf render-target still locally owned",
+                ));
+            }
+            if !preserve_contents {
+                cached.forget_known_foreign_layout_for_discard_reacquire()?;
+            }
+            let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+            // SAFETY: Forwarded from this method's caller. Discard re-bind forgets known-GENERAL
+            // because KMS may have used the buffer; preserve keeps the known-GENERAL contract.
+            unsafe {
+                device.acquire_dmabuf_render_target_image_with_sync_point(
+                    &cached,
+                    preserve_contents,
+                    acquire_sync,
+                )
+            }?;
+            cached
+        } else {
+            let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+            let Some(color_image) = (unsafe {
+                // SAFETY: Forwarded from this method's caller.
+                device.create_acquired_dmabuf_render_target_image_with_sync_point(
+                    dmabuf,
+                    preserve_contents,
+                    acquire_sync,
+                )
+            })?
+            else {
+                return Ok(None);
+            };
+            self.dmabuf_render_target_images
+                .insert(cache_key, color_image.clone());
+            color_image
         };
 
         Ok(Some(VulkanRenderTarget::from_acquired_dmabuf_render_target(

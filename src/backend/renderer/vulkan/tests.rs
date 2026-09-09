@@ -2647,6 +2647,32 @@ fn dmabuf_render_target_foreign_barriers_distinguish_discard_and_preserve_acquir
         plan_dmabuf_render_target_foreign_acquire_barrier(&local_sync, 2, usage, true).unwrap(),
         None
     );
+
+    let mut kms_intervened = released_sync;
+    kms_intervened
+        .forget_known_foreign_layout_for_discard_reacquire()
+        .unwrap();
+    assert_eq!(
+        kms_intervened.external_ownership(),
+        VulkanExternalImageOwnership::ForeignUnknown
+    );
+    assert!(kms_intervened.external_acquire_pending());
+    assert_eq!(
+        plan_dmabuf_render_target_foreign_acquire_barrier(&kms_intervened, 2, usage, false).unwrap(),
+        Some(discard_acquire)
+    );
+    assert!(matches!(
+        plan_dmabuf_render_target_foreign_acquire_barrier(&kms_intervened, 2, usage, true),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    assert!(matches!(
+        local_sync
+            .clone()
+            .forget_known_foreign_layout_for_discard_reacquire(),
+        Err(VulkanError::UnsupportedOperation(
+            "dmabuf render-target still locally owned"
+        ))
+    ));
     assert!(matches!(
         dmabuf_render_target_foreign_acquire_barrier(vk::ImageLayout::PREINITIALIZED, 2, usage),
         Err(VulkanError::UnsupportedOperation("dmabuf external layout"))

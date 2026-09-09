@@ -479,6 +479,54 @@ impl VulkanImageSyncState {
         )
     }
 
+    /// Drop a known-GENERAL foreign layout after intervening non-Vulkan access (KMS scanout).
+    ///
+    /// Public [`crate::backend::renderer::Bind<Dmabuf>`] discard-acquires from `UNDEFINED` after
+    /// waiting for the implicit WRITE fence. KMS does not prove `GENERAL`, so a cached image that
+    /// we previously released as known-GENERAL must forget that layout before the next discard
+    /// acquire. Preserve acquires must not call this.
+    pub(crate) fn forget_known_foreign_layout_for_discard_reacquire(&mut self) -> Result<(), VulkanError> {
+        match (
+            self.external_ownership,
+            self.external_acquire_pending,
+            self.external_acquire_kind,
+            self.external_release_kind,
+        ) {
+            (
+                VulkanExternalImageOwnership::ForeignKnownGeneral,
+                true,
+                VulkanExternalImageAcquireKind::None,
+                VulkanExternalImageReleaseKind::None,
+            ) if self.render_target_acquire_restore_token.is_none()
+                && self.render_target_release_restore.is_none() =>
+            {
+                *self = dmabuf_import_sync_state();
+                Ok(())
+            }
+            (
+                VulkanExternalImageOwnership::ForeignUnknown,
+                true,
+                VulkanExternalImageAcquireKind::None,
+                VulkanExternalImageReleaseKind::None,
+            ) if self.render_target_acquire_restore_token.is_none()
+                && self.render_target_release_restore.is_none() =>
+            {
+                Ok(())
+            }
+            (VulkanExternalImageOwnership::Local, false, VulkanExternalImageAcquireKind::None, _) => Err(
+                VulkanError::UnsupportedOperation("dmabuf render-target still locally owned"),
+            ),
+            (VulkanExternalImageOwnership::None, _, _, _)
+            | (VulkanExternalImageOwnership::ForeignUnknown, _, _, _)
+            | (VulkanExternalImageOwnership::ForeignKnownGeneral, _, _, _)
+            | (VulkanExternalImageOwnership::AcquirePending, _, _, _)
+            | (VulkanExternalImageOwnership::Local, _, _, _)
+            | (VulkanExternalImageOwnership::ReleasePending, _, _, _) => Err(
+                VulkanError::UnsupportedOperation("dmabuf render-target reacquire"),
+            ),
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn known_foreign_layout(&self) -> Option<vk::ImageLayout> {
         match self.external_ownership {

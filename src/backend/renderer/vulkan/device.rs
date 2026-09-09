@@ -1421,22 +1421,36 @@ impl VulkanDeviceState {
             return Ok(None);
         };
 
+        // SAFETY: Forwarded from this method's caller.
+        unsafe { self.acquire_dmabuf_render_target_image(&image, preserve_contents, acquire_semaphore) }?;
+
+        Ok(Some(image))
+    }
+
+    /// Submit a foreign acquire for an already-imported dmabuf render-target image.
+    ///
+    /// # Safety
+    ///
+    /// Same ownership, layout, and acquire-semaphore requirements as
+    /// [`Self::create_acquired_dmabuf_render_target_image`].
+    pub(crate) unsafe fn acquire_dmabuf_render_target_image(
+        &self,
+        image: &VulkanOwnedImage,
+        preserve_contents: bool,
+        acquire_semaphore: Option<&VulkanSyncFileSemaphore>,
+    ) -> Result<(), VulkanError> {
         match self.submit_dmabuf_render_target_foreign_acquire_classified(
-            &image,
+            image,
             preserve_contents,
             acquire_semaphore,
         ) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(VulkanError::UnsupportedOperation("dmabuf render-target acquire"));
-            }
-            Err(VulkanDmabufRenderTargetForeignAcquireError::RetrySafe(err)) => return Err(err),
+            Ok(true) => Ok(()),
+            Ok(false) => Err(VulkanError::UnsupportedOperation("dmabuf render-target acquire")),
+            Err(VulkanDmabufRenderTargetForeignAcquireError::RetrySafe(err)) => Err(err),
             Err(VulkanDmabufRenderTargetForeignAcquireError::AcquireSubmitted(err)) => {
-                return Err(self.recover_submitted_dmabuf_render_target_acquire(&image, err));
+                Err(self.recover_submitted_dmabuf_render_target_acquire(image, err))
             }
         }
-
-        Ok(Some(image))
     }
 
     /// Create and acquire a dmabuf color-attachment render target using a Smithay sync point as the
@@ -1473,6 +1487,26 @@ impl VulkanDeviceState {
             return Ok(None);
         };
 
+        // SAFETY: Forwarded from this method's caller.
+        unsafe {
+            self.acquire_dmabuf_render_target_image_with_sync_point(&image, preserve_contents, acquire_sync)
+        }?;
+
+        Ok(Some(image))
+    }
+
+    /// Submit a foreign acquire for an already-imported dmabuf render-target image using a sync point.
+    ///
+    /// # Safety
+    ///
+    /// Same ownership, layout, and acquire-sync requirements as
+    /// [`Self::create_acquired_dmabuf_render_target_image_with_sync_point`].
+    pub(crate) unsafe fn acquire_dmabuf_render_target_image_with_sync_point(
+        &self,
+        image: &VulkanOwnedImage,
+        preserve_contents: bool,
+        acquire_sync: Option<&SyncPoint>,
+    ) -> Result<(), VulkanError> {
         let acquire_semaphore = if let Some(acquire_sync) = acquire_sync {
             // SAFETY: Forwarded from this method's caller.
             unsafe { self.import_sync_point_wait_semaphore(acquire_sync)? }
@@ -1480,22 +1514,10 @@ impl VulkanDeviceState {
             None
         };
 
-        match self.submit_dmabuf_render_target_foreign_acquire_classified(
-            &image,
-            preserve_contents,
-            acquire_semaphore.as_ref(),
-        ) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(VulkanError::UnsupportedOperation("dmabuf render-target acquire"));
-            }
-            Err(VulkanDmabufRenderTargetForeignAcquireError::RetrySafe(err)) => return Err(err),
-            Err(VulkanDmabufRenderTargetForeignAcquireError::AcquireSubmitted(err)) => {
-                return Err(self.recover_submitted_dmabuf_render_target_acquire(&image, err));
-            }
+        // SAFETY: Forwarded from this method's caller.
+        unsafe {
+            self.acquire_dmabuf_render_target_image(&image, preserve_contents, acquire_semaphore.as_ref())
         }
-
-        Ok(Some(image))
     }
 
     fn create_bound_dmabuf_import_image_with_sync(
@@ -7091,6 +7113,12 @@ impl VulkanOwnedImage {
         self.inner.sync.get()
     }
 
+    pub(super) fn forget_known_foreign_layout_for_discard_reacquire(&self) -> Result<(), VulkanError> {
+        self.inner
+            .sync
+            .forget_known_foreign_layout_for_discard_reacquire()
+    }
+
     #[cfg(test)]
     pub(super) fn set_sync_state(&self, sync: VulkanImageSyncState) -> Result<(), VulkanError> {
         self.inner.sync.set_for_tests(sync)
@@ -7115,6 +7143,13 @@ impl VulkanSharedImageSyncState {
             .lock()
             .map(|sync| *sync)
             .map_err(|_| host_synchronization_failed())
+    }
+
+    pub(super) fn forget_known_foreign_layout_for_discard_reacquire(&self) -> Result<(), VulkanError> {
+        self.state
+            .lock()
+            .map_err(|_| host_synchronization_failed())?
+            .forget_known_foreign_layout_for_discard_reacquire()
     }
 
     #[allow(dead_code)]
