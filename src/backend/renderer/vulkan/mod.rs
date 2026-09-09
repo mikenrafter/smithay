@@ -15,7 +15,8 @@
 //! Smithay's optional renderer traits are capability surfaces. The CPU-memory/offscreen path is the
 //! most complete path. Explicit dmabuf render-target wrappers remain ownership-contract APIs on
 //! [`VulkanRenderer::bind_dmabuf_render_target`]. Public [`Bind<Dmabuf>`] is the compositor GBM
-//! scanout path: discard/full-repaint acquire, no sampled client import. Generic
+//! scanout path: wait for the buffer's implicit WRITE sync-file (KMS readers+writers), then
+//! discard/full-repaint acquire. It is not sampled client import. Generic
 //! texture `ExportMem`, `ExportDma`, broad explicit sync, blit/copy, and full presentation remain
 //! unsupported until their corresponding capability bits can become true with coverage. Sampled dmabuf
 //! import is validation-stage implemented for the normal `ImportDmaWl` path when callers provide
@@ -65,8 +66,6 @@ use std::{
 
 #[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
 use crate::backend::allocator::Buffer as _;
-#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
-use crate::backend::allocator::dmabuf::DmabufSyncFlags;
 #[cfg(all(
     feature = "wayland_frontend",
     feature = "backend_egl",
@@ -85,7 +84,7 @@ use crate::{
     backend::{
         allocator::{
             Format, Fourcc, Modifier,
-            dmabuf::{Dmabuf, WeakDmabuf},
+            dmabuf::{Dmabuf, DmabufSyncFlags, WeakDmabuf},
             format::FormatSet,
             vulkan::VulkanAllocatorDmabufForeignReleaseEvidence,
         },
@@ -1414,11 +1413,19 @@ pub struct VulkanDmabufRenderTargetAcquire<'a> {
 }
 
 impl<'a> VulkanDmabufRenderTargetAcquire<'a> {
-    /// Acquire for a full repaint, discarding previous contents.
+    /// Acquire for a full repaint, discarding previous contents, with no acquire fence.
     pub fn discard() -> Self {
+        Self::discard_with_sync(None)
+    }
+
+    /// Acquire for a full repaint, discarding previous contents after `acquire_sync` is satisfied.
+    ///
+    /// Public [`Bind<Dmabuf>`] uses this with the buffer's implicit WRITE sync-file so KMS
+    /// readers+writers complete before the discard acquire. Missing implicit fences pass `None`.
+    pub fn discard_with_sync(acquire_sync: Option<&'a SyncPoint>) -> Self {
         Self {
             preserve_contents: false,
-            acquire_sync: None,
+            acquire_sync,
         }
     }
 
@@ -6060,7 +6067,7 @@ impl VulkanRenderer {
         }
         if !target.image.sync.is_locally_usable() {
             return Err(VulkanDmabufRenderTargetForeignReleaseError::RetrySafe(
-                VulkanError::UnsupportedOperation("dmabuf external ownership"),
+                VulkanError::UnsupportedOperation("dmabuf render-target release ownership"),
             ));
         }
         let color_image =
@@ -6467,7 +6474,9 @@ impl Renderer for VulkanRenderer {
         if framebuffer.image.source == image::VulkanImageSource::RenderTarget
             && !framebuffer.image.sync.is_locally_usable()
         {
-            return Err(VulkanError::UnsupportedOperation("dmabuf external ownership"));
+            return Err(VulkanError::UnsupportedOperation(
+                "dmabuf render-target frame ownership",
+            ));
         }
         if framebuffer.color_image.is_none() {
             return Err(VulkanError::UnsupportedOperation("render target image"));
@@ -6656,13 +6665,22 @@ impl Bind<Dmabuf> for VulkanRenderer {
             return Err(VulkanError::NotPublicAdvertised("dmabuf render target"));
         }
 
+        // KMS may still hold the previous scanout of this GBM bo. Wait writers+readers via
+        // EXPORT_SYNC_FILE (not DMA_BUF_SYNC START/END). Missing implicit fences (fresh bo)
+        // fall back to discard without a wait.
+        let implicit_acquire = target
+            .export_sync_file(0, DmabufSyncFlags::WRITE)
+            .ok()
+            .map(|fd| sync_point_from_sync_file(Some(fd)));
+        let acquire = VulkanDmabufRenderTargetAcquire::discard_with_sync(implicit_acquire.as_ref());
+
         unsafe {
             // SAFETY: Public `Bind<Dmabuf>` is the compositor GBM scanout contract: the caller
-            // owns the buffer for this frame, previous contents are discarded, and no acquire
-            // fence is required. This is not sampled client-buffer import. Successful frames
-            // release the image for KMS from `Frame::finish`; failed or skipped renders are
-            // handled by `RenderTargetLifecycle<Dmabuf>` below.
-            self.bind_dmabuf_render_target(target, VulkanDmabufRenderTargetAcquire::discard())
+            // owns the buffer for this frame and previous contents are discarded. The optional
+            // acquire sync is the buffer's implicit WRITE fence, not a Wayland client point.
+            // Successful frames release the image for KMS from `Frame::finish`; failed or skipped
+            // renders are handled by `RenderTargetLifecycle<Dmabuf>` below.
+            self.bind_dmabuf_render_target(target, acquire)
         }?
         .ok_or(VulkanError::MissingCapability(
             "dmabuf render target format/modifier",

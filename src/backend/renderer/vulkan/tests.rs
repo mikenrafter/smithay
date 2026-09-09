@@ -2643,6 +2643,10 @@ fn dmabuf_render_target_foreign_barriers_distinguish_discard_and_preserve_acquir
         plan_dmabuf_render_target_foreign_acquire_barrier(&local_sync, 2, usage, false).unwrap(),
         None
     );
+    assert_eq!(
+        plan_dmabuf_render_target_foreign_acquire_barrier(&local_sync, 2, usage, true).unwrap(),
+        None
+    );
     assert!(matches!(
         dmabuf_render_target_foreign_acquire_barrier(vk::ImageLayout::PREINITIALIZED, 2, usage),
         Err(VulkanError::UnsupportedOperation("dmabuf external layout"))
@@ -3813,6 +3817,13 @@ fn public_dmabuf_bind_uses_discard_acquire_path() {
     assert!(formats.iter().next().is_none());
     assert!(!default_acquire.preserve_contents);
     assert!(default_acquire.acquire_sync.is_none());
+    let discard_with_sync = VulkanDmabufRenderTargetAcquire::discard_with_sync(Some(&signaled_sync));
+    assert!(!discard_with_sync.preserve_contents);
+    assert!(discard_with_sync.acquire_sync.is_some());
+    assert_eq!(
+        VulkanDmabufRenderTargetAcquire::discard().preserve_contents,
+        VulkanDmabufRenderTargetAcquire::discard_with_sync(None).preserve_contents
+    );
     assert!(preserve_acquire.preserve_contents);
     assert!(preserve_acquire.acquire_sync.is_some());
     assert_eq!(
@@ -9056,7 +9067,9 @@ fn internal_dmabuf_render_target_release_rejects_preconditions_before_device_loo
     ));
     assert!(matches!(
         renderer.release_acquired_dmabuf_render_target_to_foreign_general(&mut released_target, false),
-        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        Err(VulkanError::UnsupportedOperation(
+            "dmabuf render-target release ownership"
+        ))
     ));
     assert!(matches!(
         renderer
@@ -14822,7 +14835,9 @@ fn renderer_render_rejects_released_dmabuf_target_before_device_lookup() {
 
     assert!(matches!(
         renderer.render(&mut target, (1, 1).into(), Transform::Normal),
-        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        Err(VulkanError::UnsupportedOperation(
+            "dmabuf render-target frame ownership"
+        ))
     ));
 }
 
@@ -15096,7 +15111,9 @@ fn frame_finish_releases_internal_dmabuf_target_preconditions() {
 
     assert!(matches!(
         frame.finish(),
-        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+        Err(VulkanError::UnsupportedOperation(
+            "dmabuf render-target finish ownership"
+        ))
     ));
 }
 
@@ -15273,7 +15290,9 @@ fn frame_render_texture_rejects_narrow_path_preconditions_before_device_lookup()
                 Transform::Normal,
                 1.0,
             ),
-            Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+            Err(VulkanError::UnsupportedOperation(
+                "sampled dmabuf local ownership"
+            ))
         ));
     }
 

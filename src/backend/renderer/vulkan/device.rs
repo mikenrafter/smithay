@@ -1427,7 +1427,9 @@ impl VulkanDeviceState {
             acquire_semaphore,
         ) {
             Ok(true) => {}
-            Ok(false) => return Err(VulkanError::UnsupportedOperation("dmabuf external ownership")),
+            Ok(false) => {
+                return Err(VulkanError::UnsupportedOperation("dmabuf render-target acquire"));
+            }
             Err(VulkanDmabufRenderTargetForeignAcquireError::RetrySafe(err)) => return Err(err),
             Err(VulkanDmabufRenderTargetForeignAcquireError::AcquireSubmitted(err)) => {
                 return Err(self.recover_submitted_dmabuf_render_target_acquire(&image, err));
@@ -1484,7 +1486,9 @@ impl VulkanDeviceState {
             acquire_semaphore.as_ref(),
         ) {
             Ok(true) => {}
-            Ok(false) => return Err(VulkanError::UnsupportedOperation("dmabuf external ownership")),
+            Ok(false) => {
+                return Err(VulkanError::UnsupportedOperation("dmabuf render-target acquire"));
+            }
             Err(VulkanDmabufRenderTargetForeignAcquireError::RetrySafe(err)) => return Err(err),
             Err(VulkanDmabufRenderTargetForeignAcquireError::AcquireSubmitted(err)) => {
                 return Err(self.recover_submitted_dmabuf_render_target_acquire(&image, err));
@@ -1620,7 +1624,7 @@ impl VulkanDeviceState {
         let view = self.create_image_view(&image)?;
         let sampler = self.create_sampler(min_filter, mag_filter)?;
         if !self.submit_sampled_dmabuf_foreign_acquire(&image, acquire_semaphore)? {
-            return Err(VulkanError::UnsupportedOperation("dmabuf external ownership"));
+            return Err(VulkanError::UnsupportedOperation("sampled dmabuf acquire"));
         }
 
         Ok(Some(VulkanSampledImage { sampler, view, image }))
@@ -1746,7 +1750,7 @@ impl VulkanDeviceState {
             .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?
         {
             return Err(VulkanSampledDmabufForeignAcquireError::RetrySafe(
-                VulkanError::UnsupportedOperation("dmabuf external ownership"),
+                VulkanError::UnsupportedOperation("sampled dmabuf acquire"),
             ));
         }
         self.end_command_buffer(&mut command_buffer)
@@ -1886,7 +1890,12 @@ impl VulkanDeviceState {
             .record_sampled_dmabuf_foreign_acquire_barrier(&mut command_buffer, image)
             .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?
         {
-            return Ok(false);
+            // No barrier recorded: already locally usable is success. An empty command
+            // buffer must not be submitted. Unusable state stays fail-closed.
+            return Ok(image
+                .sync_state()
+                .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?
+                .is_locally_usable());
         }
         self.end_command_buffer(&mut command_buffer)
             .map_err(VulkanSampledDmabufForeignAcquireError::RetrySafe)?;
@@ -2030,7 +2039,12 @@ impl VulkanDeviceState {
             )
             .map_err(VulkanDmabufRenderTargetForeignAcquireError::RetrySafe)?
         {
-            return Ok(false);
+            // No barrier recorded: already locally usable is success. An empty command
+            // buffer must not be submitted. Unusable state stays fail-closed.
+            return Ok(image
+                .sync_state()
+                .map_err(VulkanDmabufRenderTargetForeignAcquireError::RetrySafe)?
+                .is_locally_usable());
         }
         self.end_command_buffer(&mut command_buffer)
             .map_err(VulkanDmabufRenderTargetForeignAcquireError::RetrySafe)?;
@@ -4537,9 +4551,9 @@ fn record_dmabuf_render_target_foreign_acquire_barrier(
         preserve_contents,
     )?
     else {
-        // Already locally usable: no queue-family acquire is required. Treating this as
-        // failure made public Bind<Dmabuf> report "dmabuf external ownership" on re-bind.
-        return Ok(image.sync_state()?.is_locally_usable());
+        // No barrier to record. Caller maps this to success only when the image is
+        // already locally usable (re-bind of an acquired GBM target).
+        return Ok(false);
     };
 
     let restore = image
