@@ -9112,6 +9112,18 @@ fn internal_dmabuf_render_target_release_rejects_preconditions_before_device_loo
             "dmabuf render-target release ownership"
         ))
     ));
+    assert!(
+        renderer
+            .release_dmabuf_render_target_after_render_error(&mut released_target)
+            .is_ok()
+    );
+    assert!(
+        <VulkanRenderer as RenderTargetLifecycle<Dmabuf>>::release_after_no_render(
+            &mut renderer,
+            &mut released_target,
+        )
+        .is_ok()
+    );
     assert!(matches!(
         renderer
             .release_acquired_dmabuf_render_target_to_foreign_general_sync_point(&mut missing_image, true),

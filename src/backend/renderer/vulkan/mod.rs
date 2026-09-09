@@ -6429,6 +6429,11 @@ impl VulkanRenderer {
         &mut self,
         target: &mut VulkanRenderTarget<'_>,
     ) -> Result<(), VulkanError> {
+        if target.image.source == image::VulkanImageSource::RenderTarget
+            && target.image.sync.is_already_released_to_foreign()
+        {
+            return Ok(());
+        }
         self.release_acquired_dmabuf_render_target_to_foreign_general_sync_point(target, false)
             .map(|_| ())
     }
