@@ -726,6 +726,12 @@ impl VulkanDeviceState {
             .next()
             .is_some();
         capabilities.rendering.offscreen = has_public_render_target_formats;
+        capabilities.rendering.blit = capabilities.formats.records.iter().any(|record| {
+            record.tiling == super::VulkanFormatTiling::Optimal
+                && record.usages.color_attachment
+                && record.usages.blit_src
+                && record.usages.blit_dst
+        });
         let has_dmabuf_render_target_formats =
             capabilities.formats.dmabuf_render_target.iter().next().is_some();
         capabilities.rendering.dmabuf_target_development = has_dmabuf_render_target_formats;
@@ -2820,7 +2826,9 @@ impl VulkanDeviceState {
         let image = self.create_bound_image(
             extent,
             format,
-            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::SAMPLED,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )?;
         let mut command_buffer = self.allocate_graphics_command_buffer()?;
@@ -3546,6 +3554,118 @@ impl VulkanDeviceState {
         self.submit_graphics_command_buffer_and_wait(&mut command_buffer)?;
 
         readback_buffer.read()
+    }
+
+    pub(super) fn blit_owned_images(
+        &self,
+        src: &VulkanOwnedImage,
+        dst: &VulkanOwnedImage,
+        src_offset: vk::Offset3D,
+        src_extent: vk::Extent3D,
+        dst_offset: vk::Offset3D,
+        dst_extent: vk::Extent3D,
+        filter: vk::Filter,
+    ) -> Result<(), VulkanError> {
+        if src.image() == dst.image() {
+            return Err(VulkanError::UnsupportedOperation("blit same image"));
+        }
+        if !src.usage().contains(vk::ImageUsageFlags::TRANSFER_SRC) {
+            return Err(VulkanError::UnsupportedOperation("blit source usage"));
+        }
+        if !dst.usage().contains(vk::ImageUsageFlags::TRANSFER_DST) {
+            return Err(VulkanError::UnsupportedOperation("blit destination usage"));
+        }
+
+        let src_end = vk::Offset3D {
+            x: src_offset
+                .x
+                .checked_add(
+                    i32::try_from(src_extent.width)
+                        .map_err(|_| VulkanError::UnsupportedOperation("blit source extent"))?,
+                )
+                .ok_or(VulkanError::UnsupportedOperation("blit source extent"))?,
+            y: src_offset
+                .y
+                .checked_add(
+                    i32::try_from(src_extent.height)
+                        .map_err(|_| VulkanError::UnsupportedOperation("blit source extent"))?,
+                )
+                .ok_or(VulkanError::UnsupportedOperation("blit source extent"))?,
+            z: 1,
+        };
+        let dst_end = vk::Offset3D {
+            x: dst_offset
+                .x
+                .checked_add(
+                    i32::try_from(dst_extent.width)
+                        .map_err(|_| VulkanError::UnsupportedOperation("blit destination extent"))?,
+                )
+                .ok_or(VulkanError::UnsupportedOperation("blit destination extent"))?,
+            y: dst_offset
+                .y
+                .checked_add(
+                    i32::try_from(dst_extent.height)
+                        .map_err(|_| VulkanError::UnsupportedOperation("blit destination extent"))?,
+                )
+                .ok_or(VulkanError::UnsupportedOperation("blit destination extent"))?,
+            z: 1,
+        };
+
+        let region = vk::ImageBlit::default()
+            .src_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_offsets([src_offset, src_end])
+            .dst_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .dst_offsets([dst_offset, dst_end]);
+
+        let src_restore = if src.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        } else {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        };
+        let dst_restore = if dst.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        } else {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        };
+
+        let mut command_buffer = self.allocate_graphics_command_buffer()?;
+        self.begin_command_buffer(&mut command_buffer)?;
+        self.transition_image_layout(&mut command_buffer, src, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)?;
+        self.transition_image_layout(&mut command_buffer, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL)?;
+        {
+            let _pool_guard = command_buffer.command_pool.lock_host_access()?;
+            unsafe {
+                command_buffer
+                    .command_pool
+                    .logical_device
+                    .handle()
+                    .cmd_blit_image(
+                        command_buffer.handle,
+                        src.image(),
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        dst.image(),
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[region],
+                        filter,
+                    );
+            }
+        }
+        command_buffer.referenced_images.push(Arc::clone(&src.inner));
+        command_buffer.referenced_images.push(Arc::clone(&dst.inner));
+        self.transition_image_layout(&mut command_buffer, src, src_restore)?;
+        self.transition_image_layout(&mut command_buffer, dst, dst_restore)?;
+        self.end_command_buffer(&mut command_buffer)?;
+        self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
     }
 
     #[allow(dead_code)]

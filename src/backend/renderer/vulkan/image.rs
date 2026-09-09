@@ -146,6 +146,7 @@ impl VulkanTexture {
                 source: VulkanImageSource::MemoryUpload,
                 usage: VulkanImageUsage {
                     sampled: true,
+                    transfer_src: true,
                     transfer_dst: true,
                     ..VulkanImageUsage::default()
                 },

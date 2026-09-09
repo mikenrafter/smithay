@@ -48,7 +48,7 @@
 //! 14. export dmabuf
 //! 15. KMS presentation path
 //! 16. explicit sync
-//! 17. blit/copy
+//! 17. blit/copy (same-device framebuffer `Blit` + sampled `ExportMem::copy_texture`)
 //! 18. multi-GPU integration
 //! 19. colour-capable render targets
 //! 20. HDR-ready hooks
@@ -89,9 +89,9 @@ use crate::{
             vulkan::VulkanAllocatorDmabufForeignReleaseEvidence,
         },
         renderer::{
-            Bind, Color32F, ContextId, DebugFlags, ExportMem, ImportDma, ImportMem, Offscreen,
-            RenderTargetLifecycle, Renderer, RendererSuper, SurfaceCacheTextureReleaseError, Texture,
-            TextureFilter,
+            Bind, Blit, BlitFrame, Color32F, ContextId, DebugFlags, ExportMem, ImportDma, ImportMem,
+            Offscreen, RenderTargetLifecycle, Renderer, RendererSuper, SurfaceCacheTextureReleaseError,
+            Texture, TextureFilter,
             sync::{Fence, Interrupted, SyncPoint},
         },
     },
@@ -6950,14 +6950,37 @@ impl ExportMem for VulkanRenderer {
     fn copy_texture(
         &mut self,
         texture: &Self::TextureId,
-        _region: Rectangle<i32, BufferCoord>,
-        _format: Fourcc,
+        region: Rectangle<i32, BufferCoord>,
+        format: Fourcc,
     ) -> Result<Self::TextureMapping, Self::Error> {
         if texture.context_id != self.context_id {
             return Err(VulkanError::UnsupportedOperation("foreign memory texture"));
         }
+        let sampled = texture
+            .sampled_image
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("texture memory export"))?;
+        let image = sampled.image();
+        if !image.usage().contains(vk::ImageUsageFlags::TRANSFER_SRC) {
+            return Err(VulkanError::UnsupportedOperation("texture transfer source"));
+        }
+        let texture_format = texture
+            .format()
+            .ok_or(VulkanError::UnsupportedOperation("texture format"))?;
+        if format != texture_format {
+            return Err(VulkanError::UnsupportedFormat(format));
+        }
 
-        Err(VulkanError::UnsupportedOperation("texture memory export"))
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+        let (image_offset, extent) = image_region_to_vk(texture.size(), region, "texture copy region")?;
+        let data = device.read_image_region_to_tightly_packed_buffer(image, image_offset, extent)?;
+
+        Ok(VulkanMemoryMapping {
+            data,
+            size: region.size,
+            format,
+            flipped: texture.y_inverted,
+        })
     }
 
     fn can_read_texture(&mut self, texture: &Self::TextureId) -> Result<bool, Self::Error> {
@@ -6965,7 +6988,12 @@ impl ExportMem for VulkanRenderer {
             return Err(VulkanError::UnsupportedOperation("foreign memory texture"));
         }
 
-        Ok(false)
+        Ok(texture.sampled_image.as_ref().is_some_and(|sampled| {
+            sampled
+                .image()
+                .usage()
+                .contains(vk::ImageUsageFlags::TRANSFER_SRC)
+        }))
     }
 
     fn map_texture<'a>(
@@ -6992,6 +7020,110 @@ fn extent_from_size(size: Size<i32, BufferCoord>, error: &'static str) -> Result
             .map_err(|_| VulkanError::UnsupportedOperation(error))?,
         depth: 1,
     })
+}
+
+fn physical_rect_to_buffer(rect: Rectangle<i32, Physical>) -> Rectangle<i32, BufferCoord> {
+    Rectangle::new((rect.loc.x, rect.loc.y).into(), (rect.size.w, rect.size.h).into())
+}
+
+fn texture_filter_to_vk(filter: TextureFilter) -> vk::Filter {
+    match filter {
+        TextureFilter::Nearest => vk::Filter::NEAREST,
+        TextureFilter::Linear => vk::Filter::LINEAR,
+    }
+}
+
+fn blit_render_targets(
+    device: &device::VulkanDeviceState,
+    from: &VulkanRenderTarget<'_>,
+    to: &mut VulkanRenderTarget<'_>,
+    src: Rectangle<i32, Physical>,
+    dst: Rectangle<i32, Physical>,
+    filter: TextureFilter,
+) -> Result<SyncPoint, VulkanError> {
+    if from.context_id != to.context_id {
+        return Err(VulkanError::UnsupportedOperation("foreign render target"));
+    }
+    let src_image = from
+        .color_image
+        .as_ref()
+        .ok_or(VulkanError::UnsupportedOperation("blit source image"))?;
+    let dst_image = to
+        .color_image
+        .as_ref()
+        .ok_or(VulkanError::UnsupportedOperation("blit destination image"))?;
+    if src_image.image() == dst_image.image() {
+        return Err(VulkanError::UnsupportedOperation("blit same target"));
+    }
+
+    let (src_offset, src_extent) =
+        image_region_to_vk(from.size(), physical_rect_to_buffer(src), "blit source region")?;
+    let (dst_offset, dst_extent) =
+        image_region_to_vk(to.size(), physical_rect_to_buffer(dst), "blit destination region")?;
+
+    device.blit_owned_images(
+        src_image,
+        dst_image,
+        src_offset,
+        src_extent,
+        dst_offset,
+        dst_extent,
+        texture_filter_to_vk(filter),
+    )?;
+
+    Ok(SyncPoint::signaled())
+}
+
+impl Blit for VulkanRenderer {
+    fn blit(
+        &mut self,
+        from: &Self::Framebuffer<'_>,
+        to: &mut Self::Framebuffer<'_>,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+    ) -> Result<SyncPoint, Self::Error> {
+        if !self.capabilities.rendering.blit {
+            return Err(VulkanError::MissingCapability("blit"));
+        }
+        if from.context_id != self.context_id || to.context_id != self.context_id {
+            return Err(VulkanError::UnsupportedOperation("foreign render target"));
+        }
+        let device = self.device.as_ref().ok_or(VulkanError::VulkanUnavailable)?;
+        blit_render_targets(device, from, to, src, dst, filter)
+    }
+}
+
+impl<'buffer> BlitFrame<VulkanRenderTarget<'buffer>> for VulkanFrame<'_, 'buffer> {
+    fn blit_to(
+        &mut self,
+        to: &mut VulkanRenderTarget<'buffer>,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+    ) -> Result<SyncPoint, Self::Error> {
+        let device = self.device.ok_or(VulkanError::VulkanUnavailable)?;
+        let from = self
+            .target
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("blit frame target"))?;
+        blit_render_targets(device, from, to, src, dst, filter)
+    }
+
+    fn blit_from(
+        &mut self,
+        from: &VulkanRenderTarget<'buffer>,
+        src: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        filter: TextureFilter,
+    ) -> Result<SyncPoint, Self::Error> {
+        let device = self.device.ok_or(VulkanError::VulkanUnavailable)?;
+        let to = self
+            .target
+            .as_mut()
+            .ok_or(VulkanError::UnsupportedOperation("blit frame target"))?;
+        blit_render_targets(device, from, to, src, dst, filter)
+    }
 }
 
 fn image_region_to_vk(

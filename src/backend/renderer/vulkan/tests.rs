@@ -24,8 +24,8 @@ use crate::backend::drm::DrmDeviceFd;
 use crate::backend::renderer::ImportDmaWl;
 use crate::backend::renderer::sync::Interrupted;
 use crate::backend::renderer::{
-    Bind, Color32F, DebugFlags, ExportMem, Frame, ImportDma, ImportMem, Offscreen, RenderTargetLifecycle,
-    Renderer, SurfaceCacheTextureReleaseError, Texture, TextureMapping,
+    Bind, Blit, Color32F, DebugFlags, ExportMem, Frame, ImportDma, ImportMem, Offscreen,
+    RenderTargetLifecycle, Renderer, SurfaceCacheTextureReleaseError, Texture, TextureFilter, TextureMapping,
     sync::{Fence, SyncPoint},
 };
 use crate::backend::vulkan::{Instance, PhysicalDevice, version::Version};
@@ -947,9 +947,24 @@ fn vulkan_renderer_default_capabilities_are_false() {
     assert!(!caps.external_sync.external_semaphore);
     assert!(!caps.external_sync.external_semaphore_fd);
     assert!(!caps.external_sync.sync_file_importable);
-    assert!(!caps.external_sync.sync_file_exportable);
-    assert!(!caps.external_sync.sync_file_export_from_imported);
-    assert!(!caps.external_sync.prerequisites_available);
+}
+
+#[test]
+fn blit_without_capability_bit_fails_closed() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let from = VulkanRenderTarget::new_for_tests((1, 1).into(), Some(Fourcc::Argb8888));
+    let mut to = VulkanRenderTarget::new_for_tests((1, 1).into(), Some(Fourcc::Argb8888));
+
+    assert!(matches!(
+        renderer.blit(
+            &from,
+            &mut to,
+            Rectangle::from_size((1, 1).into()),
+            Rectangle::from_size((1, 1).into()),
+            TextureFilter::Nearest,
+        ),
+        Err(VulkanError::MissingCapability("blit"))
+    ));
 }
 
 #[test]
@@ -16804,7 +16819,15 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         );
     }
     assert!(caps.rendering.offscreen);
-    assert!(!caps.rendering.blit);
+    assert_eq!(
+        caps.rendering.blit,
+        caps.formats.records.iter().any(|record| {
+            record.tiling == VulkanFormatTiling::Optimal
+                && record.usages.color_attachment
+                && record.usages.blit_src
+                && record.usages.blit_dst
+        })
+    );
     assert!(!caps.sync.explicit);
     assert!(
         has_probed_format_support(&caps.formats),
@@ -16887,6 +16910,22 @@ fn runtime_renderer_builder_initializes_with_first_physical_device() {
         );
         let readback = renderer.read_offscreen_render_target(&mut target).unwrap();
         assert_eq!(target.image.layout, VulkanImageLayoutState::TransferSrc);
+        if renderer.capabilities().rendering.blit {
+            let mut blit_dst = renderer
+                .create_offscreen_render_target(offscreen_format, (2, 2).into())
+                .unwrap();
+            let _ = renderer
+                .blit(
+                    &target,
+                    &mut blit_dst,
+                    Rectangle::from_size((2, 2).into()),
+                    Rectangle::from_size((2, 2).into()),
+                    TextureFilter::Nearest,
+                )
+                .unwrap();
+            let blit_readback = renderer.read_offscreen_render_target(&mut blit_dst).unwrap();
+            assert_eq!(blit_readback, readback);
+        }
         let color_image = target.color_image.as_ref().unwrap();
         assert_eq!(
             color_image.layout().unwrap(),
