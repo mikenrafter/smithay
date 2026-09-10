@@ -544,6 +544,14 @@ impl VulkanImageSyncState {
             (VulkanExternalImageOwnership::Local, false, VulkanExternalImageAcquireKind::None, _) => Err(
                 VulkanError::UnsupportedOperation("dmabuf render-target still locally owned"),
             ),
+            (VulkanExternalImageOwnership::AcquirePending, _, _, _)
+            | (VulkanExternalImageOwnership::ReleasePending, _, _, _)
+                if self.render_target_acquire_restore_token.is_none()
+                    && self.render_target_release_restore.is_none() =>
+            {
+                *self = dmabuf_import_sync_state();
+                Ok(())
+            }
             (VulkanExternalImageOwnership::None, _, _, _)
             | (VulkanExternalImageOwnership::ForeignUnknown, _, _, _)
             | (VulkanExternalImageOwnership::ForeignKnownGeneral, _, _, _)
@@ -1473,6 +1481,16 @@ impl Frame for VulkanFrame<'_, '_> {
         let framebuffer_opaque_regions = self
             .map_dest_relative_rects_to_framebuffer(dst, opaque_regions)
             .ok_or(VulkanError::UnsupportedOperation("render texture damage"))?;
+        if !src.loc.x.is_finite()
+            || !src.loc.y.is_finite()
+            || !src.size.w.is_finite()
+            || !src.size.h.is_finite()
+        {
+            return Err(VulkanError::UnsupportedOperation("render texture source"));
+        }
+        let Some(src) = clamp_src_to_texture(texture.image.size, src) else {
+            return Ok(());
+        };
         let (uv_origin, uv_x_axis, uv_y_axis) = source_to_uv_rect(
             texture.image.size,
             src,
@@ -1868,29 +1886,30 @@ pub(super) fn clip_render_texture_draw_area(
     Some(Some((draw_area, uv_origin, uv_x_axis, uv_y_axis)))
 }
 
+pub(super) fn clamp_src_to_texture(
+    texture_size: Size<i32, BufferCoord>,
+    src: Rectangle<f64, BufferCoord>,
+) -> Option<Rectangle<f64, BufferCoord>> {
+    if texture_size.w <= 0 || texture_size.h <= 0 {
+        return None;
+    }
+    let bounds = Rectangle::new(
+        (0.0, 0.0).into(),
+        (f64::from(texture_size.w), f64::from(texture_size.h)).into(),
+    );
+    src.intersection(bounds)
+        .filter(|clamped| clamped.size.w > 0.0 && clamped.size.h > 0.0)
+}
+
 pub(super) fn source_to_uv_rect(
     texture_size: Size<i32, BufferCoord>,
     src: Rectangle<f64, BufferCoord>,
     y_inverted: bool,
     src_transform: Transform,
 ) -> Option<([f32; 2], [f32; 2], [f32; 2])> {
-    if texture_size.w <= 0
-        || texture_size.h <= 0
-        || !src.loc.x.is_finite()
-        || !src.loc.y.is_finite()
-        || !src.size.w.is_finite()
-        || !src.size.h.is_finite()
-        || src.loc.x < 0.0
-        || src.loc.y < 0.0
-        || src.size.w <= 0.0
-        || src.size.h <= 0.0
+    let src = clamp_src_to_texture(texture_size, src)?;
+    if !src.loc.x.is_finite() || !src.loc.y.is_finite() || !src.size.w.is_finite() || !src.size.h.is_finite()
     {
-        return None;
-    }
-
-    let x_end = src.loc.x + src.size.w;
-    let y_end = src.loc.y + src.size.h;
-    if x_end > f64::from(texture_size.w) || y_end > f64::from(texture_size.h) {
         return None;
     }
 

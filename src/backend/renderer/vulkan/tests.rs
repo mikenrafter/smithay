@@ -2681,6 +2681,28 @@ fn dmabuf_render_target_foreign_barriers_distinguish_discard_and_preserve_acquir
         already_unknown.external_ownership(),
         VulkanExternalImageOwnership::ForeignUnknown
     );
+    let mut pending_release = VulkanImageSyncState {
+        external_ownership: VulkanExternalImageOwnership::ReleasePending,
+        ..VulkanImageSyncState::default()
+    };
+    pending_release
+        .forget_known_foreign_layout_for_discard_reacquire()
+        .unwrap();
+    assert_eq!(
+        pending_release.external_ownership(),
+        VulkanExternalImageOwnership::ForeignUnknown
+    );
+    let mut pending_acquire = VulkanImageSyncState {
+        external_ownership: VulkanExternalImageOwnership::AcquirePending,
+        ..VulkanImageSyncState::default()
+    };
+    pending_acquire
+        .forget_known_foreign_layout_for_discard_reacquire()
+        .unwrap();
+    assert_eq!(
+        pending_acquire.external_ownership(),
+        VulkanExternalImageOwnership::ForeignUnknown
+    );
     assert_eq!(
         plan_dmabuf_render_target_foreign_acquire_barrier(&released_sync, 2, usage, true).unwrap(),
         Some(preserve_acquire)
@@ -15371,7 +15393,21 @@ fn frame_render_texture_rejects_narrow_path_preconditions_before_device_lookup()
         &[],
         Transform::Normal,
         1.0,
-        "render texture source",
+        "render texture device",
+    );
+    let mut frame = frame_for_tests(frame_context_id.clone(), (8, 6).into(), Transform::Normal);
+    assert!(
+        frame
+            .render_texture_from_to(
+                &texture,
+                Rectangle::new((8.0, 0.0).into(), (1.0, 1.0).into()),
+                full_dst,
+                &full_damage,
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .is_ok()
     );
     assert_render_texture_error(
         &texture,
