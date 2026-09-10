@@ -9989,13 +9989,14 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
     unsafe {
         // SAFETY: This unit test only validates evidence storage and identity routing; it performs
         // no Vulkan import, acquire, sampling, or release operation with the constructed evidence.
-        VulkanRenderer::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
-            &user_data_external_state,
-            &policy_dmabuf,
-            SampledDmabufWaylandExternalStateUse::FirstImport,
-            None,
-        )
-        .unwrap();
+        renderer
+            .mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+                &user_data_external_state,
+                &policy_dmabuf,
+                SampledDmabufWaylandExternalStateUse::FirstImport,
+                None,
+            )
+            .unwrap();
     }
     let stored_external_state = renderer
         .sampled_dmabuf_wayland_user_data_foreign_general_evidence(&user_data_external_state, &policy_dmabuf)
@@ -10035,13 +10036,14 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
         unsafe {
             // SAFETY: This unit test only validates wrapper-local commit-token lifetime. It performs
             // no Vulkan import, acquire, sampling, or release operation with the constructed evidence.
-            VulkanRenderer::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
-                &orphaned_user_data_external_state,
-                &policy_dmabuf,
-                SampledDmabufWaylandExternalStateUse::FirstImport,
-                None,
-            )
-            .unwrap();
+            renderer
+                .mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+                    &orphaned_user_data_external_state,
+                    &policy_dmabuf,
+                    SampledDmabufWaylandExternalStateUse::FirstImport,
+                    None,
+                )
+                .unwrap();
         }
         renderer
             .sampled_dmabuf_wayland_user_data_foreign_general_evidence(
@@ -11567,7 +11569,9 @@ fn import_dma_wl_real_buffer_requires_import_surface_reachability() {
         // SAFETY: This validation-stage fixture supplies explicit current-commit external-state
         // evidence so production ImportDmaWl can be driven to its normal-path call-site guard. The
         // test does not advertise or execute arbitrary sampled-dmabuf import.
-        VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &dmabuf).unwrap();
+        renderer
+            .mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &dmabuf)
+            .unwrap();
     }
     assert_buffer_release_point_matches_for_tests(
         &buffer,
@@ -11906,7 +11910,9 @@ fn import_surface_real_buffer_reaches_device_import_boundary() {
         // evidence and explicit renderer-utils lifecycle coverage so normal renderer-utils
         // import_surface can be driven to the scaffold device boundary. The scaffold renderer still
         // fails before sampled-dmabuf texture import or public advertisement.
-        VulkanRenderer::mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &dmabuf).unwrap();
+        renderer
+            .mark_wayland_dmabuf_foreign_general_for_sampled_import(&buffer, &dmabuf)
+            .unwrap();
         renderer
             .mark_wayland_dmabuf_texture_cache_release_lifecycle_for_sampled_import(&buffer, &dmabuf)
             .unwrap();
@@ -13582,11 +13588,71 @@ fn import_surface_renderer_release_marker_requires_released_history() {
     renderer.record_sampled_dmabuf_released_to_foreign_general(&committed_dmabuf);
     assert!(matches!(
         renderer.sampled_dmabuf_wayland_buffer_foreign_general_evidence(&bound_buffer, &committed_dmabuf),
-        Err(VulkanError::UnsupportedOperation(
-            "sampled dmabuf Wayland external-state release generation"
-        ))
+        Ok(None)
     ));
     assert!(renderer.dmabuf_formats().iter().next().is_none());
+}
+
+#[cfg(all(feature = "wayland_frontend", feature = "backend_drm"))]
+#[test]
+fn foreign_general_evidence_other_renderer_and_stale_generation_are_not_current_proof() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let other = VulkanRenderer::new_scaffold_for_tests();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    let user_data = UserDataMap::new();
+    unsafe {
+        // SAFETY: This unit test only validates renderer-local evidence lookup. It does not import
+        // or sample a Vulkan image with the constructed marker.
+        renderer
+            .mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+                &user_data,
+                &dmabuf,
+                SampledDmabufWaylandExternalStateUse::FirstImport,
+                None,
+            )
+            .unwrap();
+    }
+    assert!(
+        renderer
+            .sampled_dmabuf_wayland_user_data_foreign_general_evidence(&user_data, &dmabuf)
+            .unwrap()
+            .is_some()
+    );
+    assert!(matches!(
+        other.sampled_dmabuf_wayland_user_data_foreign_general_evidence(&user_data, &dmabuf),
+        Ok(None)
+    ));
+
+    renderer.record_sampled_dmabuf_released_to_foreign_general(&dmabuf);
+    unsafe {
+        // SAFETY: Same as the first mark: evidence storage only.
+        renderer
+            .mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+                &user_data,
+                &dmabuf,
+                SampledDmabufWaylandExternalStateUse::CurrentReacquire,
+                renderer.sampled_dmabuf_release_generation_snapshot(&dmabuf),
+            )
+            .unwrap();
+    }
+    assert!(
+        renderer
+            .sampled_dmabuf_wayland_user_data_foreign_general_evidence(&user_data, &dmabuf)
+            .unwrap()
+            .is_some()
+    );
+    renderer.record_sampled_dmabuf_locally_acquired(&dmabuf);
+    renderer.record_sampled_dmabuf_released_to_foreign_general(&dmabuf);
+    assert!(matches!(
+        renderer.sampled_dmabuf_wayland_user_data_foreign_general_evidence(&user_data, &dmabuf),
+        Ok(None)
+    ));
 }
 
 #[test]

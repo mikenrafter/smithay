@@ -297,6 +297,7 @@ struct SampledDmabufWaylandForeignGeneralEvidence {
     external_state: SampledDmabufExternalImageState,
     commit_token: Option<Weak<()>>,
     release_generation: Option<u64>,
+    renderer_context: ContextId<VulkanTexture>,
 }
 
 #[allow(dead_code)]
@@ -306,6 +307,7 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
         use_case: SampledDmabufWaylandExternalStateUse,
         commit_token: Weak<()>,
         release_generation: Option<u64>,
+        renderer_context: ContextId<VulkanTexture>,
     ) -> Self {
         Self {
             dmabuf,
@@ -313,6 +315,7 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
             external_state: SampledDmabufExternalImageState::foreign_general(),
             commit_token: Some(commit_token),
             release_generation,
+            renderer_context,
         }
     }
 
@@ -324,6 +327,7 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
             external_state: SampledDmabufExternalImageState::foreign_general(),
             commit_token: None,
             release_generation: None,
+            renderer_context: ContextId::new(),
         }
     }
 
@@ -348,6 +352,7 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
             external_state: SampledDmabufExternalImageState::foreign_general(),
             commit_token: None,
             release_generation,
+            renderer_context: ContextId::new(),
         }
     }
 
@@ -362,11 +367,16 @@ impl SampledDmabufWaylandForeignGeneralEvidence {
             external_state,
             commit_token: None,
             release_generation: None,
+            renderer_context: ContextId::new(),
         }
     }
 
     fn is_for_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
         self.dmabuf.upgrade().as_ref() == Some(dmabuf)
+    }
+
+    fn is_for_renderer_context(&self, renderer_context: &ContextId<VulkanTexture>) -> bool {
+        &self.renderer_context == renderer_context
     }
 
     #[cfg(feature = "wayland_frontend")]
@@ -2244,7 +2254,7 @@ impl<'a> VulkanWaylandDmabufSampledImportAdmission<'a> {
                 // renderer-managed buffer, current dmabuf identity, producer evidence, acquire ordering,
                 // release ownership availability, and renderer-utils lifecycle proof above. Recording
                 // on `buffer.user_data()` avoids a second surface lookup after validation.
-                VulkanRenderer::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+                renderer.mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
                     buffer.user_data(),
                     committed_dmabuf,
                     use_case,
@@ -2529,7 +2539,7 @@ impl<'a> VulkanWaylandDmabufSampledReacquireAdmission<'a> {
                 // renderer-managed buffer, renderer release evidence, sync, and lifecycle proof tokens.
                 // Recording on `buffer.user_data()` avoids re-looking up a different same-dmabuf commit
                 // after token validation.
-                VulkanRenderer::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+                renderer.mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
                     buffer.user_data(),
                     committed_dmabuf,
                     SampledDmabufWaylandExternalStateUse::CurrentReacquire,
@@ -2916,12 +2926,13 @@ impl VulkanRenderer {
     /// metadata and linux-drm-syncobj acquire/release points are not sufficient by themselves.
     #[cfg(all(test, feature = "wayland_frontend"))]
     unsafe fn mark_wayland_dmabuf_foreign_general_for_sampled_import(
+        &self,
         buffer: &super::utils::Buffer,
         dmabuf: &Dmabuf,
     ) -> Result<(), VulkanError> {
         unsafe {
             // SAFETY: Forwarded from this test-only unsafe evidence-marking helper's caller.
-            Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+            self.mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
                 buffer.user_data(),
                 dmabuf,
                 SampledDmabufWaylandExternalStateUse::FirstImport,
@@ -2982,7 +2993,7 @@ impl VulkanRenderer {
             // satisfied and the imported dma-buf follows FOREIGN + GENERAL external layout. This
             // records the existing commit-local marks consumed by ImportDmaWl; it does not advertise
             // generic ImportDma.
-            Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+            self.mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
                 buffer.user_data(),
                 dmabuf,
                 use_case,
@@ -3033,7 +3044,7 @@ impl VulkanRenderer {
         };
         unsafe {
             // SAFETY: Forwarded from this validation contract's caller.
-            Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+            self.mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
                 buffer.user_data(),
                 dmabuf,
                 use_case,
@@ -3248,7 +3259,7 @@ impl VulkanRenderer {
             unsafe {
                 // SAFETY: Forwarded from this helper's caller after verifying that the current
                 // renderer-managed buffer is the requested dmabuf.
-                Self::mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+                self.mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
                     buffer.user_data(),
                     dmabuf,
                     use_case,
@@ -3499,6 +3510,7 @@ impl VulkanRenderer {
 
     #[cfg(feature = "wayland_frontend")]
     unsafe fn mark_wayland_dmabuf_user_data_foreign_general_for_sampled_import(
+        &self,
         user_data: &UserDataMap,
         dmabuf: &Dmabuf,
         use_case: SampledDmabufWaylandExternalStateUse,
@@ -3518,6 +3530,7 @@ impl VulkanRenderer {
                 use_case,
                 Arc::downgrade(&commit_token_slot.token),
                 release_generation,
+                self.context_id.clone(),
             )
         });
         Ok(())
@@ -4533,8 +4546,21 @@ impl VulkanRenderer {
                 "sampled dmabuf Wayland external-state identity",
             ));
         }
+        if !evidence.is_for_renderer_context(&self.context_id) {
+            // Another device's VkImage/EGLImage is not this renderer's import. Mesa
+            // EGL_EXT_image_dma_buf_import and NVIDIA keep GPU objects per-device;
+            // KWin recreates them on reset. Import fresh on this renderer.
+            return Ok(None);
+        }
         evidence.validate_commit_token(user_data)?;
-        evidence.validate_release_generation(self.sampled_dmabuf_release_generation_snapshot(dmabuf))?;
+        if evidence
+            .validate_release_generation(self.sampled_dmabuf_release_generation_snapshot(dmabuf))
+            .is_err()
+        {
+            // Stale commit-local marker after another release. Not proof for this
+            // commit; linux-interop will remark from this renderer's current history.
+            return Ok(None);
+        }
         Ok(Some(evidence.clone()))
     }
 
