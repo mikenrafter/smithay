@@ -2703,6 +2703,16 @@ fn dmabuf_render_target_foreign_barriers_distinguish_discard_and_preserve_acquir
         pending_acquire.external_ownership(),
         VulkanExternalImageOwnership::ForeignUnknown
     );
+    let mut with_restore = released_sync;
+    with_restore.render_target_acquire_restore_token = Some(1);
+    with_restore
+        .forget_known_foreign_layout_for_discard_reacquire()
+        .unwrap();
+    assert_eq!(
+        with_restore.external_ownership(),
+        VulkanExternalImageOwnership::ForeignUnknown
+    );
+    assert!(with_restore.render_target_acquire_restore_token.is_none());
     assert_eq!(
         plan_dmabuf_render_target_foreign_acquire_barrier(&released_sync, 2, usage, true).unwrap(),
         Some(preserve_acquire)

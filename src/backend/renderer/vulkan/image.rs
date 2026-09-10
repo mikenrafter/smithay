@@ -514,53 +514,16 @@ impl VulkanImageSyncState {
     /// we previously released as known-GENERAL must forget that layout before the next discard
     /// acquire. Preserve acquires must not call this.
     pub(crate) fn forget_known_foreign_layout_for_discard_reacquire(&mut self) -> Result<(), VulkanError> {
-        match (
-            self.external_ownership,
-            self.external_acquire_pending,
-            self.external_acquire_kind,
-            self.external_release_kind,
-        ) {
-            (
-                VulkanExternalImageOwnership::ForeignKnownGeneral,
-                true,
-                VulkanExternalImageAcquireKind::None,
-                VulkanExternalImageReleaseKind::None,
-            ) if self.render_target_acquire_restore_token.is_none()
-                && self.render_target_release_restore.is_none() =>
-            {
-                *self = dmabuf_import_sync_state();
-                Ok(())
-            }
-            (
-                VulkanExternalImageOwnership::ForeignUnknown,
-                true,
-                VulkanExternalImageAcquireKind::None,
-                VulkanExternalImageReleaseKind::None,
-            ) if self.render_target_acquire_restore_token.is_none()
-                && self.render_target_release_restore.is_none() =>
-            {
-                Ok(())
-            }
-            (VulkanExternalImageOwnership::Local, false, VulkanExternalImageAcquireKind::None, _) => Err(
-                VulkanError::UnsupportedOperation("dmabuf render-target still locally owned"),
-            ),
-            (VulkanExternalImageOwnership::AcquirePending, _, _, _)
-            | (VulkanExternalImageOwnership::ReleasePending, _, _, _)
-                if self.render_target_acquire_restore_token.is_none()
-                    && self.render_target_release_restore.is_none() =>
-            {
-                *self = dmabuf_import_sync_state();
-                Ok(())
-            }
-            (VulkanExternalImageOwnership::None, _, _, _)
-            | (VulkanExternalImageOwnership::ForeignUnknown, _, _, _)
-            | (VulkanExternalImageOwnership::ForeignKnownGeneral, _, _, _)
-            | (VulkanExternalImageOwnership::AcquirePending, _, _, _)
-            | (VulkanExternalImageOwnership::Local, _, _, _)
-            | (VulkanExternalImageOwnership::ReleasePending, _, _, _) => Err(
-                VulkanError::UnsupportedOperation("dmabuf render-target reacquire"),
-            ),
+        if self.is_locally_usable() {
+            return Err(VulkanError::UnsupportedOperation(
+                "dmabuf render-target still locally owned",
+            ));
         }
+        // Discard Bind does not restore in-flight acquire/release. Drop that bookkeeping and
+        // treat the image as foreign-unknown (UNDEFINED). Greeter first-present left restore
+        // tokens set and failed closed as "reacquire".
+        *self = dmabuf_import_sync_state();
+        Ok(())
     }
 
     #[allow(dead_code)]
