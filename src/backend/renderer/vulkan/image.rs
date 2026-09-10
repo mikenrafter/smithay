@@ -1178,14 +1178,21 @@ impl VulkanRenderTarget<'_> {
         dmabuf: &Dmabuf,
         import: &VulkanDmabufImportState,
         color_image: VulkanOwnedImage,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, VulkanError> {
+        let mut image = dmabuf_acquired_render_target_image_state(import);
+        image.sync = color_image.sync_state()?;
+        if !image.sync.is_locally_usable() {
+            return Err(VulkanError::UnsupportedOperation(
+                "dmabuf render-target acquire ownership",
+            ));
+        }
+        Ok(Self {
             context_id,
-            image: dmabuf_acquired_render_target_image_state(import),
+            image,
             color_image: Some(color_image),
             dmabuf: Some(dmabuf.weak()),
             _target: PhantomData,
-        }
+        })
     }
 
     #[cfg(test)]

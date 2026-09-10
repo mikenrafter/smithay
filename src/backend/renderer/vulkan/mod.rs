@@ -5625,7 +5625,7 @@ impl VulkanRenderer {
             dmabuf,
             &import,
             color_image,
-        )))
+        )?))
     }
 
     /// Import a dmabuf as an internal render target and acquire it using a Smithay sync point as the
@@ -5692,7 +5692,7 @@ impl VulkanRenderer {
             dmabuf,
             &import,
             color_image,
-        )))
+        )?))
     }
 
     /// Bind a foreign dmabuf as a Vulkan render target using explicit Vulkan acquire semantics.
@@ -6493,8 +6493,22 @@ impl VulkanRenderer {
         &mut self,
         target: &mut VulkanRenderTarget<'_>,
     ) -> Result<(), VulkanError> {
-        if target.image.source == image::VulkanImageSource::RenderTarget
-            && target.image.sync.is_already_released_to_foreign()
+        if target.image.source != image::VulkanImageSource::RenderTarget {
+            return self
+                .release_acquired_dmabuf_render_target_to_foreign_general_sync_point(target, false)
+                .map(|_| ());
+        }
+        // Frame::finish updates the owned image. The wrapper copy can still say Local.
+        // Mesa/NVIDIA keep the GBM VkImage until destroy; a second host release is not
+        // a new GPU operation. MultiFrame drop then DrmCompositor release_after must not
+        // fail closed (greeter first-present after KMS).
+        if let Some(color_image) = target.color_image.as_ref() {
+            let owned = color_image.sync_state()?;
+            if !owned.is_locally_usable() {
+                target.image.sync = owned;
+                return Ok(());
+            }
+        } else if target.image.sync.is_already_released_to_foreign() || !target.image.sync.is_locally_usable()
         {
             return Ok(());
         }
@@ -6612,12 +6626,16 @@ impl Renderer for VulkanRenderer {
         if framebuffer.image.size.w != output_size.w || framebuffer.image.size.h != output_size.h {
             return Err(VulkanError::UnsupportedOperation("frame size"));
         }
-        if framebuffer.image.source == image::VulkanImageSource::RenderTarget
-            && !framebuffer.image.sync.is_locally_usable()
-        {
-            return Err(VulkanError::UnsupportedOperation(
-                "dmabuf render-target frame ownership",
-            ));
+        if framebuffer.image.source == image::VulkanImageSource::RenderTarget {
+            let owned_local = match framebuffer.color_image.as_ref() {
+                Some(image) => image.sync_state()?.is_locally_usable(),
+                None => framebuffer.image.sync.is_locally_usable(),
+            };
+            if !framebuffer.image.sync.is_locally_usable() || !owned_local {
+                return Err(VulkanError::UnsupportedOperation(
+                    "dmabuf render-target frame ownership",
+                ));
+            }
         }
         if framebuffer.color_image.is_none() {
             return Err(VulkanError::UnsupportedOperation("render target image"));
