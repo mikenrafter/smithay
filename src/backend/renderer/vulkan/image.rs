@@ -1,6 +1,6 @@
 use std::{
     marker::PhantomData,
-    os::fd::BorrowedFd,
+    os::fd::{AsFd, BorrowedFd},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -1651,6 +1651,12 @@ impl Frame for VulkanFrame<'_, '_> {
         if released {
             target.image.layout = VulkanImageLayoutState::Undefined;
             target.image.sync = VulkanImageSyncState::foreign_known_general_for_dmabuf_import();
+            if let (Some(dmabuf), Some(sync_file)) = (
+                target.dmabuf.as_ref().and_then(WeakDmabuf::upgrade),
+                sync_file.as_ref(),
+            ) {
+                super::attach_implicit_write_fence(&dmabuf, sync_file.as_fd());
+            }
         }
 
         Ok(sync_point_from_sync_file(sync_file))

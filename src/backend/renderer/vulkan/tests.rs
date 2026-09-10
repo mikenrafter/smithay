@@ -10194,9 +10194,7 @@ fn sampled_dmabuf_import_contract_scaffold_marks_remaining_steps() {
             &user_data_lifecycle,
             &policy_dmabuf,
         ),
-        Err(VulkanError::UnsupportedOperation(
-            "sampled dmabuf Wayland texture-cache release lifecycle renderer identity"
-        ))
+        Ok(None)
     ));
     let mismatched_import_dmabuf = dmabuf_with_planes_for_tests(
         (8, 3).into(),

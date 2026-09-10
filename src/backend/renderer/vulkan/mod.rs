@@ -2626,6 +2626,15 @@ fn sync_point_from_sync_file(sync_file: Option<OwnedFd>) -> SyncPoint {
     }
 }
 
+/// Attach a compositor completion fence so implicit waiters (KMS, GLES, WSI without syncobj)
+/// see that this GPU is done. Does not consume `sync_file`. Failure is logged; explicit
+/// syncobj release is independent.
+fn attach_implicit_write_fence(dmabuf: &Dmabuf, sync_file: BorrowedFd<'_>) {
+    if let Err(err) = dmabuf.import_sync_file(0, DmabufSyncFlags::WRITE, sync_file) {
+        tracing::warn!(?err, "failed to attach implicit WRITE fence to dmabuf");
+    }
+}
+
 /// Provisional native Vulkan renderer for explicit-device in-memory/offscreen rendering.
 #[derive(Debug)]
 pub struct VulkanRenderer {
@@ -4547,6 +4556,10 @@ impl VulkanRenderer {
         };
 
         evidence.validate_commit_token(user_data)?;
+        if !evidence.is_for_renderer_context(&self.context_id) {
+            // Another GPU's evidence is not reusable here. Import fresh on this renderer.
+            return Ok(None);
+        }
         evidence.release_lifecycle(dmabuf, &self.context_id).map(Some)
     }
 
@@ -5867,6 +5880,9 @@ impl VulkanRenderer {
                 .map_err(device::VulkanSampledDmabufForeignReleaseError::ReleaseSubmitted)?;
             if let Some(dmabuf) = texture.sampled_dmabuf.as_ref().and_then(WeakDmabuf::upgrade) {
                 self.record_sampled_dmabuf_released_to_foreign_general(&dmabuf);
+                if let Some(sync_file) = release_sync_file.as_ref() {
+                    attach_implicit_write_fence(&dmabuf, sync_file.as_fd());
+                }
             }
         }
         Ok((released, release_sync_file))
