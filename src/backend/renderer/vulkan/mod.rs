@@ -3433,10 +3433,11 @@ impl VulkanRenderer {
 
     /// Mark a renderer-managed Wayland dmabuf buffer as covered by texture-cache release call sites.
     ///
-    /// This is a development-stage lifecycle evidence API for the normal [`ImportDmaWl`] path. It is
-    /// intentionally separate from the external-state marker because the normal `import_surface`
-    /// replacement-release point does not by itself prove no-next-import, reset, unmap, destruction, or
-    /// renderer teardown release call sites.
+    /// [`super::utils::import_surface`] auto-marks this when it caches a texture on a `WlSurface`:
+    /// that cache is the call site, and compositors (Anvil, cosmic-comp) must still call
+    /// [`super::utils::retire_and_release_surface_tree_textures`] while the renderer is available.
+    /// This helper remains for tests and imports that do not go through `import_surface`.
+    /// It is intentionally separate from the external-state marker.
     ///
     /// # Safety
     ///
@@ -6041,8 +6042,29 @@ impl VulkanRenderer {
                 post_retired_release_import,
             )?;
         let texture_cache_release_hook = self.sampled_dmabuf_wayland_texture_cache_release_hook(dmabuf);
-        let texture_cache_release_lifecycle =
+        let mut texture_cache_release_lifecycle =
             self.sampled_dmabuf_wayland_buffer_texture_cache_release_lifecycle(buffer, dmabuf)?;
+        if texture_cache_release_lifecycle.is_none() && surface.is_some() {
+            // import_surface caches the texture on the WlSurface. Mesa
+            // EGL_EXT_image_dma_buf_import and NVIDIA keep the imported EGLImage/VkImage
+            // until eglDestroyImageKHR/vkDestroyImage; closing the dma-buf fd does not
+            // free that GPU object. Mutter/Weston/KWin destroy it on wl_buffer destroy.
+            // Wayland has no extra lifecycle token, so this cache is the call site.
+            // Compositors (Anvil, cosmic-comp) must still call
+            // retire_and_release_surface_tree_textures while the renderer is available.
+            unsafe {
+                // SAFETY: `surface` is Some, so this import goes through the renderer-utils
+                // surface cache. The compositor using ImportDmaWl + on_commit_buffer_handler
+                // must call retire_and_release_surface_tree_textures before unmap, destroy,
+                // reset, or renderer teardown.
+                self.mark_wayland_dmabuf_user_data_texture_cache_release_lifecycle_for_sampled_import(
+                    buffer.user_data(),
+                    dmabuf,
+                )?;
+            }
+            texture_cache_release_lifecycle =
+                self.sampled_dmabuf_wayland_buffer_texture_cache_release_lifecycle(buffer, dmabuf)?;
+        }
 
         Ok(SampledDmabufImportContext {
             dmabuf,

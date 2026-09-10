@@ -12050,12 +12050,10 @@ fn import_surface_external_state_marker_requires_separate_lifecycle_evidence() {
     }
 
     let import_result = crate::backend::renderer::utils::import_surface(&mut renderer, &surface);
-    assert!(matches!(
-        import_result,
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan texture-cache release call sites"
-        ))
-    ));
+    assert!(
+        matches!(import_result, Err(VulkanError::VulkanUnavailable)),
+        "import_surface cache is the texture-cache call site; scaffold has no device: {import_result:?}"
+    );
     assert_buffer_release_point_matches_for_tests(
         &buffer,
         &expected_release_point,
@@ -12533,12 +12531,10 @@ fn import_surface_texture_cache_lifecycle_marker_is_commit_local() {
     let import_result = crate::wayland::compositor::with_states(&surface, |states| {
         crate::backend::renderer::utils::import_surface(&mut renderer, states)
     });
-    assert!(matches!(
-        import_result,
-        Err(VulkanError::MissingCapability(
-            "sampled dmabuf Wayland Vulkan texture-cache release call sites"
-        ))
-    ));
+    assert!(
+        matches!(import_result, Err(VulkanError::VulkanUnavailable)),
+        "replacement import_surface still owns the cache call site: {import_result:?}"
+    );
     assert_buffer_release_point_matches_for_tests(
         &second_buffer,
         &expected_second_release_point,
