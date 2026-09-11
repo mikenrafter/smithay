@@ -3,11 +3,11 @@
     "cosmic-comp": {
       "flake": false,
       "locked": {
-        "lastModified": 1789051423,
-        "narHash": "sha256-EVhHe3fHWlLoVAP35ZDgW7jUEGWDCK3JShSENY3vjFc=",
+        "lastModified": 1789146868,
+        "narHash": "sha256-TVX4ulcVXrU6WjFPoxQ2kbIuEIDlCsWoZt+9ge0x3DI=",
         "owner": "Pheoxy",
         "repo": "cosmic-comp",
-        "rev": "25ec37582c5bf56f2894c36714023595b7793e63",
+        "rev": "2800209cbe514422e4514cd1f417cc8f151257fb",
         "type": "github"
       },
       "original": {
