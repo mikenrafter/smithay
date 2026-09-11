@@ -23,6 +23,7 @@ use super::{
     image::{
         VulkanDmabufImportState, VulkanDmabufRenderTargetAcquireRestore, VulkanExternalImageOwnership,
         VulkanExternalMemoryHandleType, VulkanImageSyncState, dmabuf_import_sync_state,
+        dmabuf_render_target_first_use_sync_state,
     },
 };
 
@@ -1386,7 +1387,7 @@ impl VulkanDeviceState {
     ) -> Result<Option<VulkanOwnedImage>, VulkanError> {
         self.create_bound_dmabuf_image_with_sync(
             dmabuf,
-            dmabuf_import_sync_state(),
+            dmabuf_render_target_first_use_sync_state(),
             vk::ImageUsageFlags::COLOR_ATTACHMENT,
         )
     }
@@ -1413,7 +1414,7 @@ impl VulkanDeviceState {
         let sync = if preserve_contents {
             VulkanImageSyncState::foreign_known_general_for_dmabuf_import()
         } else {
-            dmabuf_import_sync_state()
+            dmabuf_render_target_first_use_sync_state()
         };
         let Some(image) =
             self.create_bound_dmabuf_image_with_sync(dmabuf, sync, vk::ImageUsageFlags::COLOR_ATTACHMENT)?
@@ -1479,7 +1480,7 @@ impl VulkanDeviceState {
         let sync = if preserve_contents {
             VulkanImageSyncState::foreign_known_general_for_dmabuf_import()
         } else {
-            dmabuf_import_sync_state()
+            dmabuf_render_target_first_use_sync_state()
         };
         let Some(image) =
             self.create_bound_dmabuf_image_with_sync(dmabuf, sync, vk::ImageUsageFlags::COLOR_ATTACHMENT)?
@@ -4567,7 +4568,7 @@ fn record_dmabuf_render_target_foreign_acquire_barrier(
     ensure_graphics_command_buffer(command_buffer)?;
     ensure_command_buffer_image_device(command_buffer, image)?;
     ensure_dmabuf_external_image(image)?;
-    let Some(_) = command_buffer.plan_dmabuf_render_target_foreign_acquire_barrier(
+    let Some(barrier) = command_buffer.plan_dmabuf_render_target_foreign_acquire_barrier(
         &image.sync_state()?,
         image.usage(),
         preserve_contents,
@@ -4582,28 +4583,14 @@ fn record_dmabuf_render_target_foreign_acquire_barrier(
         .inner
         .sync
         .begin_dmabuf_render_target_foreign_acquire(preserve_contents)?;
-    let external_layout = match restore.ownership() {
-        VulkanExternalImageOwnership::ForeignUnknown => vk::ImageLayout::UNDEFINED,
-        VulkanExternalImageOwnership::ForeignKnownGeneral => vk::ImageLayout::GENERAL,
-        VulkanExternalImageOwnership::None
-        | VulkanExternalImageOwnership::AcquirePending
+    match restore.ownership() {
+        VulkanExternalImageOwnership::ForeignUnknown
+        | VulkanExternalImageOwnership::ForeignKnownGeneral
+        | VulkanExternalImageOwnership::None => {}
+        VulkanExternalImageOwnership::AcquirePending
         | VulkanExternalImageOwnership::Local
         | VulkanExternalImageOwnership::ReleasePending => {
             let err = VulkanError::UnsupportedOperation("dmabuf external ownership");
-            image
-                .inner
-                .sync
-                .abort_dmabuf_render_target_foreign_acquire(restore)?;
-            return Err(err);
-        }
-    };
-    let barrier = match dmabuf_render_target_foreign_acquire_barrier(
-        external_layout,
-        command_buffer.queue_family_index(),
-        image.usage(),
-    ) {
-        Ok(barrier) => barrier,
-        Err(err) => {
             image
                 .inner
                 .sync
@@ -4625,11 +4612,10 @@ fn record_dmabuf_render_target_foreign_acquire_barrier(
 
     // SAFETY: `command_buffer` is in recording state and belongs to a live graphics command
     // pool/device. `image` is a bound dmabuf external-memory image retained below until command
-    // completion. The barrier is built from the restore token returned by the host-side begin step:
-    // unknown discard acquires use UNDEFINED, while known-general acquires use GENERAL even when the
-    // caller does not need to preserve contents. The barrier helper validates color-attachment usage
-    // and a local destination queue family before selecting the FOREIGN -> local ownership transfer
-    // and COLOR_ATTACHMENT layout transition.
+    // completion. The barrier is the one `plan_dmabuf_render_target_foreign_acquire_barrier`
+    // selected: first-use (None, pending) is UNDEFINED → COLOR_ATTACHMENT with IGNORED queue
+    // families; post-KMS ForeignUnknown discard is FOREIGN → local from UNDEFINED; known-GENERAL
+    // preserve is FOREIGN → local from GENERAL.
     unsafe {
         command_buffer
             .command_pool
@@ -5647,6 +5633,33 @@ pub(super) fn dmabuf_render_target_foreign_acquire_barrier(
     })
 }
 
+/// First use of a compositor-owned scanout `VkImage`: layout only, no queue-family transfer.
+///
+/// Khronos: discard from `UNDEFINED` does not require an ownership transfer from present/KMS.
+/// `src/dstQueueFamily` stay `IGNORED`. This is not client dma-buf import.
+pub(super) fn dmabuf_render_target_first_use_layout_barrier(
+    graphics_queue_family: u32,
+    usage: vk::ImageUsageFlags,
+) -> Result<VulkanExternalImageBarrier, VulkanError> {
+    if !usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+        return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
+    }
+    if !is_local_queue_family_index(graphics_queue_family) {
+        return Err(VulkanError::UnsupportedOperation("dmabuf queue family"));
+    }
+
+    Ok(VulkanExternalImageBarrier {
+        src_stage: vk::PipelineStageFlags::TOP_OF_PIPE,
+        dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        src_access: vk::AccessFlags::empty(),
+        dst_access: vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        old_layout: vk::ImageLayout::UNDEFINED,
+        new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+    })
+}
+
 #[allow(dead_code)]
 pub(super) fn dmabuf_render_target_foreign_release_barrier(
     graphics_queue_family: u32,
@@ -5749,6 +5762,9 @@ pub(super) fn plan_dmabuf_render_target_foreign_acquire_barrier(
                 usage,
             )
             .map(Some)
+        }
+        (VulkanExternalImageOwnership::None, true) if !preserve_contents => {
+            dmabuf_render_target_first_use_layout_barrier(graphics_queue_family, usage).map(Some)
         }
         (VulkanExternalImageOwnership::None, false) | (VulkanExternalImageOwnership::Local, false) => {
             Ok(None)

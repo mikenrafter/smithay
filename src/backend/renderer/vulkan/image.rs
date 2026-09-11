@@ -403,6 +403,18 @@ pub(super) fn dmabuf_import_sync_state() -> VulkanImageSyncState {
     }
 }
 
+/// Host state for a scanout `VkImage` this device just created (compositor GBM).
+///
+/// Not foreign: KMS has never owned this image object. Not locally usable until the
+/// first-use layout barrier (`UNDEFINED` → color attachment, same queue, no `FOREIGN_EXT`).
+pub(super) fn dmabuf_render_target_first_use_sync_state() -> VulkanImageSyncState {
+    VulkanImageSyncState {
+        external_acquire_pending: true,
+        external_ownership: VulkanExternalImageOwnership::None,
+        ..VulkanImageSyncState::default()
+    }
+}
+
 /// Provenance of a Vulkan image managed by the renderer.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -658,6 +670,18 @@ impl VulkanImageSyncState {
                 Ok(VulkanDmabufRenderTargetAcquireRestore {
                     token,
                     ownership: VulkanExternalImageOwnership::ForeignUnknown,
+                })
+            }
+            (VulkanExternalImageOwnership::None, true, VulkanExternalImageAcquireKind::None)
+                if !preserve_contents =>
+            {
+                let token = next_dmabuf_render_target_acquire_restore_token();
+                self.external_ownership = VulkanExternalImageOwnership::AcquirePending;
+                self.external_acquire_kind = VulkanExternalImageAcquireKind::RenderTarget;
+                self.render_target_acquire_restore_token = Some(token);
+                Ok(VulkanDmabufRenderTargetAcquireRestore {
+                    token,
+                    ownership: VulkanExternalImageOwnership::None,
                 })
             }
             (VulkanExternalImageOwnership::ForeignUnknown, true, _)

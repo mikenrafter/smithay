@@ -70,13 +70,14 @@ use super::device::{
     classify_dmabuf_render_target_release_submit_error_for_tests,
     classify_sampled_dmabuf_acquire_submit_error_for_tests,
     classify_sampled_dmabuf_release_submit_error_for_tests, dmabuf_import_memory_type_bits,
-    dmabuf_plane_layouts, dmabuf_render_target_foreign_acquire_barrier,
-    dmabuf_render_target_foreign_release_barrier, find_memory_type_index, image_copy_buffer_offset,
-    image_copy_required_size, image_layout_transition, plan_dmabuf_render_target_foreign_acquire_barrier,
-    plan_dmabuf_render_target_foreign_release_barrier, plan_sampled_dmabuf_foreign_acquire_barrier,
-    plan_sampled_dmabuf_foreign_release_barrier, project_dmabuf_render_target_sync_after_pending_acquire,
-    sampled_dmabuf_foreign_acquire_barrier, sampled_dmabuf_foreign_release_barrier, select_queue_families,
-    tightly_packed_image_size, validate_submit_wait_stage, vulkan_filter,
+    dmabuf_plane_layouts, dmabuf_render_target_first_use_layout_barrier,
+    dmabuf_render_target_foreign_acquire_barrier, dmabuf_render_target_foreign_release_barrier,
+    find_memory_type_index, image_copy_buffer_offset, image_copy_required_size, image_layout_transition,
+    plan_dmabuf_render_target_foreign_acquire_barrier, plan_dmabuf_render_target_foreign_release_barrier,
+    plan_sampled_dmabuf_foreign_acquire_barrier, plan_sampled_dmabuf_foreign_release_barrier,
+    project_dmabuf_render_target_sync_after_pending_acquire, sampled_dmabuf_foreign_acquire_barrier,
+    sampled_dmabuf_foreign_release_barrier, select_queue_families, tightly_packed_image_size,
+    validate_submit_wait_stage, vulkan_filter,
 };
 use super::error::vulkan_api_result_invalidates_context;
 use super::format::is_10bit;
@@ -2623,6 +2624,21 @@ fn dmabuf_render_target_foreign_barriers_distinguish_discard_and_preserve_acquir
         plan_dmabuf_render_target_foreign_acquire_barrier(&fresh_import_sync, 2, usage, false).unwrap(),
         Some(discard_acquire)
     );
+    let first_use_sync = super::image::dmabuf_render_target_first_use_sync_state();
+    let first_use = dmabuf_render_target_first_use_layout_barrier(2, usage).unwrap();
+    assert_eq!(first_use.old_layout, vk::ImageLayout::UNDEFINED);
+    assert_eq!(first_use.new_layout, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    assert_eq!(first_use.src_queue_family_index, vk::QUEUE_FAMILY_IGNORED);
+    assert_eq!(first_use.dst_queue_family_index, vk::QUEUE_FAMILY_IGNORED);
+    assert_eq!(
+        plan_dmabuf_render_target_foreign_acquire_barrier(&first_use_sync, 2, usage, false).unwrap(),
+        Some(first_use)
+    );
+    assert!(matches!(
+        plan_dmabuf_render_target_foreign_acquire_barrier(&first_use_sync, 2, usage, true),
+        Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
+    ));
+    assert!(!first_use_sync.is_locally_usable());
     assert!(matches!(
         plan_dmabuf_render_target_foreign_acquire_barrier(&fresh_import_sync, 2, usage, true),
         Err(VulkanError::UnsupportedOperation("dmabuf external ownership"))
