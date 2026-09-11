@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "cosmic-comp": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1789051423,
+        "narHash": "sha256-EVhHe3fHWlLoVAP35ZDgW7jUEGWDCK3JShSENY3vjFc=",
+        "owner": "Pheoxy",
+        "repo": "cosmic-comp",
+        "rev": "25ec37582c5bf56f2894c36714023595b7793e63",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Pheoxy",
+        "ref": "vulkan-renderer-e3d461a",
+        "repo": "cosmic-comp",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1789006805,
+        "narHash": "sha256-xB8mKMOx1IA9vTDNLmJZ6n4wCMq/cuWBBOzGCRnqxrU=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "8ce4ef6cb6f871616146b9fe26d2a5ae594e94fe",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "cosmic-comp": "cosmic-comp",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
