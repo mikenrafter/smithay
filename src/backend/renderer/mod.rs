@@ -779,6 +779,34 @@ pub trait ImportDma: Renderer {
         dmabuf: &Dmabuf,
         damage: Option<&[Rectangle<i32, BufferCoord>]>,
     ) -> Result<Self::TextureId, Self::Error>;
+
+    /// Formats this renderer can sample for compositor-owned cross-device copies.
+    ///
+    /// This is not the generic client [`ImportDma`] advertisement. [`Self::dmabuf_formats`] stays
+    /// that list. MultiRenderer uses this for NVIDIA→Intel (or similar) GPU blits of a compositor
+    /// GBM buffer. Default: [`Self::dmabuf_formats`].
+    fn compositor_copy_dmabuf_formats(&self) -> FormatSet {
+        self.dmabuf_formats()
+    }
+
+    /// Import a compositor-owned dmabuf for a cross-device copy.
+    ///
+    /// The buffer is not a Wayland client `wl_buffer`. Default: [`Self::import_dmabuf`].
+    fn import_compositor_dmabuf(
+        &mut self,
+        dmabuf: &Dmabuf,
+        damage: Option<&[Rectangle<i32, BufferCoord>]>,
+    ) -> Result<Self::TextureId, Self::Error> {
+        self.import_dmabuf(dmabuf, damage)
+    }
+
+    /// Release a texture from [`Self::import_compositor_dmabuf`] after the copy.
+    ///
+    /// GLES/EGL can no-op (the EGLImage lives until the buffer is destroyed). Vulkan releases
+    /// queue-family ownership back to FOREIGN so the producer GPU can acquire next frame.
+    fn release_compositor_dmabuf(&mut self, _texture: &Self::TextureId) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 // TODO: Replace this with a trait_alias, once that is stabilized.

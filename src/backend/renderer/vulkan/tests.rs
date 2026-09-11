@@ -9097,6 +9097,26 @@ fn public_dmabuf_bind_validates_metadata_before_device_lookup() {
     ));
 }
 
+#[cfg(feature = "backend_drm")]
+#[test]
+fn generic_import_dma_stays_fail_closed_for_compositor_copy_split() {
+    let mut renderer = VulkanRenderer::new_scaffold_for_tests();
+    let dmabuf = dmabuf_with_planes_for_tests(
+        (1, 1).into(),
+        Fourcc::Abgr8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+        &[(0, 0, 4)],
+    );
+    assert!(matches!(
+        renderer.import_dmabuf(&dmabuf, None),
+        Err(VulkanError::MissingCapability(
+            "sampled dmabuf generic ImportDma external-state contract"
+        ))
+    ));
+    assert!(renderer.compositor_copy_dmabuf_formats().iter().next().is_none());
+}
+
 #[test]
 fn internal_dmabuf_render_target_release_rejects_preconditions_before_device_lookup() {
     let mut renderer = VulkanRenderer::new_scaffold_for_tests();

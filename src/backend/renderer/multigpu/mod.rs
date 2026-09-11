@@ -1020,6 +1020,7 @@ struct TargetFrameData<'target, 'frame, 'buffer, T: GraphicsApi> {
     device: &'frame mut &'target mut T::Device,
     framebuffer: &'frame mut <<T::Device as ApiDevice>::Renderer as RendererSuper>::Framebuffer<'buffer>,
     texture: Option<<<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>,
+    copy_dmabuf: Option<Dmabuf>,
     format: Fourcc,
 }
 
@@ -1127,7 +1128,7 @@ where
     R: 'static,
     R::Error: 'static,
     T::Error: 'static,
-    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
+    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + RenderTargetLifecycle<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -1167,7 +1168,7 @@ where
     R: 'static,
     R::Error: 'static,
     T::Error: 'static,
-    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
+    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + RenderTargetLifecycle<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -1225,7 +1226,7 @@ where
     R: 'static,
     R::Error: 'static,
     T::Error: 'static,
-    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
+    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + RenderTargetLifecycle<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -1301,7 +1302,7 @@ where
     R: 'static,
     R::Error: 'static,
     T::Error: 'static,
-    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
+    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + RenderTargetLifecycle<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -1322,7 +1323,8 @@ where
     R: 'static,
     R::Error: 'static,
     T::Error: 'static,
-    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
+    <R::Device as ApiDevice>::Renderer:
+        Bind<Dmabuf> + RenderTargetLifecycle<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
@@ -1424,19 +1426,34 @@ where
 
             // try to import on target node
             let (direct, dmabuf) = target.cached_buffer.as_mut().unwrap();
-            // TODO: We could cache that texture all the way back to the GpuManager in a HashMap<WeakDmabuf, Texture>.
+            // GLES imports here (implicit sync). Vulkan compositor-copy import happens after
+            // the producer GPU finishes, in MultiFrame::finish_internal.
             let texture = (*direct)
                 .then(|| {
                     target
                         .device
                         .renderer_mut()
-                        .import_dmabuf(dmabuf, Some(&[Rectangle::from_size(buffer_size)]))
-                        .map_err(Error::Target)
+                        .import_compositor_dmabuf(dmabuf, Some(&[Rectangle::from_size(buffer_size)]))
                 })
-                .transpose()?;
+                .and_then(|result| match result {
+                    Ok(texture) => Some(texture),
+                    Err(err) => {
+                        warn!(
+                            "Compositor-copy import at frame start failed ({err:?}); will retry after producer finish or CPU-copy"
+                        );
+                        None
+                    }
+                });
+            let copy_dmabuf = (*direct).then(|| dmabuf.clone());
             let framebuffer = self.render.renderer_mut().bind(dmabuf).map_err(Error::Render)?;
 
-            Some((&mut target.device, framebuffer, texture, target.format))
+            Some((
+                &mut target.device,
+                framebuffer,
+                texture,
+                copy_dmabuf,
+                target.format,
+            ))
         } else {
             None
         };
@@ -1461,11 +1478,12 @@ where
                     .map_err(Error::Render)?
             }
             MultiFramebufferInternal::Target(target_framebuffer) => {
-                let (target_device, render_framebuffer, texture, format) = target_state.unwrap();
+                let (target_device, render_framebuffer, texture, copy_dmabuf, format) = target_state.unwrap();
                 target = Some(TargetFrameData {
                     device: target_device,
                     framebuffer: target_framebuffer,
                     texture,
+                    copy_dmabuf,
                     format,
                 });
                 let mut render_framebuffer = AliasableBox::from_unique(Box::new(render_framebuffer));
@@ -1615,7 +1633,8 @@ where
     R: GraphicsApi + 'static,
     R::Error: 'static,
     T::Error: 'static,
-    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
+    <R::Device as ApiDevice>::Renderer:
+        Bind<Dmabuf> + RenderTargetLifecycle<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -1624,7 +1643,7 @@ where
         return Err(Error::ImportFailed);
     }
 
-    let target_formats = ImportDma::dmabuf_formats(target.device.renderer())
+    let target_formats = ImportDma::compositor_copy_dmabuf_formats(target.device.renderer())
         .iter()
         .filter(|format| format.code == target.format)
         .copied()
@@ -1660,12 +1679,21 @@ where
 
     // verify we can bind on src and import on target
 
-    src.renderer_mut().bind(&mut dmabuf).map_err(Error::Render)?;
+    {
+        let mut framebuffer = src.renderer_mut().bind(&mut dmabuf).map_err(Error::Render)?;
+        RenderTargetLifecycle::release_after_no_render(src.renderer_mut(), &mut framebuffer)
+            .map_err(Error::Render)?;
+    }
 
-    target
+    let imported = target
         .device
         .renderer_mut()
-        .import_dmabuf(&dmabuf, Some(&[Rectangle::from_size(buffer_size)]))
+        .import_compositor_dmabuf(&dmabuf, Some(&[Rectangle::from_size(buffer_size)]))
+        .map_err(Error::Target)?;
+    let _ = target
+        .device
+        .renderer_mut()
+        .release_compositor_dmabuf(&imported)
         .map_err(Error::Target)?;
 
     Ok(dmabuf)
@@ -1738,7 +1766,21 @@ where
 
             let buffer_size = self.size.to_logical(1).to_buffer(1, Transform::Normal);
             if let Some(target) = self.target.as_mut() {
-                if let Some(texture) = target.texture.as_ref() {
+                if target.texture.is_none() {
+                    if let Some(dmabuf) = target.copy_dmabuf.as_ref() {
+                        match target
+                            .device
+                            .renderer_mut()
+                            .import_compositor_dmabuf(dmabuf, Some(&[Rectangle::from_size(buffer_size)]))
+                        {
+                            Ok(texture) => target.texture = Some(texture),
+                            Err(err) => warn!(
+                                "Compositor-copy import after producer finish failed ({err:?}); CPU-copy"
+                            ),
+                        }
+                    }
+                }
+                if target.texture.is_some() {
                     // try gpu copy
                     let damage = damage
                         .iter()
@@ -1755,7 +1797,7 @@ where
                         .map_err(Error::Target)?;
                     frame
                         .render_texture_from_to(
-                            texture,
+                            target.texture.as_ref().unwrap(),
                             Rectangle::from_size(buffer_size).to_f64(),
                             Rectangle::from_size(self.size),
                             &damage,
@@ -1765,6 +1807,11 @@ where
                         )
                         .map_err(Error::Target)?;
                     let sync = frame.finish().map_err(Error::Target)?;
+                    if let Some(texture) = target.texture.take() {
+                        if let Err(err) = target.device.renderer_mut().release_compositor_dmabuf(&texture) {
+                            warn!("Compositor-copy release after GPU blit failed: {err:?}");
+                        }
+                    }
                     render
                         .renderer_mut()
                         .cleanup_texture_cache()
@@ -2368,7 +2415,7 @@ where
     R: 'static,
     R::Error: 'static,
     T::Error: 'static,
-    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
+    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + RenderTargetLifecycle<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -2417,7 +2464,7 @@ where
     R: 'static,
     R::Error: 'static,
     T::Error: 'static,
-    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
+    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + RenderTargetLifecycle<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -2613,7 +2660,7 @@ where
     T: 'static,
     // We need this because the Renderer-impl does and ImportDma requires Renderer
     R: 'static,
-    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
+    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + RenderTargetLifecycle<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ImportDma + ImportMem,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -2717,7 +2764,7 @@ where
     T: 'static,
     // We need this because the Renderer-impl does and ImportDma requires Renderer
     R: 'static,
-    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
+    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + RenderTargetLifecycle<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -3651,7 +3698,7 @@ where
     R: 'static,
     R::Error: 'static,
     T::Error: 'static,
-    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
+    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + RenderTargetLifecycle<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -3756,7 +3803,7 @@ where
     R: 'static,
     R::Error: 'static,
     T::Error: 'static,
-    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
+    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + RenderTargetLifecycle<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -3849,7 +3896,7 @@ where
     R: 'static,
     R::Error: 'static,
     T::Error: 'static,
-    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + ExportMem + ImportDma + ImportMem,
+    <R::Device as ApiDevice>::Renderer: Bind<Dmabuf> + RenderTargetLifecycle<Dmabuf> + ExportMem + ImportDma + ImportMem,
     <T::Device as ApiDevice>::Renderer: ImportDma + ImportMem,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send + 'static,
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
@@ -4924,6 +4971,8 @@ mod tests {
             Some([test_format()].into_iter().collect())
         }
     }
+
+    impl RenderTargetLifecycle<Dmabuf> for TestRenderer {}
 
     #[derive(Debug)]
     struct TestMapping;

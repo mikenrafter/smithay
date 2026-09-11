@@ -5856,6 +5856,44 @@ impl VulkanRenderer {
         Ok(texture)
     }
 
+    /// Import a compositor-owned dmabuf for MultiRenderer cross-device copy.
+    ///
+    /// The producer is this compositor's other GPU (`Bind<Dmabuf>` + `Frame::finish`), which
+    /// releases to FOREIGN+GENERAL and attaches an implicit WRITE fence. This is not a Wayland
+    /// client buffer and does not open generic [`ImportDma`].
+    fn import_compositor_copy_dmabuf(
+        &mut self,
+        dmabuf: &Dmabuf,
+    ) -> Result<Option<VulkanTexture>, VulkanError> {
+        if !self.capabilities.import.dmabuf {
+            return Err(VulkanError::MissingCapability("compositor-copy dmabuf"));
+        }
+        self.validate_sampled_dmabuf_public_import_lifecycle(dmabuf)?;
+        let acquire_sync = dmabuf
+            .export_sync_file(0, DmabufSyncFlags::WRITE)
+            .ok()
+            .map(|fd| sync_point_from_sync_file(Some(fd)));
+        let foreign_general = unsafe {
+            // SAFETY: MultiRenderer copies a compositor GBM after the producer GPU released it to
+            // FOREIGN+GENERAL (Bind scanout/copy finish). Mesa EGL_EXT_image_dma_buf_import and
+            // NVIDIA keep a per-device EGLImage/VkImage; this is that device's import.
+            SampledDmabufKnownLayoutEvidence::foreign_general(dmabuf.weak())
+        };
+        let texture = unsafe {
+            // SAFETY: Same compositor-owned FOREIGN+GENERAL contract as above. The optional
+            // acquire sync is the buffer's implicit WRITE fence from the producer release.
+            self.create_imported_dmabuf_texture_with_known_general_layout_and_sync_point(
+                dmabuf,
+                foreign_general,
+                acquire_sync.as_ref(),
+            )?
+        };
+        if texture.is_some() {
+            self.record_sampled_dmabuf_locally_acquired(dmabuf);
+        }
+        Ok(texture)
+    }
+
     /// Release an acquired dmabuf texture back to foreign ownership in `VK_IMAGE_LAYOUT_GENERAL`.
     ///
     /// This is the release counterpart to
@@ -6906,6 +6944,35 @@ impl ImportDma for VulkanRenderer {
         Err(VulkanError::MissingCapability(
             "sampled dmabuf generic ImportDma external-state contract",
         ))
+    }
+
+    fn compositor_copy_dmabuf_formats(&self) -> FormatSet {
+        if self.capabilities.import.dmabuf {
+            self.capabilities.formats.dmabuf_import.clone()
+        } else {
+            FormatSet::default()
+        }
+    }
+
+    fn import_compositor_dmabuf(
+        &mut self,
+        dmabuf: &Dmabuf,
+        _damage: Option<&[Rectangle<i32, BufferCoord>]>,
+    ) -> Result<Self::TextureId, Self::Error> {
+        self.import_compositor_copy_dmabuf(dmabuf)?
+            .ok_or(VulkanError::MissingCapability(
+                "compositor-copy dmabuf format/modifier",
+            ))
+    }
+
+    fn release_compositor_dmabuf(&mut self, texture: &Self::TextureId) -> Result<(), Self::Error> {
+        let (released, _) = self.release_imported_dmabuf_texture_to_foreign_general(texture, true)?;
+        if !released {
+            return Err(VulkanError::UnsupportedOperation(
+                "compositor-copy dmabuf release",
+            ));
+        }
+        Ok(())
     }
 }
 
