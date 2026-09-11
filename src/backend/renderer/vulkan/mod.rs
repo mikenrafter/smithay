@@ -6738,6 +6738,12 @@ impl<'target> Bind<VulkanRenderTarget<'target>> for VulkanRenderer {
     }
 }
 
+impl<'target> RenderTargetLifecycle<VulkanRenderTarget<'target>> for VulkanRenderer {
+    fn target_age(&self, _target: &VulkanRenderTarget<'target>, age: usize) -> usize {
+        age
+    }
+}
+
 impl<'target, 'sync> Bind<VulkanDmabufRenderTarget<'target, 'sync>> for VulkanRenderer {
     fn bind<'a>(
         &mut self,

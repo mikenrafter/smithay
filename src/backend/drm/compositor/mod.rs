@@ -861,6 +861,19 @@ struct CursorState<G: AsFd + 'static> {
     previous_output_scale: Option<Scale<f64>>,
     #[cfg(feature = "renderer_pixman")]
     pixman_renderer: Option<PixmanRenderer>,
+    /// One warn per compositor for the first pre-TEST assignment miss, then debug.
+    logged_assign_miss: bool,
+}
+
+impl<G: AsFd + 'static> CursorState<G> {
+    fn note_assign_miss(&mut self, reason: &'static str) {
+        if !self.logged_assign_miss {
+            warn!(reason, "cursor plane assignment failed before KMS TEST");
+            self.logged_assign_miss = true;
+        } else {
+            debug!(reason, "cursor plane assignment failed before KMS TEST");
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error, Copy, Clone)]
@@ -1369,6 +1382,7 @@ where
                             previous_output_transform: None,
                             #[cfg(feature = "renderer_pixman")]
                             pixman_renderer,
+                            logged_assign_miss: false,
                         }
                     });
 
@@ -1551,6 +1565,7 @@ where
                 previous_output_transform: None,
                 #[cfg(feature = "renderer_pixman")]
                 pixman_renderer,
+                logged_assign_miss: false,
             }
         });
 
@@ -3203,16 +3218,12 @@ where
         }
 
         let Some(cursor_state) = self.cursor_state.as_mut() else {
-            trace!("no cursor state, skipping cursor rendering");
+            debug!("no cursor state, skipping cursor rendering");
             return None;
         };
 
         // only try to assign elements on a cursor plane that indicate so
         if element.kind() != Kind::Cursor {
-            trace!(
-                "skipping element {:?} on cursor plane(s), element kind not cursor",
-                element.id(),
-            );
             return None;
         }
 
@@ -3221,7 +3232,7 @@ where
         // if the element is greater than the cursor size we can not
         // use the cursor plane to scan out the element
         if element_size.w > self.cursor_size.w || element_size.h > self.cursor_size.h {
-            trace!("element {:?} too big for cursor plane(s), skipping", element.id(),);
+            cursor_state.note_assign_miss("element larger than DRM cursor size");
             return None;
         }
 
@@ -3272,10 +3283,7 @@ where
                 })
             })
         else {
-            trace!(
-                "skipping element {:?} on cursor plane(s), no free plane found",
-                element.id(),
-            );
+            cursor_state.note_assign_miss("no free cursor plane");
             return None;
         };
 
@@ -3392,6 +3400,7 @@ where
             Ok(buffer) => buffer,
             Err(err) => {
                 debug!("failed to create cursor buffer: {}", err);
+                cursor_state.note_assign_miss("GBM cursor buffer allocation failed");
                 return None;
             }
         };
@@ -3408,6 +3417,7 @@ where
                     "failed to export framebuffer for cursor {:?}: no framebuffer available",
                     plane_info.handle
                 );
+                cursor_state.note_assign_miss("cursor framebuffer export returned none");
                 return None;
             }
             Err(err) => {
@@ -3415,6 +3425,7 @@ where
                     "failed to export framebuffer for cursor {:?}: {}",
                     plane_info.handle, err
                 );
+                cursor_state.note_assign_miss("cursor framebuffer export failed");
                 return None;
             }
         };
@@ -3430,7 +3441,7 @@ where
             output_transform,
             &mut cursor_buffer,
         ) {
-            tracing::trace!("failed to copy element to cursor bo, skipping element on cursor plane");
+            cursor_state.note_assign_miss("CPU copy into cursor BO failed");
             return None;
         }
 
@@ -3447,88 +3458,103 @@ where
             tracing::trace!("cursor fast-path copy failed, falling back to rendering using offscreen buffer");
 
             let Some(storage) = element.underlying_storage(renderer) else {
-                trace!("Can't obtain cursor's underlying storage");
+                cursor_state.note_assign_miss("no underlying storage for pixman cursor fallback");
                 return None;
             };
 
-            let pixman_renderer = cursor_state.pixman_renderer.as_mut()?;
+            let pixman_result: Result<(), &'static str> = (|| {
+                let pixman_renderer = cursor_state
+                    .pixman_renderer
+                    .as_mut()
+                    .ok_or("pixman cursor renderer unavailable")?;
 
-            // Create a pixman image from the source cursor data. This will either be set by the
-            // client, or the compositor's choice.
-            let cursor_texture = match storage {
-                UnderlyingStorage::Wayland(buffer) => pixman_renderer
-                    .import_buffer(buffer, None, &[element.src().to_i32_up()])
-                    .transpose()
-                    .ok()
-                    .flatten(),
-                UnderlyingStorage::Memory(memory) => {
-                    let format = memory.format();
-                    let size = memory.size();
-                    let Ok(pixman_format) = pixman::FormatCode::try_from(format) else {
-                        debug!("No pixman format for {format}");
-                        return None;
-                    };
-                    unsafe {
-                        match pixman::Image::from_raw_mut(
-                            pixman_format,
-                            size.w as usize,
-                            size.h as usize,
-                            memory.as_ptr() as *mut u32,
-                            memory.stride() as usize,
-                            false,
-                        ) {
-                            Ok(image) => Some(PixmanTexture::from(image)),
-                            Err(e) => {
-                                debug!("pixman cursor: {e}");
-                                None
+                // Create a pixman image from the source cursor data. This will either be set by the
+                // client, or the compositor's choice.
+                let cursor_texture = match storage {
+                    UnderlyingStorage::Wayland(buffer) => pixman_renderer
+                        .import_buffer(buffer, None, &[element.src().to_i32_up()])
+                        .transpose()
+                        .ok()
+                        .flatten(),
+                    UnderlyingStorage::Memory(memory) => {
+                        let format = memory.format();
+                        let size = memory.size();
+                        let pixman_format = pixman::FormatCode::try_from(format).map_err(|_| {
+                            debug!("No pixman format for {format}");
+                            "no pixman format for cursor memory"
+                        })?;
+                        unsafe {
+                            match pixman::Image::from_raw_mut(
+                                pixman_format,
+                                size.w as usize,
+                                size.h as usize,
+                                memory.as_ptr() as *mut u32,
+                                memory.stride() as usize,
+                                false,
+                            ) {
+                                Ok(image) => Some(PixmanTexture::from(image)),
+                                Err(e) => {
+                                    debug!("pixman cursor: {e}");
+                                    None
+                                }
                             }
                         }
                     }
+                };
+                let cursor_texture = cursor_texture.ok_or("pixman could not import cursor storage")?;
+
+                let ret = cursor_buffer
+                    .map_mut::<_, Result<_, PixmanError>>(
+                        0,
+                        0,
+                        cursor_buffer_size.w as u32,
+                        cursor_buffer_size.h as u32,
+                        |mbo| {
+                            let plane_pixman_format =
+                                pixman::FormatCode::try_from(DrmFourcc::Argb8888).unwrap();
+                            let mut cursor_dst = unsafe {
+                                pixman::Image::from_raw_mut(
+                                    plane_pixman_format,
+                                    mbo.width() as usize,
+                                    mbo.height() as usize,
+                                    mbo.buffer_mut().as_mut_ptr() as *mut u32,
+                                    mbo.stride() as usize,
+                                    false,
+                                )
+                            }
+                            .map_err(|_| PixmanError::ImportFailed)?;
+                            let mut framebuffer = pixman_renderer.bind(&mut cursor_dst)?;
+                            let mut frame = pixman_renderer.render(
+                                &mut framebuffer,
+                                cursor_plane_size,
+                                output_transform,
+                            )?;
+                            frame.clear(Color32F::TRANSPARENT, &[Rectangle::from_size(cursor_plane_size)])?;
+                            let src = element.src();
+                            let dst = Rectangle::from_size(element_geometry.size);
+                            frame.render_texture_from_to(
+                                &cursor_texture,
+                                src,
+                                dst,
+                                &[dst],
+                                &[],
+                                element.transform(),
+                                element.alpha(),
+                            )?;
+                            let _ = frame.finish()?.wait(); // what can we do?
+                            Ok(())
+                        },
+                    )
+                    .expect("Lost track of cursor device");
+
+                if let Err(err) = ret {
+                    debug!("{err}");
+                    return Err("pixman failed to render into cursor BO");
                 }
-            }?;
-
-            let ret = cursor_buffer
-                .map_mut::<_, Result<_, PixmanError>>(
-                    0,
-                    0,
-                    cursor_buffer_size.w as u32,
-                    cursor_buffer_size.h as u32,
-                    |mbo| {
-                        let plane_pixman_format = pixman::FormatCode::try_from(DrmFourcc::Argb8888).unwrap();
-                        let mut cursor_dst = unsafe {
-                            pixman::Image::from_raw_mut(
-                                plane_pixman_format,
-                                mbo.width() as usize,
-                                mbo.height() as usize,
-                                mbo.buffer_mut().as_mut_ptr() as *mut u32,
-                                mbo.stride() as usize,
-                                false,
-                            )
-                        }
-                        .map_err(|_| PixmanError::ImportFailed)?;
-                        let mut framebuffer = pixman_renderer.bind(&mut cursor_dst)?;
-                        let mut frame =
-                            pixman_renderer.render(&mut framebuffer, cursor_plane_size, output_transform)?;
-                        frame.clear(Color32F::TRANSPARENT, &[Rectangle::from_size(cursor_plane_size)])?;
-                        let src = element.src();
-                        let dst = Rectangle::from_size(element_geometry.size);
-                        frame.render_texture_from_to(
-                            &cursor_texture,
-                            src,
-                            dst,
-                            &[dst],
-                            &[],
-                            element.transform(),
-                            element.alpha(),
-                        )?;
-                        let _ = frame.finish()?.wait(); // what can we do?
-                        Ok(())
-                    },
-                )
-                .expect("Lost track of cursor device");
-
-            if let Err(err) = ret {
-                debug!("{err}");
+                Ok(())
+            })();
+            if let Err(reason) = pixman_result {
+                cursor_state.note_assign_miss(reason);
                 return None;
             }
         };
@@ -3606,9 +3632,11 @@ where
         if res {
             cursor_state.previous_output_scale = Some(scale);
             cursor_state.previous_output_transform = Some(output_transform);
+            cursor_state.logged_assign_miss = false;
             Some(plane_info.into())
         } else {
             info!("failed to test cursor {:?} state", plane_info.handle);
+            cursor_state.note_assign_miss("KMS TEST of cursor plane failed");
             None
         }
     }
@@ -4377,76 +4405,230 @@ where
 {
     // Without access to the underlying storage we can not copy anything
     let Some(underlying_storage) = element.underlying_storage(renderer) else {
+        debug!("cursor copy: no underlying storage");
         return false;
     };
 
-    let element_src = element.src();
-    let element_scale = element_src.size / element_size.to_f64();
+    if element.transform() != Transform::Normal || output_transform != Transform::Normal {
+        debug!("cursor copy: transform is not Normal");
+        return false;
+    }
 
-    // We only copy if no crop, scale or transform is active
-    if element_src.loc != Point::default()
-        || element_scale != Scale::from(1f64)
-        || element.transform() != Transform::Normal
-        || output_transform != Transform::Normal
+    if element_size.w <= 0 || element_size.h <= 0 {
+        return false;
+    }
+
+    let element_src = element.src();
+    let bo_format = bo.format().code;
+    if bo_format != DrmFourcc::Argb8888 {
+        debug!(?bo_format, "cursor copy: cursor BO is not ARGB8888");
+        return false;
+    }
+
+    let copied = match underlying_storage {
+        UnderlyingStorage::Wayland(buffer) => shm::with_buffer_contents(buffer, |ptr, len, data| {
+            let Some(format) = shm::shm_format_to_fourcc(data.format) else {
+                return false;
+            };
+            if format != bo_format {
+                return false;
+            }
+
+            let expected_len = (data.stride * data.height) as usize;
+            if data.offset as usize + expected_len > len {
+                return false;
+            }
+
+            let src = unsafe { std::slice::from_raw_parts(ptr.offset(data.offset as isize), expected_len) };
+            blit_argb8888_into_cursor_bo(
+                bo,
+                cursor_size,
+                src,
+                data.stride,
+                data.height,
+                element_src,
+                element_size,
+            )
+        })
+        .unwrap_or(false),
+        UnderlyingStorage::Memory(memory) => {
+            if memory.format() != bo_format {
+                debug!(format = ?memory.format(), "cursor copy: memory format is not ARGB8888");
+                return false;
+            }
+            blit_argb8888_into_cursor_bo(
+                bo,
+                cursor_size,
+                memory,
+                memory.stride(),
+                memory.size().h,
+                element_src,
+                element_size,
+            )
+        }
+    };
+
+    if !copied {
+        debug!(
+            src = ?element_src,
+            ?element_size,
+            ?cursor_size,
+            "cursor copy: CPU blit into cursor BO failed"
+        );
+    }
+    copied
+}
+
+fn blit_argb8888_into_cursor_bo(
+    bo: &mut GbmBuffer,
+    cursor_size: Size<i32, Physical>,
+    src: &[u8],
+    src_stride: i32,
+    src_height: i32,
+    src_rect: Rectangle<f64, BufferCoords>,
+    dst_size: Size<i32, Physical>,
+) -> bool {
+    if src_stride < 4 || src_height <= 0 || cursor_size.w <= 0 || cursor_size.h <= 0 {
+        return false;
+    }
+
+    let dst_stride = bo.stride() as i32;
+    let mapped = bo.map_mut(0, 0, cursor_size.w as u32, cursor_size.h as u32, |mbo| {
+        let dst = mbo.buffer_mut();
+        dst.fill(0);
+        blit_argb8888(src, src_stride, src_height, src_rect, dst, dst_stride, dst_size)
+    });
+    mapped.unwrap_or(false)
+}
+
+fn blit_argb8888(
+    src: &[u8],
+    src_stride: i32,
+    src_height: i32,
+    src_rect: Rectangle<f64, BufferCoords>,
+    dst: &mut [u8],
+    dst_stride: i32,
+    dst_size: Size<i32, Physical>,
+) -> bool {
+    if src_stride < 4
+        || dst_stride < 4
+        || dst_size.w <= 0
+        || dst_size.h <= 0
+        || src_rect.size.w <= 0.0
+        || src_rect.size.h <= 0.0
     {
         return false;
     }
 
-    let bo_format = bo.format().code;
-    let bo_stride = bo.stride();
+    let dst_row_bytes = dst_stride as usize;
+    let needed = dst_row_bytes.saturating_mul(dst_size.h as usize);
+    if dst.len() < needed {
+        return false;
+    }
 
-    let mut copy_to_bo = |src, src_stride, src_height| {
-        if src_stride == bo_stride as i32 {
-            bo.write(src).is_ok()
-        } else {
-            let res = bo.map_mut(0, 0, cursor_size.w as u32, cursor_size.h as u32, |mbo| {
-                let dst = mbo.buffer_mut();
-                for row in 0..src_height {
-                    let src_row_start = (row * src_stride) as usize;
-                    let src_row_end = src_row_start + src_stride as usize;
-                    let src_row = &src[src_row_start..src_row_end];
-                    let dst_row_start = (row * bo_stride as i32) as usize;
-                    let dst_row_end = dst_row_start + src_stride as usize;
-                    let dst_row = &mut dst[dst_row_start..dst_row_end];
-                    dst_row.copy_from_slice(src_row);
-                }
-            });
-            res.is_ok()
+    let identity = src_rect.loc.x.abs() < 1e-3
+        && src_rect.loc.y.abs() < 1e-3
+        && (src_rect.size.w.round() as i32) == dst_size.w
+        && (src_rect.size.h.round() as i32) == dst_size.h;
+
+    if identity {
+        if src_height < dst_size.h {
+            return false;
         }
-    };
-
-    match underlying_storage {
-        UnderlyingStorage::Wayland(buffer) => {
-            // Only shm buffers are supported for copy
-            shm::with_buffer_contents(buffer, |ptr, len, data| {
-                let Some(format) = shm::shm_format_to_fourcc(data.format) else {
-                    return false;
-                };
-
-                if format != bo_format {
-                    return false;
-                };
-
-                let expected_len = (data.stride * data.height) as usize;
-                if data.offset as usize + expected_len > len {
-                    return false;
-                };
-
-                copy_to_bo(
-                    unsafe { std::slice::from_raw_parts(ptr.offset(data.offset as isize), expected_len) },
-                    data.stride,
-                    data.height,
-                )
-            })
-            .unwrap_or(false)
-        }
-        UnderlyingStorage::Memory(memory) => {
-            if memory.format() != bo_format {
+        let copy_w = (dst_size.w as usize)
+            .saturating_mul(4)
+            .min(src_stride as usize)
+            .min(dst_row_bytes);
+        for y in 0..dst_size.h {
+            let src_off = (y as usize).saturating_mul(src_stride as usize);
+            let dst_off = (y as usize).saturating_mul(dst_row_bytes);
+            if src_off + copy_w > src.len() {
                 return false;
-            };
-
-            copy_to_bo(memory, memory.stride(), memory.size().h)
+            }
+            dst[dst_off..dst_off + copy_w].copy_from_slice(&src[src_off..src_off + copy_w]);
         }
+        return true;
+    }
+
+    for y in 0..dst_size.h {
+        let v = src_rect.loc.y + (y as f64) * src_rect.size.h / dst_size.h as f64;
+        let sy = v.floor() as i32;
+        if sy < 0 || sy >= src_height {
+            continue;
+        }
+        let src_row = (sy as usize).saturating_mul(src_stride as usize);
+        let dst_row = (y as usize).saturating_mul(dst_row_bytes);
+        for x in 0..dst_size.w {
+            let u = src_rect.loc.x + (x as f64) * src_rect.size.w / dst_size.w as f64;
+            let sx = u.floor() as i32;
+            if sx < 0 {
+                continue;
+            }
+            let src_px = src_row.saturating_add((sx as usize).saturating_mul(4));
+            let dst_px = dst_row.saturating_add((x as usize).saturating_mul(4));
+            if src_px + 4 > src.len() || dst_px + 4 > dst.len() {
+                continue;
+            }
+            dst[dst_px..dst_px + 4].copy_from_slice(&src[src_px..src_px + 4]);
+        }
+    }
+
+    true
+}
+
+#[cfg(test)]
+mod cursor_copy_tests {
+    use super::blit_argb8888;
+    use crate::utils::{Physical, Rectangle, Size};
+
+    #[test]
+    fn identity_copy_keeps_pixels() {
+        let src = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut dst = vec![0u8; 8];
+        assert!(blit_argb8888(
+            &src,
+            8,
+            1,
+            Rectangle::from_size((2.0, 1.0).into()),
+            &mut dst,
+            8,
+            Size::<i32, Physical>::from((2, 1)),
+        ));
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn nearest_scale_down_samples_source() {
+        let mut src = vec![0u8; 8];
+        src[0..4].copy_from_slice(&[9, 8, 7, 6]);
+        src[4..8].copy_from_slice(&[1, 2, 3, 4]);
+        let mut dst = vec![0u8; 4];
+        assert!(blit_argb8888(
+            &src,
+            8,
+            1,
+            Rectangle::from_size((2.0, 1.0).into()),
+            &mut dst,
+            4,
+            Size::<i32, Physical>::from((1, 1)),
+        ));
+        assert_eq!(&dst, &[9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn crop_copies_from_source_origin() {
+        let src = vec![9u8, 8, 7, 6, 1, 2, 3, 4];
+        let mut dst = vec![0u8; 4];
+        assert!(blit_argb8888(
+            &src,
+            8,
+            1,
+            Rectangle::new((1.0, 0.0).into(), (1.0, 1.0).into()),
+            &mut dst,
+            4,
+            Size::<i32, Physical>::from((1, 1)),
+        ));
+        assert_eq!(&dst, &[1, 2, 3, 4]);
     }
 }
 
