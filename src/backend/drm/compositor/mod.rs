@@ -132,6 +132,7 @@ use std::{
     os::unix::io::{AsFd, OwnedFd},
     str::FromStr,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use drm::{
@@ -861,18 +862,65 @@ struct CursorState<G: AsFd + 'static> {
     previous_output_scale: Option<Scale<f64>>,
     #[cfg(feature = "renderer_pixman")]
     pixman_renderer: Option<PixmanRenderer>,
-    /// One warn per compositor for the first assignment miss, then debug.
+    /// First real assignment miss has been warned.
     logged_assign_miss: bool,
+    last_assign_miss: Option<Instant>,
+    last_assign_miss_reason: Option<&'static str>,
+    /// Idle CRTCs see Kind::Cursor for the pointer on another head. Log once.
+    logged_off_output_cursor: bool,
 }
 
 impl<G: AsFd + 'static> CursorState<G> {
-    fn note_assign_miss(&mut self, reason: &'static str) {
-        if !self.logged_assign_miss {
-            warn!(reason, "cursor plane assignment missed");
-            self.logged_assign_miss = true;
-        } else {
-            debug!(reason, "cursor plane assignment missed");
+    /// Real cursor-plane miss. Journald on this host stores warn/info, not debug,
+    /// including cargo-debug compositors. First miss, reason change, then every 5s.
+    fn note_assign_miss_geo(
+        &mut self,
+        reason: &'static str,
+        element_geometry: Option<Rectangle<i32, Physical>>,
+        output_geometry: Option<Rectangle<i32, Physical>>,
+    ) {
+        const INTERVAL: Duration = Duration::from_secs(5);
+        let now = Instant::now();
+        let first = !self.logged_assign_miss;
+        let reason_changed = self.last_assign_miss_reason != Some(reason);
+        let due = self
+            .last_assign_miss
+            .is_none_or(|t| now.duration_since(t) >= INTERVAL);
+        if !(first || reason_changed || due) {
+            return;
         }
+        warn!(
+            reason,
+            first,
+            ?element_geometry,
+            ?output_geometry,
+            "cursor plane assignment missed"
+        );
+        self.logged_assign_miss = true;
+        self.last_assign_miss = Some(now);
+        self.last_assign_miss_reason = Some(reason);
+    }
+
+    fn note_off_output_cursor(
+        &mut self,
+        element_geometry: Rectangle<i32, Physical>,
+        output_geometry: Rectangle<i32, Physical>,
+    ) {
+        if self.logged_off_output_cursor {
+            return;
+        }
+        self.logged_off_output_cursor = true;
+        info!(
+            ?element_geometry,
+            ?output_geometry,
+            "Kind::Cursor does not intersect this output (expected on idle CRTCs)"
+        );
+    }
+
+    fn clear_assign_miss(&mut self) {
+        self.logged_assign_miss = false;
+        self.last_assign_miss = None;
+        self.last_assign_miss_reason = None;
     }
 }
 
@@ -1383,6 +1431,9 @@ where
                             #[cfg(feature = "renderer_pixman")]
                             pixman_renderer,
                             logged_assign_miss: false,
+                            last_assign_miss: None,
+                            last_assign_miss_reason: None,
+                            logged_off_output_cursor: false,
                         }
                     });
 
@@ -1566,6 +1617,9 @@ where
                 #[cfg(feature = "renderer_pixman")]
                 pixman_renderer,
                 logged_assign_miss: false,
+                last_assign_miss: None,
+                last_assign_miss_reason: None,
+                logged_off_output_cursor: false,
             }
         });
 
@@ -2006,10 +2060,19 @@ where
             let element_output_geometry = match element_geometry.intersection(output_geometry) {
                 Some(geo) => geo,
                 None => {
-                    // Dual-head: the pointer is a Kind::Cursor on every output's
-                    // element list. Off-output is expected, not a scanout miss.
-                    // Do not warn per frame — that stalled journald on the
-                    // 2026-09-12 release play session.
+                    if element.kind() == Kind::Cursor {
+                        if let Some(cursor_state) = self.cursor_state.as_mut() {
+                            if element_geometry.size.w <= 0 || element_geometry.size.h <= 0 {
+                                cursor_state.note_assign_miss_geo(
+                                    "Kind::Cursor empty and outside output",
+                                    Some(element_geometry),
+                                    Some(output_geometry),
+                                );
+                            } else {
+                                cursor_state.note_off_output_cursor(element_geometry, output_geometry);
+                            }
+                        }
+                    }
                     continue;
                 }
             };
@@ -3226,29 +3289,49 @@ where
 
         if !frame_flags.contains(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT) {
             if let Some(cursor_state) = self.cursor_state.as_mut() {
-                cursor_state.note_assign_miss("ALLOW_CURSOR_PLANE_SCANOUT not set");
+                cursor_state.note_assign_miss_geo(
+                    "ALLOW_CURSOR_PLANE_SCANOUT not set",
+                    Some(element_geometry),
+                    Some(output_geometry),
+                );
             } else {
-                warn!("cursor plane assignment missed: ALLOW_CURSOR_PLANE_SCANOUT not set (no cursor state)");
+                warn!(
+                    ?element_geometry,
+                    ?output_geometry,
+                    "cursor plane assignment missed: ALLOW_CURSOR_PLANE_SCANOUT not set (no cursor state)"
+                );
             }
             return None;
         }
 
         let Some(cursor_state) = self.cursor_state.as_mut() else {
-            warn!("cursor plane assignment missed: no cursor state");
+            warn!(
+                ?element_geometry,
+                ?output_geometry,
+                "cursor plane assignment missed: no cursor state"
+            );
             return None;
         };
 
         let element_size = output_transform.transform_size(element_geometry.size);
 
         if element_size.w <= 0 || element_size.h <= 0 {
-            cursor_state.note_assign_miss("cursor element size is zero");
+            cursor_state.note_assign_miss_geo(
+                "cursor element size is zero",
+                Some(element_geometry),
+                Some(output_geometry),
+            );
             return None;
         }
 
         // if the element is greater than the cursor size we can not
         // use the cursor plane to scan out the element
         if element_size.w > self.cursor_size.w || element_size.h > self.cursor_size.h {
-            cursor_state.note_assign_miss("element larger than DRM cursor size");
+            cursor_state.note_assign_miss_geo(
+                "element larger than DRM cursor size",
+                Some(element_geometry),
+                Some(output_geometry),
+            );
             return None;
         }
 
@@ -3299,7 +3382,11 @@ where
                 })
             })
         else {
-            cursor_state.note_assign_miss("no free cursor plane");
+            cursor_state.note_assign_miss_geo(
+                "no free cursor plane",
+                Some(element_geometry),
+                Some(output_geometry),
+            );
             return None;
         };
 
@@ -3416,7 +3503,11 @@ where
             Ok(buffer) => buffer,
             Err(err) => {
                 debug!("failed to create cursor buffer: {}", err);
-                cursor_state.note_assign_miss("GBM cursor buffer allocation failed");
+                cursor_state.note_assign_miss_geo(
+                    "GBM cursor buffer allocation failed",
+                    Some(element_geometry),
+                    Some(output_geometry),
+                );
                 return None;
             }
         };
@@ -3433,7 +3524,11 @@ where
                     "failed to export framebuffer for cursor {:?}: no framebuffer available",
                     plane_info.handle
                 );
-                cursor_state.note_assign_miss("cursor framebuffer export returned none");
+                cursor_state.note_assign_miss_geo(
+                    "cursor framebuffer export returned none",
+                    Some(element_geometry),
+                    Some(output_geometry),
+                );
                 return None;
             }
             Err(err) => {
@@ -3441,7 +3536,11 @@ where
                     "failed to export framebuffer for cursor {:?}: {}",
                     plane_info.handle, err
                 );
-                cursor_state.note_assign_miss("cursor framebuffer export failed");
+                cursor_state.note_assign_miss_geo(
+                    "cursor framebuffer export failed",
+                    Some(element_geometry),
+                    Some(output_geometry),
+                );
                 return None;
             }
         };
@@ -3457,7 +3556,11 @@ where
             output_transform,
             &mut cursor_buffer,
         ) {
-            cursor_state.note_assign_miss("CPU copy into cursor BO failed");
+            cursor_state.note_assign_miss_geo(
+                "CPU copy into cursor BO failed",
+                Some(element_geometry),
+                Some(output_geometry),
+            );
             return None;
         }
 
@@ -3474,7 +3577,11 @@ where
             tracing::trace!("cursor fast-path copy failed, falling back to rendering using offscreen buffer");
 
             let Some(storage) = element.underlying_storage(renderer) else {
-                cursor_state.note_assign_miss("no underlying storage for pixman cursor fallback");
+                cursor_state.note_assign_miss_geo(
+                    "no underlying storage for pixman cursor fallback",
+                    Some(element_geometry),
+                    Some(output_geometry),
+                );
                 return None;
             };
 
@@ -3570,7 +3677,7 @@ where
                 Ok(())
             })();
             if let Err(reason) = pixman_result {
-                cursor_state.note_assign_miss(reason);
+                cursor_state.note_assign_miss_geo(reason, Some(element_geometry), Some(output_geometry));
                 return None;
             }
         };
@@ -3648,11 +3755,15 @@ where
         if res {
             cursor_state.previous_output_scale = Some(scale);
             cursor_state.previous_output_transform = Some(output_transform);
-            cursor_state.logged_assign_miss = false;
+            cursor_state.clear_assign_miss();
             Some(plane_info.into())
         } else {
             info!(handle = ?plane_info.handle, "failed to test cursor plane");
-            cursor_state.note_assign_miss("KMS TEST of cursor plane failed");
+            cursor_state.note_assign_miss_geo(
+                "KMS TEST of cursor plane failed",
+                Some(element_geometry),
+                Some(output_geometry),
+            );
             None
         }
     }
