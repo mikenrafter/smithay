@@ -2017,13 +2017,29 @@ impl MultiTexture {
                     buffer_format,
                 }))
             });
+        let ptr = Arc::as_ptr(&internal);
         {
-            let mut internal = internal.lock().unwrap();
-            if internal.size != size || internal.buffer_format != buffer_format {
-                internal.textures.clear();
-                internal.format = None;
-                internal.size = size;
-                internal.buffer_format = buffer_format;
+            let mut guard = internal.lock().unwrap();
+            if guard.size != size || guard.buffer_format != buffer_format {
+                // Diagnostic for a suspected race: this clears every device's cached texture in one
+                // step, but re-import for any given device happens later as a separate step (see
+                // `render_texture_from_to`'s empty-map warning). If that warning's pointer matches
+                // this one and its thread differs from this thread, a concurrent renderer observed
+                // this surface mid-clear rather than a genuine per-device import failure.
+                warn!(
+                    thread = ?std::thread::current().id(),
+                    ?ptr,
+                    had = ?guard.textures.keys().collect::<Vec<_>>(),
+                    old_size = ?guard.size,
+                    new_size = ?size,
+                    old_format = ?guard.buffer_format,
+                    new_format = ?buffer_format,
+                    "MultiTexture: clearing all per-device entries on buffer size/format change"
+                );
+                guard.textures.clear();
+                guard.format = None;
+                guard.size = size;
+                guard.buffer_format = buffer_format;
             }
         }
         MultiTexture(internal)
@@ -2400,11 +2416,16 @@ where
                 .render_texture_from_to(&texture, src, dst, damage, opaque_regions, src_transform, alpha)
                 .map_err(Error::Render)
         } else {
+            // `thread` and `ptr` are logged to correlate against the clear diagnostic in
+            // `MultiTexture::from_surface`: if a clear for this same pointer landed on a different
+            // thread shortly before this, it's a cross-thread race on this surface's shared cache
+            // rather than a genuine per-device import failure.
             warn!(
-                "Failed to render texture {:?}, import for wrong devices {:?}? {:?}",
-                Arc::as_ptr(&texture.0),
-                self.node,
-                texture.0.lock().unwrap(),
+                thread = ?std::thread::current().id(),
+                ptr = ?Arc::as_ptr(&texture.0),
+                node = ?self.node,
+                internal = ?texture.0.lock().unwrap(),
+                "Failed to render texture, import for wrong device?"
             );
             Ok(())
         }
