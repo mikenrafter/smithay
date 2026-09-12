@@ -2006,16 +2006,10 @@ where
             let element_output_geometry = match element_geometry.intersection(output_geometry) {
                 Some(geo) => geo,
                 None => {
-                    if element.kind() == Kind::Cursor {
-                        if let Some(cursor_state) = self.cursor_state.as_mut() {
-                            warn!(
-                                ?element_geometry,
-                                ?output_geometry,
-                                "Kind::Cursor does not intersect this output"
-                            );
-                            cursor_state.note_assign_miss("Kind::Cursor does not intersect output");
-                        }
-                    }
+                    // Dual-head: the pointer is a Kind::Cursor on every output's
+                    // element list. Off-output is expected, not a scanout miss.
+                    // Do not warn per frame — that stalled journald on the
+                    // 2026-09-12 release play session.
                     continue;
                 }
             };
