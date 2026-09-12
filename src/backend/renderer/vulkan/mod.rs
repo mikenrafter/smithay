@@ -3642,6 +3642,20 @@ impl VulkanRenderer {
             .retain(|dmabuf, _| !dmabuf.is_gone());
     }
 
+    /// Returns whether this renderer instance has previously acquired a render-target image for
+    /// this exact dmabuf identity, regardless of whether it is currently locally owned or already
+    /// released to foreign/KMS ownership.
+    ///
+    /// This is the signal the generic `Bind<Dmabuf>` contract uses to choose discard vs. preserve
+    /// acquire: a dmabuf this renderer has bound before was left in `GENERAL`/FOREIGN by our own
+    /// prior `Frame::finish` (see [`VulkanRenderer::bind_dmabuf_render_target`]'s doc), so
+    /// preserving is safe. A dmabuf never seen by this renderer instance keeps the discard/
+    /// `UNDEFINED` first-use contract, since its actual layout from allocation is unknown to us
+    /// and may not be `GENERAL` (see `f4720962`).
+    fn has_cached_dmabuf_render_target(&self, dmabuf: &Dmabuf) -> bool {
+        self.dmabuf_render_target_images.contains_key(&dmabuf.weak())
+    }
+
     fn cached_dmabuf_render_target_image_for_reacquire(
         &mut self,
         dmabuf: &Dmabuf,
@@ -6875,14 +6889,23 @@ impl Bind<Dmabuf> for VulkanRenderer {
             .export_sync_file(0, DmabufSyncFlags::WRITE)
             .ok()
             .map(|fd| sync_point_from_sync_file(Some(fd)));
-        let acquire = VulkanDmabufRenderTargetAcquire::discard_with_sync(implicit_acquire.as_ref());
+
+        // Preserve contents on every later bind of a dmabuf identity this renderer has already
+        // acquired before; keep the original discard/`UNDEFINED` first-use contract for one we
+        // have not (see `has_cached_dmabuf_render_target`). This mirrors `target_age` below so
+        // callers relying on buffer age get a real age exactly when contents are preserved.
+        let acquire = if self.has_cached_dmabuf_render_target(target) {
+            VulkanDmabufRenderTargetAcquire::preserve(implicit_acquire.as_ref())
+        } else {
+            VulkanDmabufRenderTargetAcquire::discard_with_sync(implicit_acquire.as_ref())
+        };
 
         unsafe {
             // SAFETY: Public `Bind<Dmabuf>` is the compositor GBM scanout contract: the caller
-            // owns the buffer for this frame and previous contents are discarded. The optional
-            // acquire sync is the buffer's implicit WRITE fence, not a Wayland client point.
-            // Successful frames release the image for KMS from `Frame::finish`; failed or skipped
-            // renders are handled by `RenderTargetLifecycle<Dmabuf>` below.
+            // owns the buffer for this frame. The optional acquire sync is the buffer's implicit
+            // WRITE fence, not a Wayland client point. Successful frames release the image for
+            // KMS from `Frame::finish`; failed or skipped renders are handled by
+            // `RenderTargetLifecycle<Dmabuf>` below.
             self.bind_dmabuf_render_target(target, acquire)
         }?
         .ok_or(VulkanError::MissingCapability(
@@ -6896,11 +6919,15 @@ impl Bind<Dmabuf> for VulkanRenderer {
 }
 
 impl RenderTargetLifecycle<Dmabuf> for VulkanRenderer {
-    fn target_age(&self, _target: &Dmabuf, _age: usize) -> usize {
-        // The generic dmabuf binding currently uses discard acquire, so preserved contents are not
-        // part of the contract. Force full repaint until a future preserve/acquire-sync policy is
-        // modeled in the standard path.
-        0
+    fn target_age(&self, target: &Dmabuf, age: usize) -> usize {
+        // Mirrors `Bind<Dmabuf>::bind`'s discard/preserve choice above: age is only meaningful
+        // once this renderer has actually preserved a prior frame's contents for this exact
+        // dmabuf identity. A never-before-seen dmabuf is always discard-bound, so force age 0.
+        if self.has_cached_dmabuf_render_target(target) {
+            age
+        } else {
+            0
+        }
     }
 
     fn release_after_render_error(&mut self, target: &mut Self::Framebuffer<'_>) -> Result<(), Self::Error> {
