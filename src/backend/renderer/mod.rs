@@ -310,6 +310,37 @@ pub trait TextureMapping: Texture {
     }
 }
 
+/// Parameters for [`Frame::draw_shadow`]: a blurred, rounded-corner drop shadow.
+///
+/// Renderer-agnostic (backed only by plain floats/arrays, no renderer-specific types), so the
+/// same value can be built once by a compositor and handed to whichever concrete [`Frame`] is
+/// current.
+#[derive(Debug, Clone, Copy)]
+pub struct ShadowParameters {
+    /// Column-major 3x3 affine matrix (e.g. `glam::Mat3::to_cols_array`) mapping a fragment's
+    /// absolute framebuffer pixel coordinates to the shadow's local geo-space coordinates.
+    /// Renderers whose shadow implementation samples per-fragment (see the Vulkan renderer) use
+    /// this; the default [`Frame::draw_shadow`] fallback does not need it.
+    pub pixel_to_geo: [f32; 9],
+    /// Same mapping into the window cutout's local space.
+    pub pixel_to_window_geo: [f32; 9],
+    /// Shadow color, straight (non-premultiplied) alpha.
+    pub color: [f32; 4],
+    /// Gaussian blur sigma, in geo-space units. Values below `0.1` render a plain rounded
+    /// rectangle instead of a blurred one.
+    pub sigma: f32,
+    /// Size of the shadow's rounded box, in geo-space units.
+    pub geo_size: [f32; 2],
+    /// Per-corner radius of the shadow's rounded box, in geo-space units.
+    pub corner_radius: [f32; 4],
+    /// Size of the window cutout, in geo-space units. All-zero disables the cutout.
+    pub window_geo_size: [f32; 2],
+    /// Per-corner radius of the window cutout, in geo-space units.
+    pub window_corner_radius: [f32; 4],
+    /// Overall element alpha multiplier.
+    pub alpha: f32,
+}
+
 /// Helper trait for [`Renderer`], which defines a rendering api for a currently in-progress frame during [`Renderer::render`].
 ///
 /// Dropping the [`Frame`] or explicitly calling [`Frame::finish`] will free any unused resources. If you need explicit control
@@ -339,6 +370,51 @@ pub trait Frame {
         damage: &[Rectangle<i32, Physical>],
         color: Color32F,
     ) -> Result<(), Self::Error>;
+
+    /// Draws a blurred, rounded-corner drop shadow at `dst`.
+    ///
+    /// `dst` is the shadow's full blurred extent (matching a `[0, 1]`-normalized render element's
+    /// geometry, not just the inner window rectangle). The default implementation approximates the
+    /// shadow with a handful of inset, partially-transparent [`Frame::draw_solid`] fills - every
+    /// renderer therefore gets *some* shadow via this method for free. Renderers with a real
+    /// blurred-shadow shader (see the Vulkan renderer) should override this with that instead.
+    fn draw_shadow(
+        &mut self,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        params: ShadowParameters,
+    ) -> Result<(), Self::Error> {
+        if damage.is_empty() || dst.size.w <= 0 || dst.size.h <= 0 {
+            return Ok(());
+        }
+        let base_alpha = params.color[3] * params.alpha;
+        if base_alpha <= 0.0 {
+            return Ok(());
+        }
+        // `dst` is the shadow's full blurred extent; `geo_size` is its unblurred box, so half the
+        // difference is roughly the blur margin available to fade a few layers across.
+        let margin_w = ((dst.size.w as f32 - params.geo_size[0]) / 2.0).max(0.0);
+        let margin_h = ((dst.size.h as f32 - params.geo_size[1]) / 2.0).max(0.0);
+        let margin = margin_w.min(margin_h);
+        const LAYERS: [(f32, f32); 4] = [(1.0, 0.15), (0.6, 0.28), (0.3, 0.50), (0.1, 0.80)];
+        for (inset_fraction, weight) in LAYERS {
+            let inset = (margin * inset_fraction).round() as i32;
+            let rect = Rectangle::new(
+                (dst.loc.x + inset, dst.loc.y + inset).into(),
+                ((dst.size.w - inset * 2).max(0), (dst.size.h - inset * 2).max(0)).into(),
+            );
+            if rect.size.w <= 0 || rect.size.h <= 0 {
+                continue;
+            }
+            let alpha = (base_alpha * weight).clamp(0.0, 1.0);
+            self.draw_solid(
+                rect,
+                damage,
+                Color32F::new(params.color[0], params.color[1], params.color[2], alpha),
+            )?;
+        }
+        Ok(())
+    }
 
     /// Render a texture to the current target as a flat 2d-plane at a given
     /// position and applying the given transformation with the given alpha value.

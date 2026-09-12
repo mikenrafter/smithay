@@ -17,7 +17,7 @@ use crate::{
             Buffer, Fourcc, Modifier,
             dmabuf::{Dmabuf, WeakDmabuf},
         },
-        renderer::{Color32F, ContextId, Frame, Texture, TextureMapping, sync::SyncPoint},
+        renderer::{Color32F, ContextId, Frame, ShadowParameters, Texture, TextureMapping, sync::SyncPoint},
     },
     utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
 };
@@ -26,7 +26,7 @@ use super::{
     VulkanError, VulkanRenderer, clear_color_value_for_format,
     device::{
         VulkanDeviceState, VulkanDmabufRenderTargetForeignReleaseError, VulkanOwnedImage, VulkanSampledImage,
-        VulkanSampledTextureDrawConstants, VulkanSolidColorDrawConstants,
+        VulkanSampledTextureDrawConstants, VulkanShadowDrawConstants, VulkanSolidColorDrawConstants,
     },
     format::{get_format_info, get_render_vk_format},
     sync_point_from_sync_file,
@@ -1441,6 +1441,73 @@ impl Frame for VulkanFrame<'_, '_> {
                     },
                 )?;
             }
+        }
+        target.image.layout = VulkanImageLayoutState::ColorAttachment;
+        Ok(())
+    }
+
+    /// Overrides [`Frame::draw_shadow`]'s generic stacked-fill default with the real blurred,
+    /// rounded-corner shader (a Vulkan port of cosmic-comp's `shadow.frag`).
+    ///
+    /// `dst`/`damage` mirror `draw_solid` above exactly, including rejecting overlapping damage
+    /// rectangles: unlike an opaque solid fill, every shadow draw blends, so overlapping scissor
+    /// regions would double-blend the same pixels.
+    fn draw_shadow(
+        &mut self,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        params: ShadowParameters,
+    ) -> Result<(), VulkanError> {
+        if damage.is_empty() {
+            return Ok(());
+        }
+
+        let framebuffer_dst = self.map_output_rect_to_framebuffer(dst);
+        let framebuffer_damage = self
+            .map_dest_relative_rects_to_framebuffer(dst, damage)
+            .ok_or(VulkanError::UnsupportedOperation("draw shadow damage"))?;
+        let clear_areas =
+            draw_solid_damage_to_clear_areas(self.output_size, framebuffer_dst, &framebuffer_damage)
+                .ok_or(VulkanError::UnsupportedOperation("draw shadow damage"))?;
+        if clear_areas.is_empty() {
+            return Ok(());
+        }
+        if rects_overlap(&clear_areas) {
+            return Err(VulkanError::UnsupportedOperation("draw shadow damage"));
+        }
+        let draw_region = Rectangle::from_size(self.output_size)
+            .intersection(framebuffer_dst)
+            .ok_or(VulkanError::UnsupportedOperation("draw shadow destination"))?;
+        let draw_area = output_destination_to_vk_rect(self.output_size, draw_region)
+            .ok_or(VulkanError::UnsupportedOperation("draw shadow destination"))?;
+
+        let device = self
+            .device
+            .ok_or(VulkanError::UnsupportedOperation("draw shadow device"))?;
+        let target = self
+            .target
+            .as_deref_mut()
+            .ok_or(VulkanError::UnsupportedOperation("draw shadow target"))?;
+        let color_image = target
+            .color_image
+            .as_ref()
+            .ok_or(VulkanError::UnsupportedOperation("offscreen target image"))?;
+        let format = target
+            .image
+            .format
+            .ok_or(VulkanError::UnsupportedOperation("offscreen target format"))?;
+
+        let pipeline = device.builtin_shadow_graphics_pipeline(get_render_vk_format(format)?)?;
+        for scissor_area in clear_areas {
+            device.render_shadow_to_color_image_in(
+                color_image,
+                &pipeline,
+                VulkanShadowDrawConstants {
+                    draw_area,
+                    scissor_area,
+                    params,
+                },
+            )?;
         }
         target.image.layout = VulkanImageLayoutState::ColorAttachment;
         Ok(())

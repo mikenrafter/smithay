@@ -12,7 +12,7 @@ use ash::{ext, khr, vk, vk::Handle};
 
 use crate::backend::{
     allocator::dmabuf::Dmabuf,
-    renderer::{TextureFilter, sync::SyncPoint},
+    renderer::{ShadowParameters, TextureFilter, sync::SyncPoint},
     vulkan::{Instance, PhysicalDevice},
 };
 
@@ -660,6 +660,9 @@ pub(crate) struct VulkanDeviceState {
     sampled_texture_descriptor_set_layout: Mutex<Option<Arc<VulkanDescriptorSetLayout>>>,
     sampled_texture_pipeline_layout: Mutex<Option<Arc<VulkanSampledTexturePipelineLayout>>>,
     solid_color_pipeline_layout: Mutex<Option<Arc<VulkanPipelineLayout>>>,
+    builtin_shadow_pipelines: Mutex<HashMap<(vk::Format, bool), Arc<VulkanShadowGraphicsPipeline>>>,
+    shadow_descriptor_set_layout: Mutex<Option<Arc<VulkanDescriptorSetLayout>>>,
+    shadow_pipeline_layout: Mutex<Option<Arc<VulkanPipelineLayout>>>,
     pending_graphics_submissions: Mutex<Vec<VulkanSubmittedCommandBuffer>>,
 }
 
@@ -833,6 +836,9 @@ impl VulkanDeviceState {
             sampled_texture_descriptor_set_layout: Mutex::new(None),
             sampled_texture_pipeline_layout: Mutex::new(None),
             solid_color_pipeline_layout: Mutex::new(None),
+            builtin_shadow_pipelines: Mutex::new(HashMap::new()),
+            shadow_descriptor_set_layout: Mutex::new(None),
+            shadow_pipeline_layout: Mutex::new(None),
             pending_graphics_submissions: Mutex::new(Vec::new()),
         })
     }
@@ -858,6 +864,9 @@ impl VulkanDeviceState {
             sampled_texture_descriptor_set_layout: Mutex::new(None),
             sampled_texture_pipeline_layout: Mutex::new(None),
             solid_color_pipeline_layout: Mutex::new(None),
+            builtin_shadow_pipelines: Mutex::new(HashMap::new()),
+            shadow_descriptor_set_layout: Mutex::new(None),
+            shadow_pipeline_layout: Mutex::new(None),
             pending_graphics_submissions: Mutex::new(Vec::new()),
         }
     }
@@ -3451,6 +3460,152 @@ impl VulkanDeviceState {
             Arc::new(self.create_builtin_solid_color_graphics_pipeline(color_format, blend_enabled)?);
         pipelines.insert(key, Arc::clone(&pipeline));
         Ok(pipeline)
+    }
+
+    fn shadow_descriptor_set_layout(&self) -> Result<Arc<VulkanDescriptorSetLayout>, VulkanError> {
+        let mut layout = self
+            .shadow_descriptor_set_layout
+            .lock()
+            .map_err(|_| host_synchronization_failed())?;
+        if let Some(layout) = layout.as_ref() {
+            return Ok(Arc::clone(layout));
+        }
+
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+        let cached = Arc::new(create_shadow_descriptor_set_layout(&logical_device)?);
+        *layout = Some(Arc::clone(&cached));
+        Ok(cached)
+    }
+
+    fn shadow_pipeline_layout(&self) -> Result<Arc<VulkanPipelineLayout>, VulkanError> {
+        let mut layout = self
+            .shadow_pipeline_layout
+            .lock()
+            .map_err(|_| host_synchronization_failed())?;
+        if let Some(layout) = layout.as_ref() {
+            return Ok(Arc::clone(layout));
+        }
+
+        let descriptor_set_layout = self.shadow_descriptor_set_layout()?;
+        let cached = Arc::new(create_shadow_pipeline_layout(&descriptor_set_layout)?);
+        *layout = Some(Arc::clone(&cached));
+        Ok(cached)
+    }
+
+    fn create_builtin_shadow_graphics_pipeline(
+        &self,
+        color_format: vk::Format,
+    ) -> Result<VulkanShadowGraphicsPipeline, VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?
+            .clone();
+
+        let vertex_shader = create_shader_module(
+            &logical_device,
+            // SAFETY: This is the same built-in fullscreen-triangle vertex shader the solid-color
+            // and sampled-texture pipelines use; see its own safety comment above.
+            unsafe { VulkanShaderSpirv::from_words_unchecked(BUILTIN_TEXTURED_VERTEX_SHADER_SPIRV)? },
+        )?;
+        let fragment_shader = create_shader_module(
+            &logical_device,
+            // SAFETY: see the safety/provenance comment on `BUILTIN_SHADOW_FRAGMENT_SHADER_SPIRV`.
+            unsafe { VulkanShaderSpirv::from_words_unchecked(BUILTIN_SHADOW_FRAGMENT_SHADER_SPIRV)? },
+        )?;
+        let layout = self.shadow_pipeline_layout()?;
+        let render_pass = self.single_color_load_render_pass(color_format)?;
+        // Shadows are always translucent (rounded/blurred alpha falloff), so blending is always on.
+        let pipeline = create_sampled_texture_graphics_pipeline(
+            &logical_device,
+            &render_pass,
+            &layout,
+            &vertex_shader,
+            &fragment_shader,
+            true,
+        )?;
+
+        Ok(VulkanShadowGraphicsPipeline {
+            color_format,
+            render_pass,
+            layout,
+            pipeline,
+        })
+    }
+
+    pub(super) fn builtin_shadow_graphics_pipeline(
+        &self,
+        color_format: vk::Format,
+    ) -> Result<Arc<VulkanShadowGraphicsPipeline>, VulkanError> {
+        let key = (color_format, true);
+        let mut pipelines = self
+            .builtin_shadow_pipelines
+            .lock()
+            .map_err(|_| host_synchronization_failed())?;
+        if let Some(pipeline) = pipelines.get(&key) {
+            return Ok(Arc::clone(pipeline));
+        }
+
+        let pipeline = Arc::new(self.create_builtin_shadow_graphics_pipeline(color_format)?);
+        pipelines.insert(key, Arc::clone(&pipeline));
+        Ok(pipeline)
+    }
+
+    /// Renders one shadow draw into `target`. Allocates a single-use uniform buffer and descriptor
+    /// set for `draw_constants.params` (see `VulkanShadowDescriptorSet`'s doc: this draw is fully
+    /// synchronous, so there is no benefit to pooling them across calls yet), records the draw, and
+    /// blocks until the GPU has finished, matching `render_solid_color_to_color_image_in`.
+    pub(super) fn render_shadow_to_color_image_in(
+        &self,
+        target: &VulkanOwnedImage,
+        pipeline: &VulkanShadowGraphicsPipeline,
+        draw_constants: VulkanShadowDrawConstants,
+    ) -> Result<(), VulkanError> {
+        let logical_device = self
+            .logical_device
+            .as_ref()
+            .ok_or_else(|| VulkanError::DeviceInitializationFailed("missing logical device".to_owned()))?;
+        validate_shadow_draw_inputs(logical_device, target, pipeline)?;
+        validate_color_attachment_area(target, draw_constants.draw_area, "shadow draw area")?;
+        validate_color_attachment_area(target, draw_constants.scissor_area, "shadow draw area")?;
+
+        let uniform_buffer = self
+            .create_host_visible_buffer(SHADOW_UNIFORM_BLOCK_SIZE, vk::BufferUsageFlags::UNIFORM_BUFFER)?;
+        uniform_buffer.write(&shadow_uniform_block_bytes(&draw_constants.params))?;
+        let descriptor_pool = create_shadow_descriptor_pool(logical_device, 1)?;
+        let descriptor_set_layout = self.shadow_descriptor_set_layout()?;
+        let descriptor_set = create_shadow_descriptor_set(
+            logical_device,
+            &descriptor_pool,
+            descriptor_set_layout.as_ref(),
+            uniform_buffer,
+        )?;
+
+        let view = self.create_color_attachment_image_view(target)?;
+        let framebuffer = create_single_color_framebuffer(pipeline.render_pass(), &view, target.extent())?;
+        let mut command_buffer = self.allocate_graphics_command_buffer()?;
+
+        self.begin_command_buffer(&mut command_buffer)?;
+        self.transition_image_layout(
+            &mut command_buffer,
+            target,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        )?;
+        synchronize_color_attachment_load(&mut command_buffer, target)?;
+        record_shadow_draw(
+            &mut command_buffer,
+            target,
+            pipeline,
+            &descriptor_set,
+            &framebuffer,
+            &draw_constants,
+        )?;
+        self.end_command_buffer(&mut command_buffer)?;
+        self.submit_graphics_command_buffer_and_wait(&mut command_buffer)
     }
 
     #[allow(dead_code)]
@@ -7701,6 +7856,298 @@ const BUILTIN_SOLID_FRAGMENT_SHADER_SPIRV: &[u32] = &[
     0x00000011, 0x00000010, 0x0003003e, 0x00000009, 0x00000011, 0x000100fd, 0x00010038,
 ];
 
+/// Fragment shader for `render_shadow_to_color_image_in`: a Vulkan port of cosmic-comp's
+/// `shadow.frag` (blurred, rounded-corner drop shadows, see that file for the algorithm). Compiled
+/// with `glslc -fshader-stage=fragment --target-env=vulkan1.0 -Werror -O`, targeting SPIR-V 1.0 to
+/// match this renderer's other built-in shaders (the enforced floor is Vulkan 1.1; SPIR-V 1.0 is
+/// valid on any Vulkan 1.0+ implementation). Validated with `spirv-val --target-env vulkan1.0` and
+/// `--target-env vulkan1.1`. Reads one `set = 0, binding = 0` fragment-stage uniform buffer (see
+/// `SHADOW_UNIFORM_BLOCK_SIZE` and `shadow_uniform_block_bytes` for its exact std140 layout,
+/// confirmed against this module's own `OpMemberDecorate ... Offset` decorations) and writes one
+/// location-0 color output. Has no vertex stage of its own; pairs with the same
+/// `BUILTIN_TEXTURED_VERTEX_SHADER_SPIRV` fullscreen-triangle vertex shader the solid-color and
+/// sampled-texture pipelines already use, since the fragment shader derives its own local geo-space
+/// coordinates from `gl_FragCoord` rather than a vertex-interpolated varying.
+const BUILTIN_SHADOW_FRAGMENT_SHADER_SPIRV: &[u32] = &[
+    0x07230203, 0x00010000, 0x000d000b, 0x0000042a, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0007000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x0000017f, 0x000001f5, 0x00030010,
+    0x00000004, 0x00000007, 0x00030047, 0x00000178, 0x00000002, 0x00040048, 0x00000178, 0x00000000,
+    0x00000005, 0x00050048, 0x00000178, 0x00000000, 0x00000007, 0x00000010, 0x00050048, 0x00000178,
+    0x00000000, 0x00000023, 0x00000000, 0x00040048, 0x00000178, 0x00000001, 0x00000005, 0x00050048,
+    0x00000178, 0x00000001, 0x00000007, 0x00000010, 0x00050048, 0x00000178, 0x00000001, 0x00000023,
+    0x00000030, 0x00050048, 0x00000178, 0x00000002, 0x00000023, 0x00000060, 0x00050048, 0x00000178,
+    0x00000003, 0x00000023, 0x00000070, 0x00050048, 0x00000178, 0x00000004, 0x00000023, 0x00000080,
+    0x00050048, 0x00000178, 0x00000005, 0x00000023, 0x00000090, 0x00050048, 0x00000178, 0x00000006,
+    0x00000023, 0x00000098, 0x00050048, 0x00000178, 0x00000007, 0x00000023, 0x000000a0, 0x00050048,
+    0x00000178, 0x00000008, 0x00000023, 0x000000a4, 0x00040047, 0x0000017a, 0x00000021, 0x00000000,
+    0x00040047, 0x0000017a, 0x00000022, 0x00000000, 0x00040047, 0x0000017f, 0x0000000b, 0x0000000f,
+    0x00040047, 0x000001f5, 0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
+    0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x0000000d, 0x00000006, 0x00000002,
+    0x00040017, 0x00000023, 0x00000006, 0x00000004, 0x0004002b, 0x00000006, 0x0000002f, 0x40000000,
+    0x0004002b, 0x00000006, 0x00000036, 0x40206c99, 0x0004002b, 0x00000006, 0x00000042, 0x3f800000,
+    0x0004002b, 0x00000006, 0x00000043, 0x3e8e8987, 0x0004002b, 0x00000006, 0x00000044, 0x3e6beb18,
+    0x0004002b, 0x00000006, 0x00000045, 0x3d9ff716, 0x00040015, 0x00000061, 0x00000020, 0x00000000,
+    0x0004002b, 0x00000061, 0x00000062, 0x00000001, 0x0004002b, 0x00000006, 0x0000006a, 0x00000000,
+    0x0004002b, 0x00000061, 0x0000006d, 0x00000000, 0x0004002b, 0x00000006, 0x0000007d, 0x3f000000,
+    0x0004002b, 0x00000006, 0x00000085, 0x3f3504f3, 0x0004002b, 0x00000006, 0x000000af, 0xc0400000,
+    0x0004002b, 0x00000006, 0x000000b6, 0x40400000, 0x00040015, 0x000000c8, 0x00000020, 0x00000001,
+    0x0004002b, 0x000000c8, 0x000000cb, 0x00000000, 0x0004002b, 0x000000c8, 0x000000d2, 0x00000004,
+    0x00020014, 0x000000d3, 0x0004002b, 0x000000c8, 0x000000f2, 0x00000001, 0x0004002b, 0x00000061,
+    0x0000012a, 0x00000002, 0x00040017, 0x00000174, 0x00000006, 0x00000003, 0x00040018, 0x00000177,
+    0x00000174, 0x00000003, 0x000b001e, 0x00000178, 0x00000177, 0x00000177, 0x00000023, 0x00000023,
+    0x00000023, 0x0000000d, 0x0000000d, 0x00000006, 0x00000006, 0x00040020, 0x00000179, 0x00000002,
+    0x00000178, 0x0004003b, 0x00000179, 0x0000017a, 0x00000002, 0x00040020, 0x0000017b, 0x00000002,
+    0x00000177, 0x00040020, 0x0000017e, 0x00000001, 0x00000023, 0x0004003b, 0x0000017e, 0x0000017f,
+    0x00000001, 0x0004002b, 0x000000c8, 0x00000190, 0x00000002, 0x00040020, 0x00000191, 0x00000002,
+    0x00000023, 0x0004002b, 0x000000c8, 0x00000194, 0x00000007, 0x00040020, 0x00000195, 0x00000002,
+    0x00000006, 0x0004002b, 0x00000006, 0x00000198, 0x3dcccccd, 0x0004002b, 0x000000c8, 0x0000019d,
+    0x00000005, 0x0004002b, 0x000000c8, 0x0000019e, 0x00000003, 0x00040020, 0x000001a3, 0x00000002,
+    0x0000000d, 0x0005002c, 0x0000000d, 0x000001ab, 0x0000006a, 0x0000006a, 0x0004002b, 0x000000c8,
+    0x000001bd, 0x00000006, 0x00040017, 0x000001c0, 0x000000d3, 0x00000002, 0x0004002b, 0x000000c8,
+    0x000001f0, 0x00000008, 0x00040020, 0x000001f4, 0x00000003, 0x00000023, 0x0004003b, 0x000001f4,
+    0x000001f5, 0x00000003, 0x0005002c, 0x0000000d, 0x00000424, 0x00000044, 0x00000044, 0x0005002c,
+    0x0000000d, 0x00000425, 0x00000043, 0x00000043, 0x0005002c, 0x0000000d, 0x00000426, 0x00000042,
+    0x00000042, 0x0005002c, 0x0000000d, 0x00000427, 0x0000007d, 0x0000007d, 0x0004002b, 0x00000006,
+    0x00000428, 0x3e800000, 0x0004002b, 0x00000006, 0x00000429, 0x3e000000, 0x00050036, 0x00000002,
+    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x00050041, 0x0000017b, 0x0000017c,
+    0x0000017a, 0x000000cb, 0x0004003d, 0x00000177, 0x0000017d, 0x0000017c, 0x0004003d, 0x00000023,
+    0x00000180, 0x0000017f, 0x00050051, 0x00000006, 0x00000182, 0x00000180, 0x00000000, 0x00050051,
+    0x00000006, 0x00000183, 0x00000180, 0x00000001, 0x00060050, 0x00000174, 0x00000184, 0x00000182,
+    0x00000183, 0x00000042, 0x00050091, 0x00000174, 0x00000185, 0x0000017d, 0x00000184, 0x00050041,
+    0x0000017b, 0x00000187, 0x0000017a, 0x000000f2, 0x0004003d, 0x00000177, 0x00000188, 0x00000187,
+    0x00050091, 0x00000174, 0x0000018e, 0x00000188, 0x00000184, 0x00050041, 0x00000191, 0x00000192,
+    0x0000017a, 0x00000190, 0x0004003d, 0x00000023, 0x00000193, 0x00000192, 0x00050041, 0x00000195,
+    0x00000196, 0x0000017a, 0x00000194, 0x0004003d, 0x00000006, 0x00000197, 0x00000196, 0x000500b8,
+    0x000000d3, 0x00000199, 0x00000197, 0x00000198, 0x000300f7, 0x0000019b, 0x00000000, 0x000400fa,
+    0x00000199, 0x0000019a, 0x000001aa, 0x000200f8, 0x0000019a, 0x0007004f, 0x0000000d, 0x000001a1,
+    0x00000185, 0x00000185, 0x00000000, 0x00000001, 0x00050041, 0x000001a3, 0x000001a4, 0x0000017a,
+    0x0000019d, 0x0004003d, 0x0000000d, 0x000001a5, 0x000001a4, 0x00050041, 0x00000191, 0x000001a7,
+    0x0000017a, 0x0000019e, 0x0004003d, 0x00000023, 0x000001a8, 0x000001a7, 0x000300f7, 0x0000027c,
+    0x00000000, 0x000300fb, 0x0000006d, 0x00000206, 0x000200f8, 0x00000206, 0x00050051, 0x00000006,
+    0x00000208, 0x00000185, 0x00000000, 0x00050051, 0x00000006, 0x0000020a, 0x000001a8, 0x00000000,
+    0x000500b8, 0x000000d3, 0x0000020b, 0x00000208, 0x0000020a, 0x000300f7, 0x00000212, 0x00000000,
+    0x000400fa, 0x0000020b, 0x0000020c, 0x00000212, 0x000200f8, 0x0000020c, 0x00050051, 0x00000006,
+    0x0000020e, 0x00000185, 0x00000001, 0x000500b8, 0x000000d3, 0x00000211, 0x0000020e, 0x0000020a,
+    0x000200f9, 0x00000212, 0x000200f8, 0x00000212, 0x000700f5, 0x000000d3, 0x00000213, 0x0000020b,
+    0x00000206, 0x00000211, 0x0000020c, 0x000300f7, 0x00000271, 0x00000000, 0x000400fa, 0x00000213,
+    0x00000214, 0x00000219, 0x000200f8, 0x00000214, 0x00050050, 0x0000000d, 0x00000218, 0x0000020a,
+    0x0000020a, 0x000200f9, 0x00000271, 0x000200f8, 0x00000219, 0x00050051, 0x00000006, 0x0000021b,
+    0x000001a5, 0x00000000, 0x00050051, 0x00000006, 0x0000021d, 0x000001a8, 0x00000001, 0x00050083,
+    0x00000006, 0x0000021e, 0x0000021b, 0x0000021d, 0x000500b8, 0x000000d3, 0x00000221, 0x0000021e,
+    0x00000208, 0x000300f7, 0x00000228, 0x00000000, 0x000400fa, 0x00000221, 0x00000222, 0x00000228,
+    0x000200f8, 0x00000222, 0x00050051, 0x00000006, 0x00000224, 0x00000185, 0x00000001, 0x000500b8,
+    0x000000d3, 0x00000227, 0x00000224, 0x0000021d, 0x000200f9, 0x00000228, 0x000200f8, 0x00000228,
+    0x000700f5, 0x000000d3, 0x00000229, 0x00000221, 0x00000219, 0x00000227, 0x00000222, 0x000300f7,
+    0x00000270, 0x00000000, 0x000400fa, 0x00000229, 0x0000022a, 0x00000233, 0x000200f8, 0x0000022a,
+    0x00050050, 0x0000000d, 0x00000232, 0x0000021e, 0x0000021d, 0x000200f9, 0x00000270, 0x000200f8,
+    0x00000233, 0x00050051, 0x00000006, 0x00000237, 0x000001a8, 0x00000002, 0x00050083, 0x00000006,
+    0x00000238, 0x0000021b, 0x00000237, 0x000500b8, 0x000000d3, 0x0000023b, 0x00000238, 0x00000208,
+    0x000300f7, 0x00000245, 0x00000000, 0x000400fa, 0x0000023b, 0x0000023c, 0x00000245, 0x000200f8,
+    0x0000023c, 0x00050051, 0x00000006, 0x0000023e, 0x000001a5, 0x00000001, 0x00050083, 0x00000006,
+    0x00000241, 0x0000023e, 0x00000237, 0x00050051, 0x00000006, 0x00000243, 0x00000185, 0x00000001,
+    0x000500b8, 0x000000d3, 0x00000244, 0x00000241, 0x00000243, 0x000200f9, 0x00000245, 0x000200f8,
+    0x00000245, 0x000700f5, 0x000000d3, 0x00000246, 0x0000023b, 0x00000233, 0x00000244, 0x0000023c,
+    0x000300f7, 0x0000026f, 0x00000000, 0x000400fa, 0x00000246, 0x00000247, 0x00000253, 0x000200f8,
+    0x00000247, 0x00050051, 0x00000006, 0x0000024f, 0x000001a5, 0x00000001, 0x00050083, 0x00000006,
+    0x00000251, 0x0000024f, 0x00000237, 0x00050050, 0x0000000d, 0x00000252, 0x00000238, 0x00000251,
+    0x000200f9, 0x0000026f, 0x000200f8, 0x00000253, 0x00050051, 0x00000006, 0x00000257, 0x000001a8,
+    0x00000003, 0x000500b8, 0x000000d3, 0x00000258, 0x00000208, 0x00000257, 0x000300f7, 0x00000262,
+    0x00000000, 0x000400fa, 0x00000258, 0x00000259, 0x00000262, 0x000200f8, 0x00000259, 0x00050051,
+    0x00000006, 0x0000025b, 0x000001a5, 0x00000001, 0x00050083, 0x00000006, 0x0000025e, 0x0000025b,
+    0x00000257, 0x00050051, 0x00000006, 0x00000260, 0x00000185, 0x00000001, 0x000500b8, 0x000000d3,
+    0x00000261, 0x0000025e, 0x00000260, 0x000200f9, 0x00000262, 0x000200f8, 0x00000262, 0x000700f5,
+    0x000000d3, 0x00000263, 0x00000258, 0x00000253, 0x00000261, 0x00000259, 0x000300f7, 0x00000264,
+    0x00000000, 0x000400fa, 0x00000263, 0x00000264, 0x0000026d, 0x000200f8, 0x00000264, 0x00050051,
+    0x00000006, 0x00000269, 0x000001a5, 0x00000001, 0x00050083, 0x00000006, 0x0000026b, 0x00000269,
+    0x00000257, 0x00050050, 0x0000000d, 0x0000026c, 0x00000257, 0x0000026b, 0x000200f9, 0x0000026f,
+    0x000200f8, 0x0000026d, 0x000200f9, 0x0000027c, 0x000200f8, 0x0000026f, 0x000700f5, 0x00000006,
+    0x00000402, 0x00000237, 0x00000247, 0x00000257, 0x00000264, 0x000700f5, 0x0000000d, 0x000003ff,
+    0x00000252, 0x00000247, 0x0000026c, 0x00000264, 0x000200f9, 0x00000270, 0x000200f8, 0x00000270,
+    0x000700f5, 0x00000006, 0x00000401, 0x0000021d, 0x0000022a, 0x00000402, 0x0000026f, 0x000700f5,
+    0x0000000d, 0x000003fe, 0x00000232, 0x0000022a, 0x000003ff, 0x0000026f, 0x000200f9, 0x00000271,
+    0x000200f8, 0x00000271, 0x000700f5, 0x00000006, 0x00000400, 0x0000020a, 0x00000214, 0x00000401,
+    0x00000270, 0x000700f5, 0x0000000d, 0x000003fd, 0x00000218, 0x00000214, 0x000003fe, 0x00000270,
+    0x0007000c, 0x00000006, 0x00000274, 0x00000001, 0x00000043, 0x000001a1, 0x000003fd, 0x00050083,
+    0x00000006, 0x00000276, 0x00000400, 0x0000007d, 0x00050081, 0x00000006, 0x00000278, 0x00000400,
+    0x0000007d, 0x0008000c, 0x00000006, 0x0000027a, 0x00000001, 0x00000031, 0x00000276, 0x00000278,
+    0x00000274, 0x00050083, 0x00000006, 0x0000027b, 0x00000042, 0x0000027a, 0x000200f9, 0x0000027c,
+    0x000200f8, 0x0000027c, 0x000700f5, 0x00000006, 0x00000403, 0x00000042, 0x0000026d, 0x0000027b,
+    0x00000271, 0x000200f9, 0x0000019b, 0x000200f8, 0x000001aa, 0x00050041, 0x000001a3, 0x000001ae,
+    0x0000017a, 0x0000019d, 0x0004003d, 0x0000000d, 0x000001af, 0x000001ae, 0x0007004f, 0x0000000d,
+    0x000001b2, 0x00000185, 0x00000185, 0x00000000, 0x00000001, 0x00060041, 0x00000195, 0x000001b7,
+    0x0000017a, 0x0000019e, 0x0000012a, 0x0004003d, 0x00000006, 0x000001b8, 0x000001b7, 0x0005008e,
+    0x0000000d, 0x00000294, 0x000001af, 0x0000007d, 0x00050083, 0x0000000d, 0x0000029b, 0x000001b2,
+    0x00000294, 0x00050051, 0x00000006, 0x0000029d, 0x0000029b, 0x00000001, 0x00050051, 0x00000006,
+    0x0000029f, 0x00000294, 0x00000001, 0x00050083, 0x00000006, 0x000002a0, 0x0000029d, 0x0000029f,
+    0x00050081, 0x00000006, 0x000002a5, 0x0000029d, 0x0000029f, 0x00050085, 0x00000006, 0x000002a7,
+    0x000000af, 0x00000197, 0x0008000c, 0x00000006, 0x000002aa, 0x00000001, 0x0000002b, 0x000002a7,
+    0x000002a0, 0x000002a5, 0x00050085, 0x00000006, 0x000002ac, 0x000000b6, 0x00000197, 0x0008000c,
+    0x00000006, 0x000002af, 0x00000001, 0x0000002b, 0x000002ac, 0x000002a0, 0x000002a5, 0x00050083,
+    0x00000006, 0x000002b2, 0x000002af, 0x000002aa, 0x00050085, 0x00000006, 0x000002b3, 0x000002b2,
+    0x00000428, 0x00050085, 0x00000006, 0x000002b6, 0x000002b2, 0x00000429, 0x00050081, 0x00000006,
+    0x000002b7, 0x000002aa, 0x000002b6, 0x000200f9, 0x000002b8, 0x000200f8, 0x000002b8, 0x000700f5,
+    0x00000006, 0x000003fc, 0x000002b7, 0x000001aa, 0x000002d1, 0x000002bc, 0x000700f5, 0x00000006,
+    0x000003fb, 0x0000006a, 0x000001aa, 0x000002ce, 0x000002bc, 0x000700f5, 0x000000c8, 0x000003fa,
+    0x000000cb, 0x000001aa, 0x000002d4, 0x000002bc, 0x000500b1, 0x000000d3, 0x000002bb, 0x000003fa,
+    0x000000d2, 0x000400f6, 0x000002d5, 0x000002bc, 0x00000000, 0x000400fa, 0x000002bb, 0x000002bc,
+    0x000002d5, 0x000200f8, 0x000002bc, 0x00050083, 0x00000006, 0x000002c0, 0x0000029d, 0x000003fc,
+    0x00050051, 0x00000006, 0x000002c2, 0x0000029b, 0x00000000, 0x00050083, 0x00000006, 0x000002e0,
+    0x0000029f, 0x000001b8, 0x0006000c, 0x00000006, 0x000002e2, 0x00000001, 0x00000004, 0x000002c0,
+    0x00050083, 0x00000006, 0x000002e3, 0x000002e0, 0x000002e2, 0x0007000c, 0x00000006, 0x000002e4,
+    0x00000001, 0x00000025, 0x000002e3, 0x0000006a, 0x00050051, 0x00000006, 0x000002e6, 0x00000294,
+    0x00000000, 0x00050083, 0x00000006, 0x000002e8, 0x000002e6, 0x000001b8, 0x00050085, 0x00000006,
+    0x000002eb, 0x000001b8, 0x000001b8, 0x00050085, 0x00000006, 0x000002ee, 0x000002e4, 0x000002e4,
+    0x00050083, 0x00000006, 0x000002ef, 0x000002eb, 0x000002ee, 0x0007000c, 0x00000006, 0x000002f0,
+    0x00000001, 0x00000028, 0x0000006a, 0x000002ef, 0x0006000c, 0x00000006, 0x000002f1, 0x00000001,
+    0x0000001f, 0x000002f0, 0x00050081, 0x00000006, 0x000002f2, 0x000002e8, 0x000002f1, 0x0004007f,
+    0x00000006, 0x000002f5, 0x000002f2, 0x00050050, 0x0000000d, 0x000002f7, 0x000002f5, 0x000002f2,
+    0x00050050, 0x0000000d, 0x000002f8, 0x000002c2, 0x000002c2, 0x00050081, 0x0000000d, 0x000002f9,
+    0x000002f8, 0x000002f7, 0x00050088, 0x00000006, 0x000002fb, 0x00000085, 0x00000197, 0x0005008e,
+    0x0000000d, 0x000002fc, 0x000002f9, 0x000002fb, 0x0006000c, 0x0000000d, 0x0000030b, 0x00000001,
+    0x00000006, 0x000002fc, 0x0006000c, 0x0000000d, 0x0000030d, 0x00000001, 0x00000004, 0x000002fc,
+    0x00050085, 0x0000000d, 0x00000310, 0x0000030d, 0x0000030d, 0x0005008e, 0x0000000d, 0x00000311,
+    0x00000310, 0x00000045, 0x00050081, 0x0000000d, 0x00000313, 0x00000424, 0x00000311, 0x00050085,
+    0x0000000d, 0x00000315, 0x00000313, 0x0000030d, 0x00050081, 0x0000000d, 0x00000317, 0x00000425,
+    0x00000315, 0x00050085, 0x0000000d, 0x00000319, 0x00000317, 0x0000030d, 0x00050081, 0x0000000d,
+    0x0000031b, 0x00000426, 0x00000319, 0x00050085, 0x0000000d, 0x0000031e, 0x0000031b, 0x0000031b,
+    0x00050085, 0x0000000d, 0x00000323, 0x0000031e, 0x0000031e, 0x00050088, 0x0000000d, 0x00000324,
+    0x0000030b, 0x00000323, 0x00050083, 0x0000000d, 0x00000325, 0x0000030b, 0x00000324, 0x0005008e,
+    0x0000000d, 0x000002fe, 0x00000325, 0x0000007d, 0x00050081, 0x0000000d, 0x00000300, 0x00000427,
+    0x000002fe, 0x00050051, 0x00000006, 0x00000302, 0x00000300, 0x00000001, 0x00050051, 0x00000006,
+    0x00000304, 0x00000300, 0x00000000, 0x00050083, 0x00000006, 0x00000305, 0x00000302, 0x00000304,
+    0x00050085, 0x00000006, 0x0000032a, 0x000003fc, 0x000003fc, 0x0004007f, 0x00000006, 0x0000032b,
+    0x0000032a, 0x00050085, 0x00000006, 0x0000032d, 0x0000002f, 0x00000197, 0x00050085, 0x00000006,
+    0x0000032f, 0x0000032d, 0x00000197, 0x00050088, 0x00000006, 0x00000330, 0x0000032b, 0x0000032f,
+    0x0006000c, 0x00000006, 0x00000331, 0x00000001, 0x0000001b, 0x00000330, 0x00050085, 0x00000006,
+    0x00000333, 0x00000036, 0x00000197, 0x00050088, 0x00000006, 0x00000334, 0x00000331, 0x00000333,
+    0x00050085, 0x00000006, 0x000002ca, 0x00000305, 0x00000334, 0x00050085, 0x00000006, 0x000002cc,
+    0x000002ca, 0x000002b3, 0x00050081, 0x00000006, 0x000002ce, 0x000003fb, 0x000002cc, 0x00050081,
+    0x00000006, 0x000002d1, 0x000003fc, 0x000002b3, 0x00050080, 0x000000c8, 0x000002d4, 0x000003fa,
+    0x000000f2, 0x000200f9, 0x000002b8, 0x000200f8, 0x000002d5, 0x000200f9, 0x0000019b, 0x000200f8,
+    0x0000019b, 0x000700f5, 0x00000006, 0x0000040e, 0x00000403, 0x0000027c, 0x000003fb, 0x000002d5,
+    0x0005008e, 0x00000023, 0x000001bc, 0x00000193, 0x0000040e, 0x00050041, 0x000001a3, 0x000001be,
+    0x0000017a, 0x000001bd, 0x0004003d, 0x0000000d, 0x000001bf, 0x000001be, 0x000500b7, 0x000001c0,
+    0x000001c1, 0x000001bf, 0x000001ab, 0x0004009a, 0x000000d3, 0x000001c2, 0x000001c1, 0x000300f7,
+    0x000001c4, 0x00000000, 0x000400fa, 0x000001c2, 0x000001c3, 0x000001c4, 0x000200f8, 0x000001c3,
+    0x00050051, 0x00000006, 0x000001c6, 0x0000018e, 0x00000000, 0x000500bc, 0x000000d3, 0x000001c7,
+    0x0000006a, 0x000001c6, 0x000300f7, 0x000001c9, 0x00000000, 0x000400fa, 0x000001c7, 0x000001c8,
+    0x000001c9, 0x000200f8, 0x000001c8, 0x00060041, 0x00000195, 0x000001cc, 0x0000017a, 0x000001bd,
+    0x0000006d, 0x0004003d, 0x00000006, 0x000001cd, 0x000001cc, 0x000500bc, 0x000000d3, 0x000001ce,
+    0x000001c6, 0x000001cd, 0x000200f9, 0x000001c9, 0x000200f8, 0x000001c9, 0x000700f5, 0x000000d3,
+    0x000001cf, 0x000001c7, 0x000001c3, 0x000001ce, 0x000001c8, 0x000300f7, 0x000001d1, 0x00000000,
+    0x000400fa, 0x000001cf, 0x000001d0, 0x000001d1, 0x000200f8, 0x000001d0, 0x00050051, 0x00000006,
+    0x000001d3, 0x0000018e, 0x00000001, 0x000500bc, 0x000000d3, 0x000001d4, 0x0000006a, 0x000001d3,
+    0x000200f9, 0x000001d1, 0x000200f8, 0x000001d1, 0x000700f5, 0x000000d3, 0x000001d5, 0x000001cf,
+    0x000001c9, 0x000001d4, 0x000001d0, 0x000300f7, 0x000001d7, 0x00000000, 0x000400fa, 0x000001d5,
+    0x000001d6, 0x000001d7, 0x000200f8, 0x000001d6, 0x00050051, 0x00000006, 0x000001d9, 0x0000018e,
+    0x00000001, 0x00060041, 0x00000195, 0x000001da, 0x0000017a, 0x000001bd, 0x00000062, 0x0004003d,
+    0x00000006, 0x000001db, 0x000001da, 0x000500bc, 0x000000d3, 0x000001dc, 0x000001d9, 0x000001db,
+    0x000200f9, 0x000001d7, 0x000200f8, 0x000001d7, 0x000700f5, 0x000000d3, 0x000001dd, 0x000001d5,
+    0x000001d1, 0x000001dc, 0x000001d6, 0x000300f7, 0x000001df, 0x00000000, 0x000400fa, 0x000001dd,
+    0x000001de, 0x000001df, 0x000200f8, 0x000001de, 0x0007004f, 0x0000000d, 0x000001e3, 0x0000018e,
+    0x0000018e, 0x00000000, 0x00000001, 0x00050041, 0x00000191, 0x000001e8, 0x0000017a, 0x000000d2,
+    0x0004003d, 0x00000023, 0x000001e9, 0x000001e8, 0x000300f7, 0x000003b2, 0x00000000, 0x000300fb,
+    0x0000006d, 0x0000033c, 0x000200f8, 0x0000033c, 0x00050051, 0x00000006, 0x00000340, 0x000001e9,
+    0x00000000, 0x000500b8, 0x000000d3, 0x00000341, 0x000001c6, 0x00000340, 0x000300f7, 0x00000348,
+    0x00000000, 0x000400fa, 0x00000341, 0x00000342, 0x00000348, 0x000200f8, 0x00000342, 0x00050051,
+    0x00000006, 0x00000344, 0x0000018e, 0x00000001, 0x000500b8, 0x000000d3, 0x00000347, 0x00000344,
+    0x00000340, 0x000200f9, 0x00000348, 0x000200f8, 0x00000348, 0x000700f5, 0x000000d3, 0x00000349,
+    0x00000341, 0x0000033c, 0x00000347, 0x00000342, 0x000300f7, 0x000003a7, 0x00000000, 0x000400fa,
+    0x00000349, 0x0000034a, 0x0000034f, 0x000200f8, 0x0000034a, 0x00050050, 0x0000000d, 0x0000034e,
+    0x00000340, 0x00000340, 0x000200f9, 0x000003a7, 0x000200f8, 0x0000034f, 0x00050051, 0x00000006,
+    0x00000351, 0x000001bf, 0x00000000, 0x00050051, 0x00000006, 0x00000353, 0x000001e9, 0x00000001,
+    0x00050083, 0x00000006, 0x00000354, 0x00000351, 0x00000353, 0x000500b8, 0x000000d3, 0x00000357,
+    0x00000354, 0x000001c6, 0x000300f7, 0x0000035e, 0x00000000, 0x000400fa, 0x00000357, 0x00000358,
+    0x0000035e, 0x000200f8, 0x00000358, 0x00050051, 0x00000006, 0x0000035a, 0x0000018e, 0x00000001,
+    0x000500b8, 0x000000d3, 0x0000035d, 0x0000035a, 0x00000353, 0x000200f9, 0x0000035e, 0x000200f8,
+    0x0000035e, 0x000700f5, 0x000000d3, 0x0000035f, 0x00000357, 0x0000034f, 0x0000035d, 0x00000358,
+    0x000300f7, 0x000003a6, 0x00000000, 0x000400fa, 0x0000035f, 0x00000360, 0x00000369, 0x000200f8,
+    0x00000360, 0x00050050, 0x0000000d, 0x00000368, 0x00000354, 0x00000353, 0x000200f9, 0x000003a6,
+    0x000200f8, 0x00000369, 0x00050051, 0x00000006, 0x0000036d, 0x000001e9, 0x00000002, 0x00050083,
+    0x00000006, 0x0000036e, 0x00000351, 0x0000036d, 0x000500b8, 0x000000d3, 0x00000371, 0x0000036e,
+    0x000001c6, 0x000300f7, 0x0000037b, 0x00000000, 0x000400fa, 0x00000371, 0x00000372, 0x0000037b,
+    0x000200f8, 0x00000372, 0x00050051, 0x00000006, 0x00000374, 0x000001bf, 0x00000001, 0x00050083,
+    0x00000006, 0x00000377, 0x00000374, 0x0000036d, 0x00050051, 0x00000006, 0x00000379, 0x0000018e,
+    0x00000001, 0x000500b8, 0x000000d3, 0x0000037a, 0x00000377, 0x00000379, 0x000200f9, 0x0000037b,
+    0x000200f8, 0x0000037b, 0x000700f5, 0x000000d3, 0x0000037c, 0x00000371, 0x00000369, 0x0000037a,
+    0x00000372, 0x000300f7, 0x000003a5, 0x00000000, 0x000400fa, 0x0000037c, 0x0000037d, 0x00000389,
+    0x000200f8, 0x0000037d, 0x00050051, 0x00000006, 0x00000385, 0x000001bf, 0x00000001, 0x00050083,
+    0x00000006, 0x00000387, 0x00000385, 0x0000036d, 0x00050050, 0x0000000d, 0x00000388, 0x0000036e,
+    0x00000387, 0x000200f9, 0x000003a5, 0x000200f8, 0x00000389, 0x00050051, 0x00000006, 0x0000038d,
+    0x000001e9, 0x00000003, 0x000500b8, 0x000000d3, 0x0000038e, 0x000001c6, 0x0000038d, 0x000300f7,
+    0x00000398, 0x00000000, 0x000400fa, 0x0000038e, 0x0000038f, 0x00000398, 0x000200f8, 0x0000038f,
+    0x00050051, 0x00000006, 0x00000391, 0x000001bf, 0x00000001, 0x00050083, 0x00000006, 0x00000394,
+    0x00000391, 0x0000038d, 0x00050051, 0x00000006, 0x00000396, 0x0000018e, 0x00000001, 0x000500b8,
+    0x000000d3, 0x00000397, 0x00000394, 0x00000396, 0x000200f9, 0x00000398, 0x000200f8, 0x00000398,
+    0x000700f5, 0x000000d3, 0x00000399, 0x0000038e, 0x00000389, 0x00000397, 0x0000038f, 0x000300f7,
+    0x0000039a, 0x00000000, 0x000400fa, 0x00000399, 0x0000039a, 0x000003a3, 0x000200f8, 0x0000039a,
+    0x00050051, 0x00000006, 0x0000039f, 0x000001bf, 0x00000001, 0x00050083, 0x00000006, 0x000003a1,
+    0x0000039f, 0x0000038d, 0x00050050, 0x0000000d, 0x000003a2, 0x0000038d, 0x000003a1, 0x000200f9,
+    0x000003a5, 0x000200f8, 0x000003a3, 0x000200f9, 0x000003b2, 0x000200f8, 0x000003a5, 0x000700f5,
+    0x00000006, 0x00000414, 0x0000036d, 0x0000037d, 0x0000038d, 0x0000039a, 0x000700f5, 0x0000000d,
+    0x00000411, 0x00000388, 0x0000037d, 0x000003a2, 0x0000039a, 0x000200f9, 0x000003a6, 0x000200f8,
+    0x000003a6, 0x000700f5, 0x00000006, 0x00000413, 0x00000353, 0x00000360, 0x00000414, 0x000003a5,
+    0x000700f5, 0x0000000d, 0x00000410, 0x00000368, 0x00000360, 0x00000411, 0x000003a5, 0x000200f9,
+    0x000003a7, 0x000200f8, 0x000003a7, 0x000700f5, 0x00000006, 0x00000412, 0x00000340, 0x0000034a,
+    0x00000413, 0x000003a6, 0x000700f5, 0x0000000d, 0x0000040f, 0x0000034e, 0x0000034a, 0x00000410,
+    0x000003a6, 0x0007000c, 0x00000006, 0x000003aa, 0x00000001, 0x00000043, 0x000001e3, 0x0000040f,
+    0x00050083, 0x00000006, 0x000003ac, 0x00000412, 0x0000007d, 0x00050081, 0x00000006, 0x000003ae,
+    0x00000412, 0x0000007d, 0x0008000c, 0x00000006, 0x000003b0, 0x00000001, 0x00000031, 0x000003ac,
+    0x000003ae, 0x000003aa, 0x00050083, 0x00000006, 0x000003b1, 0x00000042, 0x000003b0, 0x000200f9,
+    0x000003b2, 0x000200f8, 0x000003b2, 0x000700f5, 0x00000006, 0x00000415, 0x00000042, 0x000003a3,
+    0x000003b1, 0x000003a7, 0x00050083, 0x00000006, 0x000001ed, 0x00000042, 0x00000415, 0x0005008e,
+    0x00000023, 0x000001ee, 0x000001bc, 0x000001ed, 0x000200f9, 0x000001df, 0x000200f8, 0x000001df,
+    0x000700f5, 0x00000023, 0x00000422, 0x000001bc, 0x000001d7, 0x000001ee, 0x000003b2, 0x000200f9,
+    0x000001c4, 0x000200f8, 0x000001c4, 0x000700f5, 0x00000023, 0x00000421, 0x000001bc, 0x0000019b,
+    0x00000422, 0x000001df, 0x00050041, 0x00000195, 0x000001f1, 0x0000017a, 0x000001f0, 0x0004003d,
+    0x00000006, 0x000001f2, 0x000001f1, 0x0005008e, 0x00000023, 0x000001f3, 0x00000421, 0x000001f2,
+    0x0003003e, 0x000001f5, 0x000001f3, 0x000100fd, 0x00010038,
+];
+
+/// Byte size of the shadow fragment shader's uniform block (its `set = 0, binding = 0` UBO).
+const SHADOW_UNIFORM_BLOCK_SIZE: vk::DeviceSize = 176;
+
+/// Packs [`ShadowParameters`] into the std140 layout `BUILTIN_SHADOW_FRAGMENT_SHADER_SPIRV`
+/// expects, confirmed against that module's own `OpMemberDecorate ... Offset` decorations:
+/// `pixel_to_geo` mat3 @0 (48B, each column padded to 16B), `pixel_to_window_geo` mat3 @48 (48B),
+/// `color` vec4 @96, `corner_radius` vec4 @112, `window_corner_radius` vec4 @128, `geo_size` vec2
+/// @144, `window_geo_size` vec2 @152, `sigma` f32 @160, `alpha` f32 @164, then 8 bytes of trailing
+/// padding to round the block up to a 16-byte multiple.
+fn shadow_uniform_block_bytes(params: &ShadowParameters) -> [u8; SHADOW_UNIFORM_BLOCK_SIZE as usize] {
+    fn write_std140_mat3(bytes: &mut [u8], cols: &[f32; 9]) {
+        for (col, chunk) in cols.chunks_exact(3).enumerate() {
+            let base = col * 16;
+            bytes[base..base + 4].copy_from_slice(&chunk[0].to_ne_bytes());
+            bytes[base + 4..base + 8].copy_from_slice(&chunk[1].to_ne_bytes());
+            bytes[base + 8..base + 12].copy_from_slice(&chunk[2].to_ne_bytes());
+            // bytes[base + 12..base + 16] left zeroed: std140 pads each mat3 column to vec4.
+        }
+    }
+    fn write_vec4(bytes: &mut [u8], v: [f32; 4]) {
+        for (i, component) in v.iter().enumerate() {
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&component.to_ne_bytes());
+        }
+    }
+    fn write_vec2(bytes: &mut [u8], v: [f32; 2]) {
+        for (i, component) in v.iter().enumerate() {
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&component.to_ne_bytes());
+        }
+    }
+
+    let mut bytes = [0u8; SHADOW_UNIFORM_BLOCK_SIZE as usize];
+    write_std140_mat3(&mut bytes[0..48], &params.pixel_to_geo);
+    write_std140_mat3(&mut bytes[48..96], &params.pixel_to_window_geo);
+    write_vec4(&mut bytes[96..112], params.color);
+    write_vec4(&mut bytes[112..128], params.corner_radius);
+    write_vec4(&mut bytes[128..144], params.window_corner_radius);
+    write_vec2(&mut bytes[144..152], params.geo_size);
+    write_vec2(&mut bytes[152..160], params.window_geo_size);
+    bytes[160..164].copy_from_slice(&params.sigma.to_ne_bytes());
+    bytes[164..168].copy_from_slice(&params.alpha.to_ne_bytes());
+    bytes
+}
+
 impl Drop for VulkanShaderModule {
     fn drop(&mut self) {
         // SAFETY: `self.handle` was created from `self.logical_device` and this owner destroys it
@@ -8022,6 +8469,286 @@ fn create_pipeline_layout_for_descriptor_set_layout(
         logical_device: descriptor_set_layout.logical_device.clone(),
         handle,
     })
+}
+
+fn create_shadow_descriptor_set_layout(
+    logical_device: &VulkanLogicalDevice,
+) -> Result<VulkanDescriptorSetLayout, VulkanError> {
+    let bindings = [vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+    let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    // SAFETY: `logical_device` is a live Vulkan device. The single binding has descriptor count 1,
+    // a valid descriptor type, and a non-empty shader stage mask. No immutable samplers or
+    // allocation callbacks are used.
+    let handle = unsafe {
+        logical_device
+            .handle()
+            .create_descriptor_set_layout(&create_info, None)
+    }
+    .map_err(VulkanError::from)?;
+
+    Ok(VulkanDescriptorSetLayout {
+        logical_device: logical_device.clone(),
+        handle,
+    })
+}
+
+/// Unlike `create_pipeline_layout_for_descriptor_set_layout` (sampled-texture, which also needs a
+/// small per-draw push-constant range), the shadow pipeline carries everything it needs in its
+/// uniform buffer, so this layout has no push-constant range at all.
+fn create_shadow_pipeline_layout(
+    descriptor_set_layout: &VulkanDescriptorSetLayout,
+) -> Result<VulkanPipelineLayout, VulkanError> {
+    let set_layouts = [descriptor_set_layout.handle()];
+    let create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+    // SAFETY: `descriptor_set_layout.logical_device` is a live Vulkan device and owns the
+    // descriptor-set layout handle used here. No push-constant ranges or allocation callbacks are
+    // used.
+    let handle = unsafe {
+        descriptor_set_layout
+            .logical_device
+            .handle()
+            .create_pipeline_layout(&create_info, None)
+    }
+    .map_err(VulkanError::from)?;
+
+    Ok(VulkanPipelineLayout {
+        logical_device: descriptor_set_layout.logical_device.clone(),
+        handle,
+    })
+}
+
+fn create_shadow_descriptor_pool(
+    logical_device: &VulkanLogicalDevice,
+    max_sets: u32,
+) -> Result<VulkanDescriptorPool, VulkanError> {
+    if max_sets == 0 {
+        return Err(VulkanError::UnsupportedOperation("descriptor pool capacity"));
+    }
+
+    let pool_sizes = [vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::UNIFORM_BUFFER)
+        .descriptor_count(max_sets)];
+    let create_info = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(max_sets)
+        .pool_sizes(&pool_sizes);
+    // SAFETY: `logical_device` is a live Vulkan device. Local validation rejects zero `max_sets`,
+    // and this create info provides the same non-zero uniform-buffer descriptor count. No
+    // allocation callbacks are used.
+    let handle = unsafe { logical_device.handle().create_descriptor_pool(&create_info, None) }
+        .map_err(VulkanError::from)?;
+
+    Ok(VulkanDescriptorPool {
+        inner: Arc::new(VulkanDescriptorPoolInner {
+            logical_device: logical_device.clone(),
+            handle,
+            max_sets,
+            host_access: Mutex::new(()),
+        }),
+    })
+}
+
+/// Descriptor set binding one shadow-uniform buffer. Allocated fresh per draw (see
+/// `render_shadow_to_color_image_in`) alongside a single-use `VulkanDescriptorPool`, so its
+/// lifetime is just the one synchronous draw call, not cached like the pipeline/layout are.
+struct VulkanShadowDescriptorSet {
+    // Held only so `pool` (whose `Drop` frees this set) and `buffer` (which the set's descriptor
+    // points at) outlive `handle`'s use in `record_shadow_draw`; never read directly.
+    #[allow(dead_code)]
+    pool: VulkanDescriptorPool,
+    #[allow(dead_code)]
+    buffer: VulkanHostVisibleBuffer,
+    handle: vk::DescriptorSet,
+}
+
+impl VulkanShadowDescriptorSet {
+    fn handle(&self) -> vk::DescriptorSet {
+        self.handle
+    }
+}
+
+fn create_shadow_descriptor_set(
+    logical_device: &VulkanLogicalDevice,
+    pool: &VulkanDescriptorPool,
+    descriptor_set_layout: &VulkanDescriptorSetLayout,
+    buffer: VulkanHostVisibleBuffer,
+) -> Result<VulkanShadowDescriptorSet, VulkanError> {
+    if !logical_device.is_same_device(pool.logical_device())
+        || !logical_device.is_same_device(descriptor_set_layout.logical_device())
+    {
+        return Err(VulkanError::UnsupportedOperation("descriptor set device"));
+    }
+
+    let _pool_guard = pool.lock_host_access()?;
+    let set_layouts = [descriptor_set_layout.handle()];
+    let allocate_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(pool.handle())
+        .set_layouts(&set_layouts);
+    // SAFETY: `pool` and `descriptor_set_layout` are validated to belong to `logical_device`.
+    // The pool is host-locked for allocation and the set-layout slice lives through the call.
+    let descriptor_sets = unsafe { logical_device.handle().allocate_descriptor_sets(&allocate_info) }
+        .map_err(VulkanError::from)?;
+    let handle = descriptor_sets
+        .into_iter()
+        .next()
+        .ok_or_else(|| VulkanError::DeviceInitializationFailed("no descriptor set allocated".to_owned()))?;
+    let buffer_infos = [vk::DescriptorBufferInfo::default()
+        .buffer(buffer.buffer())
+        .offset(0)
+        .range(buffer.size())];
+    let writes = [vk::WriteDescriptorSet::default()
+        .dst_set(handle)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+        .buffer_info(&buffer_infos)];
+    // SAFETY: `handle` was allocated from `pool` on `logical_device`, binding 0 exists in
+    // `descriptor_set_layout` as one uniform-buffer descriptor, and `buffer` (kept alive by this
+    // returned struct) covers the whole range written here. The descriptor set is newly allocated
+    // and not concurrently accessed.
+    unsafe { logical_device.handle().update_descriptor_sets(&writes, &[]) };
+
+    Ok(VulkanShadowDescriptorSet {
+        pool: pool.clone(),
+        buffer,
+        handle,
+    })
+}
+
+/// Render-pass, pipeline-layout, and graphics-pipeline bundle for shadow draws.
+#[derive(Debug)]
+pub(super) struct VulkanShadowGraphicsPipeline {
+    color_format: vk::Format,
+    render_pass: Arc<VulkanRenderPass>,
+    layout: Arc<VulkanPipelineLayout>,
+    pipeline: VulkanGraphicsPipeline,
+}
+
+impl VulkanShadowGraphicsPipeline {
+    fn color_format(&self) -> vk::Format {
+        self.color_format
+    }
+
+    fn render_pass(&self) -> &VulkanRenderPass {
+        self.render_pass.as_ref()
+    }
+
+    fn layout(&self) -> &VulkanPipelineLayout {
+        self.layout.as_ref()
+    }
+
+    fn pipeline(&self) -> &VulkanGraphicsPipeline {
+        &self.pipeline
+    }
+}
+
+/// Draw constants for one shadow draw. `draw_area`/`scissor_area` are CPU-side only (dynamic
+/// viewport/scissor state, mirroring `VulkanSolidColorDrawConstants`); `params` is uploaded to the
+/// shadow uniform buffer via `shadow_uniform_block_bytes`.
+pub(super) struct VulkanShadowDrawConstants {
+    pub(super) draw_area: vk::Rect2D,
+    pub(super) scissor_area: vk::Rect2D,
+    pub(super) params: ShadowParameters,
+}
+
+fn validate_shadow_draw_inputs(
+    logical_device: &VulkanLogicalDevice,
+    target: &VulkanOwnedImage,
+    pipeline: &VulkanShadowGraphicsPipeline,
+) -> Result<(), VulkanError> {
+    if target.format() != pipeline.color_format() {
+        return Err(VulkanError::UnsupportedOperation("shadow pipeline format"));
+    }
+    if !logical_device.is_same_device(&target.inner.logical_device)
+        || !logical_device.is_same_device(pipeline.render_pass().logical_device())
+        || !logical_device.is_same_device(pipeline.layout().logical_device())
+        || !logical_device.is_same_device(pipeline.pipeline().logical_device())
+    {
+        return Err(VulkanError::UnsupportedOperation("shadow pipeline device"));
+    }
+    Ok(())
+}
+
+fn record_shadow_draw(
+    command_buffer: &mut VulkanCommandBuffer,
+    target: &VulkanOwnedImage,
+    pipeline: &VulkanShadowGraphicsPipeline,
+    descriptor_set: &VulkanShadowDescriptorSet,
+    framebuffer: &VulkanFramebuffer,
+    draw_constants: &VulkanShadowDrawConstants,
+) -> Result<(), VulkanError> {
+    ensure_command_buffer_recording(command_buffer)?;
+    ensure_command_buffer_image_device(command_buffer, target)?;
+    ensure_image_locally_usable_for_recorded_color_attachment_work(command_buffer, target)?;
+    if !target.usage().contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
+        return Err(VulkanError::UnsupportedOperation("image color attachment usage"));
+    }
+    validate_shadow_draw_inputs(&command_buffer.command_pool.logical_device, target, pipeline)?;
+    validate_color_attachment_area(target, draw_constants.draw_area, "shadow draw area")?;
+    validate_color_attachment_area(target, draw_constants.scissor_area, "shadow draw area")?;
+
+    let image_layout = command_buffer
+        .pending_layout_for(target)?
+        .unwrap_or(target.layout()?);
+    if image_layout != vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+        return Err(VulkanError::UnsupportedOperation("image color attachment layout"));
+    }
+
+    let render_area = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: vk::Extent2D {
+            width: target.extent().width,
+            height: target.extent().height,
+        },
+    };
+    let begin_info = vk::RenderPassBeginInfo::default()
+        .render_pass(pipeline.render_pass().handle())
+        .framebuffer(framebuffer.handle)
+        .render_area(render_area);
+    let viewport = [vk::Viewport {
+        x: draw_constants.draw_area.offset.x as f32,
+        y: draw_constants.draw_area.offset.y as f32,
+        width: draw_constants.draw_area.extent.width as f32,
+        height: draw_constants.draw_area.extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    let scissors = [draw_constants.scissor_area];
+    let descriptor_sets = [descriptor_set.handle()];
+    let _pool_guard = command_buffer.command_pool.lock_host_access()?;
+
+    // SAFETY: All bound objects were created from the same logical device by private constructors.
+    // `target` is in COLOR_ATTACHMENT_OPTIMAL for the duration of the render pass, the framebuffer
+    // uses the same render pass as `pipeline`, dynamic viewport/scissor are set before drawing, and
+    // `descriptor_set` retains the uniform buffer it was written to point at. The command buffer is
+    // host synchronized by the command-pool lock.
+    unsafe {
+        let device = command_buffer.command_pool.logical_device.handle();
+        device.cmd_begin_render_pass(command_buffer.handle, &begin_info, vk::SubpassContents::INLINE);
+        device.cmd_bind_pipeline(
+            command_buffer.handle,
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline.pipeline().handle(),
+        );
+        device.cmd_bind_descriptor_sets(
+            command_buffer.handle,
+            vk::PipelineBindPoint::GRAPHICS,
+            pipeline.layout().handle(),
+            0,
+            &descriptor_sets,
+            &[],
+        );
+        device.cmd_set_viewport(command_buffer.handle, 0, &viewport);
+        device.cmd_set_scissor(command_buffer.handle, 0, &scissors);
+        device.cmd_draw(command_buffer.handle, 3, 1, 0, 0);
+        device.cmd_end_render_pass(command_buffer.handle);
+    }
+
+    command_buffer.referenced_images.push(Arc::clone(&target.inner));
+
+    Ok(())
 }
 
 /// Descriptor pool for future sampled-texture descriptor sets.

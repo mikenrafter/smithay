@@ -50,8 +50,8 @@ use std::{
 
 use super::{
     Bind, Blit, BlitFrame, Color32F, ContextId, DebugFlags, ErasedContextId, ExportMem, Frame, ImportDma,
-    ImportMem, Offscreen, RenderTargetLifecycle, Renderer, RendererSuper, SurfaceCacheTextureReleaseError,
-    Texture, TextureFilter, TextureMapping,
+    ImportMem, Offscreen, RenderTargetLifecycle, Renderer, RendererSuper, ShadowParameters,
+    SurfaceCacheTextureReleaseError, Texture, TextureFilter, TextureMapping,
     sync::{self, SyncPoint},
 };
 #[cfg(feature = "wayland_frontend")]
@@ -2341,6 +2341,27 @@ where
             .as_mut()
             .unwrap()
             .draw_solid(dst, damage, color)
+            .map_err(Error::Render)
+    }
+
+    fn draw_shadow(
+        &mut self,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        params: ShadowParameters,
+    ) -> Result<(), Self::Error> {
+        // Explicitly delegated (rather than left to `Frame::draw_shadow`'s default) so a renderer
+        // that overrides it - the Vulkan renderer, with a real blurred-shadow shader - is actually
+        // reached through this wrapper. `Self` here is `MultiFrame`, so relying on the trait
+        // default would call *this* type's own fallback, never the inner frame's override.
+        self.damage.extend(damage.iter().copied().map(|mut rect| {
+            rect.loc += dst.loc;
+            rect
+        }));
+        self.frame
+            .as_mut()
+            .unwrap()
+            .draw_shadow(dst, damage, params)
             .map_err(Error::Render)
     }
 
