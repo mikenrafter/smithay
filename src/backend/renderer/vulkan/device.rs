@@ -3582,7 +3582,7 @@ impl VulkanDeviceState {
             logical_device,
             &descriptor_pool,
             descriptor_set_layout.as_ref(),
-            uniform_buffer,
+            &uniform_buffer,
         )?;
 
         let view = self.create_color_attachment_image_view(target)?;
@@ -3600,7 +3600,7 @@ impl VulkanDeviceState {
             &mut command_buffer,
             target,
             pipeline,
-            &descriptor_set,
+            descriptor_set,
             &framebuffer,
             &draw_constants,
         )?;
@@ -8554,28 +8554,18 @@ fn create_shadow_descriptor_pool(
 /// Descriptor set binding one shadow-uniform buffer. Allocated fresh per draw (see
 /// `render_shadow_to_color_image_in`) alongside a single-use `VulkanDescriptorPool`, so its
 /// lifetime is just the one synchronous draw call, not cached like the pipeline/layout are.
-struct VulkanShadowDescriptorSet {
-    // Held only so `pool` (whose `Drop` frees this set) and `buffer` (which the set's descriptor
-    // points at) outlive `handle`'s use in `record_shadow_draw`; never read directly.
-    #[allow(dead_code)]
-    pool: VulkanDescriptorPool,
-    #[allow(dead_code)]
-    buffer: VulkanHostVisibleBuffer,
-    handle: vk::DescriptorSet,
-}
-
-impl VulkanShadowDescriptorSet {
-    fn handle(&self) -> vk::DescriptorSet {
-        self.handle
-    }
-}
-
+/// Allocates one descriptor set from `pool`, pointing it at `buffer`.
+///
+/// Returns the bare handle rather than a wrapper owning `pool`/`buffer`: both must outlive the
+/// descriptor set's use in `record_shadow_draw`, but a plain local binding at the call site
+/// already guarantees that (and is read there via `&pool`/`&buffer`, so there is no unread-field
+/// lint to work around by bundling them into a struct).
 fn create_shadow_descriptor_set(
     logical_device: &VulkanLogicalDevice,
     pool: &VulkanDescriptorPool,
     descriptor_set_layout: &VulkanDescriptorSetLayout,
-    buffer: VulkanHostVisibleBuffer,
-) -> Result<VulkanShadowDescriptorSet, VulkanError> {
+    buffer: &VulkanHostVisibleBuffer,
+) -> Result<vk::DescriptorSet, VulkanError> {
     if !logical_device.is_same_device(pool.logical_device())
         || !logical_device.is_same_device(descriptor_set_layout.logical_device())
     {
@@ -8605,16 +8595,12 @@ fn create_shadow_descriptor_set(
         .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
         .buffer_info(&buffer_infos)];
     // SAFETY: `handle` was allocated from `pool` on `logical_device`, binding 0 exists in
-    // `descriptor_set_layout` as one uniform-buffer descriptor, and `buffer` (kept alive by this
-    // returned struct) covers the whole range written here. The descriptor set is newly allocated
-    // and not concurrently accessed.
+    // `descriptor_set_layout` as one uniform-buffer descriptor, and `buffer` covers the whole
+    // range written here; the caller keeps it alive at least as long as this descriptor set is
+    // used. The descriptor set is newly allocated and not concurrently accessed.
     unsafe { logical_device.handle().update_descriptor_sets(&writes, &[]) };
 
-    Ok(VulkanShadowDescriptorSet {
-        pool: pool.clone(),
-        buffer,
-        handle,
-    })
+    Ok(handle)
 }
 
 /// Render-pass, pipeline-layout, and graphics-pipeline bundle for shadow draws.
@@ -8675,7 +8661,7 @@ fn record_shadow_draw(
     command_buffer: &mut VulkanCommandBuffer,
     target: &VulkanOwnedImage,
     pipeline: &VulkanShadowGraphicsPipeline,
-    descriptor_set: &VulkanShadowDescriptorSet,
+    descriptor_set: vk::DescriptorSet,
     framebuffer: &VulkanFramebuffer,
     draw_constants: &VulkanShadowDrawConstants,
 ) -> Result<(), VulkanError> {
@@ -8716,14 +8702,15 @@ fn record_shadow_draw(
         max_depth: 1.0,
     }];
     let scissors = [draw_constants.scissor_area];
-    let descriptor_sets = [descriptor_set.handle()];
+    let descriptor_sets = [descriptor_set];
     let _pool_guard = command_buffer.command_pool.lock_host_access()?;
 
     // SAFETY: All bound objects were created from the same logical device by private constructors.
     // `target` is in COLOR_ATTACHMENT_OPTIMAL for the duration of the render pass, the framebuffer
     // uses the same render pass as `pipeline`, dynamic viewport/scissor are set before drawing, and
-    // `descriptor_set` retains the uniform buffer it was written to point at. The command buffer is
-    // host synchronized by the command-pool lock.
+    // the caller keeps the uniform buffer `descriptor_set` was written to point at alive at least
+    // as long as this recorded draw is in use. The command buffer is host synchronized by the
+    // command-pool lock.
     unsafe {
         let device = command_buffer.command_pool.logical_device.handle();
         device.cmd_begin_render_pass(command_buffer.handle, &begin_info, vk::SubpassContents::INLINE);
