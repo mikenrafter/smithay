@@ -861,17 +861,17 @@ struct CursorState<G: AsFd + 'static> {
     previous_output_scale: Option<Scale<f64>>,
     #[cfg(feature = "renderer_pixman")]
     pixman_renderer: Option<PixmanRenderer>,
-    /// One warn per compositor for the first pre-TEST assignment miss, then debug.
+    /// One warn per compositor for the first assignment miss, then debug.
     logged_assign_miss: bool,
 }
 
 impl<G: AsFd + 'static> CursorState<G> {
     fn note_assign_miss(&mut self, reason: &'static str) {
         if !self.logged_assign_miss {
-            warn!(reason, "cursor plane assignment failed before KMS TEST");
+            warn!(reason, "cursor plane assignment missed");
             self.logged_assign_miss = true;
         } else {
-            debug!(reason, "cursor plane assignment failed before KMS TEST");
+            debug!(reason, "cursor plane assignment missed");
         }
     }
 }
@@ -2005,7 +2005,19 @@ where
             // if not we can skip it
             let element_output_geometry = match element_geometry.intersection(output_geometry) {
                 Some(geo) => geo,
-                None => continue,
+                None => {
+                    if element.kind() == Kind::Cursor {
+                        if let Some(cursor_state) = self.cursor_state.as_mut() {
+                            warn!(
+                                ?element_geometry,
+                                ?output_geometry,
+                                "Kind::Cursor does not intersect this output"
+                            );
+                            cursor_state.note_assign_miss("Kind::Cursor does not intersect output");
+                        }
+                    }
+                    continue;
+                }
             };
 
             // Then test if the element is completely hidden behind opaque regions
@@ -2019,9 +2031,10 @@ where
                 .iter()
                 .fold(0usize, |acc, item| acc + (item.size.w * item.size.h) as usize);
 
-            if element_visible_area == 0 {
-                // No need to draw a completely hidden element
-                trace!("skipping completely obscured element {:?}", element.id());
+            if element_visible_area == 0 && element.kind() != Kind::Cursor {
+                // No need to draw a completely hidden element. Kind::Cursor stays in the
+                // list so the cursor plane can still be tried; opaque occlusion of a
+                // pointer is a compositing miss, not a reason to skip assignment.
 
                 // We allow multiple instance of a single element, so do not
                 // override the state if we already have one
@@ -3213,21 +3226,30 @@ where
         R: Renderer,
         E: RenderElement<R>,
     {
-        if !frame_flags.contains(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT) {
-            return None;
-        }
-
-        let Some(cursor_state) = self.cursor_state.as_mut() else {
-            debug!("no cursor state, skipping cursor rendering");
-            return None;
-        };
-
-        // only try to assign elements on a cursor plane that indicate so
         if element.kind() != Kind::Cursor {
             return None;
         }
 
+        if !frame_flags.contains(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT) {
+            if let Some(cursor_state) = self.cursor_state.as_mut() {
+                cursor_state.note_assign_miss("ALLOW_CURSOR_PLANE_SCANOUT not set");
+            } else {
+                warn!("cursor plane assignment missed: ALLOW_CURSOR_PLANE_SCANOUT not set (no cursor state)");
+            }
+            return None;
+        }
+
+        let Some(cursor_state) = self.cursor_state.as_mut() else {
+            warn!("cursor plane assignment missed: no cursor state");
+            return None;
+        };
+
         let element_size = output_transform.transform_size(element_geometry.size);
+
+        if element_size.w <= 0 || element_size.h <= 0 {
+            cursor_state.note_assign_miss("cursor element size is zero");
+            return None;
+        }
 
         // if the element is greater than the cursor size we can not
         // use the cursor plane to scan out the element
@@ -3635,7 +3657,7 @@ where
             cursor_state.logged_assign_miss = false;
             Some(plane_info.into())
         } else {
-            info!("failed to test cursor {:?} state", plane_info.handle);
+            info!(handle = ?plane_info.handle, "failed to test cursor plane");
             cursor_state.note_assign_miss("KMS TEST of cursor plane failed");
             None
         }
