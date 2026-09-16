@@ -1965,6 +1965,17 @@ struct MultiTextureInternal {
     format: Option<Fourcc>,
     #[allow(dead_code)]
     buffer_format: Format,
+    /// Bumped every time `textures` is wiped wholesale (buffer size/format change, or surface
+    /// destruction). cosmic-comp renders each output on its own thread, and each thread imports
+    /// a shared surface's buffer for its own device independently - `import_surface`'s per-device
+    /// gate (`RendererSurfaceState::textures`/`renderer_seen`) correctly serializes each device's
+    /// own "have I imported this commit yet", but that gate is a *different* lock than this
+    /// struct's own, so it does nothing to stop one device's wipe-for-a-newer-commit from landing
+    /// in the middle of another device's already-valid-for-its-own-commit import finishing up.
+    /// Generation-gated inserts (see `MultiTexture::current_generation` and the wayland import call
+    /// sites that use it) refuse to write a result that's no longer for the generation they
+    /// started importing for, instead of overwriting a newer wipe with stale data.
+    generation: u64,
 }
 // SAFETY: We require `Send` for textures of renderers suitable for the MultiRenderer.
 //  Type erasure just forces us to do this instead.
@@ -1973,7 +1984,9 @@ unsafe impl Send for MultiTextureInternal {}
 #[cfg(feature = "wayland_frontend")]
 pub(crate) fn clear_surface_textures(states: &crate::wayland::compositor::SurfaceData) {
     if let Some(texture) = states.data_map.get::<Arc<Mutex<MultiTextureInternal>>>() {
-        texture.lock().unwrap().textures.clear();
+        let mut guard = texture.lock().unwrap();
+        guard.textures.clear();
+        guard.generation = guard.generation.wrapping_add(1);
     }
 }
 
@@ -2015,17 +2028,21 @@ impl MultiTexture {
                     size,
                     format: None,
                     buffer_format,
+                    generation: 0,
                 }))
             });
         let ptr = Arc::as_ptr(&internal);
         {
             let mut guard = internal.lock().unwrap();
             if guard.size != size || guard.buffer_format != buffer_format {
-                // Diagnostic for a suspected race: this clears every device's cached texture in one
-                // step, but re-import for any given device happens later as a separate step (see
+                // Cross-thread race: this clears every device's cached texture in one step, but
+                // re-import for any given device happens later as a separate step (see
                 // `render_texture_from_to`'s empty-map warning). If that warning's pointer matches
                 // this one and its thread differs from this thread, a concurrent renderer observed
-                // this surface mid-clear rather than a genuine per-device import failure.
+                // this surface mid-clear rather than a genuine per-device import failure. The
+                // generation bump below is what lets the wayland import call sites (which capture
+                // `current_generation` right after calling this function) detect that and discard
+                // a stale insert instead of writing into a generation this wipe already moved past.
                 warn!(
                     thread = ?std::thread::current().id(),
                     ?ptr,
@@ -2040,6 +2057,7 @@ impl MultiTexture {
                 guard.format = None;
                 guard.size = size;
                 guard.buffer_format = buffer_format;
+                guard.generation = guard.generation.wrapping_add(1);
             }
         }
         MultiTexture(internal)
@@ -2051,7 +2069,19 @@ impl MultiTexture {
             size,
             format: None,
             buffer_format,
+            generation: 0,
         })))
+    }
+
+    /// The clear-generation observed right now. Callers that import a wayland surface's buffer
+    /// asynchronously relative to other devices doing the same (see the wayland dmabuf/shm import
+    /// helpers below) capture this immediately after `from_surface`/`wayland_cached_or_fresh_multi_texture`
+    /// returns, and pass it to a generation-gated insert once their import work completes, so a
+    /// result computed for a generation this cache has since moved past is discarded instead of
+    /// silently corrupting the newer generation's state.
+    #[cfg(feature = "wayland_frontend")]
+    fn current_generation(&self) -> u64 {
+        self.0.lock().unwrap().generation
     }
 
     /// Create a `MultiTexture` from a renderer `A`-specific texture type.
@@ -2215,6 +2245,48 @@ impl MultiTexture {
         );
         tex.textures
             .insert(render_id, GpuSingleTexture::Direct(Box::new(texture) as Box<_>));
+    }
+
+    /// Like [`Self::insert_texture`], but for a wayland surface import racing a concurrent clear
+    /// on another thread (see `current_generation`'s doc): discards `texture` instead of inserting
+    /// it if this cache has moved past `expected_generation` since the caller started importing.
+    /// Returns whether the insert actually happened, so the caller can decide whether to log.
+    #[cfg(feature = "wayland_frontend")]
+    fn insert_texture_for_generation<A: GraphicsApi + 'static>(
+        &mut self,
+        render_id: &ContextId<<<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>,
+        texture: <<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
+        expected_generation: u64,
+    ) -> bool
+    where
+        <<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: 'static,
+    {
+        let mut tex = self.0.lock().unwrap();
+        if tex.generation != expected_generation {
+            trace!(
+                expected = expected_generation,
+                current = tex.generation,
+                "Discarding wayland surface import for a generation this cache has moved past"
+            );
+            return false;
+        }
+        let format = texture.format();
+        if format != tex.format && !tex.textures.is_empty() {
+            warn!(has = ?tex.format, got = ?format, "Multi-SubTexture with wrong format!");
+            return false;
+        }
+        tex.format = format;
+
+        let render_id = render_id.erased();
+        trace!(
+            "Inserting into: {:p} for {:?}: {:?}",
+            Arc::as_ptr(&self.0),
+            render_id,
+            tex
+        );
+        tex.textures
+            .insert(render_id, GpuSingleTexture::Direct(Box::new(texture) as Box<_>));
+        true
     }
 
     #[cfg(feature = "wayland_frontend")]
@@ -2490,7 +2562,12 @@ where
         })
         .map_err(|_| Error::ImportFailed)??;
         let mut texture = MultiTexture::from_surface(surface, dimensions, format);
-        texture.insert_texture::<R>(&self.render.renderer().context_id(), shm_texture);
+        let expected_generation = texture.current_generation();
+        texture.insert_texture_for_generation::<R>(
+            &self.render.renderer().context_id(),
+            shm_texture,
+            expected_generation,
+        );
         Ok(texture)
     }
 
@@ -2592,11 +2669,15 @@ where
 {
     let mut texture = wayland_cached_or_fresh_multi_texture(surface, dmabuf);
     let texture_ref = texture.0.clone();
+    // Captured before the device import below, which is the actual slow step (real GPU work,
+    // not just a lock acquisition) - a concurrent clear on another output's render thread landing
+    // anywhere in that gap must not have its wipe overwritten by this now-stale result.
+    let expected_generation = texture.current_generation();
     let renderer = render.renderer_mut();
     let imported = renderer
         .import_dma_buffer_from_surface_state(buffer, surface, damage)
         .map_err(Error::Render)?;
-    texture.insert_texture::<R>(&renderer.context_id(), imported);
+    texture.insert_texture_for_generation::<R>(&renderer.context_id(), imported, expected_generation);
     if let Some(surface) = surface {
         surface.data_map.insert_if_missing_threadsafe(|| texture_ref);
     }
@@ -2633,6 +2714,10 @@ where
 
     let mut texture = wayland_cached_or_fresh_multi_texture(surface, dmabuf);
     let texture_ref = texture.0.clone();
+    // See `import_wayland_dmabuf_on_render_device`'s comment: captured before either device
+    // import below (both do real GPU work), so a concurrent clear on another output's render
+    // thread anywhere in that gap is detected instead of silently overwritten.
+    let expected_generation = texture.current_generation();
     let damage = Some(damage);
     let render_id = render.renderer().context_id().erased();
 
@@ -2642,7 +2727,16 @@ where
             .renderer_mut()
             .import_dma_buffer_from_surface_state(buffer, surface, damage.unwrap_or(&[]))
             .map_err(Error::Target)?;
-        texture.insert_texture::<T>(&target.renderer().context_id(), imported);
+        if !texture.insert_texture_for_generation::<T>(
+            &target.renderer().context_id(),
+            imported,
+            expected_generation,
+        ) {
+            // Stale: a newer commit's clear already moved this cache past the generation we
+            // imported for. Nothing to copy from, and nothing to corrupt - a fresh import for
+            // whatever's current now will happen on the next frame that needs this surface.
+            return Ok(texture);
+        }
 
         let mut texture_internal = texture.0.lock().unwrap();
         let mut render_texture = texture_internal.textures.remove(&render_id);
@@ -2656,7 +2750,9 @@ where
         let copy = texture_copy::<T, R>(target, render, src_texture, &mut render_texture, damage)
             .map_err(Error::transpose);
         if let Some(render_texture) = render_texture.filter(|_| copy.is_ok()) {
-            texture_internal.textures.insert(render_id, render_texture);
+            if texture_internal.generation == expected_generation {
+                texture_internal.textures.insert(render_id, render_texture);
+            }
         }
         copy
     } else if let Some(other) = other_renderers.iter_mut().find(|other| src_node == *other.node()) {
@@ -2664,7 +2760,13 @@ where
             .renderer_mut()
             .import_dma_buffer_from_surface_state(buffer, surface, damage.unwrap_or(&[]))
             .map_err(Error::Render)?;
-        texture.insert_texture::<R>(&other.renderer().context_id(), imported);
+        if !texture.insert_texture_for_generation::<R>(
+            &other.renderer().context_id(),
+            imported,
+            expected_generation,
+        ) {
+            return Ok(texture);
+        }
 
         let mut texture_internal = texture.0.lock().unwrap();
         let mut render_texture = texture_internal.textures.remove(&render_id);
@@ -2678,7 +2780,9 @@ where
         let copy = texture_copy::<R, R>(other, render, src_texture, &mut render_texture, damage)
             .map_err(Error::generalize::<T>);
         if let Some(render_texture) = render_texture.filter(|_| copy.is_ok()) {
-            texture_internal.textures.insert(render_id, render_texture);
+            if texture_internal.generation == expected_generation {
+                texture_internal.textures.insert(render_id, render_texture);
+            }
         }
         copy
     } else {
