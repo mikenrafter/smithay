@@ -1140,7 +1140,26 @@ impl VulkanDeviceState {
         &self,
         import: &VulkanDmabufImportState,
     ) -> Result<Option<VulkanDmabufExternalImageFormatProperties>, VulkanError> {
-        self.dmabuf_external_image_format_properties_for_usage(import, vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        self.dmabuf_render_target_external_image_format_properties_for_usage(
+            import,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        )
+    }
+
+    /// Like [`Self::dmabuf_render_target_external_image_format_properties`], but for `usage`
+    /// combinations beyond plain `COLOR_ATTACHMENT` - e.g. `COLOR_ATTACHMENT | TRANSFER_SRC` for
+    /// a render target that also needs to be usable as a [`Self::blit_owned_images`] source
+    /// (screencopy/screen-sharing). `usage` must still be a render-target-shaped combination
+    /// (`COLOR_ATTACHMENT`, optionally combined with `TRANSFER_SRC` and/or `TRANSFER_DST`) - see
+    /// [`Self::dmabuf_external_image_format_properties_for_usage`]'s own `has_modifier_record`
+    /// check.
+    #[allow(dead_code)]
+    fn dmabuf_render_target_external_image_format_properties_for_usage(
+        &self,
+        import: &VulkanDmabufImportState,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Option<VulkanDmabufExternalImageFormatProperties>, VulkanError> {
+        self.dmabuf_external_image_format_properties_for_usage(import, usage)
     }
 
     #[allow(dead_code)]
@@ -1153,9 +1172,17 @@ impl VulkanDeviceState {
             return Ok(None);
         }
 
+        // `COLOR_ATTACHMENT` combined with `TRANSFER_SRC` and/or `TRANSFER_DST` is still a
+        // render-target-shaped request (a color-attachment image that's also usable as a blit
+        // source/destination) - covered by the same modifier record as plain `COLOR_ATTACHMENT`.
+        let render_target_usages = vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::TRANSFER_DST;
         let has_modifier_record = if usage == vk::ImageUsageFlags::SAMPLED {
             self.capabilities.formats.dmabuf_import_record(import).is_some()
-        } else if usage == vk::ImageUsageFlags::COLOR_ATTACHMENT {
+        } else if usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            && render_target_usages.contains(usage)
+        {
             self.capabilities
                 .formats
                 .dmabuf_render_target_record(import)
@@ -1252,7 +1279,21 @@ impl VulkanDeviceState {
         &self,
         import: &VulkanDmabufImportState,
     ) -> Result<Option<VulkanDmabufImportCandidate>, VulkanError> {
-        let Some(properties) = self.dmabuf_render_target_external_image_format_properties(import)? else {
+        self.dmabuf_render_target_candidate_for_usage(import, vk::ImageUsageFlags::COLOR_ATTACHMENT)
+    }
+
+    /// Like [`Self::dmabuf_render_target_candidate`], but probes a specific render-target-shaped
+    /// `usage` combination (see [`Self::dmabuf_external_image_format_properties_for_usage`])
+    /// instead of assuming plain `COLOR_ATTACHMENT`.
+    #[allow(dead_code)]
+    fn dmabuf_render_target_candidate_for_usage(
+        &self,
+        import: &VulkanDmabufImportState,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Option<VulkanDmabufImportCandidate>, VulkanError> {
+        let Some(properties) =
+            self.dmabuf_render_target_external_image_format_properties_for_usage(import, usage)?
+        else {
             return Ok(None);
         };
 
@@ -1288,10 +1329,14 @@ impl VulkanDeviceState {
         import: &VulkanDmabufImportState,
         usage: vk::ImageUsageFlags,
     ) -> Result<Option<VulkanDmabufImportImage>, VulkanError> {
+        let render_target_usages = vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::TRANSFER_DST;
         let candidate = if usage == vk::ImageUsageFlags::SAMPLED {
             self.dmabuf_import_candidate(import)?
-        } else if usage == vk::ImageUsageFlags::COLOR_ATTACHMENT {
-            self.dmabuf_render_target_candidate(import)?
+        } else if usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) && render_target_usages.contains(usage)
+        {
+            self.dmabuf_render_target_candidate_for_usage(import, usage)?
         } else {
             None
         };
@@ -1491,9 +1536,7 @@ impl VulkanDeviceState {
         } else {
             dmabuf_render_target_first_use_sync_state()
         };
-        let Some(image) =
-            self.create_bound_dmabuf_image_with_sync(dmabuf, sync, vk::ImageUsageFlags::COLOR_ATTACHMENT)?
-        else {
+        let Some(image) = self.create_bound_dmabuf_render_target_image_with_sync(dmabuf, sync)? else {
             return Ok(None);
         };
 
@@ -1536,6 +1579,37 @@ impl VulkanDeviceState {
         sync: VulkanImageSyncState,
     ) -> Result<Option<VulkanOwnedImage>, VulkanError> {
         self.create_bound_dmabuf_image_with_sync(dmabuf, sync, vk::ImageUsageFlags::SAMPLED)
+    }
+
+    /// Creates a dmabuf render-target image, preferring one that also supports being used as a
+    /// [`Self::blit_owned_images`] source (`TRANSFER_SRC` - needed for screencopy/screen-sharing)
+    /// when this dmabuf's format and modifier actually support it, falling back to a plain
+    /// color-attachment-only image (display still works, just without blit-source capability)
+    /// when they don't. Vendor-agnostic: this only depends on what
+    /// `vkGetPhysicalDeviceImageFormatProperties2` reports (or, failing that prediction, what
+    /// `vkCreateImage` itself actually accepts) for this specific format/modifier combination on
+    /// this device, never on which driver/GPU is behind it - see `ISSUES.md` for why some
+    /// hardware needs this fallback at all. A genuine image-creation error on the enhanced
+    /// attempt falls back too, rather than propagating and risking the primary scanout path,
+    /// since the format-properties query is a prediction of driver support, not a guarantee.
+    fn create_bound_dmabuf_render_target_image_with_sync(
+        &self,
+        dmabuf: &Dmabuf,
+        sync: VulkanImageSyncState,
+    ) -> Result<Option<VulkanOwnedImage>, VulkanError> {
+        let with_blit_source = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC;
+        match self.create_bound_dmabuf_image_with_sync(dmabuf, sync, with_blit_source) {
+            Ok(Some(image)) => return Ok(Some(image)),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(
+                    ?err,
+                    "dmabuf render target with blit-source usage unsupported, falling back to \
+                     color-attachment only"
+                );
+            }
+        }
+        self.create_bound_dmabuf_image_with_sync(dmabuf, sync, vk::ImageUsageFlags::COLOR_ATTACHMENT)
     }
 
     fn create_bound_dmabuf_image_with_sync(
