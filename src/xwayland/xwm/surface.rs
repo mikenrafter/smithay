@@ -192,9 +192,20 @@ pub(super) enum WMProtocol {
 impl PartialEq for X11Surface {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        let self_alive = self.state.lock().unwrap().alive;
-        let other_alive = other.state.lock().unwrap().alive;
-        self.xwm == other.xwm && self.window == other.window && self_alive && other_alive
+        let self_state = self.state.lock().unwrap();
+        let other_state = other.state.lock().unwrap();
+        // wl_surface is compared in addition to the X11 window id: Xwayland
+        // pairs a window with a *new* wl_surface across an unmap/re-map (a
+        // fullscreen mode switch, for example), and callers that use this
+        // equality to decide whether pointer/keyboard focus actually changed
+        // (e.g. Smithay's PointerInternal::motion) need to see that as a
+        // change, or focus/relative-motion events silently keep targeting the
+        // stale surface.
+        self.xwm == other.xwm
+            && self.window == other.window
+            && self_state.wl_surface == other_state.wl_surface
+            && self_state.alive
+            && other_state.alive
     }
 }
 
