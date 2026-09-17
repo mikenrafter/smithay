@@ -171,7 +171,7 @@ use x11rb::{
     errors::{ReplyError, ReplyOrIdError},
     properties::{WmHints, WmHintsState},
     protocol::{
-        Event,
+        ErrorKind, Event,
         composite::{ConnectionExt as _, Redirect},
         randr::{ConnectionExt as _, Notify, NotifyMask},
         render::{ConnectionExt as _, CreatePictureAux, PictureWrapper},
@@ -1514,6 +1514,20 @@ impl X11Wm {
     }
 }
 
+/// A checked X11 reply where `BadWindow` means the window was already
+/// destroyed by its owning client, rather than a fault - common for
+/// short-lived helper windows racing `CreateNotify`/`MapRequest` against
+/// their own destruction. Returns `Ok(None)` in that case so callers can
+/// just stop processing the window instead of the reply's error aborting
+/// the whole XWM event.
+fn reply_or_window_gone<T>(reply: Result<T, ReplyError>) -> Result<Option<T>, ReplyError> {
+    match reply {
+        Ok(value) => Ok(Some(value)),
+        Err(ReplyError::X11Error(ref err)) if err.error_kind == ErrorKind::Window => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 fn handle_event<D>(
     loop_handle: &LoopHandle<'_, D>,
     dh: &DisplayHandle,
@@ -1571,7 +1585,11 @@ where
                 return Ok(());
             }
 
-            let attrs = conn.get_window_attributes(n.window)?.reply()?;
+            let Some(attrs) = reply_or_window_gone(conn.get_window_attributes(n.window)?.reply())? else {
+                // Destroyed by its owning client before we could query it - lost
+                // the race to a short-lived window, not an error.
+                return Ok(());
+            };
             if attrs.class != WindowClass::INPUT_OUTPUT {
                 return Ok(());
             }
@@ -1587,10 +1605,13 @@ where
                 return Ok(());
             }
 
-            let geo = conn.get_geometry(n.window)?.reply()?;
+            // CreateNotify already carries x/y/width/height - no round-trip needed
+            // (the geometry the server would answer with is exactly these fields).
+            // Removing this call also removes it as a place this event's handling
+            // could race the window's destruction, on top of not blocking at all.
             let geometry = Rectangle::<i32, Client>::new(
-                (geo.x as i32, geo.y as i32).into(),
-                (geo.width as i32, geo.height as i32).into(),
+                (n.x as i32, n.y as i32).into(),
+                (n.width as i32, n.height as i32).into(),
             )
             .to_f64()
             .to_logical(xwm.client_scale.load(Ordering::Acquire))
@@ -1622,8 +1643,12 @@ where
                     // we reparent windows, because a lot of stuff expects, that we do
                     let geo_cookie = conn.get_geometry(r.window)?;
                     let attrs_cookie = conn.get_window_attributes(r.window)?;
-                    let geo = geo_cookie.reply()?;
-                    let attrs = attrs_cookie.reply()?;
+                    let Some(geo) = reply_or_window_gone(geo_cookie.reply())? else {
+                        return Ok(());
+                    };
+                    let Some(attrs) = reply_or_window_gone(attrs_cookie.reply())? else {
+                        return Ok(());
+                    };
                     let colormap = xwm.colormap_for_visual(attrs.visual)?;
 
                     let win = r.window;
