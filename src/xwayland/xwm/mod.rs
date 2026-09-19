@@ -1514,16 +1514,21 @@ impl X11Wm {
     }
 }
 
-/// A checked X11 reply where `BadWindow` means the window was already
-/// destroyed by its owning client, rather than a fault - common for
+/// A checked X11 reply where `BadWindow`/`BadDrawable` means the window was
+/// already destroyed by its owning client, rather than a fault - common for
 /// short-lived helper windows racing `CreateNotify`/`MapRequest` against
-/// their own destruction. Returns `Ok(None)` in that case so callers can
-/// just stop processing the window instead of the reply's error aborting
-/// the whole XWM event.
+/// their own destruction. (`GetGeometry` takes a drawable, so a dead window
+/// there reports `BadDrawable`, not `BadWindow`.) Returns `Ok(None)` in that
+/// case so callers can just stop processing the window instead of the
+/// reply's error aborting the whole XWM event.
 fn reply_or_window_gone<T>(reply: Result<T, ReplyError>) -> Result<Option<T>, ReplyError> {
     match reply {
         Ok(value) => Ok(Some(value)),
-        Err(ReplyError::X11Error(ref err)) if err.error_kind == ErrorKind::Window => Ok(None),
+        Err(ReplyError::X11Error(ref err))
+            if matches!(err.error_kind, ErrorKind::Window | ErrorKind::Drawable) =>
+        {
+            Ok(None)
+        }
         Err(err) => Err(err),
     }
 }
