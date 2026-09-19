@@ -192,31 +192,9 @@ pub(super) enum WMProtocol {
 impl PartialEq for X11Surface {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        if self.xwm != other.xwm || self.window != other.window {
-            return false;
-        }
-        // Clones of the same surface share one state mutex; std's Mutex is not
-        // reentrant, so the two locks below must never be held at the same
-        // time (and comparing a surface to itself must not lock twice).
-        if Arc::ptr_eq(&self.state, &other.state) {
-            return self.state.lock().unwrap().alive;
-        }
-        let (self_alive, self_surface) = {
-            let s = self.state.lock().unwrap();
-            (s.alive, s.wl_surface.clone())
-        };
-        let (other_alive, other_surface) = {
-            let o = other.state.lock().unwrap();
-            (o.alive, o.wl_surface.clone())
-        };
-        // wl_surface is compared in addition to the X11 window id: Xwayland
-        // pairs a window with a *new* wl_surface across an unmap/re-map (a
-        // fullscreen mode switch, for example), and callers that use this
-        // equality to decide whether pointer/keyboard focus actually changed
-        // (e.g. Smithay's PointerInternal::motion) need to see that as a
-        // change, or focus/relative-motion events silently keep targeting the
-        // stale surface.
-        self_alive && other_alive && self_surface == other_surface
+        let self_alive = self.state.lock().unwrap().alive;
+        let other_alive = other.state.lock().unwrap().alive;
+        self.xwm == other.xwm && self.window == other.window && self_alive && other_alive
     }
 }
 
