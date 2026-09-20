@@ -1052,8 +1052,21 @@ impl X11Wm {
         let dh = dh.clone();
         handle.insert_source(source, move |event, _, data| match event {
             calloop::channel::Event::Msg(event) => {
+                // Every X11 event is handled on the compositor's main thread, which is
+                // also its input thread; any blocking reply in here delays input.
+                let kind = event_kind(&event);
+                let started = std::time::Instant::now();
                 if let Err(err) = handle_event(&event_handle, &dh, data, id, event) {
                     warn!(id = id.0, err = ?err, "Failed to handle X11 event");
+                }
+                let elapsed = started.elapsed();
+                if elapsed >= std::time::Duration::from_millis(1) {
+                    debug!(
+                        id = id.0,
+                        event = kind,
+                        us = elapsed.as_micros() as u64,
+                        "slow X11 event on main thread"
+                    );
                 }
             }
             calloop::channel::Event::Closed => {
@@ -1511,6 +1524,31 @@ impl X11Wm {
             self.colormaps.borrow_mut().insert(visual, colormap);
             Ok(colormap)
         }
+    }
+}
+
+fn event_kind(event: &Event) -> &'static str {
+    match event {
+        Event::CreateNotify(_) => "CreateNotify",
+        Event::MapRequest(_) => "MapRequest",
+        Event::MapNotify(_) => "MapNotify",
+        Event::UnmapNotify(_) => "UnmapNotify",
+        Event::DestroyNotify(_) => "DestroyNotify",
+        Event::ReparentNotify(_) => "ReparentNotify",
+        Event::ConfigureRequest(_) => "ConfigureRequest",
+        Event::ConfigureNotify(_) => "ConfigureNotify",
+        Event::PropertyNotify(_) => "PropertyNotify",
+        Event::ClientMessage(_) => "ClientMessage",
+        Event::FocusIn(_) => "FocusIn",
+        Event::FocusOut(_) => "FocusOut",
+        Event::SelectionRequest(_) => "SelectionRequest",
+        Event::SelectionNotify(_) => "SelectionNotify",
+        Event::XfixesSelectionNotify(_) => "XfixesSelectionNotify",
+        Event::SyncAlarmNotify(_) => "SyncAlarmNotify",
+        Event::RandrNotify(_) => "RandrNotify",
+        Event::RandrScreenChangeNotify(_) => "RandrScreenChangeNotify",
+        Event::Error(_) => "Error",
+        _ => "other",
     }
 }
 
