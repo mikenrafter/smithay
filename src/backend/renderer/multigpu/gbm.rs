@@ -26,7 +26,7 @@ use crate::{
         allocator::Buffer as BufferTrait,
         egl::display::EGLBufferReader,
         renderer::{
-            Bind, ExportMem, ImportDma, ImportEgl, ImportMem,
+            Bind, ExportMem, ImportDma, ImportEgl, ImportMem, RenderTargetLifecycle,
             multigpu::{Error as MultigpuError, MultiRenderer, MultiTexture, import_dmabuf_internal},
         },
     },
@@ -280,6 +280,7 @@ where
         + BorrowMut<GlesRenderer>
         + Renderer<Error = GlesError>
         + Bind<Dmabuf>
+        + RenderTargetLifecycle<Dmabuf>
         + ImportDma
         + ImportMem
         + ImportEgl
